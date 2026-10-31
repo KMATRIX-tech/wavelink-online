@@ -1,0 +1,47 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B0F19"/>
+      <stop offset="50%" stop-color="#140E2D"/>
+      <stop offset="100%" stop-color="#070A12"/>
+    </linearGradient>
+    <linearGradient id="waveGrad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9333EA"/>
+      <stop offset="50%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#EC4899"/>
+    </linearGradient>
+    <linearGradient id="waveGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="16" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background rounded squircle -->
+  <rect width="512" height="512" rx="128" fill="url(#bgGrad)"/>
+  
+  <!-- Subtle border highlight -->
+  <rect x="4" y="4" width="504" height="504" rx="124" fill="none" stroke="url(#waveGrad1)" stroke-width="6" stroke-opacity="0.5"/>
+
+  <!-- Wave Icon Centered -->
+  <g transform="translate(106, 126) scale(1.2)" filter="url(#glow)">
+    <!-- Wave 1: Lower flow -->
+    <path d="M10 160 C 50 120, 100 200, 150 160 C 200 120, 240 180, 240 180" 
+          fill="none" stroke="url(#waveGrad2)" stroke-width="28" stroke-linecap="round"/>
+    
+    <!-- Wave 2: Middle prominent wave -->
+    <path d="M10 100 C 50 50, 110 150, 160 100 C 200 60, 240 110, 240 110" 
+          fill="none" stroke="url(#waveGrad1)" stroke-width="32" stroke-linecap="round"/>
+
+    <!-- Wave 3: Top crest -->
+    <path d="M20 40 C 60 10, 110 70, 150 40 C 190 10, 230 50, 230 50" 
+          fill="none" stroke="#F472B6" stroke-width="24" stroke-linecap="round"/>
+
+    <!-- Sparkle accent -->
+    <circle cx="210" cy="20" r="10" fill="#FBBF24" />
+  </g>
+</svg>

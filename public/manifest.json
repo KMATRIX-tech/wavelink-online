@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "WaveLink - Social & Creator Network",
+  "short_name": "WaveLink",
+  "description": "WaveLink is a modern social network featuring real-time feed, Airtel Money & AzamPay mobile payments, creator tipping, post boosting, and native monetization.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#070A12",
+  "theme_color": "#070A12",
+  "categories": ["social", "entertainment", "finance"],
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}

@@ -1,0 +1,199 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email.lower() == 'keylanmbilinyi5@gmail.com' ||
+        request.auth.token.email.lower() == 'keylanmbilinyi5@gnail.com'
+      );
+    }
+
+    function isSubAdmin() {
+      return isSignedIn() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isSubAdmin == true;
+    }
+
+    function isAdmin() {
+      return isSuperAdmin() || isSubAdmin();
+    }
+
+    // Default catch-all deny rule for zero-trust baseline
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Connection test document
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // User profiles
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if isOwner(userId) || isAdmin();
+      allow update: if isSuperAdmin() || isAdmin() || (
+        isOwner(userId) &&
+        (!('role' in request.resource.data) || request.resource.data.role == 'user' || (resource != null && request.resource.data.role == resource.data.role)) &&
+        (!('isSubAdmin' in request.resource.data) || request.resource.data.isSubAdmin == false || (resource != null && request.resource.data.isSubAdmin == resource.data.isSubAdmin))
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // Social feed posts
+    match /posts/{postId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+
+      match /comments/{commentId} {
+        allow read: if true;
+        allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+        allow update, delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+      }
+
+      match /chunks/{chunkId} {
+        allow read: if true;
+        allow create, update, delete: if isSignedIn();
+      }
+    }
+
+    // Sparks: 24-hour ephemeral moments
+    match /sparks/{sparkId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+
+      match /chunks/{chunkId} {
+        allow read: if true;
+        allow create, update, delete: if isSignedIn();
+      }
+    }
+
+    // Global Announcements & Community Notice Board Events
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+
+      match /chunks/{chunkId} {
+        allow read: if true;
+        allow create, update, delete: if isSignedIn();
+      }
+    }
+
+    // Support Tickets & Complaints
+    match /supportTickets/{ticketId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // User-created groups & group messages
+    match /groups/{groupId} {
+      allow read: if true;
+      allow create: if isSignedIn();
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (resource.data.creatorId == request.auth.uid || isAdmin());
+
+      match /messages/{messageId} {
+        allow read: if true;
+        allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
+        allow update: if isSignedIn();
+        allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || isAdmin());
+      }
+    }
+
+    // Real-Time Channel & Direct Messages (including lastSeen read receipts)
+    match /channels/{channelId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+
+      match /messages/{messageId} {
+        allow read: if true;
+        allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
+        allow update: if isSignedIn();
+        allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || isAdmin());
+      }
+    }
+
+    // Global App Settings (video/voice call locks)
+    match /appSettings/{settingsId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Subscriptions and mobile payment transactions
+    match /subscriptions/{subId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+    }
+
+    // Payment Gateway Developer Settings (Client IDs, Secrets, Webhook)
+    match /paymentConfig/{configId} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    // In-App Notifications (messages, calls, posts, follows)
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
+    }
+
+    // User Follows
+    match /follows/{followId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.followerId == request.auth.uid;
+      allow delete: if isSignedIn() && (resource.data.followerId == request.auth.uid || isAdmin());
+    }
+
+    // Manual Mobile Money Transaction Verifications for WaveLink Pro
+    match /pending_verifications/{verificationId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Direct Manual Payment Requests for WaveLink Pro & Harvest Pass (Private to submitting user & admins)
+    match /payment_requests/{requestId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // System Domains for OAuth Whitelisting tracking
+    match /system_domains/{domainId} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if isAdmin();
+    }
+
+    // Official Coupon & Promo Codes
+    match /coupons/{codeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /promo_codes/{codeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,372 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile information with account status, username, bio, avatar, and saved items",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string" },
+        "username": { "type": "string", "maxLength": 40 },
+        "displayName": { "type": "string", "maxLength": 80 },
+        "photoURL": { "type": "string" },
+        "bio": { "type": "string", "maxLength": 280 },
+        "status": { "type": "string", "enum": ["active", "warned", "banned"] },
+        "warningMessage": { "type": "string", "maxLength": 500 },
+        "isBanned": { "type": "boolean" },
+        "savedPostIds": { "type": "array" },
+        "isSubAdmin": { "type": "boolean" },
+        "role": { "type": "string", "enum": ["super_admin", "sub_admin", "user"] },
+        "hasBlueStar": { "type": "boolean" },
+        "isPro": { "type": "boolean" },
+        "proPlan": { "type": "string", "enum": ["weekly", "monthly", "annual"] },
+        "proExpiresAt": { "type": "string" },
+        "proBadge": { "type": "string", "enum": ["verified", "vip", "creator", "founder"] },
+        "proBorderEffect": { "type": "string", "enum": ["aura-gold", "neon-pulse", "cosmic-glow", "emerald-ring", "none"] },
+        "proAccentColor": { "type": "string", "enum": ["purple", "gold", "emerald", "neon", "crimson"] },
+        "points": { "type": "number" },
+        "wavePoints": { "type": "number" },
+        "loginStreak": { "type": "number" },
+        "lastDailyRewardDate": { "type": "string" },
+        "lastDailyRewardAmount": { "type": "number" },
+        "totalLoginDays": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "email", "displayName", "status", "isBanned"]
+    },
+    "Post": {
+      "title": "Post",
+      "description": "User shared posts and videos in the community feed",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorEmail": { "type": "string" },
+        "authorName": { "type": "string", "maxLength": 80 },
+        "authorUsername": { "type": "string", "maxLength": 40 },
+        "authorPhotoURL": { "type": "string" },
+        "content": { "type": "string", "maxLength": 2000 },
+        "imageUrl": { "type": "string" },
+        "videoUrl": { "type": "string" },
+        "thumbnailUrl": { "type": "string" },
+        "hasVideoChunks": { "type": "boolean" },
+        "videoFileName": { "type": "string" },
+        "mediaType": { "type": "string", "enum": ["image", "video", "none"] },
+        "likes": { "type": "array" },
+        "likesCount": { "type": "number" },
+        "reactions": { "type": "object" },
+        "reactionCounts": { "type": "object" },
+        "commentsCount": { "type": "number" },
+        "savesCount": { "type": "number" },
+        "songTitle": { "type": "string" },
+        "songArtist": { "type": "string" },
+        "songAlbumArt": { "type": "string" },
+        "songPreviewUrl": { "type": "string" },
+        "songAlbumName": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "authorId", "authorEmail", "authorName", "content", "likesCount"]
+    },
+    "Spark": {
+      "title": "Spark",
+      "description": "24-hour ephemeral legendary moments with photo or video uploaded from device, with optional soundtrack",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorEmail": { "type": "string" },
+        "authorName": { "type": "string", "maxLength": 80 },
+        "authorUsername": { "type": "string", "maxLength": 40 },
+        "authorPhotoURL": { "type": "string" },
+        "legendaryTag": { "type": "string", "maxLength": 60 },
+        "caption": { "type": "string", "maxLength": 500 },
+        "mediaUrl": { "type": "string" },
+        "mediaType": { "type": "string", "enum": ["image", "video"] },
+        "hasVideoChunks": { "type": "boolean" },
+        "videoFileName": { "type": "string" },
+        "songTitle": { "type": "string" },
+        "songArtist": { "type": "string" },
+        "songAlbumArt": { "type": "string" },
+        "songPreviewUrl": { "type": "string" },
+        "likes": { "type": "array" },
+        "likesCount": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "expiresAt": { "type": "string" }
+      },
+      "required": ["id", "authorId", "authorEmail", "authorName", "mediaType", "createdAt", "expiresAt"]
+    },
+    "PostComment": {
+      "title": "PostComment",
+      "description": "Comments attached to community posts",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "postId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorEmail": { "type": "string" },
+        "authorName": { "type": "string", "maxLength": 80 },
+        "authorPhotoURL": { "type": "string" },
+        "content": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "postId", "authorId", "authorName", "content"]
+    },
+    "Announcement": {
+      "title": "Announcement",
+      "description": "Global community events, church schedules, and official platform notices on the Notice Board",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorEmail": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorUsername": { "type": "string" },
+        "authorPhotoURL": { "type": "string" },
+        "title": { "type": "string", "maxLength": 160 },
+        "content": { "type": "string", "maxLength": 3000 },
+        "priority": { "type": "string", "enum": ["normal", "urgent"] },
+        "type": { "type": "string", "enum": ["announcement", "event", "schedule"] },
+        "eventDate": { "type": "string" },
+        "eventTime": { "type": "string" },
+        "eventLocation": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "rsvpUserIds": { "type": "array" },
+        "rsvpCount": { "type": "number" },
+        "isPinned": { "type": "boolean" },
+        "isOfficialPartner": { "type": "boolean" },
+        "partnerType": { "type": "string" },
+        "partnerBadgeTitle": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "authorId", "authorEmail", "title", "content", "priority"]
+    },
+    "SupportTicket": {
+      "title": "SupportTicket",
+      "description": "Private complaints and tickets submitted by users to admin desk",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "userName": { "type": "string" },
+        "subject": { "type": "string", "maxLength": 140 },
+        "message": { "type": "string", "maxLength": 2000 },
+        "status": { "type": "string", "enum": ["open", "in_progress", "resolved"] },
+        "adminReply": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "userEmail", "subject", "message", "status"]
+    },
+    "ChannelMessage": {
+      "title": "ChannelMessage",
+      "description": "Real-time chat messages in general and direct channels",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "channelId": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderEmail": { "type": "string" },
+        "senderName": { "type": "string", "maxLength": 80 },
+        "senderUsername": { "type": "string", "maxLength": 40 },
+        "senderPhotoURL": { "type": "string" },
+        "text": { "type": "string", "maxLength": 2000 },
+        "mediaUrl": { "type": "string" },
+        "mediaType": { "type": "string", "enum": ["image", "video", "none"] },
+        "gifUrl": { "type": "string" },
+        "replyToId": { "type": "string" },
+        "replyToText": { "type": "string", "maxLength": 200 },
+        "replyToSenderName": { "type": "string" },
+        "isEdited": { "type": "boolean" },
+        "isDeleted": { "type": "boolean" },
+        "readBy": { "type": "array" },
+        "lastSeenAt": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "channelId", "senderId", "senderEmail", "senderName"]
+    },
+    "ChatGroup": {
+      "title": "ChatGroup",
+      "description": "User created community groups with customizable logos, group admins, and members",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 60 },
+        "description": { "type": "string", "maxLength": 280 },
+        "logoUrl": { "type": "string" },
+        "creatorId": { "type": "string" },
+        "creatorName": { "type": "string", "maxLength": 80 },
+        "creatorEmail": { "type": "string" },
+        "adminIds": { "type": "array" },
+        "memberIds": { "type": "array" },
+        "lastSeen": { "type": "object" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "name", "creatorId", "adminIds", "memberIds", "createdAt"]
+    },
+    "AppSettings": {
+      "title": "AppSettings",
+      "description": "Global application configuration including call unlocks managed by admin",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "videoCallsUnlocked": { "type": "boolean" },
+        "voiceCallsUnlocked": { "type": "boolean" },
+        "updatedAt": { "type": "string" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["id", "videoCallsUnlocked", "voiceCallsUnlocked"]
+    },
+    "PaymentTransaction": {
+      "title": "PaymentTransaction",
+      "description": "Mobile money subscription transactions for Airtel Money, M-Pesa, and Tigo Pesa",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "userName": { "type": "string" },
+        "planId": { "type": "string", "enum": ["weekly", "monthly", "annual", "boost", "tip"] },
+        "provider": { "type": "string", "enum": ["airtel", "mpesa", "tigopesa", "azampay"] },
+        "phoneNumber": { "type": "string" },
+        "amountTZS": { "type": "number" },
+        "amountUSD": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "processing", "completed", "failed"] },
+        "reference": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "planId", "provider", "phoneNumber", "amountTZS", "status", "reference"]
+    },
+    "PaymentGatewayConfig": {
+      "title": "PaymentGatewayConfig",
+      "description": "API keys and secrets for Airtel Money, Vodacom M-Pesa, ClickPesa, and AzamPay",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "environment": { "type": "string", "enum": ["sandbox", "live"] },
+        "airtelClientId": { "type": "string" },
+        "airtelClientSecret": { "type": "string" },
+        "mpesaConsumerKey": { "type": "string" },
+        "mpesaConsumerSecret": { "type": "string" },
+        "mpesaPasskey": { "type": "string" },
+        "mpesaShortCode": { "type": "string" },
+        "clickpesaApiKey": { "type": "string" },
+        "azampayClientId": { "type": "string" },
+        "azampaySecret": { "type": "string" },
+        "azampayAppName": { "type": "string" },
+        "azampayApiKey": { "type": "string" },
+        "azampayEnv": { "type": "string", "enum": ["sandbox", "live", "production"] },
+        "webhookSecret": { "type": "string" }
+      },
+      "required": ["id", "environment"]
+    },
+    "PendingVerification": {
+      "title": "PendingVerification",
+      "description": "Manual mobile money payment verification requests with SMS transaction IDs",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "userName": { "type": "string" },
+        "userPhotoURL": { "type": "string" },
+        "tierId": { "type": "string", "enum": ["weekly", "monthly", "annual"] },
+        "tierName": { "type": "string" },
+        "amountTZS": { "type": "number" },
+        "carrier": { "type": "string" },
+        "transactionId": { "type": "string", "maxLength": 100 },
+        "phoneNumber": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "submittedAt": { "type": "string" },
+        "approvedAt": { "type": "string" },
+        "approvedBy": { "type": "string" }
+      },
+      "required": ["id", "userId", "transactionId", "amountTZS", "status", "submittedAt"]
+    },
+    "SystemDomain": {
+      "title": "SystemDomain",
+      "description": "Registered preview and production domains for OAuth whitelisting",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "domain": { "type": "string" },
+        "url": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "needs_auth_whitelist"] },
+        "lastSeenAt": { "type": "string" },
+        "firstSeenAt": { "type": "string" }
+      },
+      "required": ["id", "domain", "status", "lastSeenAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profiles and account standing records"
+    },
+    "/posts/{postId}": {
+      "schema": { "$ref": "#/entities/Post" },
+      "description": "Public social posts"
+    },
+    "/posts/{postId}/comments/{commentId}": {
+      "schema": { "$ref": "#/entities/PostComment" },
+      "description": "Comments attached to posts"
+    },
+    "/posts/{postId}/chunks/{chunkId}": {
+      "schema": { "type": "object" },
+      "description": "Video and media binary chunks for large file uploads"
+    },
+    "/sparks/{sparkId}": {
+      "schema": { "$ref": "#/entities/Spark" },
+      "description": "24-hour ephemeral legendary moments"
+    },
+    "/sparks/{sparkId}/chunks/{chunkId}": {
+      "schema": { "type": "object" },
+      "description": "Video chunks for spark moments"
+    },
+    "/announcements/{announcementId}": {
+      "schema": { "$ref": "#/entities/Announcement" },
+      "description": "Global official platform announcements"
+    },
+    "/supportTickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/SupportTicket" },
+      "description": "Complaints and support tickets submitted to admin"
+    },
+    "/groups/{groupId}": {
+      "schema": { "$ref": "#/entities/ChatGroup" },
+      "description": "User created groups"
+    },
+    "/groups/{groupId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChannelMessage" },
+      "description": "Messages in user created groups"
+    },
+    "/channels/{channelId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChannelMessage" },
+      "description": "Real-time communication messages"
+    },
+    "/appSettings/{settingsId}": {
+      "schema": { "$ref": "#/entities/AppSettings" },
+      "description": "Global platform configurations and feature unlocks"
+    },
+    "/subscriptions/{subId}": {
+      "schema": { "$ref": "#/entities/PaymentTransaction" },
+      "description": "Mobile money payment subscriptions"
+    },
+    "/paymentConfig/{configId}": {
+      "schema": { "$ref": "#/entities/PaymentGatewayConfig" },
+      "description": "Admin-only payment gateway credentials"
+    },
+    "/pending_verifications/{verificationId}": {
+      "schema": { "$ref": "#/entities/PendingVerification" },
+      "description": "Manual mobile money subscription verifications pending admin approval"
+    },
+    "/system_domains/{domainId}": {
+      "schema": { "$ref": "#/entities/SystemDomain" },
+      "description": "Registered preview and production domains for OAuth authorized domains configuration"
+    }
+  }
+}
+
