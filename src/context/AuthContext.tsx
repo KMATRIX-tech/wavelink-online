@@ -11,7 +11,7 @@ import {
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
 import { auth, db, ADMIN_EMAIL, isOwnerEmail, isAdminEmail, isSuperAdminEmail, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
-import { UserProfile } from '../types';
+import { UserProfile, PointTransaction, PointTransactionCategory, PointTransactionType } from '../types';
 
 export const DAILY_REWARD_SCHEDULE = [10, 15, 20, 25, 30, 40, 50];
 
@@ -35,6 +35,49 @@ interface LocalDailyRewardCache {
   lastDailyRewardDate: string;
   lastDailyRewardAmount: number;
   totalLoginDays: number;
+}
+
+export function getLocalPointTransactions(uid?: string | null): PointTransaction[] {
+  try {
+    if (typeof window === 'undefined' || !uid) return [];
+    const raw = localStorage.getItem(`wavelink_point_transactions_${uid}`);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PointTransaction[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function setLocalPointTransactions(uid: string, txs: PointTransaction[]) {
+  try {
+    if (typeof window === 'undefined' || !uid) return;
+    localStorage.setItem(`wavelink_point_transactions_${uid}`, JSON.stringify(txs.slice(0, 60)));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
+
+export function mergePointTransactions(
+  uid: string,
+  ...lists: (PointTransaction[] | undefined | null)[]
+): PointTransaction[] {
+  const map = new Map<string, PointTransaction>();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (item && item.id && !map.has(item.id)) {
+        map.set(item.id, item);
+      }
+    }
+  }
+  const merged = Array.from(map.values()).sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+  if (uid) {
+    setLocalPointTransactions(uid, merged);
+  }
+  return merged.slice(0, 60);
 }
 
 function getLocalDailyRewardCache(uid?: string | null): LocalDailyRewardCache | null {
@@ -61,15 +104,20 @@ function computeDailyRewardState(
   uid: string,
   profileData?: Partial<UserProfile> | null
 ): {
-  rewardFields: LocalDailyRewardCache;
+  rewardFields: LocalDailyRewardCache & { pointTransactions: PointTransaction[] };
   newlyAwarded: boolean;
   pointsAwarded: number;
 } {
   const todayKey = getLocalDateKey();
   const yesterdayKey = getYesterdayDateKey();
   const localCache = getLocalDailyRewardCache(uid);
+  const existingTxs = mergePointTransactions(
+    uid,
+    profileData?.pointTransactions,
+    getLocalPointTransactions(uid)
+  );
 
-  // Merge Firestore and local cache (take whichever has the most recent date / highest points)
+  // Merge Firestore and local cache
   const existingLastDate =
     profileData?.lastDailyRewardDate && localCache?.lastDailyRewardDate
       ? profileData.lastDailyRewardDate >= localCache.lastDailyRewardDate
@@ -77,12 +125,13 @@ function computeDailyRewardState(
         : localCache.lastDailyRewardDate
       : profileData?.lastDailyRewardDate || localCache?.lastDailyRewardDate || '';
 
-  const existingPoints = Math.max(
-    profileData?.points ?? 0,
-    profileData?.wavePoints ?? 0,
-    localCache?.points ?? 0,
-    localCache?.wavePoints ?? 0
-  );
+  const existingPoints =
+    typeof profileData?.points === 'number'
+      ? profileData.points
+      : typeof profileData?.wavePoints === 'number'
+      ? profileData.wavePoints
+      : localCache?.points ?? localCache?.wavePoints ?? 0;
+
   const existingStreak = Math.max(
     profileData?.loginStreak ?? 0,
     localCache?.loginStreak ?? 0
@@ -96,19 +145,39 @@ function computeDailyRewardState(
     localCache?.totalLoginDays ?? 0
   );
 
+  const todayTxId = `daily_reward_${todayKey}`;
+
   // Already rewarded today
-  if (existingLastDate === todayKey && existingPoints > 0) {
-    const currentFields: LocalDailyRewardCache = {
+  if (existingLastDate === todayKey && (existingPoints > 0 || existingTxs.some((t) => t.id === todayTxId))) {
+    const streakVal = Math.max(1, existingStreak);
+    let updatedTxs = existingTxs;
+    if (!existingTxs.some((t) => t.id === todayTxId)) {
+      const seededTodayTx: PointTransaction = {
+        id: todayTxId,
+        userId: uid,
+        type: 'earned',
+        category: 'daily_reward',
+        title: `Day ${streakVal} Daily Login Bonus`,
+        description: `Habitual engagement streak reward (${streakVal}-day streak)`,
+        amount: existingLastAmount,
+        balanceAfter: existingPoints,
+        reference: `DLY-${todayKey.replace(/-/g, '')}`,
+        createdAt: new Date().toISOString()
+      };
+      updatedTxs = mergePointTransactions(uid, [seededTodayTx], existingTxs);
+    }
+
+    const currentFields = {
       points: existingPoints,
       wavePoints: existingPoints,
-      loginStreak: Math.max(1, existingStreak),
+      loginStreak: streakVal,
       lastDailyRewardDate: todayKey,
       lastDailyRewardAmount: existingLastAmount,
       totalLoginDays: Math.max(1, existingTotalDays)
     };
     setLocalDailyRewardCache(uid, currentFields);
     return {
-      rewardFields: currentFields,
+      rewardFields: { ...currentFields, pointTransactions: updatedTxs },
       newlyAwarded: false,
       pointsAwarded: 0
     };
@@ -122,6 +191,21 @@ function computeDailyRewardState(
   const nextTotalPoints = existingPoints + bonusPoints;
   const nextTotalDays = existingTotalDays + 1;
 
+  const rewardTx: PointTransaction = {
+    id: todayTxId,
+    userId: uid,
+    type: 'earned',
+    category: 'daily_reward',
+    title: `Day ${nextStreak} Daily Login Bonus`,
+    description: `Habitual engagement streak reward (${nextStreak}-day login streak)`,
+    amount: bonusPoints,
+    balanceAfter: nextTotalPoints,
+    reference: `DLY-${todayKey.replace(/-/g, '')}`,
+    createdAt: new Date().toISOString()
+  };
+
+  const updatedTxs = mergePointTransactions(uid, [rewardTx], existingTxs);
+
   const updatedFields: LocalDailyRewardCache = {
     points: nextTotalPoints,
     wavePoints: nextTotalPoints,
@@ -133,7 +217,7 @@ function computeDailyRewardState(
 
   setLocalDailyRewardCache(uid, updatedFields);
   return {
-    rewardFields: updatedFields,
+    rewardFields: { ...updatedFields, pointTransactions: updatedTxs },
     newlyAwarded: true,
     pointsAwarded: bonusPoints
   };
@@ -153,6 +237,15 @@ interface AuthContextType {
   dailyRewardJustClaimed: { points: number; streak: number; totalPoints: number } | null;
   dismissDailyRewardNotice: () => void;
   claimDailyReward: () => Promise<{ claimed: boolean; pointsAwarded: number; streak: number; totalPoints: number }>;
+  recordPointTransaction: (params: {
+    type: PointTransactionType;
+    category: PointTransactionCategory;
+    title: string;
+    description: string;
+    amount: number;
+    reference?: string;
+    id?: string;
+  }) => Promise<{ success: boolean; newBalance: number; transaction?: PointTransaction; error?: string }>;
   signInWithGoogle: () => Promise<void>;
   signInWithEmail: (email: string, pass: string) => Promise<void>;
   registerWithEmail: (email: string, pass: string, displayName: string, username?: string) => Promise<void>;
@@ -365,6 +458,106 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   };
 
+  const recordPointTransaction = async (params: {
+    type: PointTransactionType;
+    category: PointTransactionCategory;
+    title: string;
+    description: string;
+    amount: number;
+    reference?: string;
+    id?: string;
+  }): Promise<{ success: boolean; newBalance: number; transaction?: PointTransaction; error?: string }> => {
+    if (!currentUser) {
+      return { success: false, newBalance: 0, error: 'You must be signed in to manage points.' };
+    }
+
+    const uid = currentUser.uid;
+    const localCache = getLocalDailyRewardCache(uid);
+    const currentPoints =
+      typeof userProfile?.points === 'number'
+        ? userProfile.points
+        : typeof userProfile?.wavePoints === 'number'
+        ? userProfile.wavePoints
+        : localCache?.points ?? DAILY_REWARD_SCHEDULE[0];
+
+    const absAmount = Math.max(1, Math.round(Math.abs(params.amount)));
+    if (params.type === 'spent' && currentPoints < absAmount) {
+      return {
+        success: false,
+        newBalance: currentPoints,
+        error: `Insufficient WavePoints. You need ${absAmount} pts (Current balance: ${currentPoints} pts).`
+      };
+    }
+
+    const newBalance = params.type === 'earned' ? currentPoints + absAmount : currentPoints - absAmount;
+    const nowIso = new Date().toISOString();
+    const txId = params.id || `pt_tx_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const reference = params.reference || `WVP-${Math.floor(100000 + Math.random() * 900000)}`;
+
+    const newTx: PointTransaction = {
+      id: txId,
+      userId: uid,
+      type: params.type,
+      category: params.category,
+      title: params.title,
+      description: params.description,
+      amount: absAmount,
+      balanceAfter: newBalance,
+      reference,
+      createdAt: nowIso
+    };
+
+    const updatedTxs = mergePointTransactions(
+      uid,
+      [newTx],
+      userProfile?.pointTransactions,
+      getLocalPointTransactions(uid)
+    );
+
+    const updatedCache: LocalDailyRewardCache = {
+      points: newBalance,
+      wavePoints: newBalance,
+      loginStreak: userProfile?.loginStreak ?? localCache?.loginStreak ?? 1,
+      lastDailyRewardDate: userProfile?.lastDailyRewardDate || localCache?.lastDailyRewardDate || getLocalDateKey(),
+      lastDailyRewardAmount: userProfile?.lastDailyRewardAmount ?? localCache?.lastDailyRewardAmount ?? DAILY_REWARD_SCHEDULE[0],
+      totalLoginDays: userProfile?.totalLoginDays ?? localCache?.totalLoginDays ?? 1
+    };
+    setLocalDailyRewardCache(uid, updatedCache);
+
+    setUserProfile((prev) =>
+      prev
+        ? {
+            ...prev,
+            points: newBalance,
+            wavePoints: newBalance,
+            pointTransactions: updatedTxs,
+            updatedAt: nowIso
+          }
+        : prev
+    );
+
+    try {
+      await setDoc(
+        doc(db, 'users', uid),
+        cleanFirestoreData({
+          points: newBalance,
+          wavePoints: newBalance,
+          pointTransactions: updatedTxs,
+          updatedAt: nowIso
+        }),
+        { merge: true }
+      );
+    } catch (err) {
+      console.warn('Firestore point transaction sync fallback:', err);
+    }
+
+    return {
+      success: true,
+      newBalance,
+      transaction: newTx
+    };
+  };
+
   useEffect(() => {
     let unsubscribeDoc: (() => void) | null = null;
     let presenceInterval: ReturnType<typeof setInterval> | null = null;
@@ -394,12 +587,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           hasBlueStar: Boolean(prev.hasBlueStar || prev.isPro || isOwner || localPro),
           isOnline: true,
           lastSeenAt: nowIso,
-          points: Math.max(prev.points ?? 0, prev.wavePoints ?? 0, rewardFields.points),
-          wavePoints: Math.max(prev.points ?? 0, prev.wavePoints ?? 0, rewardFields.wavePoints),
+          points: prev.points ?? prev.wavePoints ?? rewardFields.points,
+          wavePoints: prev.points ?? prev.wavePoints ?? rewardFields.wavePoints,
           loginStreak: Math.max(prev.loginStreak ?? 0, rewardFields.loginStreak),
           lastDailyRewardDate: rewardFields.lastDailyRewardDate,
           lastDailyRewardAmount: rewardFields.lastDailyRewardAmount,
-          totalLoginDays: Math.max(prev.totalLoginDays ?? 0, rewardFields.totalLoginDays)
+          totalLoginDays: Math.max(prev.totalLoginDays ?? 0, rewardFields.totalLoginDays),
+          pointTransactions: rewardFields.pointTransactions
         } : ({
           id: user.uid,
           email: user.email || '',
@@ -439,11 +633,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               const snapData = docSnap.data() as UserProfile;
               const currentLocalPro = hasLocalProPass(user.uid);
               const localReward = getLocalDailyRewardCache(user.uid);
-              const resolvedPoints = Math.max(
-                snapData.points ?? 0,
-                snapData.wavePoints ?? 0,
-                localReward?.points ?? 0,
-                localReward?.wavePoints ?? 0
+              const resolvedPoints =
+                typeof snapData.points === 'number'
+                  ? snapData.points
+                  : typeof snapData.wavePoints === 'number'
+                  ? snapData.wavePoints
+                  : localReward?.points ?? localReward?.wavePoints ?? DAILY_REWARD_SCHEDULE[0];
+              const mergedTxs = mergePointTransactions(
+                user.uid,
+                snapData.pointTransactions,
+                getLocalPointTransactions(user.uid)
               );
               setUserProfile({
                 ...snapData,
@@ -455,7 +654,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 loginStreak: Math.max(snapData.loginStreak ?? 0, localReward?.loginStreak ?? 1),
                 lastDailyRewardDate: snapData.lastDailyRewardDate || localReward?.lastDailyRewardDate,
                 lastDailyRewardAmount: snapData.lastDailyRewardAmount ?? localReward?.lastDailyRewardAmount ?? 10,
-                totalLoginDays: Math.max(snapData.totalLoginDays ?? 0, localReward?.totalLoginDays ?? 1)
+                totalLoginDays: Math.max(snapData.totalLoginDays ?? 0, localReward?.totalLoginDays ?? 1),
+                pointTransactions: mergedTxs
               });
             }
           },
@@ -863,6 +1063,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         dailyRewardJustClaimed,
         dismissDailyRewardNotice,
         claimDailyReward,
+        recordPointTransaction,
         signInWithGoogle,
         signInWithEmail,
         registerWithEmail,

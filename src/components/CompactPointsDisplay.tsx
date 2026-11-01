@@ -31,10 +31,10 @@ export const CompactPointsDisplay: React.FC<CompactPointsDisplayProps> = ({
 
   // Sync fallback if local profile updates before snapshot
   useEffect(() => {
-    if (fallbackPoints > points) {
-      setPoints(fallbackPoints);
+    if (typeof userProfile?.points === 'number' && userProfile.points !== points) {
+      setPoints(userProfile.points);
     }
-  }, [fallbackPoints, points]);
+  }, [userProfile?.points]);
 
   // Real-time Firestore listener on the user's document for the 'points' field
   useEffect(() => {

@@ -1,8 +1,15 @@
-import React, { useState, useEffect } from 'react';
-import { useAuth } from '../context/AuthContext';
+import React, { useState, useEffect, useMemo } from 'react';
+import { useAuth, DAILY_REWARD_SCHEDULE, getLocalDateKey, getLocalPointTransactions } from '../context/AuthContext';
 import { db } from '../firebase';
 import { collection, query, where, onSnapshot, orderBy } from 'firebase/firestore';
-import { Post, SubscriptionTier, PaymentTransaction, MobileMoneyProvider } from '../types';
+import {
+  Post,
+  SubscriptionTier,
+  PaymentTransaction,
+  MobileMoneyProvider,
+  PointTransaction,
+  PointTransactionCategory
+} from '../types';
 import {
   PRO_TIERS,
   MOBILE_CARRIERS,
@@ -43,7 +50,11 @@ import {
   Lock,
   Percent,
   Copy,
-  Check
+  Check,
+  ArrowUpRight,
+  ArrowDownRight,
+  Calendar,
+  Filter
 } from 'lucide-react';
 
 interface MonetizationHubProps {
@@ -54,7 +65,19 @@ interface MonetizationHubProps {
 export const MonetizationHub: React.FC<MonetizationHubProps> = ({
   onNavigateToFeed
 }) => {
-  const { currentUser, userProfile, isAdmin, isProEffective, isExemptFromPayments, activateHarvestPass, verifyAndRedeemCoupon, showGlobalToast } = useAuth();
+  const {
+    currentUser,
+    userProfile,
+    isAdmin,
+    isProEffective,
+    isExemptFromPayments,
+    activateHarvestPass,
+    verifyAndRedeemCoupon,
+    claimDailyReward,
+    recordPointTransaction,
+    updateUserProfile,
+    showGlobalToast
+  } = useAuth();
   const isProUser = isProEffective;
   const [copiedAdminPhone, setCopiedAdminPhone] = useState(false);
   const [hubPromoCode, setHubPromoCode] = useState('');
@@ -93,7 +116,13 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
   };
 
   // Active section tab inside MonetizationHub
-  const [activeSection, setActiveSection] = useState<'tiers' | 'tipping' | 'boost' | 'affiliate'>('tiers');
+  const [activeSection, setActiveSection] = useState<'tiers' | 'tipping' | 'boost' | 'affiliate' | 'history'>('tiers');
+
+  // Transaction History sub-view filters & feedback state
+  const [historyTypeFilter, setHistoryTypeFilter] = useState<'all' | 'earned' | 'spent'>('all');
+  const [historyCategoryFilter, setHistoryCategoryFilter] = useState<'all' | PointTransactionCategory>('all');
+  const [pointActionFeedback, setPointActionFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [isProcessingPointAction, setIsProcessingPointAction] = useState(false);
 
   // Subscription state
   const [selectedTierId, setSelectedTierId] = useState<'weekly' | 'monthly' | 'annual'>('monthly');
@@ -179,6 +208,255 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
     );
     return () => unsub();
   }, [currentUser]);
+
+  // Load user's own payment/subscription/boost/tip transactions for history enrichment
+  const [userSentSubscriptions, setUserSentSubscriptions] = useState<PaymentTransaction[]>([]);
+  useEffect(() => {
+    if (!currentUser) return;
+    const q = query(
+      collection(db, 'subscriptions'),
+      where('userId', '==', currentUser.uid)
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: PaymentTransaction[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PaymentTransaction));
+        setUserSentSubscriptions(list);
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [currentUser]);
+
+  const currentPointsBalance =
+    userProfile?.points ??
+    userProfile?.wavePoints ??
+    DAILY_REWARD_SCHEDULE[0];
+
+  const todayKey = getLocalDateKey();
+  const isDailyClaimedToday = userProfile?.lastDailyRewardDate === todayKey;
+  const engagementBonusId = `hub_engagement_${todayKey}`;
+
+  // Build unified points transaction history from profile, local storage, daily streak history, and tips/boosts
+  const allPointTransactions = useMemo<PointTransaction[]>(() => {
+    const uid = currentUser?.uid || 'guest';
+    const map = new Map<string, PointTransaction>();
+
+    const storedList = userProfile?.pointTransactions || [];
+    const localList = getLocalPointTransactions(uid);
+
+    for (const item of [...storedList, ...localList]) {
+      if (item && item.id && !map.has(item.id)) {
+        map.set(item.id, item);
+      }
+    }
+
+    // Ensure today's daily login reward and prior streak days are represented
+    const streakDays = Math.max(1, userProfile?.loginStreak ?? 1);
+    for (let i = 0; i < streakDays; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dateKey = getLocalDateKey(d);
+      const txId = `daily_reward_${dateKey}`;
+      if (!map.has(txId)) {
+        const dayStreakNum = Math.max(1, streakDays - i);
+        const cycleIdx = (dayStreakNum - 1) % DAILY_REWARD_SCHEDULE.length;
+        const pts = i === 0
+          ? (userProfile?.lastDailyRewardAmount ?? DAILY_REWARD_SCHEDULE[cycleIdx])
+          : DAILY_REWARD_SCHEDULE[cycleIdx];
+        map.set(txId, {
+          id: txId,
+          userId: uid,
+          type: 'earned',
+          category: 'daily_reward',
+          title: `Day ${dayStreakNum} Daily Login Bonus`,
+          description: `Habitual login reward claimed on ${dateKey}`,
+          amount: pts,
+          reference: `DLY-${dateKey.replace(/-/g, '')}`,
+          createdAt: i === 0 ? (userProfile?.updatedAt || new Date().toISOString()) : d.toISOString()
+        });
+      }
+    }
+
+    // Include creator tips received as bonus points activity (+25 pts per supporter tip)
+    for (const tip of userTips) {
+      const tipPtId = `tip_recv_pt_${tip.id}`;
+      if (!map.has(tipPtId)) {
+        map.set(tipPtId, {
+          id: tipPtId,
+          userId: uid,
+          type: 'earned',
+          category: 'tip_received',
+          title: `Creator Tip Bonus from ${tip.userName || 'Supporter'}`,
+          description: `Received TZS ${(tip.netAmountTZS || Math.round(tip.amountTZS * 0.9)).toLocaleString()} net tip (+25 creator points)`,
+          amount: 25,
+          reference: tip.reference || `TIP-${tip.id.slice(0, 6).toUpperCase()}`,
+          createdAt: tip.createdAt
+        });
+      }
+    }
+
+    // Include user's sent tips or boosts from subscriptions collection if not already logged
+    for (const sub of userSentSubscriptions) {
+      if (sub.planId === 'tip') {
+        const sentTipId = `tip_sent_pt_${sub.id}`;
+        if (!map.has(sentTipId)) {
+          map.set(sentTipId, {
+            id: sentTipId,
+            userId: uid,
+            type: 'earned',
+            category: 'tip_sent',
+            title: `Supporter Karma Reward (Tipped ${sub.recipientName || 'Creator'})`,
+            description: `Sent TZS ${sub.amountTZS.toLocaleString()} creator tip (+15 supporter karma points)`,
+            amount: 15,
+            reference: sub.reference,
+            createdAt: sub.createdAt
+          });
+        }
+      }
+    }
+
+    return Array.from(map.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }, [currentUser?.uid, userProfile?.pointTransactions, userProfile?.loginStreak, userProfile?.lastDailyRewardAmount, userProfile?.updatedAt, userTips, userSentSubscriptions]);
+
+  const filteredPointTransactions = useMemo(() => {
+    return allPointTransactions.filter((tx) => {
+      if (historyTypeFilter !== 'all' && tx.type !== historyTypeFilter) return false;
+      if (historyCategoryFilter !== 'all' && tx.category !== historyCategoryFilter) return false;
+      return true;
+    });
+  }, [allPointTransactions, historyTypeFilter, historyCategoryFilter]);
+
+  const totalPointsEarned = useMemo(
+    () => allPointTransactions.filter((t) => t.type === 'earned').reduce((sum, t) => sum + t.amount, 0),
+    [allPointTransactions]
+  );
+
+  const totalPointsSpent = useMemo(
+    () => allPointTransactions.filter((t) => t.type === 'spent').reduce((sum, t) => sum + t.amount, 0),
+    [allPointTransactions]
+  );
+
+  const hasClaimedEngagementToday = useMemo(
+    () => allPointTransactions.some((t) => t.id === engagementBonusId),
+    [allPointTransactions, engagementBonusId]
+  );
+
+  const showTimedPointFeedback = (type: 'success' | 'error', message: string) => {
+    setPointActionFeedback({ type, message });
+    setTimeout(() => {
+      setPointActionFeedback((prev) => (prev?.message === message ? null : prev));
+    }, 4500);
+  };
+
+  // Earn Points: Claim Daily Login Check-in or Creator Hub Engagement Bonus
+  const handleClaimEngagementBonus = async () => {
+    if (hasClaimedEngagementToday) {
+      showTimedPointFeedback('error', 'Today\'s +15 pts Creator Hub Check-In Bonus has already been claimed.');
+      return;
+    }
+    setIsProcessingPointAction(true);
+    try {
+      const res = await recordPointTransaction({
+        id: engagementBonusId,
+        type: 'earned',
+        category: 'community_bonus',
+        title: 'Creator Hub Daily Check-In Bonus',
+        description: 'Earned for reviewing creator monetization & community metrics today',
+        amount: 15,
+        reference: `ENG-${todayKey.replace(/-/g, '')}`
+      });
+      if (res.success) {
+        showTimedPointFeedback('success', '+15 WavePoints added to your balance!');
+        showGlobalToast('✨ +15 WavePoints Earned (Creator Hub Check-In)');
+      } else if (res.error) {
+        showTimedPointFeedback('error', res.error);
+      }
+    } finally {
+      setIsProcessingPointAction(false);
+    }
+  };
+
+  // Spend Points: Redeem points for a 24h Post Boost (-20 pts)
+  const handleRedeemPointsPostBoost = async () => {
+    const targetPostId = selectedPostToBoost || userPosts[0]?.id;
+    const targetPost = userPosts.find((p) => p.id === targetPostId);
+    setIsProcessingPointAction(true);
+    try {
+      const res = await recordPointTransaction({
+        type: 'spent',
+        category: 'post_boost',
+        title: 'Wave Post Priority Boost (Points Redemption)',
+        description: targetPost
+          ? `Boosted "${targetPost.content ? targetPost.content.substring(0, 36) : 'Wave Post'}" for 48 hours`
+          : 'Redeemed 20 WavePoints for 48-hour feed priority boost',
+        amount: 20,
+        reference: `PBST-${Math.floor(100000 + Math.random() * 900000)}`
+      });
+      if (!res.success) {
+        showTimedPointFeedback('error', res.error || 'Insufficient points for Post Boost.');
+        return;
+      }
+      if (targetPostId) {
+        const txId = `pts_boost_${Date.now()}`;
+        await completePostBoost(txId, targetPostId);
+      }
+      showTimedPointFeedback('success', 'Spent 20 WavePoints! Your wave post is now boosted for 48 hours.');
+      showGlobalToast('🚀 Post Boosted with 20 WavePoints!');
+    } finally {
+      setIsProcessingPointAction(false);
+    }
+  };
+
+  // Spend Points: Redeem points for Golden Aura Profile Ring (-15 pts)
+  const handleRedeemPointsProfileAura = async () => {
+    setIsProcessingPointAction(true);
+    try {
+      const res = await recordPointTransaction({
+        type: 'spent',
+        category: 'profile_perk',
+        title: 'Golden Aura Profile Spotlight Ring',
+        description: 'Redeemed 15 WavePoints to activate the Aura-Gold profile border effect',
+        amount: 15,
+        reference: `PERK-${Math.floor(100000 + Math.random() * 900000)}`
+      });
+      if (!res.success) {
+        showTimedPointFeedback('error', res.error || 'Insufficient points for Profile Spotlight.');
+        return;
+      }
+      await updateUserProfile({ proBorderEffect: 'aura-gold' }).catch(() => {});
+      showTimedPointFeedback('success', 'Spent 15 WavePoints! Aura-Gold profile ring is now active.');
+      showGlobalToast('👑 Golden Aura Profile Ring Activated (-15 pts)');
+    } finally {
+      setIsProcessingPointAction(false);
+    }
+  };
+
+  // Spend Points: Send Community Spotlight Badge (-10 pts)
+  const handleRedeemCommunitySpotlight = async () => {
+    setIsProcessingPointAction(true);
+    try {
+      const res = await recordPointTransaction({
+        type: 'spent',
+        category: 'tip_sent',
+        title: 'Community Wave Spotlight Boost',
+        description: 'Spent 10 WavePoints to support community creator visibility',
+        amount: 10,
+        reference: `GFT-${Math.floor(100000 + Math.random() * 900000)}`
+      });
+      if (!res.success) {
+        showTimedPointFeedback('error', res.error || 'Insufficient points.');
+        return;
+      }
+      showTimedPointFeedback('success', 'Spent 10 WavePoints on Community Wave Spotlight!');
+      showGlobalToast('🎁 Community Wave Spotlight Sent (-10 pts)');
+    } finally {
+      setIsProcessingPointAction(false);
+    }
+  };
 
   // Handle phone changes and auto-detect Airtel Money
   const handlePhoneChange = (val: string) => {
@@ -391,7 +669,18 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
               Manage WaveLink Pro subscriptions, enable Creator Tipping (10% platform fee), boost post reach for 2,000 TZS, and explore native in-feed affiliate revenue.
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveSection('history')}
+              className="px-3.5 py-1.5 rounded-2xl bg-amber-400/25 hover:bg-amber-400/35 backdrop-blur-md text-white font-mono font-black text-xs flex items-center gap-1.5 border border-amber-300/50 transition active:scale-95 cursor-pointer shadow-xs"
+            >
+              <Coins size={14} className="text-amber-300" />
+              <span>{currentPointsBalance.toLocaleString()} pts</span>
+              <span className="text-[10px] font-sans font-bold bg-white/20 px-2 py-0.5 rounded-full">
+                View History
+              </span>
+            </button>
             <span className="px-3.5 py-1.5 rounded-2xl bg-white/20 backdrop-blur-md text-white font-mono font-bold text-xs flex items-center gap-1.5 border border-white/30">
               <Zap size={14} className="fill-amber-300 text-amber-300" />
               <span>Lipa kwa Simu • Airtel Money • Tigo Pesa</span>
@@ -472,6 +761,26 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
         >
           <ShoppingBag size={15} />
           <span>In-Feed Ads &amp; Affiliates</span>
+        </button>
+        <button
+          onClick={() => setActiveSection('history')}
+          className={`flex-1 min-w-[145px] py-2.5 px-3 rounded-xl transition flex items-center justify-center gap-2 ${
+            activeSection === 'history'
+              ? 'bg-blue-600 text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Clock size={15} />
+          <span>Transaction History</span>
+          <span
+            className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-black ${
+              activeSection === 'history'
+                ? 'bg-white/20 text-white'
+                : 'bg-amber-100 text-amber-800'
+            }`}
+          >
+            {allPointTransactions.length}
+          </span>
         </button>
       </div>
 
@@ -1009,6 +1318,430 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          SECTION 5: POINTS TRANSACTION HISTORY SUB-VIEW
+          ======================================================== */}
+      {activeSection === 'history' && (
+        <div className="space-y-6 animate-fade-in">
+          {/* Points Summary Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="bg-white border border-amber-200/90 rounded-3xl p-5 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-amber-700">
+                  Current WavePoints Balance
+                </span>
+                <span className="p-2 rounded-xl bg-amber-50 text-amber-600 border border-amber-200/80">
+                  <Coins size={16} />
+                </span>
+              </div>
+              <div className="my-2 flex items-baseline gap-1.5">
+                <span className="text-2xl sm:text-3xl font-black font-mono tabular-nums text-[#0F172A]">
+                  {currentPointsBalance.toLocaleString()}
+                </span>
+                <span className="text-xs font-extrabold uppercase text-amber-600">pts</span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-slate-100">
+                <span className="flex items-center gap-1 font-semibold text-slate-700">
+                  <Flame size={13} className="text-amber-500" />
+                  <span>{Math.max(1, userProfile?.loginStreak ?? 1)}-Day Login Streak</span>
+                </span>
+                <span className="text-emerald-600 font-bold">
+                  {isDailyClaimedToday ? '✓ Claimed Today' : 'Ready to Claim'}
+                </span>
+              </div>
+            </div>
+
+            <div className="bg-white border border-emerald-200/90 rounded-3xl p-5 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-700">
+                  Total Points Earned
+                </span>
+                <span className="p-2 rounded-xl bg-emerald-50 text-emerald-600 border border-emerald-200/80">
+                  <ArrowUpRight size={16} />
+                </span>
+              </div>
+              <div className="my-2 flex items-baseline gap-1.5">
+                <span className="text-2xl sm:text-3xl font-black font-mono tabular-nums text-emerald-600">
+                  +{totalPointsEarned.toLocaleString()}
+                </span>
+                <span className="text-xs font-extrabold uppercase text-emerald-600">pts</span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-slate-100">
+                <span>Daily streaks, tips &amp; bonuses</span>
+                <span className="font-mono font-bold text-emerald-700">
+                  {allPointTransactions.filter((t) => t.type === 'earned').length} events
+                </span>
+              </div>
+            </div>
+
+            <div className="bg-white border border-rose-200/90 rounded-3xl p-5 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-rose-600">
+                  Total Points Spent
+                </span>
+                <span className="p-2 rounded-xl bg-rose-50 text-rose-600 border border-rose-200/80">
+                  <ArrowDownRight size={16} />
+                </span>
+              </div>
+              <div className="my-2 flex items-baseline gap-1.5">
+                <span className="text-2xl sm:text-3xl font-black font-mono tabular-nums text-rose-600">
+                  -{totalPointsSpent.toLocaleString()}
+                </span>
+                <span className="text-xs font-extrabold uppercase text-rose-600">pts</span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-slate-100">
+                <span>Post boosts, profile perks &amp; gifts</span>
+                <span className="font-mono font-bold text-rose-700">
+                  {allPointTransactions.filter((t) => t.type === 'spent').length} events
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Feedback Banner for Point Earning / Spending Actions */}
+          {pointActionFeedback && (
+            <div
+              className={`p-4 rounded-2xl border text-xs sm:text-sm font-bold flex items-center justify-between gap-3 animate-fade-in ${
+                pointActionFeedback.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-rose-50 border-rose-200 text-rose-800'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <CheckCircle2
+                  size={17}
+                  className={pointActionFeedback.type === 'success' ? 'text-emerald-600 shrink-0' : 'text-rose-600 shrink-0'}
+                />
+                <span>{pointActionFeedback.message}</span>
+              </div>
+              <span className="font-mono text-xs px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-800">
+                Balance: {currentPointsBalance.toLocaleString()} pts
+              </span>
+            </div>
+          )}
+
+          {/* Quick Points Earn & Spend Actions Card */}
+          <div className="bg-white border border-slate-200/90 rounded-3xl p-6 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h3 className="font-extrabold text-base text-[#0F172A] flex items-center gap-2">
+                  <Sparkles size={18} className="text-amber-500" />
+                  <span>Earn &amp; Redeem WavePoints</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Claim daily engagement bonuses or spend your WavePoints on post boosts and profile perks. Every action is logged below in real time.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 pt-1">
+              {/* Earn 1: Daily Hub Check-In Bonus */}
+              <div className="p-4 rounded-2xl bg-emerald-50/60 border border-emerald-200/90 flex flex-col justify-between space-y-3">
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-mono font-black text-[10px]">
+                      +15 PTS
+                    </span>
+                    <Gift size={15} className="text-emerald-600" />
+                  </div>
+                  <h4 className="font-bold text-xs text-[#0F172A] mt-2">
+                    Creator Hub Check-In
+                  </h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Daily bonus for reviewing your creator hub &amp; wallet activity.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={isProcessingPointAction || hasClaimedEngagementToday}
+                  onClick={handleClaimEngagementBonus}
+                  className="w-full py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-extrabold text-xs transition shadow-2xs cursor-pointer"
+                >
+                  {hasClaimedEngagementToday ? '✓ Claimed Today' : 'Claim +15 pts'}
+                </button>
+              </div>
+
+              {/* Spend 1: 48h Post Boost with Points */}
+              <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-slate-200/90 flex flex-col justify-between space-y-3">
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 font-mono font-black text-[10px]">
+                      -20 PTS
+                    </span>
+                    <Rocket size={15} className="text-blue-600" />
+                  </div>
+                  <h4 className="font-bold text-xs text-[#0F172A] mt-2">
+                    Boost Post with Points
+                  </h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Redeem 20 pts to boost your latest wave post in the feed for 48h.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={isProcessingPointAction || currentPointsBalance < 20}
+                  onClick={handleRedeemPointsPostBoost}
+                  className="w-full py-2 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-extrabold text-xs transition shadow-2xs cursor-pointer"
+                >
+                  Redeem (-20 pts)
+                </button>
+              </div>
+
+              {/* Spend 2: Golden Aura Profile Ring */}
+              <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-slate-200/90 flex flex-col justify-between space-y-3">
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 font-mono font-black text-[10px]">
+                      -15 PTS
+                    </span>
+                    <Crown size={15} className="text-amber-500" />
+                  </div>
+                  <h4 className="font-bold text-xs text-[#0F172A] mt-2">
+                    Aura-Gold Profile Ring
+                  </h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Equip the luminous golden aura border on your profile avatar.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={isProcessingPointAction || currentPointsBalance < 15}
+                  onClick={handleRedeemPointsProfileAura}
+                  className="w-full py-2 px-3 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white font-extrabold text-xs transition shadow-2xs cursor-pointer"
+                >
+                  Redeem (-15 pts)
+                </button>
+              </div>
+
+              {/* Spend 3: Community Spotlight Gift */}
+              <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-slate-200/90 flex flex-col justify-between space-y-3">
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 font-mono font-black text-[10px]">
+                      -10 PTS
+                    </span>
+                    <HandCoins size={15} className="text-purple-600" />
+                  </div>
+                  <h4 className="font-bold text-xs text-[#0F172A] mt-2">
+                    Community Spotlight Gift
+                  </h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Contribute 10 pts to the community creator spotlight pool.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={isProcessingPointAction || currentPointsBalance < 10}
+                  onClick={handleRedeemCommunitySpotlight}
+                  className="w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-extrabold text-xs transition shadow-2xs cursor-pointer"
+                >
+                  Redeem (-10 pts)
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Transaction History Ledger */}
+          <div className="bg-white border border-slate-200/90 rounded-3xl p-6 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] space-y-5">
+            <div className="flex items-center justify-between flex-wrap gap-3 pb-4 border-b border-slate-100">
+              <div>
+                <h3 className="font-extrabold text-base text-[#0F172A] flex items-center gap-2">
+                  <Clock size={18} className="text-[#3B82F6]" />
+                  <span>Recent Points Earning &amp; Spending Activity</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Complete ledger of your WavePoints bonuses, streak rewards, creator tips, and point redemptions.
+                </p>
+              </div>
+
+              {/* Filter Controls */}
+              <div className="flex items-center flex-wrap gap-2">
+                <div className="inline-flex rounded-xl bg-[#F8FAFC] border border-slate-200 p-1 text-xs font-bold">
+                  <button
+                    type="button"
+                    onClick={() => setHistoryTypeFilter('all')}
+                    className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                      historyTypeFilter === 'all'
+                        ? 'bg-blue-600 text-white shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    All ({allPointTransactions.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryTypeFilter('earned')}
+                    className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                      historyTypeFilter === 'earned'
+                        ? 'bg-emerald-600 text-white shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Earned ({allPointTransactions.filter((t) => t.type === 'earned').length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryTypeFilter('spent')}
+                    className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                      historyTypeFilter === 'spent'
+                        ? 'bg-rose-600 text-white shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Spent ({allPointTransactions.filter((t) => t.type === 'spent').length})
+                  </button>
+                </div>
+
+                <div className="relative flex items-center">
+                  <Filter size={13} className="absolute left-3 text-slate-400 pointer-events-none" />
+                  <select
+                    value={historyCategoryFilter}
+                    onChange={(e) => setHistoryCategoryFilter(e.target.value as 'all' | PointTransactionCategory)}
+                    className="pl-8 pr-3 py-2 rounded-xl bg-[#F8FAFC] border border-slate-200 text-xs font-bold text-slate-700 focus:outline-none focus:border-blue-500"
+                  >
+                    <option value="all">All Categories</option>
+                    <option value="daily_reward">Daily Login Rewards</option>
+                    <option value="community_bonus">Community Bonuses</option>
+                    <option value="post_boost">Post Boosts</option>
+                    <option value="profile_perk">Profile Perks</option>
+                    <option value="tip_received">Tips Received</option>
+                    <option value="tip_sent">Tips &amp; Gifts Sent</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            {filteredPointTransactions.length === 0 ? (
+              <div className="py-12 text-center space-y-2 text-slate-400">
+                <Coins size={32} className="mx-auto opacity-50 text-amber-500" />
+                <p className="text-sm font-bold text-slate-600">No point transactions match this filter</p>
+                <p className="text-xs text-slate-400 max-w-sm mx-auto">
+                  Try switching the filter to &ldquo;All&rdquo; or use the quick actions above to earn or redeem WavePoints.
+                </p>
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {filteredPointTransactions.map((tx) => {
+                  const isEarned = tx.type === 'earned';
+                  const formattedDate = (() => {
+                    try {
+                      const d = new Date(tx.createdAt);
+                      return d.toLocaleDateString(undefined, {
+                        month: 'short',
+                        day: 'numeric',
+                        year: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                      });
+                    } catch {
+                      return tx.createdAt;
+                    }
+                  })();
+
+                  const getCategoryBadgeLabel = (cat: PointTransactionCategory) => {
+                    switch (cat) {
+                      case 'daily_reward':
+                        return 'Daily Streak';
+                      case 'post_boost':
+                        return 'Post Boost';
+                      case 'profile_perk':
+                        return 'Profile Perk';
+                      case 'tip_received':
+                        return 'Creator Tip';
+                      case 'tip_sent':
+                        return 'Supporter Gift';
+                      case 'pro_bonus':
+                        return 'Pro Pass';
+                      default:
+                        return 'Hub Bonus';
+                    }
+                  };
+
+                  return (
+                    <div
+                      key={tx.id}
+                      className="py-3.5 px-2 sm:px-3 hover:bg-slate-50/80 rounded-2xl transition flex items-center justify-between gap-3"
+                    >
+                      <div className="flex items-start sm:items-center gap-3.5 min-w-0">
+                        <div
+                          className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 border ${
+                            isEarned
+                              ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
+                              : 'bg-rose-50 border-rose-200 text-rose-600'
+                          }`}
+                        >
+                          {tx.category === 'daily_reward' ? (
+                            <Calendar size={18} />
+                          ) : tx.category === 'post_boost' ? (
+                            <Rocket size={18} />
+                          ) : tx.category === 'profile_perk' ? (
+                            <Crown size={18} />
+                          ) : tx.category === 'tip_received' || tx.category === 'tip_sent' ? (
+                            <HandCoins size={18} />
+                          ) : (
+                            <Sparkles size={18} />
+                          )}
+                        </div>
+
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-extrabold text-xs sm:text-sm text-[#0F172A] truncate">
+                              {tx.title}
+                            </span>
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider ${
+                                isEarned
+                                  ? 'bg-emerald-100/80 text-emerald-800'
+                                  : 'bg-rose-100/80 text-rose-800'
+                              }`}
+                            >
+                              {getCategoryBadgeLabel(tx.category)}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-500 mt-0.5 line-clamp-1">
+                            {tx.description}
+                          </p>
+                          <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono mt-1">
+                            <span>{formattedDate}</span>
+                            {tx.reference && (
+                              <>
+                                <span>•</span>
+                                <span>Ref: {tx.reference}</span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="text-right shrink-0">
+                        <div
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl font-mono text-xs sm:text-sm font-black ${
+                            isEarned
+                              ? 'bg-emerald-50 text-emerald-600 border border-emerald-200/80'
+                              : 'bg-rose-50 text-rose-600 border border-rose-200/80'
+                          }`}
+                        >
+                          {isEarned ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
+                          <span>
+                            {isEarned ? '+' : '-'}
+                            {tx.amount.toLocaleString()} pts
+                          </span>
+                        </div>
+                        {typeof tx.balanceAfter === 'number' && (
+                          <div className="text-[10px] font-mono text-slate-400 mt-1">
+                            Bal: {tx.balanceAfter.toLocaleString()} pts
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -40,8 +40,33 @@ export interface UserProfile {
   lastDailyRewardDate?: string; // YYYY-MM-DD local date
   lastDailyRewardAmount?: number;
   totalLoginDays?: number;
+  pointTransactions?: PointTransaction[];
   createdAt: string;
   updatedAt?: string;
+}
+
+export type PointTransactionType = 'earned' | 'spent';
+
+export type PointTransactionCategory =
+  | 'daily_reward'
+  | 'post_boost'
+  | 'tip_received'
+  | 'tip_sent'
+  | 'profile_perk'
+  | 'community_bonus'
+  | 'pro_bonus';
+
+export interface PointTransaction {
+  id: string;
+  userId: string;
+  type: PointTransactionType;
+  category: PointTransactionCategory;
+  title: string;
+  description: string;
+  amount: number;
+  balanceAfter?: number;
+  reference?: string;
+  createdAt: string;
 }
 
 export type ReactionType = 'like' | 'heart' | 'fire';

@@ -30,6 +30,7 @@
         "lastDailyRewardDate": { "type": "string" },
         "lastDailyRewardAmount": { "type": "number" },
         "totalLoginDays": { "type": "number" },
+        "pointTransactions": { "type": "array" },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
