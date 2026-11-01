@@ -32,9 +32,9 @@ Your personality & responsibilities:
 - Keep responses clear, well-structured, and welcoming.`;
 
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
+    throw new Error('GEMINI_API_KEY or VITE_GEMINI_API_KEY is not configured.');
   }
   return new GoogleGenAI({
     apiKey,
@@ -155,7 +155,7 @@ app.post('/api/welink/image', async (req: Request, res: Response) => {
       });
     } catch {
       response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
+        model: 'gemini-3.1-flash-lite-image',
         contents: { parts },
         config: {
           imageConfig: {
