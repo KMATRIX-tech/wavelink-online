@@ -31,10 +31,31 @@ Your personality & responsibilities:
 - Assist Pro creators with brainstorming viral post ideas, reel scripts, captions, hashtags, and community event descriptions.
 - Keep responses clear, well-structured, and welcoming.`;
 
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+function getGeminiApiKey(): string {
+  const apiKey =
+    (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_GEMINI_API_KEY) ||
+    process.env.VITE_GEMINI_API_KEY ||
+    process.env.GEMINI_API_KEY ||
+    '';
+
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY or VITE_GEMINI_API_KEY is not configured.');
+    console.warn(
+      '[Gemini API Client] Warning: Gemini API key is missing. Checked import.meta.env.VITE_GEMINI_API_KEY, process.env.VITE_GEMINI_API_KEY, and process.env.GEMINI_API_KEY.'
+    );
+  }
+
+  return apiKey;
+}
+
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    console.warn(
+      '[Gemini API Client] Warning: Cannot initialize GoogleGenAI: Gemini API key is missing. Checked import.meta.env.VITE_GEMINI_API_KEY, process.env.VITE_GEMINI_API_KEY, and process.env.GEMINI_API_KEY.'
+    );
+    throw new Error(
+      'Gemini API key is missing. Checked import.meta.env.VITE_GEMINI_API_KEY, process.env.VITE_GEMINI_API_KEY, and process.env.GEMINI_API_KEY.'
+    );
   }
   return new GoogleGenAI({
     apiKey,

@@ -18,6 +18,34 @@ Your personality & responsibilities:
 - Assist Pro creators with brainstorming viral post ideas, reel scripts, captions, hashtags, and community event descriptions.
 - Keep responses clear, well-structured, and welcoming.`;
 
+/**
+ * Resolves the Gemini API key safely across build and runtime environments:
+ * const apiKey = import.meta.env.VITE_GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+ * If the key is missing, logs a clear warning to the console instead of throwing a silent error.
+ */
+export function getGeminiApiKey(): string {
+  let apiKey = '';
+  try {
+    apiKey =
+      (typeof import.meta !== 'undefined' && import.meta.env?.VITE_GEMINI_API_KEY) ||
+      (typeof process !== 'undefined' && process.env?.VITE_GEMINI_API_KEY) ||
+      (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) ||
+      '';
+  } catch {
+    apiKey = '';
+  }
+
+  if (!apiKey) {
+    console.warn(
+      '[Gemini API Client] Warning: Gemini API key is missing. Checked import.meta.env.VITE_GEMINI_API_KEY, process.env.VITE_GEMINI_API_KEY, and process.env.GEMINI_API_KEY.'
+    );
+  }
+
+  return apiKey;
+}
+
+export const hasGeminiApiKey = (): boolean => Boolean(getGeminiApiKey());
+
 export type WelinkChatModel = 'gemini-3.8-flash' | 'gemini-4-argon' | 'gemini-3.1-flash-lite';
 
 export interface WelinkChatMessage {
