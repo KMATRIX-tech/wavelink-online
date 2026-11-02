@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { isOwnerEmail, ADMIN_EMAIL } from '../firebase';
+import { isOwnerEmail, ADMIN_EMAIL, isAuthNetworkError, getFriendlyAuthErrorMessage } from '../firebase';
 import {
   Waves,
   Sparkles,
@@ -46,21 +46,13 @@ export const AuthView: React.FC = () => {
         await registerWithEmail(email, password, displayName.trim() || 'Keylan Mbilinyi (Platform Owner)', username.trim() || 'keylan');
       }
     } catch (err: unknown) {
+      const friendly = getFriendlyAuthErrorMessage(err, 'email');
       const msg = err instanceof Error ? err.message : String(err);
-      if (
-        msg.includes('auth/invalid-credential') ||
-        msg.includes('auth/wrong-password') ||
-        msg.includes('auth/user-not-found')
-      ) {
-        setError('Invalid credentials. Use 1-Click Owner Launch below for instant access.');
-      } else if (msg.includes('auth/email-already-in-use')) {
-        // If owner already exists, switch to sign-in and proceed
+      if (msg.includes('auth/email-already-in-use')) {
         setMode('signin');
         setError('Account exists. Please enter your password or click 1-Click Owner Launch.');
-      } else if (msg.includes('auth/weak-password')) {
-        setError('Password should be at least 6 characters.');
       } else {
-        setError(msg.replace('Firebase: ', ''));
+        setError(friendly || 'Authentication failed. Please verify credentials.');
       }
     } finally {
       setIsSubmitting(false);
@@ -73,9 +65,10 @@ export const AuthView: React.FC = () => {
     try {
       await signInWithGoogle();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('auth/popup-closed-by-user')) {
-        setError(msg.replace('Firebase: ', ''));
+      console.warn('AuthView Google Sign-In notice:', err);
+      const friendly = getFriendlyAuthErrorMessage(err, 'google');
+      if (friendly) {
+        setError(friendly);
       }
     } finally {
       setIsSubmitting(false);
@@ -93,11 +86,11 @@ export const AuthView: React.FC = () => {
         '@keylan'
       );
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('Owner quick launch error:', err);
+      console.warn('Owner quick launch notice:', err);
       setEmail(ADMIN_EMAIL);
       setPassword('WaveLinkAdmin2025!');
-      setError(`Owner launch attempt: ${msg.replace('Firebase: ', '')}. Credentials filled above.`);
+      const friendly = getFriendlyAuthErrorMessage(err, 'quick');
+      setError(friendly || 'Credentials pre-filled. Please click Sign In to continue.');
     } finally {
       setQuickLoading(false);
     }

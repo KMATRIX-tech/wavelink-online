@@ -25,10 +25,10 @@ import {
 } from 'lucide-react';
 import {
   sendWelinkChatMessage,
+  sendWelinkChatMessageStream,
   generateWelinkImage,
   generateWelinkVideo,
-  hasViteGeminiApiKey,
-  connectWelinkLiveVoiceClient,
+  getWelinkLiveVoiceWsUrl,
 } from '../services/geminiService';
 
 interface WelinkAssistantDrawerProps {
@@ -119,7 +119,6 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceTranscripts, setVoiceTranscripts] = useState<{ role: 'user' | 'model'; text: string }[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
-  const clientLiveSessionRef = useRef<{ sendAudio: (b64: string) => void; close: () => void } | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -168,26 +167,66 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     if (!textOverride) setChatInput('');
     setIsChatLoading(true);
 
+    const modelTurnId = `model_${Date.now()}`;
+    let accumulatedText = '';
+
     try {
-      const data = await sendWelinkChatMessage({
+      await sendWelinkChatMessageStream({
         model: selectedModel,
         messages: updatedMessages.map((m) => ({
           role: m.role,
           text: m.text,
         })),
+        onChunk: (chunkText) => {
+          accumulatedText += chunkText;
+          setMessages((prev) => {
+            const exists = prev.some((m) => m.id === modelTurnId);
+            if (exists) {
+              return prev.map((m) =>
+                m.id === modelTurnId ? { ...m, text: accumulatedText } : m
+              );
+            }
+            return [
+              ...prev,
+              {
+                id: modelTurnId,
+                role: 'model',
+                text: accumulatedText,
+                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                modelUsed: selectedModel,
+              },
+            ];
+          });
+        },
       });
+    } catch (streamErr: any) {
+      if (accumulatedText) {
+        // Partial text already rendered successfully
+        setChatError(null);
+      } else {
+        // Seamless fallback to standard server-side chat endpoint
+        try {
+          const data = await sendWelinkChatMessage({
+            model: selectedModel,
+            messages: updatedMessages.map((m) => ({
+              role: m.role,
+              text: m.text,
+            })),
+          });
 
-      const modelTurn: ChatTurn = {
-        id: `model_${Date.now()}`,
-        role: 'model',
-        text: data.reply,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        modelUsed: data.model,
-      };
+          const modelTurn: ChatTurn = {
+            id: modelTurnId,
+            role: 'model',
+            text: data.reply,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            modelUsed: data.model,
+          };
 
-      setMessages((prev) => [...prev, modelTurn]);
-    } catch (err: any) {
-      setChatError(err.message || 'Connection error while talking to WELINK.');
+          setMessages((prev) => [...prev, modelTurn]);
+        } catch (fallbackErr: any) {
+          setChatError(fallbackErr.message || streamErr.message || 'Connection error while talking to WELINK.');
+        }
+      }
     } finally {
       setIsChatLoading(false);
     }
@@ -300,59 +339,8 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       outputAudioCtxRef.current = outputCtx;
       nextStartTimeRef.current = 0;
 
-      if (hasViteGeminiApiKey()) {
-        const liveSession = await connectWelinkLiveVoiceClient({
-          onConnected: () => {
-            setIsVoiceConnecting(false);
-            setIsVoiceActive(true);
-          },
-          onAudio: (audio) => {
-            playPcm24kAudio(audio);
-          },
-          onInputTranscript: (txt) => {
-            setVoiceTranscripts((prev) => [...prev.slice(-15), { role: 'user', text: txt }]);
-          },
-          onOutputTranscript: (txt) => {
-            setVoiceTranscripts((prev) => [...prev.slice(-15), { role: 'model', text: txt }]);
-          },
-          onInterrupted: () => {
-            activeSourcesRef.current.forEach((src) => {
-              try {
-                src.stop();
-              } catch {
-                // ignore
-              }
-            });
-            activeSourcesRef.current = [];
-            if (outputAudioCtxRef.current) {
-              nextStartTimeRef.current = outputAudioCtxRef.current.currentTime;
-            }
-          },
-          onError: (errMsg) => {
-            setVoiceError(errMsg);
-            stopVoiceSession();
-          },
-        });
-        clientLiveSessionRef.current = liveSession;
-
-        const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
-
-        processor.onaudioprocess = (e) => {
-          if (clientLiveSessionRef.current) {
-            const base64Audio = float32ToPcm16Base64(e.inputBuffer.getChannelData(0));
-            clientLiveSessionRef.current.sendAudio(base64Audio);
-          }
-        };
-
-        source.connect(processor);
-        processor.connect(inputCtx.destination);
-        return;
-      }
-
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}/api/welink/live`);
+      const wsUrl = getWelinkLiveVoiceWsUrl();
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -451,10 +439,6 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     if (outputAudioCtxRef.current) {
       outputAudioCtxRef.current.close().catch(() => {});
       outputAudioCtxRef.current = null;
-    }
-    if (clientLiveSessionRef.current) {
-      clientLiveSessionRef.current.close();
-      clientLiveSessionRef.current = null;
     }
     if (wsRef.current) {
       try {

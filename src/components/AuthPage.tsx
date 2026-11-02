@@ -6,7 +6,14 @@ import {
   createUserWithEmailAndPassword,
   updateProfile as fbUpdateProfile
 } from 'firebase/auth';
-import { auth, ADMIN_EMAIL, isOwnerEmail } from '../firebase';
+import {
+  auth,
+  ADMIN_EMAIL,
+  isOwnerEmail,
+  isAuthNetworkError,
+  getFriendlyAuthErrorMessage,
+  isIframeEnvironment
+} from '../firebase';
 import { recordSystemDomain } from '../services/verificationService';
 import { useAuth } from '../context/AuthContext';
 import {
@@ -51,6 +58,7 @@ export const AuthPage: React.FC = () => {
 
   /**
    * 1. Built-in Firebase Google Sign-In via standard signInWithPopup(auth, googleProvider)
+   * Defensively catches iframe / third-party cookie network timeouts
    */
   const handleGoogleSignIn = async () => {
     setError(null);
@@ -63,9 +71,10 @@ export const AuthPage: React.FC = () => {
       await signInWithPopup(auth, googleProvider);
       setStatusMessage('Signed in successfully! Loading your profile...');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('auth/popup-closed-by-user') && !msg.includes('auth/cancelled-popup-request')) {
-        setError(msg.replace('Firebase: ', ''));
+      console.warn('Google Sign-In notice:', err);
+      const friendlyMsg = getFriendlyAuthErrorMessage(err, 'google');
+      if (friendlyMsg) {
+        setError(friendlyMsg);
       }
       setStatusMessage(null);
     } finally {
@@ -76,6 +85,7 @@ export const AuthPage: React.FC = () => {
   /**
    * 2. Built-in Firebase Email & Password Form Handler
    * Explicitly supports both Signing Up (creating a new account) and Signing In
+   * with automatic transient network retry
    */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -100,24 +110,29 @@ export const AuthPage: React.FC = () => {
       setStatusMessage('Creating your WaveLink account with Firebase...');
 
       try {
-        const res = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+        let res;
+        try {
+          res = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+        } catch (initialErr) {
+          if (isAuthNetworkError(initialErr)) {
+            // Transient network retry
+            await new Promise((r) => setTimeout(r, 600));
+            res = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+          } else {
+            throw initialErr;
+          }
+        }
         await fbUpdateProfile(res.user, {
           displayName: name
         });
         setStatusMessage('Welcome to WaveLink! Opening your dashboard...');
       } catch (err: any) {
-        const code = err?.code || '';
-        const msg = err?.message || String(err);
-
-        if (code === 'auth/email-already-in-use') {
+        const friendly = getFriendlyAuthErrorMessage(err, 'email');
+        if (err?.code === 'auth/email-already-in-use') {
           setError('An account with this email already exists. Switching to Sign In...');
           setAuthMode('signin');
-        } else if (code === 'auth/weak-password') {
-          setError('Password is too weak. Please use at least 6 characters.');
-        } else if (code === 'auth/invalid-email') {
-          setError('Please enter a valid email address.');
         } else {
-          setError(msg.replace('Firebase: ', ''));
+          setError(friendly);
         }
         setStatusMessage(null);
       } finally {
@@ -130,7 +145,16 @@ export const AuthPage: React.FC = () => {
       setStatusMessage('Signing in to your WaveLink account...');
 
       try {
-        await signInWithEmailAndPassword(auth, cleanEmail, password);
+        try {
+          await signInWithEmailAndPassword(auth, cleanEmail, password);
+        } catch (initialErr) {
+          if (isAuthNetworkError(initialErr)) {
+            await new Promise((r) => setTimeout(r, 600));
+            await signInWithEmailAndPassword(auth, cleanEmail, password);
+          } else {
+            throw initialErr;
+          }
+        }
         setStatusMessage('Welcome back! Logging you in...');
       } catch (err: any) {
         const code = err?.code || '';
@@ -142,8 +166,8 @@ export const AuthPage: React.FC = () => {
           msg.includes('user-not-found') ||
           msg.includes('invalid-credential')
         ) {
-          // Offer seamless auto-registration or switch to signup
-          setStatusMessage('No account found. Automatically registering your new account with Firebase...');
+          // Offer seamless auto-registration
+          setStatusMessage('No existing account found. Creating your new account on WaveLink...');
           try {
             const createRes = await createUserWithEmailAndPassword(auth, cleanEmail, password);
             const name = displayName.trim() || cleanEmail.split('@')[0];
@@ -151,30 +175,14 @@ export const AuthPage: React.FC = () => {
             setStatusMessage('Account created successfully! Welcome to WaveLink 🌊');
             return;
           } catch (createErr: any) {
-            const createCode = createErr?.code || '';
-            const createMsg = createErr?.message || String(createErr);
-
-            if (createCode === 'auth/email-already-in-use') {
-              setError('Incorrect password for this account. Please try again.');
-            } else if (createCode === 'auth/weak-password') {
-              setError('Password is too weak. Must be at least 6 characters.');
-            } else {
-              setError(createMsg.replace('Firebase: ', ''));
-            }
+            const friendlyCreate = getFriendlyAuthErrorMessage(createErr, 'email');
+            setError(friendlyCreate);
             setStatusMessage(null);
             return;
           }
-        } else if (code === 'auth/wrong-password') {
-          setError('Incorrect password. Please verify your password and try again.');
-          setStatusMessage(null);
-        } else if (code === 'auth/too-many-requests') {
-          setError('Too many attempts. Please wait a minute and try again.');
-          setStatusMessage(null);
-        } else if (code === 'auth/invalid-email') {
-          setError('Please enter a valid email address.');
-          setStatusMessage(null);
         } else {
-          setError(msg.replace('Firebase: ', ''));
+          const friendly = getFriendlyAuthErrorMessage(err, 'email');
+          setError(friendly);
           setStatusMessage(null);
         }
       } finally {
@@ -202,10 +210,11 @@ export const AuthPage: React.FC = () => {
         'Keylan Mbilinyi (Platform Owner)',
         '@keylan'
       );
+      setStatusMessage('Signed in as Platform Owner! Welcome back Keylan 👑');
     } catch (err: any) {
-      console.log('Owner quick sign-in ready in form:', err);
-      // If error, values are populated in the form for 1-click submit
-      setStatusMessage('Owner credentials loaded into form. Click Sign In to proceed.');
+      console.warn('Owner quick sign-in notice:', err);
+      const friendly = getFriendlyAuthErrorMessage(err, 'quick');
+      setError(friendly || 'Credentials loaded into form. Click Sign In to proceed.');
       setIsLoading(false);
     }
   };
@@ -399,6 +408,11 @@ export const AuthPage: React.FC = () => {
               )}
               <span>Continue with Google</span>
             </button>
+            {isIframeEnvironment() && (
+              <p className="mt-2 text-[11px] text-center text-slate-500 font-medium">
+                💡 Embedded preview active: Email Sign-In &amp; 1-Click Launch run natively without cross-origin restrictions.
+              </p>
+            )}
 
             <div className="flex items-center my-5">
               <div className="flex-1 h-[1px] bg-gradient-to-r from-transparent via-blue-200 to-pink-200" />

@@ -1,4 +1,10 @@
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+/**
+ * WELINK AI Services (Server-Side Architecture)
+ * 
+ * All Gemini model interactions (chat, streaming, image generation, video creation,
+ * and Live voice WebSocket bridging) run securely on the server via /api/welink/*.
+ * No @google/genai SDK or API keys are bundled or exposed to the client browser.
+ */
 
 export const WELINK_SYSTEM_INSTRUCTION = `You are WELINK, the official AI Assistant and warm, encouraging community guide for WaveLink members.
 Your personality & responsibilities:
@@ -12,82 +18,34 @@ Your personality & responsibilities:
 - Assist Pro creators with brainstorming viral post ideas, reel scripts, captions, hashtags, and community event descriptions.
 - Keep responses clear, well-structured, and welcoming.`;
 
-/**
- * Initializes the Gemini API client using import.meta.env.VITE_GEMINI_API_KEY
- */
-export function getGeminiClient(): GoogleGenAI {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('VITE_GEMINI_API_KEY is not configured in environment variables.');
-  }
-  return new GoogleGenAI({ apiKey });
-}
+export type WelinkChatModel = 'gemini-3.8-flash' | 'gemini-4-argon' | 'gemini-3.1-flash-lite';
 
-export function hasViteGeminiApiKey(): boolean {
-  return Boolean(import.meta.env.VITE_GEMINI_API_KEY && String(import.meta.env.VITE_GEMINI_API_KEY).trim());
+export interface WelinkChatMessage {
+  role: 'user' | 'model';
+  text: string;
 }
 
 /**
- * Multi-turn conversational AI for WELINK Community Guide.
- * Uses import.meta.env.VITE_GEMINI_API_KEY when set (e.g., on Netlify), with server proxy fallback.
+ * Send a multi-turn chat message to WELINK via server-side Gemini API
  */
 export async function sendWelinkChatMessage(params: {
-  model: 'gemini-3.8-flash' | 'gemini-4-argon' | 'gemini-3.1-flash-lite';
-  messages: { role: 'user' | 'model'; text: string }[];
+  model: WelinkChatModel;
+  messages: WelinkChatMessage[];
 }): Promise<{ reply: string; model: string }> {
   const { model = 'gemini-3.8-flash', messages } = params;
 
-  if (hasViteGeminiApiKey()) {
-    const ai = getGeminiClient();
-    const history = messages.slice(0, -1).map((m) => ({
-      role: m.role === 'model' ? 'model' : 'user',
-      parts: [{ text: String(m.text || '') }],
-    }));
-    const latestMessage = String(messages[messages.length - 1]?.text || '');
-
-    let usedModel = model;
-    let response;
-    try {
-      const chat = ai.chats.create({
-        model: usedModel,
-        history,
-        config: {
-          systemInstruction: WELINK_SYSTEM_INSTRUCTION,
-        },
-      });
-      response = await chat.sendMessage({ message: latestMessage });
-    } catch (primaryErr) {
-      if (usedModel !== 'gemini-3.8-flash') {
-        usedModel = 'gemini-3.8-flash';
-        const fallbackChat = ai.chats.create({
-          model: usedModel,
-          history,
-          config: {
-            systemInstruction: WELINK_SYSTEM_INSTRUCTION,
-          },
-        });
-        response = await fallbackChat.sendMessage({ message: latestMessage });
-      } else {
-        throw primaryErr;
-      }
-    }
-
-    return {
-      reply: response.text || 'I am here to help! Could you rephrase your question?',
-      model: usedModel,
-    };
-  }
-
-  // Fallback to server-side proxy when running in full-stack mode without client env key
   const response = await fetch('/api/welink/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model, messages }),
   });
-  const data = await response.json();
+
+  const data = await response.json().catch(() => ({}));
+
   if (!response.ok || !data.success) {
-    throw new Error(data.error || 'WELINK could not process that request.');
+    throw new Error(data.error || 'WELINK encountered an error generating a response.');
   }
+
   return {
     reply: data.reply,
     model: data.model || model,
@@ -95,7 +53,78 @@ export async function sendWelinkChatMessage(params: {
 }
 
 /**
- * Create & Edit Images with WELINK Image Studio
+ * Stream a multi-turn chat response from WELINK via Server-Sent Events (SSE)
+ */
+export async function sendWelinkChatMessageStream(params: {
+  model: WelinkChatModel;
+  messages: WelinkChatMessage[];
+  onChunk: (text: string) => void;
+}): Promise<{ fullText: string; model: string }> {
+  const { model = 'gemini-3.8-flash', messages, onChunk } = params;
+
+  const response = await fetch('/api/welink/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || `HTTP ${response.status} from chat stream.`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('Streaming response body is unavailable in this browser.');
+  }
+
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  let fullText = '';
+  let responseModel = model;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+
+      if (payload === '[DONE]') {
+        return { fullText, model: responseModel };
+      }
+
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.error) {
+          throw new Error(parsed.error);
+        }
+        if (parsed.text) {
+          fullText += parsed.text;
+          onChunk(parsed.text);
+        }
+        if (parsed.model) {
+          responseModel = parsed.model;
+        }
+      } catch (parseErr: any) {
+        if (parseErr.message && !parseErr.message.includes('Unexpected token')) {
+          throw parseErr;
+        }
+      }
+    }
+  }
+
+  return { fullText, model: responseModel };
+}
+
+/**
+ * Create & Edit Images with WELINK Image Studio via server-side Gemini API
  */
 export async function generateWelinkImage(params: {
   prompt: string;
@@ -104,87 +133,23 @@ export async function generateWelinkImage(params: {
   aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4';
   imageSize?: '1K' | '2K';
 }): Promise<{ imageUrl: string; caption: string }> {
-  const {
-    prompt,
-    imageBase64,
-    imageMimeType = 'image/png',
-    aspectRatio = '1:1',
-    imageSize = '1K',
-  } = params;
-
-  if (hasViteGeminiApiKey()) {
-    const ai = getGeminiClient();
-    const parts: any[] = [];
-
-    if (imageBase64) {
-      const cleanBase64 = String(imageBase64).replace(/^data:[^;]+;base64,/, '');
-      parts.push({
-        inlineData: {
-          data: cleanBase64,
-          mimeType: imageMimeType,
-        },
-      });
-    }
-    parts.push({ text: String(prompt).trim() });
-
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-nano-banana-2.1',
-        contents: { parts },
-        config: {
-          imageConfig: {
-            aspectRatio,
-            imageSize,
-          },
-        },
-      });
-    } catch {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite-image',
-        contents: { parts },
-        config: {
-          imageConfig: {
-            aspectRatio,
-          },
-        },
-      });
-    }
-
-    let imageUrl = '';
-    let caption = '';
-
-    for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-      if (part.inlineData?.data) {
-        const mime = part.inlineData.mimeType ?? 'image/png';
-        imageUrl = `data:${mime};base64,${part.inlineData.data}`;
-      } else if (part.text) {
-        caption += part.text;
-      }
-    }
-
-    if (!imageUrl) {
-      throw new Error(caption || 'No image was returned by WELINK Image Studio.');
-    }
-
-    return { imageUrl, caption };
-  }
-
   const response = await fetch('/api/welink/image', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      prompt: prompt.trim(),
-      imageBase64,
-      imageMimeType,
-      aspectRatio,
-      imageSize,
+      prompt: params.prompt.trim(),
+      imageBase64: params.imageBase64,
+      imageMimeType: params.imageMimeType || 'image/png',
+      aspectRatio: params.aspectRatio || '1:1',
+      imageSize: params.imageSize || '1K',
     }),
   });
-  const data = await response.json();
+
+  const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.success) {
-    throw new Error(data.error || 'Failed to generate image.');
+    throw new Error(data.error || 'Failed to generate or edit image with WELINK.');
   }
+
   return {
     imageUrl: data.imageUrl,
     caption: data.caption || '',
@@ -192,59 +157,28 @@ export async function generateWelinkImage(params: {
 }
 
 /**
- * Generate Video from Text using gemini-omni-1.1-flash
+ * Generate Video from Text with WELINK Studio via server-side Gemini API
  */
 export async function generateWelinkVideo(params: {
   prompt: string;
   aspectRatio?: '16:9' | '9:16';
 }): Promise<{ videoUrl: string; caption: string }> {
-  const { prompt, aspectRatio = '16:9' } = params;
-  const validAspect = aspectRatio === '9:16' ? '9:16' : '16:9';
-
-  if (hasViteGeminiApiKey()) {
-    const ai = getGeminiClient();
-    const interaction = await ai.interactions.create({
-      model: 'gemini-omni-1.1-flash',
-      input: String(prompt).trim(),
-      response_format: {
-        type: 'video',
-        aspect_ratio: validAspect,
-        duration: '5s',
-        resolution: '720p',
-      },
-    } as any);
-
-    let videoUrl = '';
-    let caption = '';
-
-    for (const output of (interaction as any).outputs ?? []) {
-      if (output.type === 'video' && output.data) {
-        const mime = output.mime_type || 'video/mp4';
-        videoUrl = `data:${mime};base64,${output.data}`;
-      } else if (output.type === 'text' && output.text) {
-        caption += output.text;
-      }
-    }
-
-    if (!videoUrl) {
-      throw new Error(caption || 'No video output was generated. Please try a different prompt.');
-    }
-
-    return { videoUrl, caption };
-  }
+  const validAspect = params.aspectRatio === '9:16' ? '9:16' : '16:9';
 
   const response = await fetch('/api/welink/video', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      prompt: prompt.trim(),
+      prompt: params.prompt.trim(),
       aspectRatio: validAspect,
     }),
   });
-  const data = await response.json();
+
+  const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.success) {
-    throw new Error(data.error || 'Failed to generate video.');
+    throw new Error(data.error || 'Failed to generate video with WELINK.');
   }
+
   return {
     videoUrl: data.videoUrl,
     caption: data.caption || '',
@@ -252,69 +186,10 @@ export async function generateWelinkVideo(params: {
 }
 
 /**
- * Connect to Gemini Live Voice API directly when VITE_GEMINI_API_KEY is available
+ * Returns the WebSocket URL for the server-side Gemini Live Voice API bridge
  */
-export async function connectWelinkLiveVoiceClient(callbacks: {
-  onConnected: () => void;
-  onAudio: (base64Pcm24k: string) => void;
-  onInputTranscript: (text: string) => void;
-  onOutputTranscript: (text: string) => void;
-  onInterrupted: () => void;
-  onError: (errMsg: string) => void;
-}): Promise<{
-  sendAudio: (base64Pcm16k: string) => void;
-  close: () => void;
-}> {
-  const ai = getGeminiClient();
-  const session = await ai.live.connect({
-    model: 'gemini-3.8-live',
-    config: {
-      responseModalities: [Modality.AUDIO],
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
-      },
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
-      systemInstruction: WELINK_SYSTEM_INSTRUCTION,
-    },
-    callbacks: {
-      onmessage: (message: LiveServerMessage) => {
-        const content = message.serverContent;
-        if (content?.inputTranscription?.text) {
-          callbacks.onInputTranscript(content.inputTranscription.text);
-        }
-        if (content?.outputTranscription?.text) {
-          callbacks.onOutputTranscript(content.outputTranscription.text);
-        }
-        for (const part of content?.modelTurn?.parts ?? []) {
-          if (part.inlineData?.data) {
-            callbacks.onAudio(part.inlineData.data);
-          }
-        }
-        if (content?.interrupted) {
-          callbacks.onInterrupted();
-        }
-      },
-      onerror: (err: any) => {
-        callbacks.onError(err?.message || 'WELINK Live voice session error.');
-      },
-    },
-  });
-
-  callbacks.onConnected();
-
-  return {
-    sendAudio: (base64Pcm16k: string) => {
-      session.sendRealtimeInput({
-        audio: { data: base64Pcm16k, mimeType: 'audio/pcm;rate=16000' },
-      });
-    },
-    close: () => {
-      try {
-        session.close();
-      } catch {
-        // ignore
-      }
-    },
-  };
+export function getWelinkLiveVoiceWsUrl(): string {
+  if (typeof window === 'undefined') return '';
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/api/welink/live`;
 }

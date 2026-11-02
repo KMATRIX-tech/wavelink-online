@@ -10,7 +10,19 @@ import {
   updateProfile as fbUpdateProfile
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
-import { auth, db, ADMIN_EMAIL, isOwnerEmail, isAdminEmail, isSuperAdminEmail, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
+import {
+  auth,
+  db,
+  ADMIN_EMAIL,
+  isOwnerEmail,
+  isAdminEmail,
+  isSuperAdminEmail,
+  handleFirestoreError,
+  OperationType,
+  cleanFirestoreData,
+  isAuthNetworkError,
+  getFriendlyAuthErrorMessage
+} from '../firebase';
 import { UserProfile, PointTransaction, PointTransactionCategory, PointTransactionType } from '../types';
 
 export const DAILY_REWARD_SCHEDULE = [10, 15, 20, 25, 30, 40, 50];
@@ -689,6 +701,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  // Defensive network retry helper for transient Firebase Auth connection errors
+  const withAuthNetworkRetry = async <T,>(fn: () => Promise<T>, maxRetries = 1): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      if (isAuthNetworkError(err) && maxRetries > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        return await fn();
+      }
+      throw err;
+    }
+  };
+
   const signInWithGoogle = async () => {
     try {
       const googleProvider = new GoogleAuthProvider();
@@ -696,38 +721,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const res = await signInWithPopup(auth, googleProvider);
       await syncUserProfileDoc(res.user);
     } catch (err: unknown) {
-      console.error('Google Sign-In Error:', err);
+      console.warn('Google Sign-In Attempt notice:', err);
+      if (isAuthNetworkError(err)) {
+        throw new Error(
+          'Google Sign-In popup could not connect due to browser cross-origin iframe security. Please use Email Sign-In or 1-Click Platform Owner Launch below.'
+        );
+      }
       throw err;
     }
   };
 
   const signInWithEmail = async (email: string, pass: string) => {
     try {
-      const res = await signInWithEmailAndPassword(auth, email, pass);
+      const cleanEmail = email.trim();
+      const res = await withAuthNetworkRetry(() =>
+        signInWithEmailAndPassword(auth, cleanEmail, pass)
+      );
       await syncUserProfileDoc(res.user);
     } catch (err: unknown) {
-      console.error('Email Sign-In Error:', err);
+      console.warn('Email Sign-In Notice:', err);
       throw err;
     }
   };
 
   const registerWithEmail = async (email: string, pass: string, displayName: string, username?: string) => {
     try {
-      const res = await createUserWithEmailAndPassword(auth, email, pass);
+      const cleanEmail = email.trim();
+      const res = await withAuthNetworkRetry(() =>
+        createUserWithEmailAndPassword(auth, cleanEmail, pass)
+      );
       if (displayName) {
         await fbUpdateProfile(res.user, { displayName });
       }
       await syncUserProfileDoc(res.user, displayName, username);
     } catch (err: unknown) {
-      console.error('Registration Error:', err);
+      console.warn('Registration Notice:', err);
       throw err;
     }
   };
 
   // Unified seamless authentication: attempt sign-in first; if user not found, automatically register
   const authenticateSeamlessly = async (email: string, pass: string) => {
+    const cleanEmail = email.trim();
     try {
-      const res = await signInWithEmailAndPassword(auth, email, pass);
+      const res = await withAuthNetworkRetry(() =>
+        signInWithEmailAndPassword(auth, cleanEmail, pass)
+      );
       await syncUserProfileDoc(res.user);
     } catch (err: any) {
       const code = err?.code || '';
@@ -739,13 +778,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         msg.includes('invalid-credential')
       ) {
         try {
-          const createRes = await createUserWithEmailAndPassword(auth, email, pass);
-          const emailPrefix = email.split('@')[0];
+          const createRes = await withAuthNetworkRetry(() =>
+            createUserWithEmailAndPassword(auth, cleanEmail, pass)
+          );
+          const emailPrefix = cleanEmail.split('@')[0];
           await fbUpdateProfile(createRes.user, { displayName: emailPrefix });
           await syncUserProfileDoc(createRes.user, emailPrefix, `@${emailPrefix}`);
           return;
         } catch (createErr) {
-          console.error('Seamless registration error:', createErr);
+          console.warn('Seamless registration notice:', createErr);
           throw createErr;
         }
       }
@@ -759,8 +800,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     displayName?: string,
     username?: string
   ) => {
+    const cleanEmail = email.trim();
     try {
-      const res = await signInWithEmailAndPassword(auth, email, pass);
+      const res = await withAuthNetworkRetry(() =>
+        signInWithEmailAndPassword(auth, cleanEmail, pass)
+      );
       await syncUserProfileDoc(res.user, displayName, username);
     } catch (err: any) {
       const code = err?.code || '';
@@ -772,14 +816,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         msg.includes('invalid-credential')
       ) {
         try {
-          const createRes = await createUserWithEmailAndPassword(auth, email, pass);
+          const createRes = await withAuthNetworkRetry(() =>
+            createUserWithEmailAndPassword(auth, cleanEmail, pass)
+          );
           if (displayName) {
             await fbUpdateProfile(createRes.user, { displayName });
           }
           await syncUserProfileDoc(createRes.user, displayName, username);
           return;
         } catch (createErr) {
-          console.error('Quick account creation error:', createErr);
+          console.warn('Quick account creation notice:', createErr);
           throw createErr;
         }
       }

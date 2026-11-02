@@ -108,8 +108,87 @@ app.post('/api/welink/chat', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/welink/chat/stream
+ * Streaming Server-Sent Events (SSE) for WELINK Community Guide
+ */
+app.post('/api/welink/chat/stream', async (req: Request, res: Response) => {
+  try {
+    const { messages = [], model = 'gemini-3.8-flash' } = req.body;
+    const allowedModels = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.1-flash-lite'];
+    const selectedModel = allowedModels.includes(model) ? model : 'gemini-3.8-flash';
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      res.status(400).json({ success: false, error: 'Messages array is required.' });
+      return;
+    }
+
+    const ai = getGeminiClient();
+
+    const history = messages.slice(0, -1).map((m: { role: string; text: string }) => ({
+      role: m.role === 'model' ? 'model' : 'user',
+      parts: [{ text: String(m.text || '') }],
+    }));
+
+    const latestMessage = String(messages[messages.length - 1]?.text || '');
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    let streamResponse;
+    let usedModel = selectedModel;
+
+    try {
+      const chat = ai.chats.create({
+        model: selectedModel,
+        history,
+        config: {
+          systemInstruction: WELINK_SYSTEM_INSTRUCTION,
+        },
+      });
+      streamResponse = await chat.sendMessageStream({ message: latestMessage });
+    } catch (primaryErr) {
+      if (selectedModel !== 'gemini-3.8-flash') {
+        usedModel = 'gemini-3.8-flash';
+        const fallbackChat = ai.chats.create({
+          model: usedModel,
+          history,
+          config: {
+            systemInstruction: WELINK_SYSTEM_INSTRUCTION,
+          },
+        });
+        streamResponse = await fallbackChat.sendMessageStream({ message: latestMessage });
+      } else {
+        throw primaryErr;
+      }
+    }
+
+    for await (const chunk of streamResponse) {
+      const text = chunk.text || '';
+      if (text) {
+        res.write(`data: ${JSON.stringify({ text, model: usedModel })}\n\n`);
+      }
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (error: any) {
+    console.error('[WELINK Chat Stream] Error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Error generating streaming chat response.',
+      });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: error.message || 'Stream interrupted.' })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+/**
  * POST /api/welink/image
- * Create & Edit Images with gemini-nano-banana-2.1 (with fallback to gemini-2.5-flash-image)
+ * Create & Edit Images with gemini-nano-banana-2.1 (with fallback to gemini-3.1-flash-lite-image)
  */
 app.post('/api/welink/image', async (req: Request, res: Response) => {
   try {
