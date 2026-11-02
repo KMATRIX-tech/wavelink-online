@@ -313,6 +313,7 @@ export async function recordSystemDomain(rawDomain?: string): Promise<void> {
       new Set(
         [
           currentHost,
+          'wavelink-platform.netlify.app',
           'wavelink-online.netlify.app',
           'wavelink-social.netlify.app'
         ].filter((d) => Boolean(d) && d !== 'localhost' && d !== '127.0.0.1')

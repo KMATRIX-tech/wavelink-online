@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "formal-photon-n48x0"
+  },
+  "targets": {
+    "formal-photon-n48x0": {
+      "hosting": {
+        "app": [
+          "wavelink-platform.netlify.app"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
