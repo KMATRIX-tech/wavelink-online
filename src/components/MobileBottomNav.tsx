@@ -1,50 +1,134 @@
 import React from 'react';
 import { ActiveTab } from '../types';
 import { useAuth } from '../context/AuthContext';
+import { triggerHaptic } from '../utils/haptics';
 import {
   Home,
-  Search,
-  PlusCircle,
-  CalendarDays,
-  User,
-  Crown
+  Film,
+  Plus,
+  MessageSquare,
+  User
 } from 'lucide-react';
 
 interface MobileBottomNavProps {
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
+  hasUnreadNotifications?: boolean;
 }
 
-export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({ activeTab, setActiveTab }) => {
-  const { userProfile, currentUser, isProEffective, isExemptFromPayments } = useAuth();
-  const isProUser = isProEffective || isExemptFromPayments;
+export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
+  activeTab,
+  setActiveTab,
+  hasUnreadNotifications = false
+}) => {
+  const { userProfile, currentUser } = useAuth();
 
-  const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; isAction?: boolean }[] = [
-    { id: 'feed', label: 'Home', icon: <Home size={20} /> },
-    { id: 'videos', label: 'Search', icon: <Search size={20} /> },
-    { id: 'studio', label: 'Create', icon: <PlusCircle size={24} className="text-white" />, isAction: true },
-    { id: 'announcements', label: 'Notices', icon: <CalendarDays size={20} /> },
-    { id: 'settings', label: 'Profile', icon: <User size={20} /> },
+  const navItems: {
+    id: ActiveTab;
+    label: string;
+    icon: (active: boolean) => React.ReactNode;
+    activeColor: string;
+    isPrimaryAction?: boolean;
+    showDot?: boolean;
+  }[] = [
+    {
+      id: 'feed',
+      label: 'Home',
+      activeColor: 'text-[#2563EB]',
+      showDot: hasUnreadNotifications,
+      icon: (active) => (
+        <Home
+          size={22}
+          strokeWidth={active ? 2.5 : 1.8}
+          className={active ? 'text-[#2563EB]' : 'text-[#78716C]'}
+        />
+      )
+    },
+    {
+      id: 'videos',
+      label: 'Reels',
+      activeColor: 'text-[#F43F5E]',
+      icon: (active) => (
+        <Film
+          size={22}
+          strokeWidth={active ? 2.5 : 1.8}
+          className={active ? 'text-[#F43F5E]' : 'text-[#78716C]'}
+        />
+      )
+    },
+    {
+      id: 'studio',
+      label: 'Create',
+      isPrimaryAction: true,
+      activeColor: 'text-[#0D9488]',
+      icon: () => <Plus size={24} strokeWidth={2.5} className="text-white" />
+    },
+    {
+      id: 'chat',
+      label: 'Chat',
+      activeColor: 'text-[#0284C7]',
+      icon: (active) => (
+        <MessageSquare
+          size={22}
+          strokeWidth={active ? 2.5 : 1.8}
+          className={active ? 'text-[#0284C7]' : 'text-[#78716C]'}
+        />
+      )
+    },
+    {
+      id: 'settings',
+      label: 'Profile',
+      activeColor: 'text-[#D97706]',
+      icon: (active) => (
+        <div className="relative">
+          {userProfile?.photoURL || currentUser?.photoURL ? (
+            <img
+              src={userProfile?.photoURL || currentUser?.photoURL || ''}
+              alt="Profile"
+              className={`w-6 h-6 rounded-full object-cover transition ring-2 ${
+                active ? 'ring-[#D97706]' : 'ring-transparent'
+              }`}
+            />
+          ) : (
+            <User
+              size={22}
+              strokeWidth={active ? 2.5 : 1.8}
+              className={active ? 'text-[#D97706]' : 'text-[#78716C]'}
+            />
+          )}
+        </div>
+      )
+    }
   ];
 
+  const handleNavClick = (id: ActiveTab, isPrimary?: boolean) => {
+    triggerHaptic(isPrimary ? 'medium' : 'tab');
+    setActiveTab(id);
+  };
+
   return (
-    <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200/90 pb-safe shadow-lg">
-      <div className="flex items-center justify-around h-14 max-w-md mx-auto px-2">
+    <nav
+      className="fixed bottom-0 left-0 right-0 z-30 bg-[var(--bg-surface)]/95 backdrop-blur-md border-t border-[var(--border-hairline)] pb-safe shadow-[0_-2px_12px_rgba(28,25,23,0.04)]"
+      aria-label="Main Navigation"
+    >
+      <div className="flex items-center justify-between h-16 max-w-xl mx-auto px-3">
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
 
-          if (item.isAction) {
+          if (item.isPrimaryAction) {
             return (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id)}
-                className="flex flex-col items-center justify-center -mt-4 group active:scale-90 transition-transform"
-                title="Create Wave Post or Story"
+                type="button"
+                onClick={() => handleNavClick(item.id, true)}
+                className="flex flex-col items-center justify-center -mt-4 group active:scale-95 transition-transform"
+                title="Create Wave or Reel"
+                aria-label="Create new Wave or Reel"
               >
-                <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] shadow-md shadow-blue-500/25 group-hover:shadow-blue-500/40 transition">
-                  {item.icon}
+                <div className="w-12 h-12 rounded-2xl bg-[#0D9488] hover:bg-[#0f766e] flex items-center justify-center shadow-md shadow-[#0D9488]/25 transition">
+                  {item.icon(isActive)}
                 </div>
-                <span className="text-[9px] font-bold mt-1 text-[#3B82F6]">
+                <span className="text-[11px] font-bold mt-1 text-[#0D9488]">
                   {item.label}
                 </span>
               </button>
@@ -54,23 +138,24 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({ activeTab, set
           return (
             <button
               key={item.id}
-              onClick={() => setActiveTab(item.id)}
-              className={`flex flex-col items-center justify-center flex-1 py-1 transition-all duration-150 relative ${
-                isActive
-                  ? 'text-[#3B82F6] font-extrabold scale-105'
-                  : 'text-slate-400 hover:text-slate-700'
+              type="button"
+              onClick={() => handleNavClick(item.id, false)}
+              className={`flex-1 flex flex-col items-center justify-center py-1.5 transition-colors relative min-h-[48px] ${
+                isActive ? item.activeColor : 'text-[#78716C] hover:text-[#1C1917]'
               }`}
+              aria-label={item.label}
+              aria-current={isActive ? 'page' : undefined}
             >
-              <div className="relative">
-                {item.icon}
-                {item.id === 'announcements' && (
-                  <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-500 ring-2 ring-white" />
-                )}
-                {item.id === 'settings' && isProUser && (
-                  <Crown size={9} className="absolute -top-1.5 -right-1.5 text-amber-400 fill-amber-400" />
+              <div className="relative flex items-center justify-center">
+                {item.icon(isActive)}
+                {item.showDot && (
+                  <span
+                    className="absolute -top-0.5 -right-1.5 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-white"
+                    title="New reaction or reply"
+                  />
                 )}
               </div>
-              <span className="text-[10px] tracking-tight mt-0.5">
+              <span className={`text-[11px] mt-1 tracking-tight ${isActive ? 'font-bold' : 'font-medium'}`}>
                 {item.label}
               </span>
             </button>

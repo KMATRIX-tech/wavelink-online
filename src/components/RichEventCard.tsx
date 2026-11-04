@@ -12,10 +12,7 @@ import {
   Bell,
   Pin,
   Trash2,
-  Building2,
-  BookmarkCheck,
-  Megaphone,
-  Church
+  BookmarkCheck
 } from 'lucide-react';
 
 interface RichEventCardProps {
@@ -72,73 +69,64 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
     }
   };
 
-  const handleToggleReminder = () => {
-    setIsReminderSet((prev) => !prev);
-  };
-
-  const categoryBadge = () => {
-    if (announcement.type === 'schedule' || announcement.partnerType === 'church') {
-      return (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200/80">
-          <Church size={12} className="text-emerald-600" />
-          <span>Church &amp; Service Schedule</span>
-        </span>
-      );
-    }
-    if (announcement.type === 'announcement' && !announcement.eventDate) {
-      return (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-amber-50 text-amber-700 border border-amber-200/80">
-          <Megaphone size={12} className="text-amber-600" />
-          <span>Official Notice</span>
-        </span>
-      );
-    }
+  // Compact pinned notice card for the home feed with a single small badge
+  if (isFeedBanner) {
     return (
-      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-blue-50 text-blue-700 border border-blue-200/80">
-        <Calendar size={12} className="text-blue-600" />
-        <span>Community Event</span>
-      </span>
+      <article className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-4 shadow-2xs transition">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-[#2563EB] border border-blue-200/70">
+                <Pin size={10} className="text-[#2563EB]" />
+                <span>Pinned Notice</span>
+              </span>
+              {announcement.eventDate && (
+                <span className="text-[11px] text-[#78716C] font-medium truncate">
+                  {announcement.eventDate}
+                </span>
+              )}
+            </div>
+            <h3 className="text-sm sm:text-base font-bold text-[#1C1917] leading-snug truncate">
+              {announcement.title}
+            </h3>
+            <p className="text-xs text-[#78716C] mt-0.5 line-clamp-2 leading-relaxed">
+              {announcement.content}
+            </p>
+          </div>
+
+          {onRsvp && (
+            <button
+              type="button"
+              onClick={() => onRsvp(announcement.id)}
+              className={`min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition active:scale-95 ${
+                isRsvped
+                  ? 'bg-[#0D9488] text-white'
+                  : 'bg-[#FAF7F2] hover:bg-blue-50 text-[#2563EB] border border-[#EFECE6]'
+              }`}
+            >
+              <CheckCircle2 size={13} />
+              <span>{isRsvped ? 'Going' : 'RSVP'}</span>
+            </button>
+          )}
+        </div>
+      </article>
     );
-  };
+  }
 
   return (
-    <article
-      className={`rounded-2xl bg-white border transition-all duration-200 overflow-hidden flex flex-col ${
-        isFeedBanner
-          ? 'border-blue-300 shadow-[0_4px_20px_-4px_rgba(37,99,235,0.10)]'
-          : 'border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(15,23,42,0.04)] hover:border-slate-300 hover:shadow-[0_6px_24px_-4px_rgba(15,23,42,0.07)]'
-      }`}
-    >
-      {/* Top Pinned Banner */}
-      {announcement.isPinned && (
-        <div className="bg-blue-600 px-5 py-2 text-white flex items-center justify-between text-xs font-bold tracking-wide">
-          <div className="flex items-center gap-1.5">
-            <Pin size={13} className="fill-white rotate-45" />
-            <span className="uppercase text-[11px] tracking-wider">
-              Pinned Notice Board Highlight
-            </span>
-          </div>
-          <span className="text-[10px] bg-white/20 px-2.5 py-0.5 rounded-md uppercase font-extrabold">
-            Featured
-          </span>
-        </div>
-      )}
-
-      {/* Optional Header Event Banner Image */}
+    <article className="rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xs overflow-hidden flex flex-col">
       {announcement.imageUrl && (
-        <div className="relative w-full aspect-21/9 max-h-64 overflow-hidden bg-slate-50 border-b border-slate-100">
+        <div className="relative w-full aspect-21/9 max-h-60 overflow-hidden bg-[#FAF7F2] border-b border-[var(--border-hairline)]">
           <img
             src={announcement.imageUrl}
             alt={announcement.title}
-            className="w-full h-full object-cover transition-transform duration-300 hover:scale-[1.01]"
+            className="w-full h-full object-cover"
             loading="lazy"
           />
         </div>
       )}
 
-      {/* Card Content Area */}
-      <div className="p-5 sm:p-6 flex-1 flex flex-col space-y-4 bg-white">
-        {/* Top Category & Author Row */}
+      <div className="p-5 sm:p-6 flex-1 flex flex-col space-y-4">
         <div className="flex items-start justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3 min-w-0">
             <img
@@ -147,60 +135,37 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
                 `https://api.dicebear.com/7.x/shapes/svg?seed=${announcement.authorId}`
               }
               alt={announcement.authorName}
-              className="w-10 h-10 rounded-full object-cover ring-1 ring-slate-200 shrink-0"
+              className="w-10 h-10 rounded-full object-cover ring-1 ring-[#EFECE6] shrink-0"
             />
             <div className="min-w-0">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <CrystalBadge
-                  email={announcement.authorEmail}
-                  name={announcement.authorName}
-                  size="sm"
-                />
-
-                {(announcement.isOfficialPartner ||
-                  announcement.partnerType ||
-                  announcement.authorEmail === 'keylanmbilinyi5@gmail.com') && (
-                  <span
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200"
-                    title="Verified Community Organizer"
-                  >
-                    <Building2 size={11} className="text-emerald-600" />
-                    <span>
-                      {announcement.partnerBadgeTitle ||
-                        (announcement.partnerType === 'church'
-                          ? 'Church Leader'
-                          : 'Verified Organizer')}
-                    </span>
-                  </span>
-                )}
-              </div>
-
-              <div className="text-[11px] text-slate-500 flex items-center gap-2 mt-0.5 font-mono tabular-numbers">
-                <span>
-                  Posted{' '}
-                  {new Date(announcement.createdAt).toLocaleDateString(undefined, {
-                    month: 'short',
-                    day: 'numeric',
-                    year: 'numeric'
-                  })}
-                </span>
-                {announcement.priority === 'urgent' && (
-                  <span className="text-[10px] font-sans font-extrabold text-rose-600 bg-rose-50 px-2 py-0.5 rounded-md border border-rose-200 uppercase">
-                    Urgent Priority
-                  </span>
-                )}
+              <CrystalBadge
+                email={announcement.authorEmail}
+                name={announcement.authorName}
+                size="sm"
+              />
+              <div className="text-[11px] text-[#78716C] mt-0.5">
+                {new Date(announcement.createdAt).toLocaleDateString(undefined, {
+                  month: 'short',
+                  day: 'numeric',
+                  year: 'numeric'
+                })}
               </div>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
-            {categoryBadge()}
+            {announcement.isPinned && (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-blue-50 text-[#2563EB] border border-blue-200/80">
+                <Pin size={11} />
+                <span>Pinned</span>
+              </span>
+            )}
             {canDelete && onDelete && (
               <button
                 type="button"
                 onClick={() => onDelete(announcement.id)}
-                className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition"
-                title="Delete Notice / Event"
+                className="p-2 text-[#78716C] hover:text-rose-600 hover:bg-rose-50 rounded-xl transition"
+                title="Delete Notice"
               >
                 <Trash2 size={16} />
               </button>
@@ -208,131 +173,94 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
           </div>
         </div>
 
-        {/* Headline & Body Text */}
         <div>
-          <h3 className="text-lg sm:text-xl font-extrabold text-slate-900 tracking-tight leading-snug">
+          <h3 className="text-lg font-extrabold text-[#1C1917] tracking-tight leading-snug">
             {announcement.title}
           </h3>
-          <p className="text-sm text-slate-600 mt-2 leading-relaxed whitespace-pre-line">
+          <p className="text-sm text-[#57534E] mt-1.5 leading-relaxed whitespace-pre-line">
             {announcement.content}
           </p>
         </div>
 
-        {/* Structured Event Metadata Strip (Date, Time, Venue) */}
         {(announcement.eventDate ||
           announcement.eventTime ||
           announcement.eventLocation) && (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
             {announcement.eventDate && (
-              <div className="flex items-center gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200/80 text-slate-900">
-                <div className="p-2 rounded-lg bg-white border border-slate-200/80 text-blue-600 shrink-0 shadow-2xs">
-                  <Calendar size={15} />
-                </div>
+              <div className="flex items-center gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917]">
+                <Calendar size={15} className="text-[#2563EB] shrink-0" />
                 <div className="min-w-0">
-                  <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">
-                    Event Date
-                  </div>
-                  <div className="truncate font-bold text-xs text-slate-900 font-mono tabular-numbers">
-                    {announcement.eventDate}
-                  </div>
+                  <div className="text-[10px] uppercase font-bold text-[#78716C]">Date</div>
+                  <div className="truncate font-bold text-xs">{announcement.eventDate}</div>
                 </div>
               </div>
             )}
 
             {announcement.eventTime && (
-              <div className="flex items-center gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200/80 text-slate-900">
-                <div className="p-2 rounded-lg bg-white border border-slate-200/80 text-emerald-600 shrink-0 shadow-2xs">
-                  <Clock size={15} />
-                </div>
+              <div className="flex items-center gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917]">
+                <Clock size={15} className="text-[#0D9488] shrink-0" />
                 <div className="min-w-0">
-                  <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">
-                    Start Time
-                  </div>
-                  <div className="truncate font-bold text-xs text-slate-900 font-mono tabular-numbers">
-                    {announcement.eventTime}
-                  </div>
+                  <div className="text-[10px] uppercase font-bold text-[#78716C]">Time</div>
+                  <div className="truncate font-bold text-xs">{announcement.eventTime}</div>
                 </div>
               </div>
             )}
 
             {announcement.eventLocation && (
-              <div className="flex items-center gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200/80 text-slate-900">
-                <div className="p-2 rounded-lg bg-white border border-slate-200/80 text-amber-600 shrink-0 shadow-2xs">
-                  <MapPin size={15} />
-                </div>
+              <div className="flex items-center gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917]">
+                <MapPin size={15} className="text-[#D97706] shrink-0" />
                 <div className="min-w-0">
-                  <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">
-                    Venue / Location
-                  </div>
-                  <div className="truncate font-bold text-xs text-slate-900">
-                    {announcement.eventLocation}
-                  </div>
+                  <div className="text-[10px] uppercase font-bold text-[#78716C]">Location</div>
+                  <div className="truncate font-bold text-xs">{announcement.eventLocation}</div>
                 </div>
               </div>
             )}
           </div>
         )}
 
-        {/* Action Buttons & RSVP Counter Footer */}
-        <div className="pt-3.5 border-t border-slate-100 flex items-center justify-between gap-2 flex-wrap">
+        <div className="pt-3 border-t border-[#EFECE6] flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-2">
             {onRsvp && (
               <button
                 type="button"
                 onClick={() => onRsvp(announcement.id)}
-                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition active:scale-95 whitespace-nowrap ${
+                className={`min-h-[42px] px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition active:scale-95 ${
                   isRsvped
-                    ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-xs'
-                    : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'
+                    ? 'bg-[#0D9488] text-white'
+                    : 'bg-[#2563EB] hover:bg-[#1D4ED8] text-white'
                 }`}
               >
-                <CheckCircle2
-                  size={14}
-                  className={isRsvped ? 'fill-white text-emerald-600' : ''}
-                />
-                <span>{isRsvped ? 'Attending (RSVPed)' : 'RSVP to Attend'}</span>
+                <CheckCircle2 size={14} />
+                <span>{isRsvped ? 'Going (RSVPed)' : 'RSVP to Attend'}</span>
               </button>
             )}
 
-            <div className="flex items-center gap-1.5 text-xs font-bold text-slate-600 px-3 py-2 rounded-xl bg-slate-50 border border-slate-200/80 font-mono tabular-numbers">
-              <Users size={14} className="text-slate-400" />
-              <span>
-                {rsvpCount} {rsvpCount === 1 ? 'Member' : 'Members'} Going
-              </span>
+            <div className="flex items-center gap-1.5 text-xs font-bold text-[#78716C] px-3 py-2 rounded-xl bg-[#FAF7F2] border border-[#EFECE6]">
+              <Users size={14} />
+              <span>{rsvpCount} Going</span>
             </div>
           </div>
 
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={handleToggleReminder}
-              className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 border transition active:scale-95 whitespace-nowrap ${
+              onClick={() => setIsReminderSet((p) => !p)}
+              className={`min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 border transition ${
                 isReminderSet
                   ? 'bg-amber-50 border-amber-300 text-amber-800'
-                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                  : 'bg-white border-[#EFECE6] text-[#78716C] hover:bg-[#FAF7F2]'
               }`}
-              title="Set Event Reminder"
             >
-              {isReminderSet ? (
-                <>
-                  <BookmarkCheck size={14} className="text-amber-600" />
-                  <span>Reminder Set</span>
-                </>
-              ) : (
-                <>
-                  <Bell size={14} className="text-slate-500" />
-                  <span>Remind Me</span>
-                </>
-              )}
+              {isReminderSet ? <BookmarkCheck size={14} /> : <Bell size={14} />}
+              <span>{isReminderSet ? 'Reminder Set' : 'Remind'}</span>
             </button>
 
             <button
               type="button"
               onClick={handleShare}
-              className="px-3 py-2 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-bold flex items-center gap-1.5 transition active:scale-95 whitespace-nowrap"
-              title="Share Event / Notice"
+              className="min-h-[40px] px-3 py-2 rounded-xl bg-white border border-[#EFECE6] text-[#78716C] hover:bg-[#FAF7F2] text-xs font-bold flex items-center gap-1.5 transition"
             >
-              <Share2 size={14} className="text-slate-500" />
+              <Share2 size={14} />
               <span>{isCopied ? 'Copied!' : 'Share'}</span>
             </button>
           </div>

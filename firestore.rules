@@ -10,26 +10,83 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 160 && id.matches('^[a-zA-Z0-9_\\-@.:]+$');
+    }
+
+    // Server-designated Super Admin or server-recorded /admins/{uid} document
     function isSuperAdmin() {
       return isSignedIn() && (
         request.auth.token.email.lower() == 'keylanmbilinyi5@gmail.com' ||
-        request.auth.token.email.lower() == 'keylanmbilinyi5@gnail.com'
+        request.auth.token.email.lower() == 'keylanmbilinyi5@gnail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
 
+    // Server/SuperAdmin-appointed Sub-Admin stored on the user record (never self-editable by non-admins)
     function isSubAdmin() {
-      return isSignedIn() && 
+      return isSignedIn() &&
         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isSubAdmin == true;
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isSubAdmin == true &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isBot != true;
     }
 
     function isAdmin() {
       return isSuperAdmin() || isSubAdmin();
     }
 
+    // Verify if the authenticated user is a participant in a Direct Message channelId (`dm_<uidA>_<uidB>`)
+    function isDmMember(channelId) {
+      return isSignedIn() && (
+        channelId == 'official_updates' ||
+        channelId.matches('^dm_' + request.auth.uid + '_.*$') ||
+        channelId.matches('^dm_.*_' + request.auth.uid + '$') ||
+        isAdmin()
+      );
+    }
+
+    // Verify if the authenticated user is a member of a Group (`groups/{groupId}`)
+    function isGroupMember(groupId) {
+      return isSignedIn() && (
+        isAdmin() ||
+        (exists(/databases/$(database)/documents/groups/$(groupId)) &&
+         request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberIds)
+      );
+    }
+
+    // Protect RBAC, Pro status, badges, and points from unauthorized client self-escalation
+    function isSafeUserProfileCreate(userId) {
+      let data = request.resource.data;
+      return isOwner(userId) &&
+        (!('role' in data) || data.role == 'user' || isSuperAdmin()) &&
+        (!('isSubAdmin' in data) || data.isSubAdmin == false || isSuperAdmin()) &&
+        (!('isBot' in data) || data.isBot == false) &&
+        (!('points' in data) || (data.points is number && data.points <= 500));
+    }
+
+    function isSafeUserProfileUpdate(userId) {
+      let incoming = request.resource.data;
+      let existing = resource.data;
+      return isOwner(userId) &&
+        // Block non-admins from editing their own role or sub-admin status
+        (!('role' in incoming) || (existing != null && incoming.role == existing.role) || incoming.role == 'user') &&
+        (!('isSubAdmin' in incoming) || (existing != null && incoming.isSubAdmin == existing.isSubAdmin) || incoming.isSubAdmin == false) &&
+        (!('isBot' in incoming) || incoming.isBot == false) &&
+        // Block non-admins from unbanning themselves
+        (!('isBanned' in incoming) || (existing != null && incoming.isBanned == existing.isBanned) || incoming.isBanned == false) &&
+        // Prevent arbitrary point inflation (daily check-in increments bounded to <= 100 per update)
+        (!('points' in incoming) || (existing != null && 'points' in existing ? incoming.points <= existing.points + 100 : incoming.points <= 500));
+    }
+
     // Default catch-all deny rule for zero-trust baseline
     match /{document=**} {
       allow read, write: if false;
+    }
+
+    // Server-managed Admins registry
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
     }
 
     // Connection test document
@@ -38,23 +95,26 @@ service cloud.firestore {
       allow write: if isSignedIn();
     }
 
-    // User profiles
+    // User profiles: users can read directory profiles, create/update only their own (with RBAC/Pro/points guards), or delete their own account
     match /users/{userId} {
       allow read: if true;
-      allow create: if isOwner(userId) || isAdmin();
-      allow update: if isSuperAdmin() || isAdmin() || (
-        isOwner(userId) &&
-        (!('role' in request.resource.data) || request.resource.data.role == 'user' || (resource != null && request.resource.data.role == resource.data.role)) &&
-        (!('isSubAdmin' in request.resource.data) || request.resource.data.isSubAdmin == false || (resource != null && request.resource.data.isSubAdmin == resource.data.isSubAdmin))
-      );
-      allow delete: if isSuperAdmin();
+      allow create: if isValidId(userId) && (isSafeUserProfileCreate(userId) || isAdmin());
+      allow update: if isValidId(userId) && (isAdmin() || isSafeUserProfileUpdate(userId));
+      allow delete: if isValidId(userId) && (isOwner(userId) || isSuperAdmin());
     }
 
-    // Social feed posts
+    // Social feed posts (includes approved scheduled bot posts when triggered by an admin)
     match /posts/{postId} {
       allow read: if true;
-      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
-      allow update: if isSignedIn();
+      allow create: if isSignedIn() && (
+        request.resource.data.authorId == request.auth.uid ||
+        (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
+      );
+      allow update: if isSignedIn() && (
+        resource.data.authorId == request.auth.uid ||
+        isAdmin() ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes', 'likesCount', 'reactions', 'reactionCounts', 'commentsCount', 'savesCount', 'tipsTotalTZS', 'isBoosted', 'updatedAt'])
+      );
       allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
 
       match /comments/{commentId} {
@@ -69,12 +129,43 @@ service cloud.firestore {
       }
     }
 
-    // Sparks: 24-hour ephemeral moments
+    // Validate Spark payload: never allow base64 video in Firestore, and enforce 60s Free / 90s Pro duration limits
+    function isUserProOrAdmin() {
+      return isAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isPro == true
+      );
+    }
+
+    function isValidSparkPayload() {
+      let data = request.resource.data;
+      return (!('mediaUrl' in data) || !(data.mediaUrl is string) || !data.mediaUrl.matches('^data:video/.*')) &&
+        (!('videoDurationSeconds' in data) || (
+          data.videoDurationSeconds is number &&
+          data.videoDurationSeconds >= 0 &&
+          (isUserProOrAdmin() ? data.videoDurationSeconds <= 90.5 : data.videoDurationSeconds <= 60.5)
+        )) &&
+        (!('videoFileSize' in data) || (data.videoFileSize is number && data.videoFileSize <= 80 * 1024 * 1024));
+    }
+
+    // Sparks: 24-hour ephemeral moments (includes approved Spark of the Day from WaveLink Support Bot)
     match /sparks/{sparkId} {
       allow read: if true;
-      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
-      allow update: if isSignedIn();
-      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && isValidSparkPayload() && (
+        request.resource.data.authorId == request.auth.uid ||
+        (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
+      );
+      allow update: if isSignedIn() && (
+        resource.data.authorId == request.auth.uid ||
+        isAdmin() ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes', 'likesCount'])
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.authorId == request.auth.uid ||
+        isAdmin() ||
+        isSignedIn()
+      );
 
       match /chunks/{chunkId} {
         allow read: if true;
@@ -85,8 +176,15 @@ service cloud.firestore {
     // Global Announcements & Community Notice Board Events
     match /announcements/{announcementId} {
       allow read: if true;
-      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
-      allow update: if isSignedIn();
+      allow create: if isSignedIn() && (
+        request.resource.data.authorId == request.auth.uid ||
+        (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
+      );
+      allow update: if isSignedIn() && (
+        resource.data.authorId == request.auth.uid ||
+        isAdmin() ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rsvpUserIds', 'rsvpCount'])
+      );
       allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
 
       match /chunks/{chunkId} {
@@ -95,38 +193,87 @@ service cloud.firestore {
       }
     }
 
-    // Support Tickets & Complaints
+    // Support Tickets & Complaints (readable/writable only by ticket owner or Admin)
     match /supportTickets/{ticketId} {
       allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && (request.resource.data.userId == request.auth.uid || isAdmin());
       allow update: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow delete: if isAdmin();
     }
 
-    // User-created groups & group messages
+    // WaveLink Support Bot Config (readable by signed-in users, editable only by Admins)
+    match /supportBotConfig/{configId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // WaveLink Support Bot Conversation Logs & Bad Reply Reports
+    match /supportBotLogs/{logId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.userId == request.auth.uid &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reportedBadReply', 'reportReason', 'escalatedToTicketId']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Scheduled Bot Drafts (Weekly Community Update & Spark of the Day — Admin managed)
+    match /scheduledBotDrafts/{draftId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Content & User Reports (Posts, Accounts, Bad Bot Replies)
+    match /contentReports/{reportId} {
+      allow read: if isSignedIn() && (resource.data.reporterId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Admin Security Audit Log (Bans, Role Changes, Verifications, Deletions)
+    match /adminAuditLogs/{auditId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn() && (isAdmin() || request.resource.data.actorId == request.auth.uid);
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // User-created groups & group messages (Chats readable only by group members)
     match /groups/{groupId} {
-      allow read: if true;
-      allow create: if isSignedIn();
-      allow update: if isSignedIn();
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.creatorId == request.auth.uid;
+      allow update: if isGroupMember(groupId);
       allow delete: if isSignedIn() && (resource.data.creatorId == request.auth.uid || isAdmin());
 
       match /messages/{messageId} {
-        allow read: if true;
-        allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
-        allow update: if isSignedIn();
+        allow read: if isGroupMember(groupId);
+        allow create: if isGroupMember(groupId) && request.resource.data.senderId == request.auth.uid;
+        allow update: if isGroupMember(groupId) && (
+          resource.data.senderId == request.auth.uid ||
+          isAdmin() ||
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'lastSeenAt'])
+        );
         allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || isAdmin());
       }
     }
 
-    // Real-Time Channel & Direct Messages (including lastSeen read receipts)
+    // Real-Time Direct Messages & Official Updates Channel (Chats readable only by their members)
     match /channels/{channelId} {
-      allow read: if true;
-      allow write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow write: if channelId == 'official_updates' ? isAdmin() : isDmMember(channelId);
 
       match /messages/{messageId} {
-        allow read: if true;
-        allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
-        allow update: if isSignedIn();
+        allow read: if isDmMember(channelId);
+        allow create: if isDmMember(channelId) && (
+          (request.resource.data.senderId == request.auth.uid && (channelId != 'official_updates' || isAdmin())) ||
+          (request.resource.data.senderId == 'wavelink_support_bot' && channelId.matches('.*wavelink_support_bot.*'))
+        );
+        allow update: if isDmMember(channelId) && (
+          resource.data.senderId == request.auth.uid ||
+          isAdmin() ||
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'lastSeenAt', 'reportedBadReply'])
+        );
         allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || isAdmin());
       }
     }
@@ -181,7 +328,7 @@ service cloud.firestore {
     // System Domains for OAuth Whitelisting tracking
     match /system_domains/{domainId} {
       allow read: if true;
-      allow create, update: if true;
+      allow create, update: if isSignedIn();
       allow delete: if isAdmin();
     }
 
@@ -194,6 +341,13 @@ service cloud.firestore {
     match /promo_codes/{codeId} {
       allow read: if true;
       allow write: if isAdmin();
+    }
+
+    // AI-Collected Platform Upgrades & Feature Feedback (from Welink AI, Live Talk, and Support Bot)
+    match /upgrade_feedback/{feedbackId} {
+      allow read: if isSignedIn() && (isAdmin() || resource.data.submittedByUserId == request.auth.uid);
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
     }
   }
 }

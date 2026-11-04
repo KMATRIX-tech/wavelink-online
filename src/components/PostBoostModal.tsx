@@ -159,31 +159,31 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/75 backdrop-blur-md animate-fade-in">
-      <div className="relative w-full max-w-md bg-white dark:bg-[#131927] border border-amber-300 dark:border-amber-900/60 rounded-3xl shadow-2xl overflow-hidden flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-stone-900/40 backdrop-blur-md animate-fade-in">
+      <div className="relative w-full max-w-md bg-white border border-[var(--border-subtle)] rounded-3xl shadow-2xl overflow-hidden flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-gray-100 dark:border-gray-800 bg-gradient-to-r from-amber-500/15 via-rose-500/15 to-purple-500/15">
+        <div className="flex items-center justify-between p-5 border-b border-[var(--border-subtle)] bg-[#FAF7F2]">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-amber-500 to-rose-500 text-white shadow-xs">
+            <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white shadow-xs">
               <Rocket size={20} />
             </div>
             <div>
               <div className="flex items-center gap-1.5">
-                <span className="font-extrabold text-base text-gray-900 dark:text-white">
+                <span className="font-extrabold text-base text-[#1C1917]">
                   Boost Wave Post
                 </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-amber-500 text-white">
                   2,000 TZS
                 </span>
               </div>
-              <p className="text-[11px] text-gray-500 dark:text-gray-400">
+              <p className="text-[11px] text-[#57534E] font-medium">
                 +300% Reach & Top Priority for 48 Hours
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 rounded-xl"
+            className="p-1.5 text-[#57534E] hover:text-[#1C1917] rounded-xl"
           >
             <X size={18} />
           </button>
@@ -194,45 +194,45 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
           {step === 'intro' && (
             <form onSubmit={handleInitiateBoost} className="space-y-4">
               {/* Post Preview Snippet */}
-              <div className="p-3.5 rounded-2xl bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 text-xs space-y-1">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">
+              <div className="p-3.5 rounded-2xl bg-[#FAF7F2] border border-[var(--border-subtle)] text-xs space-y-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-[#57534E] block">
                   Wave Selected for Boosting:
                 </span>
-                <p className="text-gray-800 dark:text-gray-200 line-clamp-2 italic">
+                <p className="text-[#1C1917] line-clamp-2 italic">
                   "{post.content || 'Photo/Video wave moment'}"
                 </p>
               </div>
 
               {/* Benefits list */}
               <div className="space-y-2 text-xs">
-                <div className="flex items-center gap-2 text-gray-700 dark:text-gray-300">
-                  <CheckCircle2 size={14} className="text-amber-500 shrink-0" />
+                <div className="flex items-center gap-2 text-[#1C1917]">
+                  <CheckCircle2 size={14} className="text-[#0D9488] shrink-0" />
                   <span>Prioritized placement across all community member feeds</span>
                 </div>
-                <div className="flex items-center gap-2 text-gray-700 dark:text-gray-300">
-                  <CheckCircle2 size={14} className="text-amber-500 shrink-0" />
-                  <span>Luminous golden <strong>  Boosted</strong> badge attached to post</span>
+                <div className="flex items-center gap-2 text-[#1C1917]">
+                  <CheckCircle2 size={14} className="text-[#0D9488] shrink-0" />
+                  <span>Luminous golden <strong>Boosted</strong> badge attached to post</span>
                 </div>
-                <div className="flex items-center gap-2 text-gray-700 dark:text-gray-300">
-                  <CheckCircle2 size={14} className="text-amber-500 shrink-0" />
+                <div className="flex items-center gap-2 text-[#1C1917]">
+                  <CheckCircle2 size={14} className="text-[#0D9488] shrink-0" />
                   <span>Active for 48 full hours with instant real-time analytics</span>
                 </div>
               </div>
 
               {/* Pro Perks Enforcement: Restrict post-boosting to Pro users and Admins */}
               {!canBoost ? (
-                <div className="p-5 rounded-2xl bg-gradient-to-br from-amber-50 to-purple-50 dark:from-amber-950/30 dark:to-purple-950/30 border border-amber-300 dark:border-amber-700/50 space-y-3">
-                  <div className="flex items-center gap-2 text-amber-700 dark:text-amber-300 font-black text-xs uppercase tracking-wider">
+                <div className="p-5 rounded-2xl bg-[#FFFBEB] border border-amber-200 space-y-3">
+                  <div className="flex items-center gap-2 text-amber-800 font-black text-xs uppercase tracking-wider">
                     <Crown size={18} className="text-amber-500" />
                     <span>WaveLink Pro Exclusive Perk</span>
                   </div>
-                  <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
+                  <p className="text-xs text-[#57534E] leading-relaxed">
                     Post Boosting is restricted to <strong>WaveLink Pro</strong> members and <strong>Administrators</strong>. Upgrade to Pro to boost your posts, unlock 500MB uploads, verified Blue Star, and enjoy an ad-free experience!
                   </p>
                   <button
                     type="button"
                     onClick={() => setIsUpgradeModalOpen(true)}
-                    className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 via-rose-500 to-purple-600 hover:opacity-95 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/30 transition active:scale-95"
+                    className="w-full py-3 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-95"
                   >
                     <Crown size={16} />
                     <span>Upgrade to Pro to Boost Posts</span>
@@ -240,19 +240,19 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
                 </div>
               ) : (
                 /* Pro / Admin users can activate the 48h boost directly */
-                <div className="p-4 rounded-2xl bg-gradient-to-r from-amber-500/15 via-purple-500/15 to-indigo-500/15 border-2 border-amber-400/60 dark:border-amber-500/40 space-y-3">
-                  <div className="flex items-center gap-2 text-amber-700 dark:text-amber-300 font-black text-xs uppercase tracking-wider">
+                <div className="p-4 rounded-2xl bg-[#FFFBEB] border border-amber-200 space-y-3">
+                  <div className="flex items-center gap-2 text-amber-800 font-black text-xs uppercase tracking-wider">
                     <Crown size={16} />
                     <span>VIP Privilege Active • Complimentary Post Boost</span>
                   </div>
-                  <p className="text-xs text-gray-700 dark:text-gray-300 leading-relaxed">
+                  <p className="text-xs text-[#57534E] leading-relaxed">
                     As a verified <strong>Pro Member / Administrator</strong>, you can activate this 48-hour boost immediately!
                   </p>
                   <button
                     type="button"
                     onClick={handleInstantFreeBoost}
                     disabled={isProcessing}
-                    className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 via-rose-500 to-purple-600 hover:opacity-95 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/30 transition active:scale-95"
+                    className="w-full py-3 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-95"
                   >
                     {isProcessing ? (
                       <>
@@ -274,17 +274,17 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
           {/* Step: Waiting for PIN */}
           {step === 'ussd_push' && activeTx && (
             <div className="space-y-4 text-center py-2 animate-fade-in">
-              <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-700 dark:text-amber-300 text-xs font-black">
+              <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-xs font-black">
                 <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping inline-block" />
                 <span>{statusMessage || 'Waiting for PIN...'}</span>
               </div>
 
-              <div className="bg-slate-900 text-white rounded-2xl p-4 border-2 border-amber-400/50 shadow-xl text-left space-y-2.5 font-mono text-xs max-w-sm mx-auto">
-                <div className="flex items-center justify-between pb-1.5 border-b border-gray-700">
-                  <span className="font-bold text-amber-400">🔴 Airtel Money USSD</span>
-                  <span className="text-[10px] text-gray-400">Ref: {activeTx.reference}</span>
+              <div className="bg-[#FAF7F2] text-[#1C1917] rounded-2xl p-4 border-2 border-amber-300 shadow-sm text-left space-y-2.5 font-mono text-xs max-w-sm mx-auto">
+                <div className="flex items-center justify-between pb-1.5 border-b border-[var(--border-subtle)]">
+                  <span className="font-bold text-amber-700">🔴 Airtel Money USSD</span>
+                  <span className="text-[10px] text-[#57534E]">Ref: {activeTx.reference}</span>
                 </div>
-                <p className="text-gray-200 text-xs">
+                <p className="text-[#1C1917] text-xs">
                   Thibitisha malipo ya TZS 2,000 ku-boost Wave Post yako?
                   <br />
                   Weka PIN yako ya Mobile Money kuthibitisha:
@@ -295,7 +295,7 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
                   value={ussdPin}
                   onChange={(e) => setUssdPin(e.target.value.replace(/[^0-9]/g, ''))}
                   placeholder="Enter 4-digit PIN"
-                  className="w-full px-3 py-2 rounded-xl bg-black/60 border border-amber-400/60 text-amber-300 placeholder-gray-500 text-sm tracking-widest text-center focus:outline-none"
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-amber-300 text-[#1C1917] placeholder-[#78716C] text-sm tracking-widest text-center focus:outline-none"
                 />
               </div>
 
@@ -308,14 +308,14 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
               <div className="flex items-center justify-center gap-2 pt-1">
                 <button
                   onClick={() => setStep('intro')}
-                  className="px-4 py-2 text-xs font-semibold rounded-xl text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
+                  className="px-4 py-2 text-xs font-semibold rounded-xl text-[#57534E] hover:bg-stone-100"
                 >
                   Back
                 </button>
                 <button
                   onClick={handleConfirmUssdPin}
                   disabled={isAuthorizingPin || ussdPin.length < 4}
-                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center gap-2 shadow-md transition disabled:opacity-50"
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center gap-2 shadow-sm transition disabled:opacity-50"
                 >
                   {isAuthorizingPin ? (
                     <>
@@ -339,10 +339,10 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
               <div className="w-14 h-14 rounded-full bg-emerald-500 text-white mx-auto flex items-center justify-center shadow-lg shadow-emerald-500/30">
                 <CheckCircle2 size={28} />
               </div>
-              <h4 className="text-lg font-black text-gray-900 dark:text-white">
+              <h4 className="text-lg font-black text-[#1C1917]">
                 Payment Successful!
               </h4>
-              <p className="text-xs text-gray-500 max-w-xs mx-auto">
+              <p className="text-xs text-[#57534E] max-w-xs mx-auto">
                 Your wave is now officially boosted for 48 hours with priority feed ranking and a golden badge!
               </p>
             </div>

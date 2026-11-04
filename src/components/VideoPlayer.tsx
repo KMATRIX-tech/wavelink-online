@@ -189,19 +189,29 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   if (isLoading) {
     return (
-      <div className={`aspect-video w-full rounded-2xl bg-slate-900 border border-slate-200 flex flex-col items-center justify-center text-white/90 ${className}`}>
-        <Loader2 className="w-8 h-8 animate-spin text-[#3B82F6] mb-2" />
-        <span className="text-xs font-semibold">Loading video from Firestore...</span>
-        <span className="text-[10px] text-slate-400 mt-0.5">Assembling high-definition stream</span>
+      <div className={`aspect-video w-full rounded-2xl bg-[#FAF7F2] border border-[var(--border-subtle)] flex flex-col items-center justify-center text-[#1C1917] ${className}`}>
+        <Loader2 className="w-8 h-8 animate-spin text-[#2563EB] mb-2" />
+        <span className="text-xs font-semibold text-[#1C1917]">Loading video...</span>
+        <span className="text-[10px] text-[#57534E] mt-0.5">Preparing stream</span>
       </div>
     );
   }
 
   if (hasError || !resolvedSrc) {
+    if (thumbnailUrl) {
+      return (
+        <div className={`relative aspect-video w-full rounded-2xl overflow-hidden bg-[#FAF7F2] border border-[var(--border-subtle)] flex items-center justify-center ${className}`}>
+          <img src={thumbnailUrl} alt="Video thumbnail" className="w-full h-full object-cover" />
+          <div className="absolute bottom-3 right-3 px-2.5 py-1 rounded-full bg-white/90 text-[#1C1917] text-[10px] font-bold shadow-xs">
+            Video Preview
+          </div>
+        </div>
+      );
+    }
     return (
-      <div className={`aspect-video w-full rounded-2xl bg-slate-100 border border-slate-200 flex flex-col items-center justify-center text-slate-500 p-4 ${className}`}>
-        <p className="text-xs font-bold text-slate-700">Video stream unavailable</p>
-        <span className="text-[10px] text-slate-500 mt-1">Re-upload or refresh to view</span>
+      <div className={`aspect-video w-full rounded-2xl bg-[#FAF7F2] border border-[var(--border-subtle)] flex flex-col items-center justify-center text-[#57534E] p-4 ${className}`}>
+        <p className="text-xs font-bold text-[#1C1917]">Video clip ready</p>
+        <span className="text-[10px] text-[#57534E] mt-1">Refresh to reload stream</span>
       </div>
     );
   }

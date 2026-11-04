@@ -100,50 +100,50 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
   return (
     <div className="max-w-5xl mx-auto py-6 px-3 sm:px-6 space-y-6">
       {successNotice && (
-        <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3 animate-in fade-in">
+        <div className="p-4 rounded-2xl bg-teal-50 border border-teal-300 text-teal-950 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3 animate-in fade-in">
           <span>{successNotice}</span>
           <button
             type="button"
             onClick={() => setSuccessNotice(null)}
-            className="text-emerald-700 hover:text-emerald-950 text-xs px-2 py-1 rounded-lg hover:bg-emerald-100"
+            className="text-teal-800 hover:text-teal-950 text-xs px-2 py-1 rounded-lg hover:bg-teal-100"
           >
             ✕
           </button>
         </div>
       )}
-      <div className="bg-white dark:bg-[#131927] border border-blue-200/70 dark:border-gray-800 rounded-3xl p-6 shadow-xs flex items-center justify-between flex-wrap gap-4">
+      <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 shadow-xs flex items-center justify-between flex-wrap gap-4">
         <div>
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300 border border-blue-200/60 text-xs font-bold uppercase tracking-wider mb-2">
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-[#2563EB] border border-blue-200/80 text-xs font-bold uppercase tracking-wider mb-2">
             <Users size={13} />
             <span>Community Directory</span>
           </div>
-          <h2 className="text-2xl font-extrabold text-[#0F172A] dark:text-white">
+          <h2 className="text-2xl font-extrabold text-[#1C1917]">
             WaveLink Members ({users.length})
           </h2>
-          <p className="text-xs sm:text-sm text-slate-500 dark:text-gray-400 mt-1">
+          <p className="text-xs sm:text-sm text-[#57534E] mt-1">
             Real registered members across the network. Zero bot profiles or artificial activity.
           </p>
         </div>
 
         {/* Search */}
         <div className="relative w-full sm:w-64">
-          <Search className="absolute left-3.5 top-3 text-gray-400" size={16} />
+          <Search className="absolute left-3.5 top-3 text-[#57534E]" size={16} />
           <input
             type="text"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             placeholder="Search members..."
-            className="w-full pl-9 pr-4 py-2 rounded-xl bg-slate-50 dark:bg-gray-800 border border-slate-200 dark:border-gray-700 text-xs text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-xs sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
           />
         </div>
       </div>
 
       {isLoading ? (
-        <div className="py-16 text-center text-xs text-gray-400">Loading member directory...</div>
+        <div className="py-16 text-center text-xs font-medium text-[#57534E]">Loading member directory...</div>
       ) : filteredUsers.length === 0 ? (
-        <div className="text-center py-16 bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-6">
-          <Users size={32} className="mx-auto text-gray-300 dark:text-gray-600 mb-2" />
-          <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">
+        <div className="text-center py-16 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6">
+          <Users size={32} className="mx-auto text-[#57534E] mb-2" />
+          <p className="text-sm font-bold text-[#1C1917]">
             {searchTerm ? 'No members found matching your search.' : 'No members registered yet.'}
           </p>
         </div>
@@ -155,7 +155,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
             return (
               <div
                 key={user.id}
-                className="bg-white dark:bg-[#131927] border border-slate-200/90 dark:border-gray-800 rounded-3xl p-5 shadow-xs flex flex-col justify-between transition hover:border-blue-300 dark:hover:border-blue-900/60 hover:shadow-sm"
+                className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-5 shadow-xs flex flex-col justify-between transition hover:border-[#2563EB]/40 hover:shadow-sm"
               >
                 <div>
                   <div className="flex items-start justify-between gap-3 mb-3">
@@ -163,11 +163,11 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                       <img
                         src={user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.id}`}
                         alt={user.displayName}
-                        className="w-12 h-12 rounded-full object-cover ring-2 ring-blue-500/20"
+                        className="w-12 h-12 rounded-full object-cover ring-2 ring-[#2563EB]/20"
                       />
                       {!user.isBanned && (
                         <span
-                          className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-emerald-500 ring-2 ring-white dark:ring-[#131927]"
+                          className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#0D9488] ring-2 ring-white"
                           title="Online Member"
                         />
                       )}
@@ -175,18 +175,18 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
 
                     <div>
                       {user.isBanned ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 uppercase">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-200 uppercase">
                           <ShieldAlert size={10} />
                           Banned
                         </span>
                       ) : user.status === 'warned' ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300 uppercase">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200 uppercase">
                           <AlertTriangle size={10} />
                           Warned
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950 dark:text-emerald-300">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-pulse" />
                           <span>Online</span>
                         </span>
                       )}
@@ -202,8 +202,8 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                       isSubAdmin={user.isSubAdmin || user.role === 'sub_admin'}
                       size="md"
                     />
-                    <div className="flex items-center gap-1.5 text-[11px] text-gray-400 mt-0.5">
-                      <span className="font-mono text-blue-600 dark:text-blue-400 font-semibold">
+                    <div className="flex items-center gap-1.5 text-xs text-[#57534E] mt-0.5">
+                      <span className="font-mono text-[#2563EB] font-bold">
                         {user.username || `@${user.email.split('@')[0]}`}
                       </span>
                       <span>·</span>
@@ -211,13 +211,13 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                     </div>
                   </div>
 
-                  <p className="text-xs text-gray-600 dark:text-gray-300 line-clamp-2 mb-4">
+                  <p className="text-xs text-[#57534E] line-clamp-2 mb-4 leading-relaxed">
                     {user.bio || 'WaveLink Community Member'}
                   </p>
                 </div>
 
-                <div className="pt-3 border-t border-gray-100 dark:border-gray-800/80 flex items-center justify-between text-xs gap-2">
-                  <span className="text-[10px] text-gray-400">
+                <div className="pt-3 border-t border-[#EFECE6] flex items-center justify-between text-xs gap-2">
+                  <span className="text-[11px] font-medium text-[#57534E]">
                     Joined {new Date(user.createdAt).toLocaleDateString(undefined, { month: 'short', year: 'numeric' })}
                   </span>
 
@@ -226,15 +226,15 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                       <button
                         type="button"
                         onClick={() => handleToggleFollow(user)}
-                        className={`px-2.5 py-1.5 rounded-xl font-semibold text-xs flex items-center gap-1 transition ${
+                        className={`px-3 py-1.5 rounded-xl font-bold text-xs flex items-center gap-1 transition ${
                           followingMap[user.id]
-                            ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25'
-                            : 'bg-slate-100 dark:bg-gray-800 text-slate-700 dark:text-gray-300 hover:bg-blue-600 hover:text-white dark:hover:bg-blue-600'
+                            ? 'bg-teal-50 text-[#0D9488] border border-teal-200 hover:bg-teal-100'
+                            : 'bg-[#FAF7F2] text-[#1C1917] border border-[#D6D3CD] hover:bg-[#2563EB] hover:text-white hover:border-[#2563EB]'
                         }`}
                       >
                         {followingMap[user.id] ? (
                           <>
-                            <Check size={12} className="text-emerald-400" />
+                            <Check size={12} className="text-[#0D9488]" />
                             <span>Following</span>
                           </>
                         ) : (
@@ -246,17 +246,18 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                       </button>
 
                       <button
+                        type="button"
                         onClick={() => handleMessageClick(user)}
-                        className={`px-3 py-1.5 rounded-xl font-semibold text-xs flex items-center gap-1.5 transition ${
+                        className={`px-3 py-1.5 rounded-xl font-bold text-xs flex items-center gap-1.5 transition ${
                           isSuperAdminEmail(user.email) && !canTalkToAdmin
-                            ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-300/40 hover:bg-amber-100'
-                            : 'bg-blue-50 dark:bg-blue-950/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-700 dark:text-blue-300'
+                            ? 'bg-amber-50 text-amber-900 border border-amber-300/80 hover:bg-amber-100'
+                            : 'bg-blue-50 hover:bg-blue-100 text-[#2563EB] border border-blue-200/80'
                         }`}
                       >
                         {isSuperAdminEmail(user.email) && !canTalkToAdmin ? (
                           <>
-                            <Lock size={12} className="text-amber-500" />
-                            <span>Admin</span>
+                            <Lock size={12} className="text-amber-600" />
+                            <span>Try Pro</span>
                           </>
                         ) : (
                           <>
@@ -274,54 +275,46 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
         </div>
       )}
 
-      {/* Admin Direct Messaging Restriction Modal */}
+      {/* Gentle Try Pro Note when tapping Admin Direct Messaging */}
       {showAdminLockModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fade-in">
-          <div className="w-full max-w-md bg-white dark:bg-[#131927] border border-amber-300 dark:border-amber-900/80 rounded-3xl p-6 sm:p-7 shadow-2xl space-y-4 relative">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs animate-fade-in">
+          <div className="w-full max-w-md bg-white border border-[#EFECE6] rounded-3xl p-6 sm:p-7 shadow-2xl space-y-4 relative">
             <button
+              type="button"
               onClick={() => setShowAdminLockModal(false)}
-              className="absolute top-5 right-5 p-1 rounded-xl text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+              className="absolute top-4 right-4 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#57534E] hover:text-[#1C1917] hover:bg-[#FAF7F2]"
             >
               <X size={18} />
             </button>
 
-            <div className="w-14 h-14 rounded-2xl bg-gradient-to-tr from-amber-400 to-sky-500 text-white flex items-center justify-center shadow-lg shadow-sky-500/30">
-              <Star size={28} className="fill-white" />
+            <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-sm">
+              <Star size={24} className="fill-white" />
             </div>
 
             <div>
-              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">
-                Verified Blue Star Required
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider bg-blue-50 text-[#2563EB] border border-blue-200">
+                Try WaveLink Pro
               </span>
-              <h3 className="text-xl font-black text-gray-900 dark:text-white mt-1">
-                Protected Administrator Channel
+              <h3 className="text-lg font-extrabold text-[#1C1917] mt-1.5">
+                Direct Administrator Messaging
               </h3>
             </div>
 
-            <p className="text-xs sm:text-sm text-gray-600 dark:text-gray-300 leading-relaxed">
-              Direct messaging and calls with Platform Administrator (<span className="font-semibold text-purple-600 dark:text-purple-400">{ADMIN_EMAIL}</span>) are strictly reserved for <strong className="text-sky-600 dark:text-sky-400">Verified Blue Star subscribers</strong> and <strong className="text-purple-600 dark:text-purple-400">Platform Administrators</strong>.
+            <p className="text-xs sm:text-sm text-[#57534E] leading-relaxed">
+              Direct messaging and calls with Platform Administrator (<span className="font-bold text-[#1C1917]">{ADMIN_EMAIL}</span>) are included with <strong>WaveLink Pro</strong>.
             </p>
-
-            <div className="p-3.5 rounded-2xl bg-sky-50/80 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-900 text-xs space-y-1.5">
-              <div className="font-bold text-sky-900 dark:text-sky-200 flex items-center gap-1.5">
-                <Sparkles size={14} className="text-sky-500" />
-                <span>How to unlock direct access:</span>
-              </div>
-              <p className="text-[11px] text-sky-700 dark:text-sky-300">
-                Subscribe to WaveLink Pro to immediately receive your permanent <strong>Verified Blue Star badge</strong>, direct admin access, 500MB uploads, and 1080p calling.
-              </p>
-            </div>
 
             <div className="flex items-center gap-3 pt-2">
               <button
+                type="button"
                 onClick={() => {
                   setShowAdminLockModal(false);
                   setShowPaymentModal(true);
                 }}
-                className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-sky-500 via-indigo-600 to-purple-600 hover:opacity-95 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-sky-600/25 transition"
+                className="flex-1 min-h-[48px] py-3 px-4 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-sm transition"
               >
                 <Star size={16} className="fill-white" />
-                <span>Get Verified Blue Star (Pro)</span>
+                <span>Try WaveLink Pro</span>
               </button>
             </div>
           </div>
@@ -334,7 +327,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
           onClose={() => setShowPaymentModal(false)}
           onSuccess={() => {
             setShowPaymentModal(false);
-            setSuccessNotice('🎉 Congratulations! You are now a Verified Blue Star member with full admin messaging and pro privileges unlocked!');
+            setSuccessNotice('Welcome to WaveLink Pro! Direct admin messaging and Pro privileges are now active.');
             setTimeout(() => setSuccessNotice(null), 5000);
           }}
         />

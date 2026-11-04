@@ -3,7 +3,16 @@ import { useAuth } from '../context/AuthContext';
 import { db, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
 import { doc, setDoc } from 'firebase/firestore';
 import { OnlineSong } from '../types';
-import { compressImage, generateVideoThumbnail, saveVideoPost } from '../utils/mediaStorage';
+import {
+  compressImage,
+  generateVideoThumbnail,
+  saveVideoPost,
+  cloneVideoFileToMemory,
+  validateVideoFileSize,
+  formatVideoFileSize,
+  FREE_MAX_VIDEO_MB,
+  PRO_MAX_VIDEO_MB
+} from '../utils/mediaStorage';
 import { SongSelectorModal } from './SongSelectorModal';
 import { SongPlayerCard } from './SongPlayerCard';
 import {
@@ -133,27 +142,31 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       return;
     }
 
-    // Check size limit: 500MB for Pro, 50MB for free
-    const maxSizeBytes = isProUser ? 500 * 1024 * 1024 : 50 * 1024 * 1024;
-    if (file.size > maxSizeBytes) {
-      if (!isProUser && file.size <= 500 * 1024 * 1024) {
-        setStudioNotice(`This file is ${(file.size / (1024 * 1024)).toFixed(1)}MB. Free tier limit is 50MB. Upgrade to WaveLink Pro to upload large media up to 500MB!`);
-      } else {
-        setStudioNotice(`File exceeds the maximum allowed ${(maxSizeBytes / (1024 * 1024))}MB limit.`);
+    // Check tiered video size limit: 100 MB for Pro/Admin, 0 KB - 4 MB for Free
+    if (isVid) {
+      const validation = validateVideoFileSize(file, Boolean(isProUser || isAdmin));
+      if (!validation.valid) {
+        setStudioNotice(validation.error || 'Video exceeds your plan upload limit.');
+        return;
       }
+    } else if (file.size > 50 * 1024 * 1024) {
+      setStudioNotice('Image file exceeds the maximum allowed 50MB limit.');
       return;
     }
 
-    setOriginalFile(file);
-    setFileName(file.name);
-    setMediaType(isVid ? 'video' : 'image');
-
     if (isImg) {
+      setOriginalFile(file);
+      setFileName(file.name);
+      setMediaType('image');
       // Automatic initial downscaling to prevent memory bloat
       const compressed = await compressImage(file, 1600, 1600, 0.85);
       setMediaUrl(compressed);
     } else {
-      const objectUrl = URL.createObjectURL(file);
+      const safeVideo = await cloneVideoFileToMemory(file);
+      setOriginalFile(safeVideo);
+      setFileName(safeVideo.name);
+      setMediaType('video');
+      const objectUrl = URL.createObjectURL(safeVideo);
       setMediaUrl(objectUrl);
     }
 
@@ -386,18 +399,10 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
           // Thumbnail
           const thumbnail = await generateVideoThumbnail(originalFile);
 
-          // Convert video for fast concurrent chunking
-          const videoDataUrl = await new Promise<string>((resolve) => {
-            const reader = new FileReader();
-            reader.onload = (e) => resolve(e.target?.result as string);
-            reader.onerror = () => resolve('');
-            reader.readAsDataURL(originalFile);
-          });
-
           const { videoUrl: directUrl, hasVideoChunks } = await saveVideoPost(
             postId,
             originalFile,
-            videoDataUrl,
+            undefined,
             'posts',
             (pct) => setPublishProgress(35 + Math.round(pct * 0.55))
           );
@@ -513,6 +518,11 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
                     </h3>
                     <p className="text-xs text-slate-500 leading-relaxed">
                       Choose an image or video from your device or camera to customize with text, filters, and soundtracks.
+                    </p>
+                    <p className="text-[11px] font-bold text-[#0D9488] mt-1.5">
+                      {isProUser || isAdmin
+                        ? `WaveLink Pro Active: Upload videos over 10 MB up to ${PRO_MAX_VIDEO_MB} MB`
+                        : `Video upload limit: 0 KB – ${FREE_MAX_VIDEO_MB} MB (Free) • Up to ${PRO_MAX_VIDEO_MB} MB (WaveLink Pro)`}
                     </p>
                   </div>
 
@@ -1069,10 +1079,10 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
                 type="button"
                 onClick={handlePublishToFeed}
                 disabled={isPublishing || (!mediaUrl && !caption.trim() && !selectedSong)}
-                className="w-full py-3 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-black text-sm flex items-center justify-center gap-2 shadow-md shadow-blue-500/20 transition active:scale-98 disabled:opacity-40"
+                className="w-full min-h-[50px] py-3.5 px-6 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-[0.99] disabled:opacity-40"
               >
                 <Send size={16} />
-                <span>Publish to WaveFeed 🌊</span>
+                <span>Publish Wave</span>
               </button>
             )}
           </div>

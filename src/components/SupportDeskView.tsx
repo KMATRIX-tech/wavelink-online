@@ -10,10 +10,12 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  addDoc,
   where
 } from 'firebase/firestore';
 import { SupportTicket, TicketStatus } from '../types';
 import { CrystalBadge } from './CrystalBadge';
+import { sanitizeUserText } from '../utils/security';
 import {
   HelpCircle,
   Inbox,
@@ -23,8 +25,29 @@ import {
   AlertCircle,
   MessageSquare,
   Shield,
-  Trash2
+  Trash2,
+  Bot,
+  Zap
 } from 'lucide-react';
+
+const ONE_TAP_ADMIN_REPLIES: { label: string; text: string }[] = [
+  {
+    label: '✅ Resolved & Checked',
+    text: 'Hello! A human administrator has reviewed your request and resolved this issue for your account. Thank you for being part of WaveLink!'
+  },
+  {
+    label: '💳 Payment / Pro Verified',
+    text: 'Habari / Hello! We have verified your Mobile Money transaction reference and updated your WaveLink Pro status. Enjoy your Pro perks!'
+  },
+  {
+    label: '💰 Refund In Progress',
+    text: 'Hello! Our billing team has verified your refund inquiry and initiated processing back to your Mobile Money wallet within 24–48 hours.'
+  },
+  {
+    label: '🛡️ Moderation Action Taken',
+    text: 'Thank you for your safety report. Our human moderation team has reviewed the account/content and taken protective action.'
+  }
+];
 
 export const SupportDeskView: React.FC = () => {
   const { currentUser, userProfile, isAdmin } = useAuth();
@@ -42,6 +65,7 @@ export const SupportDeskView: React.FC = () => {
   const [replyText, setReplyText] = useState('');
   const [newStatus, setNewStatus] = useState<TicketStatus>('in_progress');
   const [isReplying, setIsReplying] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   // Listen to tickets: If admin, load all tickets. If user, load only their tickets.
   useEffect(() => {
@@ -76,7 +100,9 @@ export const SupportDeskView: React.FC = () => {
 
   const handleSubmitTicket = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!subject.trim() || !message.trim() || !currentUser) return;
+    const safeSubject = sanitizeUserText(subject, 160);
+    const safeMessage = sanitizeUserText(message, 1500);
+    if (!safeSubject || !safeMessage || !currentUser) return;
     setIsSubmitting(true);
 
     try {
@@ -86,9 +112,12 @@ export const SupportDeskView: React.FC = () => {
         userId: currentUser.uid,
         userEmail: currentUser.email || 'user',
         userName: userProfile?.displayName || currentUser.displayName || 'WaveLink Member',
-        subject: subject.trim(),
-        message: message.trim(),
+        topic: 'general_support',
+        summary: safeSubject,
+        subject: safeSubject,
+        message: safeMessage,
         status: 'open',
+        source: 'user',
         createdAt: new Date().toISOString()
       };
 
@@ -104,29 +133,54 @@ export const SupportDeskView: React.FC = () => {
     }
   };
 
-  const handleAdminReply = async (ticketId: string) => {
-    if (!replyText.trim() || !isAdmin) return;
+  const sendAdminReplyToTicket = async (
+    ticket: SupportTicket,
+    rawReply: string,
+    targetStatus: TicketStatus
+  ) => {
+    const safeReply = sanitizeUserText(rawReply, 1500);
+    if (!safeReply || !isAdmin) return;
     setIsReplying(true);
 
     try {
-      await updateDoc(doc(db, 'supportTickets', ticketId), {
-        adminReply: replyText.trim(),
-        status: newStatus,
+      await updateDoc(doc(db, 'supportTickets', ticket.id), {
+        adminReply: safeReply,
+        status: targetStatus,
         updatedAt: new Date().toISOString()
       });
+
+      // If this ticket came from a WaveLink Support Bot DM conversation, also post the human follow-up into their DM thread
+      if (ticket.botConversationId) {
+        await addDoc(collection(db, 'directMessages', ticket.botConversationId, 'messages'), {
+          channelId: ticket.botConversationId,
+          senderId: currentUser?.uid || 'admin',
+          senderEmail: currentUser?.email || '',
+          senderName: userProfile?.displayName || 'WaveLink Admin Support',
+          senderPhotoURL: userProfile?.photoURL || '',
+          text: `🛡️ [Admin Follow-Up on Ticket #${ticket.id.substring(7, 13)}]: ${safeReply}`,
+          createdAt: new Date().toISOString()
+        }).catch(() => {});
+      }
+
       setReplyText('');
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `supportTickets/${ticketId}`);
+      handleFirestoreError(err, OperationType.UPDATE, `supportTickets/${ticket.id}`);
     } finally {
       setIsReplying(false);
     }
   };
 
+  const handleAdminReply = async (ticketId: string) => {
+    const target = tickets.find((t) => t.id === ticketId) || selectedTicket;
+    if (!target) return;
+    await sendAdminReplyToTicket(target, replyText, newStatus);
+  };
+
   const handleDeleteTicket = async (ticketId: string) => {
     if (!isAdmin) return;
-    if (!confirm('Permanently delete this ticket?')) return;
     try {
       await deleteDoc(doc(db, 'supportTickets', ticketId));
+      setConfirmDeleteId(null);
       if (selectedTicket?.id === ticketId) setSelectedTicket(null);
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `supportTickets/${ticketId}`);
@@ -137,21 +191,21 @@ export const SupportDeskView: React.FC = () => {
     switch (status) {
       case 'open':
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-900 border border-amber-200">
             <Clock size={12} />
             Open
           </span>
         );
       case 'in_progress':
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-blue-50 text-[#2563EB] border border-blue-200">
             <AlertCircle size={12} />
             In Progress
           </span>
         );
       case 'resolved':
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
             <CheckCircle2 size={12} />
             Resolved
           </span>
@@ -162,22 +216,22 @@ export const SupportDeskView: React.FC = () => {
   return (
     <div className="max-w-5xl mx-auto py-6 px-3 sm:px-6 space-y-6">
       {/* Header */}
-      <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-6 shadow-xs flex items-center justify-between flex-wrap gap-4">
+      <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 shadow-xs flex items-center justify-between flex-wrap gap-4">
         <div>
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300 text-xs font-bold uppercase tracking-wider mb-2">
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-[#2563EB] border border-blue-200/80 text-xs font-bold uppercase tracking-wider mb-2">
             <HelpCircle size={13} />
             <span>Community Desk</span>
           </div>
-          <h2 className="text-2xl font-extrabold text-gray-900 dark:text-white">
-            Support & Complaint Box
+          <h2 className="text-2xl font-extrabold text-[#1C1917]">
+            Support &amp; Complaint Box
           </h2>
-          <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-400 mt-1">
+          <p className="text-xs sm:text-sm text-[#57534E] mt-1">
             Submit private feedback, report issues, or communicate confidential inquiries directly with platform administration.
           </p>
         </div>
 
         {isAdmin && (
-          <div className="px-3.5 py-2 rounded-2xl bg-gradient-to-r from-purple-600 to-indigo-600 text-white text-xs font-semibold flex items-center gap-2 shadow-md shadow-purple-600/25">
+          <div className="px-3.5 py-2 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white text-xs font-bold flex items-center gap-2 shadow-xs">
             <Shield size={16} />
             <span>Admin Inbox ({tickets.length} total tickets)</span>
           </div>
@@ -188,22 +242,22 @@ export const SupportDeskView: React.FC = () => {
         {/* Left Column: Form (for users) or Ticket List */}
         <div className="lg:col-span-5 space-y-6">
           {/* Ticket Submission Form for regular members */}
-          <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-5 shadow-xs">
-            <h3 className="font-bold text-gray-900 dark:text-white text-sm mb-3 flex items-center gap-2">
-              <MessageSquare size={16} className="text-purple-600" />
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-5 shadow-xs">
+            <h3 className="font-bold text-[#1C1917] text-sm mb-3 flex items-center gap-2">
+              <MessageSquare size={16} className="text-[#2563EB]" />
               <span>Submit New Ticket to Admin</span>
             </h3>
 
             {submissionSuccess && (
-              <div className="mb-4 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 text-xs flex items-center gap-2">
-                <CheckCircle2 size={16} className="text-emerald-500 shrink-0" />
+              <div className="mb-4 p-3 rounded-xl bg-teal-50 border border-teal-200 text-teal-900 text-xs font-semibold flex items-center gap-2">
+                <CheckCircle2 size={16} className="text-[#0D9488] shrink-0" />
                 <span>Ticket submitted successfully! Admin has been notified.</span>
               </div>
             )}
 
             <form onSubmit={handleSubmitTicket} className="space-y-3.5">
               <div>
-                <label className="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1">
+                <label className="block text-xs font-bold text-[#1C1917] mb-1">
                   Subject / Summary
                 </label>
                 <input
@@ -212,12 +266,12 @@ export const SupportDeskView: React.FC = () => {
                   value={subject}
                   onChange={(e) => setSubject(e.target.value)}
                   placeholder="e.g. Account question, feature request, report"
-                  className="w-full px-3.5 py-2 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs sm:text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-xs sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1">
+                <label className="block text-xs font-bold text-[#1C1917] mb-1">
                   Message Details
                 </label>
                 <textarea
@@ -226,14 +280,14 @@ export const SupportDeskView: React.FC = () => {
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
                   placeholder="Describe your issue or feedback in detail..."
-                  className="w-full p-3.5 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs sm:text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none"
+                  className="w-full p-3.5 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-xs sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#2563EB] resize-none"
                 />
               </div>
 
               <button
                 type="submit"
                 disabled={isSubmitting || !subject.trim() || !message.trim()}
-                className="w-full py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-md shadow-purple-600/30 transition disabled:opacity-50"
+                className="w-full min-h-[46px] py-2.5 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-xs transition disabled:opacity-50"
               >
                 <Send size={14} />
                 <span>Submit to Admin Inbox</span>
@@ -242,16 +296,16 @@ export const SupportDeskView: React.FC = () => {
           </div>
 
           {/* Ticket list summary for left side */}
-          <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-5 shadow-xs">
-            <h4 className="font-bold text-gray-900 dark:text-white text-xs uppercase tracking-wider text-gray-400 mb-3">
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-5 shadow-xs">
+            <h4 className="font-extrabold text-xs uppercase tracking-wider text-[#57534E] mb-3">
               {isAdmin ? 'All User Inquiries' : 'Your Submitted Tickets'} ({tickets.length})
             </h4>
 
             {isLoading ? (
-              <div className="py-6 text-center text-xs text-gray-400">Loading tickets...</div>
+              <div className="py-6 text-center text-xs font-medium text-[#57534E]">Loading tickets...</div>
             ) : tickets.length === 0 ? (
-              <div className="text-center py-6 text-gray-400 text-xs">
-                <Inbox size={24} className="mx-auto mb-1 opacity-50" />
+              <div className="text-center py-6 text-[#57534E] text-xs">
+                <Inbox size={24} className="mx-auto mb-1 text-[#2563EB]/60" />
                 No support tickets found.
               </div>
             ) : (
@@ -262,21 +316,34 @@ export const SupportDeskView: React.FC = () => {
                     onClick={() => setSelectedTicket(t)}
                     className={`p-3 rounded-2xl cursor-pointer border transition text-left ${
                       selectedTicket?.id === t.id
-                        ? 'border-purple-500 bg-purple-50/60 dark:bg-purple-950/40'
-                        : 'border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50'
+                        ? 'border-[#2563EB] bg-blue-50/80'
+                        : 'border-[#EFECE6] bg-[#FAF7F2]/60 hover:bg-[#FAF7F2]'
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="font-bold text-xs text-gray-900 dark:text-white truncate max-w-[170px]">
+                    <div className="flex items-center justify-between mb-1 gap-1.5">
+                      <span className="font-bold text-xs text-[#1C1917] truncate max-w-[165px]">
                         {t.subject}
                       </span>
-                      {getStatusBadge(t.status)}
+                      <div className="flex items-center gap-1 shrink-0">
+                        {t.source === 'support_bot' && (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
+                            <Bot size={10} />
+                            <span>Bot</span>
+                          </span>
+                        )}
+                        {getStatusBadge(t.status)}
+                      </div>
                     </div>
-                    <p className="text-[11px] text-gray-500 line-clamp-1 mb-1.5">
-                      {t.message}
+                    {t.topic && (
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-[#0D9488] mb-0.5">
+                        Topic: {t.topic.replace(/_/g, ' ')}
+                      </div>
+                    )}
+                    <p className="text-xs text-[#57534E] line-clamp-1 mb-1.5">
+                      {t.summary || t.message}
                     </p>
-                    <div className="flex items-center justify-between text-[10px] text-gray-400">
-                      <span>{t.userEmail}</span>
+                    <div className="flex items-center justify-between text-[11px] font-medium text-[#57534E]">
+                      <span className="truncate max-w-[140px]">{t.userName || t.userEmail}</span>
                       <span>{new Date(t.createdAt).toLocaleDateString()}</span>
                     </div>
                   </div>
@@ -289,66 +356,128 @@ export const SupportDeskView: React.FC = () => {
         {/* Right Column: Ticket Conversation / Inspector */}
         <div className="lg:col-span-7">
           {selectedTicket ? (
-            <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-6 shadow-xs space-y-6">
-              <div className="flex items-start justify-between border-b border-gray-100 dark:border-gray-800 pb-4">
+            <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 shadow-xs space-y-5">
+              <div className="flex items-start justify-between border-b border-[#EFECE6] pb-4 gap-3">
                 <div>
-                  <div className="flex items-center gap-2 mb-1.5">
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                     {getStatusBadge(selectedTicket.status)}
-                    <span className="text-xs text-gray-400">
+                    {selectedTicket.source === 'support_bot' && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
+                        <Bot size={12} />
+                        <span>Escalated by WaveLink Support Bot</span>
+                      </span>
+                    )}
+                    {selectedTicket.topic && (
+                      <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase bg-blue-50 text-[#2563EB] border border-blue-200">
+                        {selectedTicket.topic.replace(/_/g, ' ')}
+                      </span>
+                    )}
+                    <span className="text-xs font-mono text-[#57534E]">
                       ID: #{selectedTicket.id.substring(7, 13)}
                     </span>
                   </div>
-                  <h3 className="text-lg font-bold text-gray-900 dark:text-white">
+                  <h3 className="text-lg font-extrabold text-[#1C1917]">
                     {selectedTicket.subject}
                   </h3>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Submitted by: <span className="font-semibold">{selectedTicket.userName}</span> ({selectedTicket.userEmail}) on{' '}
+                  <p className="text-xs text-[#57534E] mt-1">
+                    User: <span className="font-bold text-[#1C1917]">{selectedTicket.userName}</span> ({selectedTicket.userEmail}) •{' '}
                     {new Date(selectedTicket.createdAt).toLocaleString()}
                   </p>
                 </div>
 
                 {isAdmin && (
-                  <button
-                    onClick={() => handleDeleteTicket(selectedTicket.id)}
-                    className="p-2 text-gray-400 hover:text-rose-600 rounded-lg transition"
-                    title="Delete Ticket"
-                  >
-                    <Trash2 size={16} />
-                  </button>
+                  confirmDeleteId === selectedTicket.id ? (
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteTicket(selectedTicket.id)}
+                        className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-xs font-bold"
+                      >
+                        Confirm Delete
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteId(null)}
+                        className="px-2 py-1 rounded-lg bg-stone-100 text-stone-700 text-xs font-semibold"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteId(selectedTicket.id)}
+                      className="p-2 text-[#57534E] hover:text-rose-600 rounded-lg transition"
+                      title="Delete Ticket"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  )
                 )}
               </div>
 
+              {/* Ticket Summary Box (if present) */}
+              {selectedTicket.summary && (
+                <div className="p-3.5 rounded-2xl bg-teal-50/70 border border-teal-200 text-xs text-[#1C1917]">
+                  <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#0D9488] block mb-0.5">
+                    Ticket Summary ({selectedTicket.topic || 'General'})
+                  </span>
+                  <p className="font-semibold">{selectedTicket.summary}</p>
+                </div>
+              )}
+
               {/* User Original Message */}
-              <div className="p-4 rounded-2xl bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block mb-1">
+              <div className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6]">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-[#57534E] block mb-1">
                   User Inquiry:
                 </span>
-                <p className="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap leading-relaxed">
+                <p className="text-sm text-[#1C1917] whitespace-pre-wrap leading-relaxed">
                   {selectedTicket.message}
                 </p>
               </div>
 
               {/* Admin Reply (if exists) */}
               {selectedTicket.adminReply && (
-                <div className="p-4 rounded-2xl bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-purple-600 dark:text-purple-400">
+                <div className="p-4 rounded-2xl bg-blue-50/80 border border-blue-200">
+                  <div className="flex items-center justify-between mb-1.5 flex-wrap gap-2">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-[#2563EB]">
                       Official Admin Response:
                     </span>
                     <CrystalBadge email="keylanmbilinyi5@gmail.com" name="Platform Administration" size="sm" />
                   </div>
-                  <p className="text-sm text-purple-950 dark:text-purple-200 whitespace-pre-wrap leading-relaxed">
+                  <p className="text-sm text-[#1C1917] whitespace-pre-wrap leading-relaxed">
                     {selectedTicket.adminReply}
                   </p>
                 </div>
               )}
 
-              {/* Admin Response Composer (Available exclusively for keylanmbilinyi5@gmail.com) */}
+              {/* Admin Response Composer + One-Tap Quick Replies */}
               {isAdmin ? (
-                <div className="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-3">
-                  <h4 className="text-xs font-bold text-gray-800 dark:text-gray-200 flex items-center gap-1.5">
-                    <Shield size={14} className="text-purple-600" />
-                    <span>Admin Reply Desk:</span>
+                <div className="pt-4 border-t border-[#EFECE6] space-y-3.5">
+                  <div className="space-y-2">
+                    <span className="text-xs font-extrabold text-[#1C1917] flex items-center gap-1.5">
+                      <Zap size={14} className="text-[#0D9488]" />
+                      <span>One-Tap Reply &amp; Resolve:</span>
+                    </span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {ONE_TAP_ADMIN_REPLIES.map((preset, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          disabled={isReplying}
+                          onClick={() => sendAdminReplyToTicket(selectedTicket, preset.text, 'resolved')}
+                          className="px-3 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200 text-xs font-bold transition active:scale-95 disabled:opacity-50"
+                          title={preset.text}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <h4 className="text-xs font-bold text-[#1C1917] flex items-center gap-1.5 pt-1">
+                    <Shield size={14} className="text-[#2563EB]" />
+                    <span>Custom Admin Reply:</span>
                   </h4>
 
                   <textarea
@@ -356,16 +485,16 @@ export const SupportDeskView: React.FC = () => {
                     value={replyText}
                     onChange={(e) => setReplyText(e.target.value)}
                     placeholder="Type official response to this member..."
-                    className="w-full p-3 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs sm:text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none"
+                    className="w-full p-3 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-xs sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#2563EB] resize-none"
                   />
 
                   <div className="flex items-center justify-between flex-wrap gap-2">
                     <div className="flex items-center gap-2">
-                      <span className="text-xs text-gray-500 font-semibold">Update Status:</span>
+                      <span className="text-xs text-[#57534E] font-bold">Update Status:</span>
                       <select
                         value={newStatus}
                         onChange={(e) => setNewStatus(e.target.value as TicketStatus)}
-                        className="py-1 px-2.5 rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs font-medium text-gray-900 dark:text-white"
+                        className="py-1.5 px-3 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-xs font-bold text-[#1C1917]"
                       >
                         <option value="in_progress">In Progress</option>
                         <option value="resolved">Resolved</option>
@@ -376,7 +505,7 @@ export const SupportDeskView: React.FC = () => {
                     <button
                       onClick={() => handleAdminReply(selectedTicket.id)}
                       disabled={isReplying || !replyText.trim()}
-                      className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-semibold text-xs flex items-center gap-2 transition disabled:opacity-40"
+                      className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold text-xs flex items-center gap-2 transition disabled:opacity-40"
                     >
                       <Send size={13} />
                       <span>Send Admin Reply</span>
@@ -384,19 +513,19 @@ export const SupportDeskView: React.FC = () => {
                   </div>
                 </div>
               ) : !selectedTicket.adminReply ? (
-                <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300 text-xs flex items-center gap-2">
-                  <Clock size={16} className="shrink-0" />
+                <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-medium flex items-center gap-2">
+                  <Clock size={16} className="shrink-0 text-amber-600" />
                   <span>Your ticket has been placed into the admin triage queue. An administrator will reply shortly.</span>
                 </div>
               ) : null}
             </div>
           ) : (
-            <div className="h-full min-h-[300px] flex flex-col items-center justify-center p-8 bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl text-center text-gray-400">
-              <Inbox size={40} className="mb-2 text-purple-400/60" />
-              <p className="font-semibold text-sm text-gray-700 dark:text-gray-300">
+            <div className="h-full min-h-[300px] flex flex-col items-center justify-center p-8 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl text-center">
+              <Inbox size={40} className="mb-2 text-[#2563EB]/60" />
+              <p className="font-bold text-sm text-[#1C1917]">
                 Select a ticket to view conversation
               </p>
-              <p className="text-xs text-gray-500 max-w-xs mt-1">
+              <p className="text-xs text-[#57534E] max-w-xs mt-1">
                 Click on any ticket in the left list or submit a new inquiry above.
               </p>
             </div>

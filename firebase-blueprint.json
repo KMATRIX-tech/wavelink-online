@@ -72,7 +72,7 @@
     },
     "Spark": {
       "title": "Spark",
-      "description": "24-hour ephemeral legendary moments with photo or video uploaded from device, with optional soundtrack",
+      "description": "24-hour ephemeral legendary moments with photo or video uploaded directly to Firebase Storage, storing only URL and metadata in Firestore",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
@@ -84,9 +84,16 @@
         "legendaryTag": { "type": "string", "maxLength": 60 },
         "caption": { "type": "string", "maxLength": 500 },
         "mediaUrl": { "type": "string" },
+        "storagePath": { "type": "string" },
+        "thumbnailUrl": { "type": "string" },
         "mediaType": { "type": "string", "enum": ["image", "video"] },
         "hasVideoChunks": { "type": "boolean" },
         "videoFileName": { "type": "string" },
+        "videoDurationSeconds": { "type": "number" },
+        "videoWidth": { "type": "number" },
+        "videoHeight": { "type": "number" },
+        "videoFileSize": { "type": "number" },
+        "videoMimeType": { "type": "string" },
         "songTitle": { "type": "string" },
         "songArtist": { "type": "string" },
         "songAlbumArt": { "type": "string" },
@@ -301,6 +308,99 @@
         "firstSeenAt": { "type": "string" }
       },
       "required": ["id", "domain", "status", "lastSeenAt"]
+    },
+    "SupportBotConfig": {
+      "title": "SupportBotConfig",
+      "description": "Admin configuration and daily Gemini cap for the automated WaveLink Support Bot",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "dailyGeminiCap": { "type": "number" },
+        "dailyGeminiUsed": { "type": "number" },
+        "usageDate": { "type": "string" },
+        "userRateLimitPerMinute": { "type": "number" },
+        "maxMessageLength": { "type": "number" },
+        "updatedAt": { "type": "string" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["id", "enabled", "dailyGeminiCap"]
+    },
+    "SupportBotLog": {
+      "title": "SupportBotLog",
+      "description": "Audit log of every automated WaveLink Support Bot reply and user report status",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "userName": { "type": "string", "maxLength": 80 },
+        "channelId": { "type": "string" },
+        "userMessage": { "type": "string", "maxLength": 1200 },
+        "botReply": { "type": "string", "maxLength": 4000 },
+        "language": { "type": "string", "enum": ["en", "sw"] },
+        "escalatedToTicketId": { "type": "string" },
+        "reportedBadReply": { "type": "boolean" },
+        "reportReason": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "userMessage", "botReply", "createdAt"]
+    },
+    "ScheduledBotDraft": {
+      "title": "ScheduledBotDraft",
+      "description": "Scheduled Weekly Community Updates and Spark of the Day drafts approved in the Admin Panel",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string", "enum": ["weekly_update", "spark_of_the_day"] },
+        "title": { "type": "string", "maxLength": 160 },
+        "content": { "type": "string", "maxLength": 2000 },
+        "mediaUrl": { "type": "string" },
+        "legendaryTag": { "type": "string", "maxLength": 60 },
+        "status": { "type": "string", "enum": ["draft", "approved", "posted"] },
+        "scheduledFor": { "type": "string" },
+        "approvedBy": { "type": "string" },
+        "approvedAt": { "type": "string" },
+        "postedAt": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "type", "title", "content", "status", "scheduledFor", "createdAt"]
+    },
+    "ContentReport": {
+      "title": "ContentReport",
+      "description": "User reports against posts, accounts, or bad support bot replies",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "reporterId": { "type": "string" },
+        "reporterEmail": { "type": "string" },
+        "reporterName": { "type": "string", "maxLength": 80 },
+        "targetType": { "type": "string", "enum": ["user", "post", "bot_reply"] },
+        "targetId": { "type": "string" },
+        "targetAuthorId": { "type": "string" },
+        "targetSummary": { "type": "string", "maxLength": 500 },
+        "reason": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["open", "reviewed", "dismissed"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "reporterId", "targetType", "targetId", "reason", "status", "createdAt"]
+    },
+    "AdminAuditLog": {
+      "title": "AdminAuditLog",
+      "description": "Immutable audit log recording admin bans, role changes, verifications, and deletions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "actorId": { "type": "string" },
+        "actorEmail": { "type": "string" },
+        "actorName": { "type": "string", "maxLength": 80 },
+        "action": { "type": "string" },
+        "targetId": { "type": "string" },
+        "targetLabel": { "type": "string", "maxLength": 160 },
+        "details": { "type": "string", "maxLength": 1000 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "actorId", "actorEmail", "action", "targetId", "details", "createdAt"]
     }
   },
   "firestore": {
@@ -367,6 +467,26 @@
     "/system_domains/{domainId}": {
       "schema": { "$ref": "#/entities/SystemDomain" },
       "description": "Registered preview and production domains for OAuth authorized domains configuration"
+    },
+    "/supportBotConfig/{configId}": {
+      "schema": { "$ref": "#/entities/SupportBotConfig" },
+      "description": "Admin configuration and daily Gemini cap for the WaveLink Support Bot"
+    },
+    "/supportBotLogs/{logId}": {
+      "schema": { "$ref": "#/entities/SupportBotLog" },
+      "description": "Logs of WaveLink Support Bot conversations and reported replies"
+    },
+    "/scheduledBotDrafts/{draftId}": {
+      "schema": { "$ref": "#/entities/ScheduledBotDraft" },
+      "description": "Scheduled Weekly Updates and Spark of the Day drafts approved by Admin"
+    },
+    "/contentReports/{reportId}": {
+      "schema": { "$ref": "#/entities/ContentReport" },
+      "description": "User-submitted reports for posts, accounts, and bot replies"
+    },
+    "/adminAuditLogs/{auditId}": {
+      "schema": { "$ref": "#/entities/AdminAuditLog" },
+      "description": "Admin audit trail for bans, role changes, verifications, and deletions"
     }
   }
 }

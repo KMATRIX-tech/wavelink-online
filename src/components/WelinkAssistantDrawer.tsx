@@ -1,44 +1,78 @@
 import React, { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { useAuth } from '../context/AuthContext';
 import {
   Waves,
   Sparkles,
   X,
   Send,
-  Crown,
-  Lock,
   MessageSquare,
   Image as ImageIcon,
-  Film,
   Mic,
   MicOff,
   Loader2,
   Download,
   Upload,
   Trash2,
-  CheckCircle2,
   AlertCircle,
-  KeyRound,
-  ArrowRight,
   Bot,
   Volume2,
+  VolumeX,
+  PhoneCall,
+  PhoneOff,
+  Radio,
+  Zap,
+  RotateCcw,
+  Lightbulb,
 } from 'lucide-react';
 import {
   sendWelinkChatMessage,
   sendWelinkChatMessageStream,
   generateWelinkImage,
-  generateWelinkVideo,
   getWelinkLiveVoiceWsUrl,
+  sendWelinkVoiceTurn,
 } from '../services/geminiService';
+import {
+  buildWelinkCacheKey,
+  getCachedWelinkResponse,
+  findCachedResponseByPrompt,
+  setCachedWelinkResponse,
+  loadDrawerThreadFromCache,
+  saveDrawerThreadToCache,
+  clearDrawerThreadCache,
+  CachedWelinkResponse,
+} from '../services/welinkCache';
+import {
+  detectUpgradeIdea,
+  recordUpgradeFeedback,
+} from '../services/upgradeFeedbackService';
+
+export type WelinkMode = 'chat' | 'image' | 'voice';
 
 interface WelinkAssistantDrawerProps {
   isOpen: boolean;
   onClose: () => void;
   onOpenUpgrade: () => void;
+  initialMode?: WelinkMode;
 }
 
-type WelinkMode = 'chat' | 'image' | 'video' | 'voice';
 type ChatModel = 'gemini-3.8-flash' | 'gemini-4-argon' | 'gemini-3.1-flash-lite';
+export type WelinkVoicePersona = 'Zephyr' | 'Kore' | 'Puck' | 'Fenrir';
+
+const VOICE_PERSONAS: { id: WelinkVoicePersona; label: string; desc: string; pitch: number; rate: number }[] = [
+  { id: 'Zephyr', label: 'Zephyr', desc: 'Warm & Calm', pitch: 1.02, rate: 1.0 },
+  { id: 'Kore', label: 'Kore', desc: 'Friendly & Clear', pitch: 1.1, rate: 1.03 },
+  { id: 'Puck', label: 'Puck', desc: 'Upbeat & Creative', pitch: 1.06, rate: 1.06 },
+  { id: 'Fenrir', label: 'Fenrir', desc: 'Deep & Steady', pitch: 0.9, rate: 0.97 },
+];
+
+const LIVE_VOICE_STARTERS = [
+  'Hey WELINK, I have an upgrade idea for WaveLink',
+  'Hey WELINK, give me 3 viral reel ideas!',
+  'How do I grow my followers on WaveLink?',
+  'Explain WaveLink Pro and Blue Star perks',
+  'Help me brainstorm a caption for my Spark',
+];
 
 interface ChatTurn {
   id: string;
@@ -46,9 +80,11 @@ interface ChatTurn {
   text: string;
   timestamp: string;
   modelUsed?: string;
+  fromCache?: boolean;
 }
 
 const QUICK_PROMPTS = [
+  '💡 I want to suggest an upgrade to improve WaveLink',
   'Give me 5 viral Wave Reel ideas for this week',
   'How do WaveLink Pro, Blue Star & creator tipping work?',
   'Help me write an engaging Notice Board event post',
@@ -74,25 +110,43 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
   isOpen,
   onClose,
   onOpenUpgrade,
+  initialMode,
 }) => {
-  const { currentUser, userProfile, isProEffective, verifyAndRedeemCoupon } = useAuth();
+  const { currentUser, userProfile, isProEffective } = useAuth();
 
-  const [mode, setMode] = useState<WelinkMode>('chat');
+  const [mode, setMode] = useState<WelinkMode>(initialMode || 'chat');
   const [selectedModel, setSelectedModel] = useState<ChatModel>('gemini-3.8-flash');
 
-  // Chat state
-  const [messages, setMessages] = useState<ChatTurn[]>([
-    {
-      id: 'welcome',
-      role: 'model',
-      text: `Hi ${userProfile?.displayName || currentUser?.displayName || 'Waver'}! I'm WELINK, your WaveLink AI Community Guide. Ask me anything about WaveLink features, brainstorm viral post & reel ideas, or switch tabs above to create images, generate videos, or chat by voice!`,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    },
-  ]);
+  useEffect(() => {
+    if (isOpen && initialMode) {
+      setMode(initialMode);
+    }
+  }, [isOpen, initialMode]);
+
+  // Strictly scoped user namespace for WELINK Assistant drawer cache
+  const userScope = currentUser?.uid || userProfile?.email || 'guest';
+
+  const getWelcomeTurn = (): ChatTurn => ({
+    id: 'welcome',
+    role: 'model',
+    text: `Hi **${userProfile?.displayName || currentUser?.displayName || 'Friend'}**! I'm **WELINK**, your WaveLink AI Community Guide.\n\n* Ask me anything about WaveLink features\n* Brainstorm post captions and reel ideas\n* Switch tabs above to create AI images or talk live by voice!`,
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  });
+
+  // Chat state (strictly isolated to WelinkAssistantDrawer)
+  const [messages, setMessages] = useState<ChatTurn[]>(() => [getWelcomeTurn()]);
   const [chatInput, setChatInput] = useState('');
+  const [debouncedChatInput, setDebouncedChatInput] = useState('');
+  const [instantCacheHit, setInstantCacheHit] = useState<CachedWelinkResponse | null>(null);
   const [isChatLoading, setIsChatLoading] = useState(false);
+  const [hasReceivedFirstChunk, setHasReceivedFirstChunk] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const inputDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSubmitTimeRef = useRef<number>(0);
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+  const isDrawerOpenRef = useRef<boolean>(isOpen);
+  const hasHydratedThreadRef = useRef<string>('');
 
   // Image Studio state
   const [imagePrompt, setImagePrompt] = useState('');
@@ -103,21 +157,26 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
   const [generatedImageCaption, setGeneratedImageCaption] = useState<string>('');
   const [isImageLoading, setIsImageLoading] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
+  const [tryProNote, setTryProNote] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Video Generator state
-  const [videoPrompt, setVideoPrompt] = useState('');
-  const [videoAspectRatio, setVideoAspectRatio] = useState<'16:9' | '9:16'>('16:9');
-  const [generatedVideoUrl, setGeneratedVideoUrl] = useState<string | null>(null);
-  const [generatedVideoCaption, setGeneratedVideoCaption] = useState<string>('');
-  const [isVideoLoading, setIsVideoLoading] = useState(false);
-  const [videoError, setVideoError] = useState<string | null>(null);
-
-  // Voice Live API state
+  // Voice Live Talking state
+  const [selectedVoice, setSelectedVoice] = useState<WelinkVoicePersona>('Zephyr');
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [isVoiceConnecting, setIsVoiceConnecting] = useState(false);
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
+  const [isWelinkSpeaking, setIsWelinkSpeaking] = useState(false);
+  const [isWelinkThinkingVoice, setIsWelinkThinkingVoice] = useState(false);
+  const [userAudioLevel, setUserAudioLevel] = useState(0);
+  const [liveInterimText, setLiveInterimText] = useState('');
+  const [voiceQuickInput, setVoiceQuickInput] = useState('');
+  const [voiceCallSeconds, setVoiceCallSeconds] = useState(0);
   const [voiceError, setVoiceError] = useState<string | null>(null);
-  const [voiceTranscripts, setVoiceTranscripts] = useState<{ role: 'user' | 'model'; text: string }[]>([]);
+  const [voiceTranscripts, setVoiceTranscripts] = useState<{ role: 'user' | 'model'; text: string; time?: string }[]>([]);
+  const [upgradeNotice, setUpgradeNotice] = useState<string | null>(null);
+
+  // Refs for audio & websocket callbacks to prevent stale closures
   const wsRef = useRef<WebSocket | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
@@ -125,11 +184,49 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const speechRecognitionRef = useRef<any>(null);
+  const isMicMutedRef = useRef<boolean>(false);
+  const isSpeakerMutedRef = useRef<boolean>(false);
+  const isVoiceActiveRef = useRef<boolean>(false);
+  const bridgeModeRef = useRef<'native_live' | 'hybrid'>('hybrid');
+  const selectedVoiceRef = useRef<WelinkVoicePersona>('Zephyr');
+  const voiceTranscriptsRef = useRef<{ role: 'user' | 'model'; text: string }[]>([]);
+  const lastLevelUpdateRef = useRef<number>(0);
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
 
-  // Coupon redemption state for Free Users
-  const [couponInput, setCouponInput] = useState('');
-  const [isRedeeming, setIsRedeeming] = useState(false);
-  const [couponMessage, setCouponMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  useEffect(() => {
+    isMicMutedRef.current = isMicMuted;
+  }, [isMicMuted]);
+
+  useEffect(() => {
+    isSpeakerMutedRef.current = isSpeakerMuted;
+    if (isSpeakerMuted && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      setIsWelinkSpeaking(false);
+    }
+  }, [isSpeakerMuted]);
+
+  useEffect(() => {
+    selectedVoiceRef.current = selectedVoice;
+  }, [selectedVoice]);
+
+  useEffect(() => {
+    voiceTranscriptsRef.current = voiceTranscripts;
+    if (mode === 'voice') {
+      transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [voiceTranscripts, mode]);
+
+  useEffect(() => {
+    if (!isVoiceActive) {
+      setVoiceCallSeconds(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setVoiceCallSeconds((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isVoiceActive]);
 
   useEffect(() => {
     if (isOpen && mode === 'chat') {
@@ -137,48 +234,223 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     }
   }, [messages, isOpen, mode]);
 
-  // Cleanup voice session if drawer closes or component unmounts
   useEffect(() => {
-    if (!isOpen && isVoiceActive) {
-      stopVoiceSession();
+    isDrawerOpenRef.current = isOpen;
+    if (!isOpen) {
+      if (isVoiceActive) {
+        stopVoiceSession();
+      }
+      // Abort any in-flight chat stream when drawer closes so state never leaks
+      if (chatAbortControllerRef.current) {
+        chatAbortControllerRef.current.abort();
+        chatAbortControllerRef.current = null;
+      }
+      if (inputDebounceTimerRef.current) {
+        clearTimeout(inputDebounceTimerRef.current);
+        inputDebounceTimerRef.current = null;
+      }
+      setIsChatLoading(false);
+      setHasReceivedFirstChunk(false);
     }
   }, [isOpen]);
+
+  // Hydrate isolated drawer conversation thread from IndexedDB when opened
+  useEffect(() => {
+    if (!isOpen || hasHydratedThreadRef.current === userScope) return;
+    let cancelled = false;
+    loadDrawerThreadFromCache(userScope).then((cachedTurns) => {
+      if (cancelled || !isDrawerOpenRef.current) return;
+      hasHydratedThreadRef.current = userScope;
+      if (cachedTurns && cachedTurns.length > 0) {
+        setMessages(cachedTurns);
+      } else {
+        setMessages([getWelcomeTurn()]);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, userScope]);
+
+  // Persist isolated drawer conversation thread to IndexedDB when messages update
+  useEffect(() => {
+    if (!isOpen || messages.length <= 1) return;
+    void saveDrawerThreadToCache(userScope, messages);
+  }, [messages, isOpen, userScope]);
+
+  // Debounced input lookup against IndexedDB for instant cache preview (<5ms)
+  useEffect(() => {
+    let active = true;
+    const trimmed = debouncedChatInput.trim();
+    if (trimmed.length < 3) {
+      setInstantCacheHit(null);
+      return;
+    }
+    findCachedResponseByPrompt(userScope, selectedModel, trimmed).then((hit) => {
+      if (active && isDrawerOpenRef.current) {
+        setInstantCacheHit(hit);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [debouncedChatInput, userScope, selectedModel]);
 
   useEffect(() => {
     return () => {
       stopVoiceSession();
+      if (chatAbortControllerRef.current) {
+        chatAbortControllerRef.current.abort();
+        chatAbortControllerRef.current = null;
+      }
+      if (inputDebounceTimerRef.current) {
+        clearTimeout(inputDebounceTimerRef.current);
+        inputDebounceTimerRef.current = null;
+      }
     };
   }, []);
+
+  /**
+   * Debounced chat input handler:
+   * Immediately updates the controlled input for responsive typing while debouncing
+   * normalization & IndexedDB cache lookups by 220ms to avoid unnecessary re-renders.
+   */
+  const handleChatInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const nextValue = e.target.value;
+    setChatInput(nextValue);
+
+    if (inputDebounceTimerRef.current) {
+      clearTimeout(inputDebounceTimerRef.current);
+    }
+    if (!nextValue.trim()) {
+      setDebouncedChatInput('');
+      setInstantCacheHit(null);
+      return;
+    }
+    inputDebounceTimerRef.current = setTimeout(() => {
+      if (isDrawerOpenRef.current) {
+        setDebouncedChatInput(nextValue);
+      }
+    }, 220);
+  };
+
+  const handleClearDrawerChat = async () => {
+    if (chatAbortControllerRef.current) {
+      chatAbortControllerRef.current.abort();
+      chatAbortControllerRef.current = null;
+    }
+    setIsChatLoading(false);
+    setHasReceivedFirstChunk(false);
+    setChatError(null);
+    setInstantCacheHit(null);
+    const freshWelcome = getWelcomeTurn();
+    setMessages([freshWelcome]);
+    await clearDrawerThreadCache(userScope);
+  };
 
   const handleSendMessage = async (textOverride?: string) => {
     const promptText = (textOverride ?? chatInput).trim();
     if (!promptText || isChatLoading) return;
 
+    // Debounce rapid duplicate submissions within 350ms
+    const nowMs = Date.now();
+    if (nowMs - lastSubmitTimeRef.current < 350) return;
+    lastSubmitTimeRef.current = nowMs;
+
+    if (inputDebounceTimerRef.current) {
+      clearTimeout(inputDebounceTimerRef.current);
+      inputDebounceTimerRef.current = null;
+    }
+
     setChatError(null);
+    setInstantCacheHit(null);
+    setDebouncedChatInput('');
+
+    const nowTimestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const newUserTurn: ChatTurn = {
-      id: `user_${Date.now()}`,
+      id: `user_${nowMs}`,
       role: 'user',
       text: promptText,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      timestamp: nowTimestamp,
     };
+
+    const previousUserTurns = messages.filter((m) => m.role === 'user');
+    const lastUserText = previousUserTurns[previousUserTurns.length - 1]?.text;
+    const exactCacheKey = buildWelinkCacheKey(userScope, selectedModel, promptText, lastUserText);
+    const promptOnlyKey = buildWelinkCacheKey(userScope, selectedModel, promptText);
 
     const updatedMessages = [...messages, newUserTurn];
     setMessages(updatedMessages);
     if (!textOverride) setChatInput('');
+
+    // Check if the user is sharing an upgrade suggestion or platform improvement idea
+    const detectedUpgrade = detectUpgradeIdea(promptText);
+    if (detectedUpgrade) {
+      void recordUpgradeFeedback({
+        source: 'welink_ai',
+        title: detectedUpgrade.title,
+        summary: detectedUpgrade.summary,
+        userQuote: promptText,
+        category: detectedUpgrade.category,
+        impact: detectedUpgrade.impact,
+        userId: currentUser?.uid,
+        userName: userProfile?.displayName || currentUser?.displayName || 'WaveLink Member',
+        userEmail: userProfile?.email || currentUser?.email || undefined,
+      }).then(() => {
+        setUpgradeNotice(`💡 Upgrade suggestion "${detectedUpgrade.title}" captured for Founder Keylan!`);
+        setTimeout(() => setUpgradeNotice(null), 5000);
+      });
+    }
+
+    // 1. Check lightweight IndexedDB cache first for sub-5ms response
+    const cachedHit =
+      (await getCachedWelinkResponse(exactCacheKey)) ||
+      (await getCachedWelinkResponse(promptOnlyKey)) ||
+      (await findCachedResponseByPrompt(userScope, selectedModel, promptText));
+
+    if (cachedHit && cachedHit.reply) {
+      if (!isDrawerOpenRef.current) return;
+      const cachedTurn: ChatTurn = {
+        id: `model_${Date.now()}`,
+        role: 'model',
+        text: cachedHit.reply,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        modelUsed: cachedHit.model || selectedModel,
+        fromCache: true,
+      };
+      setMessages((prev) => [...prev, cachedTurn]);
+      return;
+    }
+
     setIsChatLoading(true);
+    setHasReceivedFirstChunk(false);
+
+    const apiHistory = updatedMessages
+      .filter((m) => m.id !== 'welcome')
+      .slice(-10)
+      .map((m) => ({
+        role: m.role,
+        text: m.text,
+      }));
+
+    if (chatAbortControllerRef.current) {
+      chatAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    chatAbortControllerRef.current = controller;
 
     const modelTurnId = `model_${Date.now()}`;
     let accumulatedText = '';
 
     try {
-      await sendWelinkChatMessageStream({
+      const streamRes = await sendWelinkChatMessageStream({
         model: selectedModel,
-        messages: updatedMessages.map((m) => ({
-          role: m.role,
-          text: m.text,
-        })),
+        messages: apiHistory,
+        signal: controller.signal,
         onChunk: (chunkText) => {
+          if (!isDrawerOpenRef.current || controller.signal.aborted) return;
           accumulatedText += chunkText;
+          setHasReceivedFirstChunk(true);
           setMessages((prev) => {
             const exists = prev.some((m) => m.id === modelTurnId);
             if (exists) {
@@ -199,20 +471,38 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
           });
         },
       });
+
+      const finalReply = (accumulatedText || streamRes.fullText || '').trim();
+      if (finalReply && isDrawerOpenRef.current && !controller.signal.aborted) {
+        void setCachedWelinkResponse({
+          key: exactCacheKey,
+          userScope,
+          prompt: promptText,
+          reply: finalReply,
+          model: streamRes.model || selectedModel,
+        });
+        void setCachedWelinkResponse({
+          key: promptOnlyKey,
+          userScope,
+          prompt: promptText,
+          reply: finalReply,
+          model: streamRes.model || selectedModel,
+        });
+      }
     } catch (streamErr: any) {
+      if (controller.signal.aborted || !isDrawerOpenRef.current) {
+        return;
+      }
       if (accumulatedText) {
-        // Partial text already rendered successfully
         setChatError(null);
       } else {
-        // Seamless fallback to standard server-side chat endpoint
         try {
           const data = await sendWelinkChatMessage({
             model: selectedModel,
-            messages: updatedMessages.map((m) => ({
-              role: m.role,
-              text: m.text,
-            })),
+            messages: apiHistory,
+            signal: controller.signal,
           });
+          if (!isDrawerOpenRef.current || controller.signal.aborted) return;
 
           const modelTurn: ChatTurn = {
             id: modelTurnId,
@@ -223,12 +513,30 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
           };
 
           setMessages((prev) => [...prev, modelTurn]);
+          void setCachedWelinkResponse({
+            key: exactCacheKey,
+            userScope,
+            prompt: promptText,
+            reply: data.reply,
+            model: data.model || selectedModel,
+          });
         } catch (fallbackErr: any) {
-          setChatError(fallbackErr.message || streamErr.message || 'Connection error while talking to WELINK.');
+          if (controller.signal.aborted || !isDrawerOpenRef.current) return;
+          setChatError(
+            fallbackErr.message ||
+              streamErr.message ||
+              'WELINK Chat is taking a quick breather. Please try again in a moment.'
+          );
         }
       }
     } finally {
-      setIsChatLoading(false);
+      if (chatAbortControllerRef.current === controller) {
+        chatAbortControllerRef.current = null;
+      }
+      if (isDrawerOpenRef.current) {
+        setIsChatLoading(false);
+        setHasReceivedFirstChunk(false);
+      }
     }
   };
 
@@ -245,12 +553,32 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     reader.readAsDataURL(file);
   };
 
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const dailyCountKey = `wavelink_ai_img_count_${todayKey}`;
+  const usedTodayCount = Number(localStorage.getItem(dailyCountKey) || '0');
+  const freeDailyLimit = 1;
+  const proDailyLimit = 25;
+  const canGenerateToday = isProEffective ? usedTodayCount < proDailyLimit : usedTodayCount < freeDailyLimit;
+
   const handleGenerateImage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!imagePrompt.trim() || isImageLoading) return;
 
-    setIsImageLoading(true);
     setImageError(null);
+    setTryProNote(null);
+
+    if (!canGenerateToday) {
+      if (!isProEffective) {
+        setTryProNote(
+          "You've enjoyed your 1 free AI image for today! Try Pro in your Profile for more daily AI image creations."
+        );
+      } else {
+        setImageError("You've reached today's image limit. Please try again tomorrow!");
+      }
+      return;
+    }
+
+    setIsImageLoading(true);
 
     try {
       const data = await generateWelinkImage({
@@ -263,37 +591,70 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
 
       setGeneratedImageUrl(data.imageUrl);
       setGeneratedImageCaption(data.caption || '');
+
+      localStorage.setItem(dailyCountKey, String(usedTodayCount + 1));
     } catch (err: any) {
-      setImageError(err.message || 'Image generation failed.');
+      setImageError(err.message || 'Image creation is resting right now, please try again later.');
     } finally {
       setIsImageLoading(false);
     }
   };
 
-  const handleGenerateVideo = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!videoPrompt.trim() || isVideoLoading) return;
+  const speakWithBrowserVoice = (rawText: string) => {
+    if (isSpeakerMutedRef.current) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
 
-    setIsVideoLoading(true);
-    setVideoError(null);
-    setGeneratedVideoUrl(null);
+    const cleanSpeech = rawText
+      .replace(/[*#_`~>]+/g, '')
+      .replace(/\[(.*?)\]\(.*?\)/g, '$1')
+      .trim();
+    if (!cleanSpeech) return;
 
     try {
-      const data = await generateWelinkVideo({
-        prompt: videoPrompt.trim(),
-        aspectRatio: videoAspectRatio,
-      });
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(cleanSpeech);
+      const persona = VOICE_PERSONAS.find((p) => p.id === selectedVoiceRef.current) || VOICE_PERSONAS[0];
+      utterance.pitch = persona.pitch;
+      utterance.rate = persona.rate;
 
-      setGeneratedVideoUrl(data.videoUrl);
-      setGeneratedVideoCaption(data.caption || '');
-    } catch (err: any) {
-      setVideoError(err.message || 'Video generation failed.');
-    } finally {
-      setIsVideoLoading(false);
+      const voices = window.speechSynthesis.getVoices();
+      const englishVoice =
+        voices.find((v) => v.lang.startsWith('en') && (v.name.includes('Google') || v.name.includes('Natural'))) ||
+        voices.find((v) => v.lang.startsWith('en'));
+      if (englishVoice) {
+        utterance.voice = englishVoice;
+      }
+
+      utterance.onstart = () => setIsWelinkSpeaking(true);
+      utterance.onend = () => setIsWelinkSpeaking(false);
+      utterance.onerror = () => setIsWelinkSpeaking(false);
+
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      setIsWelinkSpeaking(false);
     }
   };
 
+  const interruptWelinkSpeech = () => {
+    activeSourcesRef.current.forEach((src) => {
+      try {
+        src.stop();
+      } catch {
+        // ignore
+      }
+    });
+    activeSourcesRef.current = [];
+    if (outputAudioCtxRef.current) {
+      nextStartTimeRef.current = outputAudioCtxRef.current.currentTime;
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setIsWelinkSpeaking(false);
+  };
+
   const playPcm24kAudio = (base64Data: string) => {
+    if (isSpeakerMutedRef.current) return;
     const outCtx = outputAudioCtxRef.current;
     if (!outCtx) return;
 
@@ -319,18 +680,168 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
 
     const now = outCtx.currentTime;
     const startAt = Math.max(now, nextStartTimeRef.current);
+    setIsWelinkSpeaking(true);
+    source.onended = () => {
+      activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source);
+      if (activeSourcesRef.current.length === 0) {
+        setIsWelinkSpeaking(false);
+      }
+    };
     source.start(startAt);
     nextStartTimeRef.current = startAt + audioBuffer.duration;
     activeSourcesRef.current.push(source);
+  };
+
+  const handleSendSpokenTurn = async (spokenText: string) => {
+    const cleanText = spokenText.trim();
+    if (!cleanText) return;
+
+    interruptWelinkSpeech();
+    setLiveInterimText('');
+    const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    setVoiceTranscripts((prev) => [
+      ...prev.slice(-20),
+      { role: 'user', text: cleanText, time: nowTime },
+    ]);
+
+    // Check if the user is sharing an upgrade suggestion or platform improvement idea via voice
+    const detectedUpgrade = detectUpgradeIdea(cleanText);
+    if (detectedUpgrade) {
+      void recordUpgradeFeedback({
+        source: 'live_talk',
+        title: detectedUpgrade.title,
+        summary: detectedUpgrade.summary,
+        userQuote: cleanText,
+        category: detectedUpgrade.category,
+        impact: detectedUpgrade.impact,
+        userId: currentUser?.uid,
+        userName: userProfile?.displayName || currentUser?.displayName || 'WaveLink Member',
+        userEmail: userProfile?.email || currentUser?.email || undefined,
+      }).then(() => {
+        setUpgradeNotice(`💡 Live voice upgrade "${detectedUpgrade.title}" captured for Founder Keylan!`);
+        setTimeout(() => setUpgradeNotice(null), 5000);
+      });
+    }
+
+    // If WebSocket is open in native or hybrid mode, send via WebSocket first
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      setIsWelinkThinkingVoice(true);
+      wsRef.current.send(
+        JSON.stringify({
+          speechText: cleanText,
+          forceHybrid: bridgeModeRef.current === 'hybrid',
+        })
+      );
+      return;
+    }
+
+    // Direct REST voice-turn fallback so Live Talking always responds even without WebSocket
+    setIsWelinkThinkingVoice(true);
+    try {
+      const history = voiceTranscriptsRef.current.slice(-8).map((t) => ({
+        role: t.role,
+        text: t.text,
+      }));
+      const res = await sendWelinkVoiceTurn({
+        transcript: cleanText,
+        history,
+      });
+      setVoiceTranscripts((prev) => [
+        ...prev.slice(-20),
+        {
+          role: 'model',
+          text: res.reply,
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+      ]);
+      speakWithBrowserVoice(res.spokenText || res.reply);
+    } catch {
+      // ignore
+    } finally {
+      setIsWelinkThinkingVoice(false);
+    }
+  };
+
+  const startBrowserSpeechRecognition = () => {
+    if (typeof window === 'undefined') return;
+    const SpeechRec =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRec) return;
+
+    try {
+      const recognition = new SpeechRec();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event: any) => {
+        if (isMicMutedRef.current) return;
+        let interim = '';
+        let finalTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0]?.transcript || '';
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript;
+          } else {
+            interim += transcript;
+          }
+        }
+
+        if (interim.trim()) {
+          setLiveInterimText(interim.trim());
+        }
+
+        if (finalTranscript.trim()) {
+          setLiveInterimText('');
+          const spoken = finalTranscript.trim();
+          if (bridgeModeRef.current === 'hybrid' || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            handleSendSpokenTurn(spoken);
+          } else {
+            // In native_live mode, show the user's transcript immediately as well
+            setVoiceTranscripts((prev) => [
+              ...prev.slice(-20),
+              {
+                role: 'user',
+                text: spoken,
+                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              },
+            ]);
+          }
+        }
+      };
+
+      recognition.onerror = () => {
+        // Keep session active even if browser speech recognition pauses
+      };
+
+      recognition.onend = () => {
+        if (isVoiceActiveRef.current && !isMicMutedRef.current) {
+          try {
+            recognition.start();
+          } catch {
+            // ignore restart error
+          }
+        }
+      };
+
+      recognition.start();
+      speechRecognitionRef.current = recognition;
+    } catch {
+      // Browser speech recognition optional
+    }
   };
 
   const startVoiceSession = async () => {
     if (isVoiceActive || isVoiceConnecting) return;
     setVoiceError(null);
     setIsVoiceConnecting(true);
+    setIsMicMuted(false);
+    isMicMutedRef.current = false;
 
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
       const inputCtx = new AudioContext({ sampleRate: 16000 });
@@ -338,65 +849,138 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       inputAudioCtxRef.current = inputCtx;
       outputAudioCtxRef.current = outputCtx;
       nextStartTimeRef.current = 0;
+    } catch {
+      // If microphone hardware is unavailable in preview iframe, continue in interactive Live Voice Bridge mode
+      stream = null;
+    }
 
-      const wsUrl = getWelinkLiveVoiceWsUrl();
+    startBrowserSpeechRecognition();
+
+    try {
+      const wsUrl = getWelinkLiveVoiceWsUrl(selectedVoice);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
+        if (stream && inputAudioCtxRef.current) {
+          const inputCtx = inputAudioCtxRef.current;
+          const source = inputCtx.createMediaStreamSource(stream);
+          const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+          processorRef.current = processor;
 
-        processor.onaudioprocess = (e) => {
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            const base64Audio = float32ToPcm16Base64(e.inputBuffer.getChannelData(0));
-            wsRef.current.send(JSON.stringify({ audio: base64Audio }));
-          }
-        };
+          processor.onaudioprocess = (e) => {
+            if (isMicMutedRef.current) {
+              setUserAudioLevel(0);
+              return;
+            }
+            const channelData = e.inputBuffer.getChannelData(0);
 
-        source.connect(processor);
-        processor.connect(inputCtx.destination);
+            // Compute RMS audio level for live voice orb animation
+            const now = Date.now();
+            if (now - lastLevelUpdateRef.current > 90) {
+              let sum = 0;
+              for (let i = 0; i < channelData.length; i += 4) {
+                sum += channelData[i] * channelData[i];
+              }
+              const rms = Math.sqrt(sum / (channelData.length / 4));
+              const normalizedLevel = Math.min(100, Math.round(rms * 420));
+              setUserAudioLevel(normalizedLevel);
+              lastLevelUpdateRef.current = now;
+            }
+
+            if (wsRef.current?.readyState === WebSocket.OPEN && bridgeModeRef.current === 'native_live') {
+              const base64Audio = float32ToPcm16Base64(channelData);
+              wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+            }
+          };
+
+          source.connect(processor);
+          processor.connect(inputCtx.destination);
+        }
       };
 
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
           if (msg.status === 'connected') {
+            bridgeModeRef.current = msg.bridgeMode === 'native_live' ? 'native_live' : 'hybrid';
             setIsVoiceConnecting(false);
             setIsVoiceActive(true);
+            isVoiceActiveRef.current = true;
+
+            // Greet user on initial connection if transcript is empty
+            if (voiceTranscriptsRef.current.length === 0) {
+              const userName = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Friend';
+              const greeting = `Hi ${userName}! I'm WELINK, live and ready to talk. Ask me anything about WaveLink, content ideas, or community growth!`;
+              setVoiceTranscripts([
+                {
+                  role: 'model',
+                  text: greeting,
+                  time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                },
+              ]);
+              if (bridgeModeRef.current === 'hybrid') {
+                speakWithBrowserVoice(greeting);
+              }
+            }
           }
           if (msg.audio) {
+            setIsWelinkThinkingVoice(false);
             playPcm24kAudio(msg.audio);
           }
           if (msg.inputTranscript) {
+            setLiveInterimText('');
+            const spoken = String(msg.inputTranscript).trim();
             setVoiceTranscripts((prev) => [
-              ...prev.slice(-15),
-              { role: 'user', text: msg.inputTranscript },
+              ...prev.slice(-20),
+              {
+                role: 'user',
+                text: spoken,
+                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              },
             ]);
-          }
-          if (msg.outputTranscript) {
-            setVoiceTranscripts((prev) => [
-              ...prev.slice(-15),
-              { role: 'model', text: msg.outputTranscript },
-            ]);
-          }
-          if (msg.interrupted) {
-            activeSourcesRef.current.forEach((src) => {
-              try {
-                src.stop();
-              } catch {
-                // ignore
-              }
-            });
-            activeSourcesRef.current = [];
-            if (outputAudioCtxRef.current) {
-              nextStartTimeRef.current = outputAudioCtxRef.current.currentTime;
+
+            const detectedUpgrade = detectUpgradeIdea(spoken);
+            if (detectedUpgrade) {
+              void recordUpgradeFeedback({
+                source: 'live_talk',
+                title: detectedUpgrade.title,
+                summary: detectedUpgrade.summary,
+                userQuote: spoken,
+                category: detectedUpgrade.category,
+                impact: detectedUpgrade.impact,
+                userId: currentUser?.uid,
+                userName: userProfile?.displayName || currentUser?.displayName || 'WaveLink Member',
+                userEmail: userProfile?.email || currentUser?.email || undefined,
+              }).then(() => {
+                setUpgradeNotice(`💡 Live voice upgrade "${detectedUpgrade.title}" captured for Founder Keylan!`);
+                setTimeout(() => setUpgradeNotice(null), 5000);
+              });
             }
           }
+          if (msg.outputTranscript) {
+            setIsWelinkThinkingVoice(false);
+            setVoiceTranscripts((prev) => [
+              ...prev.slice(-20),
+              {
+                role: 'model',
+                text: msg.outputTranscript,
+                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              },
+            ]);
+            if (msg.speakAloud) {
+              speakWithBrowserVoice(msg.outputTranscript);
+            }
+          }
+          if (msg.interrupted) {
+            interruptWelinkSpeech();
+          }
           if (msg.error) {
-            setVoiceError(msg.error);
-            stopVoiceSession();
+            // Switch to hybrid mode rather than dropping the call
+            bridgeModeRef.current = 'hybrid';
+            setIsVoiceConnecting(false);
+            setIsVoiceActive(true);
+            isVoiceActiveRef.current = true;
           }
         } catch {
           // ignore malformed messages
@@ -404,22 +988,37 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       };
 
       ws.onerror = () => {
-        setVoiceError('Live voice connection interrupted.');
-        stopVoiceSession();
+        // Fallback to direct voice turn mode so the user can still talk live
+        bridgeModeRef.current = 'hybrid';
+        setIsVoiceConnecting(false);
+        setIsVoiceActive(true);
+        isVoiceActiveRef.current = true;
       };
 
       ws.onclose = () => {
-        setIsVoiceActive(false);
-        setIsVoiceConnecting(false);
+        if (!isVoiceActiveRef.current) {
+          setIsVoiceConnecting(false);
+        }
       };
-    } catch (err: any) {
-      setVoiceError(err.message || 'Microphone access is required for WELINK Live Voice.');
+    } catch {
+      bridgeModeRef.current = 'hybrid';
       setIsVoiceConnecting(false);
-      stopVoiceSession();
+      setIsVoiceActive(true);
+      isVoiceActiveRef.current = true;
     }
   };
 
   const stopVoiceSession = () => {
+    isVoiceActiveRef.current = false;
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.onend = null;
+        speechRecognitionRef.current.stop();
+      } catch {
+        // ignore
+      }
+      speechRecognitionRef.current = null;
+    }
     if (processorRef.current) {
       try {
         processorRef.current.disconnect();
@@ -448,40 +1047,22 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       }
       wsRef.current = null;
     }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
     activeSourcesRef.current = [];
+    setUserAudioLevel(0);
+    setLiveInterimText('');
+    setIsWelinkSpeaking(false);
+    setIsWelinkThinkingVoice(false);
     setIsVoiceActive(false);
     setIsVoiceConnecting(false);
   };
 
-  const handleRedeemCoupon = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!couponInput.trim() || isRedeeming) return;
-
-    setIsRedeeming(true);
-    setCouponMessage(null);
-
-    try {
-      const success = await verifyAndRedeemCoupon(couponInput.trim());
-      if (success) {
-        setCouponMessage({
-          type: 'success',
-          text: 'WaveLink Pro Pass activated! Unlocking WELINK AI...',
-        });
-        setCouponInput('');
-      } else {
-        setCouponMessage({
-          type: 'error',
-          text: 'Invalid or expired coupon code. Please check your code and try again.',
-        });
-      }
-    } catch (err: any) {
-      setCouponMessage({
-        type: 'error',
-        text: err.message || 'Could not verify coupon pass.',
-      });
-    } finally {
-      setIsRedeeming(false);
-    }
+  const formatCallDuration = (totalSec: number) => {
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   };
 
   if (!isOpen) return null;
@@ -490,675 +1071,710 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     <div className="fixed inset-0 z-50 flex justify-end">
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-slate-900/35 backdrop-blur-xs transition-opacity"
+        className="fixed inset-0 bg-stone-900/30 backdrop-blur-xs transition-opacity"
         onClick={onClose}
       />
 
       {/* Drawer Container */}
-      <aside className="relative z-10 w-full max-w-md sm:max-w-lg bg-white h-full shadow-2xl border-l border-slate-200 flex flex-col overflow-hidden animate-slide-left">
-        {/* Header */}
-        <div className="px-5 py-4 bg-gradient-to-r from-[#2563eb] via-[#3B82F6] to-[#10B981] text-white flex items-center justify-between shrink-0">
+      <aside className="relative z-10 w-full max-w-md sm:max-w-lg bg-[var(--bg-surface,#FFFFFF)] h-full shadow-2xl border-l border-[var(--border-hairline,#EFECE6)] flex flex-col overflow-hidden animate-slide-left">
+        {/* Calm Warm Header */}
+        <div className="px-5 py-4 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-2xl bg-white/20 backdrop-blur-xs shadow-inner flex items-center justify-center">
-              <Waves size={22} className="text-white" />
+            <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white flex items-center justify-center shadow-xs">
+              <Waves size={20} />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h2 className="font-extrabold text-lg tracking-tight leading-none">
+                <h2 className="font-extrabold text-base tracking-tight text-[var(--text-primary,#1C1917)] leading-none">
                   WELINK AI
                 </h2>
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-300 text-slate-900 shadow-2xs">
-                  <Crown size={10} />
-                  Pro Exclusive
-                </span>
+                {isProEffective && (
+                  <span className="text-[10px] font-bold text-[#0D9488] bg-[#CCFBF1] px-2 py-0.5 rounded-full">
+                    Pro
+                  </span>
+                )}
               </div>
-              <p className="text-xs text-blue-50 font-medium mt-1">
-                Your WaveLink Community Guide & Creative Studio
+              <p className="text-xs text-[var(--text-secondary,#78716C)] mt-0.5">
+                Community Guide &amp; Image Studio
               </p>
             </div>
           </div>
 
           <button
+            type="button"
             onClick={onClose}
-            className="p-2 rounded-xl bg-white/15 hover:bg-white/25 text-white transition"
+            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition active:scale-95"
             title="Close WELINK"
+            aria-label="Close WELINK"
           >
-            <X size={18} />
+            <X size={20} />
           </button>
         </div>
 
-        {/* Access Control Gate: Strict Pro Check */}
-        {!isProEffective ? (
-          <div className="flex-1 overflow-y-auto p-6 bg-[#F8FAFC] flex flex-col justify-between">
-            <div className="space-y-5">
-              {/* Friendly Invite Card */}
-              <div className="bg-white rounded-3xl p-6 border border-slate-200/90 shadow-sm text-center space-y-4">
-                <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[#2563eb] to-[#10B981] text-white flex items-center justify-center mx-auto shadow-lg shadow-blue-500/20">
-                  <Sparkles size={30} />
-                </div>
+        {/* Upgrade Suggestion Recorded Notification Banner */}
+        {upgradeNotice && (
+          <div className="px-4 py-2.5 bg-gradient-to-r from-amber-500 via-amber-600 to-orange-500 text-white text-xs font-bold flex items-center justify-between gap-2 shadow-sm animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-center gap-2">
+              <Lightbulb size={16} className="text-amber-200 shrink-0" />
+              <span>{upgradeNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setUpgradeNotice(null)}
+              className="text-white/80 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-white/20 transition"
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
-                <div className="space-y-1.5">
-                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-extrabold bg-blue-50 text-[#2563eb] border border-blue-200">
-                    <Lock size={12} />
-                    WaveLink Pro Feature
+        {/* Main Content Area */}
+        <div className="flex-1 flex flex-col min-h-0 bg-[var(--bg-canvas,#FAF7F2)]">
+          {/* Mode Navigation Tabs (Chat Guide, Images, Live Voice) */}
+          <div className="px-3 pt-3 pb-2 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setMode('chat')}
+              className={`flex-1 min-h-[44px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                mode === 'chat'
+                  ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
+                  : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
+              }`}
+            >
+              <MessageSquare size={15} />
+              <span>Chat Guide</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMode('image')}
+              className={`flex-1 min-h-[44px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                mode === 'image'
+                  ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
+                  : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
+              }`}
+            >
+              <ImageIcon size={15} />
+              <span>Images</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMode('voice')}
+              className={`flex-1 min-h-[44px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                mode === 'voice'
+                  ? 'bg-[#0D9488] text-white shadow-xs'
+                  : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
+              }`}
+            >
+              <Mic size={15} />
+              <span>Live Voice</span>
+            </button>
+          </div>
+
+          {/* TAB 1: MULTI-TURN CHAT GUIDE (Rendered with react-markdown) */}
+          {mode === 'chat' && (
+            <div className="flex-1 flex flex-col min-h-0">
+              {/* Model Selector Bar */}
+              <div className="px-4 py-2 bg-[var(--bg-subtle,#F5F1EA)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between gap-2 text-[11px]">
+                <span className="font-bold text-[var(--text-secondary,#78716C)] flex items-center gap-1">
+                  <Bot size={13} className="text-[var(--accent-primary,#2563EB)]" />
+                  WELINK Style:
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedModel('gemini-3.1-flash-lite')}
+                    className={`px-2.5 py-1 rounded-xl font-bold transition ${
+                      selectedModel === 'gemini-3.1-flash-lite'
+                        ? 'bg-white text-[var(--accent-primary,#2563EB)] shadow-2xs'
+                        : 'text-[var(--text-secondary,#78716C)] hover:bg-white/60'
+                    }`}
+                  >
+                    Quick
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedModel('gemini-3.8-flash')}
+                    className={`px-2.5 py-1 rounded-xl font-bold transition ${
+                      selectedModel === 'gemini-3.8-flash'
+                        ? 'bg-white text-[var(--accent-primary,#2563EB)] shadow-2xs'
+                        : 'text-[var(--text-secondary,#78716C)] hover:bg-white/60'
+                    }`}
+                  >
+                    Balanced
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedModel('gemini-4-argon')}
+                    className={`px-2.5 py-1 rounded-xl font-bold transition ${
+                      selectedModel === 'gemini-4-argon'
+                        ? 'bg-white text-[#0D9488] shadow-2xs'
+                        : 'text-[var(--text-secondary,#78716C)] hover:bg-white/60'
+                    }`}
+                  >
+                    Deep
+                  </button>
+                  {messages.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={handleClearDrawerChat}
+                      className="ml-1 px-2 py-1 rounded-xl text-[var(--text-secondary,#78716C)] hover:text-rose-600 hover:bg-white/60 font-bold flex items-center gap-1 transition"
+                      title="Reset WELINK drawer conversation"
+                    >
+                      <RotateCcw size={11} />
+                      <span>Reset</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Messages Scroll Thread */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                {messages.map((turn) => (
+                  <div
+                    key={turn.id}
+                    className={`flex ${turn.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[86%] rounded-3xl px-4 py-3 text-sm leading-relaxed shadow-2xs ${
+                        turn.role === 'user'
+                          ? 'bg-[var(--accent-primary,#2563EB)] text-white rounded-br-sm'
+                          : 'bg-white text-[var(--text-primary,#1C1917)] border border-[var(--border-hairline,#EFECE6)] rounded-bl-sm'
+                      }`}
+                    >
+                      {turn.role === 'model' && (
+                        <div className="flex items-center justify-between gap-2 mb-1.5 text-[11px] font-extrabold text-[var(--accent-primary,#2563EB)] uppercase tracking-wider">
+                          <span className="flex items-center gap-1.5">
+                            <Waves size={12} />
+                            <span>WELINK Guide</span>
+                          </span>
+                          {turn.fromCache && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-teal-50 text-[#0D9488] text-[9px] font-bold normal-case tracking-normal border border-teal-200/70"
+                              title="Served instantly from local IndexedDB cache"
+                            >
+                              <Zap size={9} />
+                              <span>Instant</span>
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {turn.role === 'model' ? (
+                        <div className="prose prose-sm max-w-none text-[var(--text-primary,#1C1917)] [&_p]:my-1.5 [&_ul]:my-1.5 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1.5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5 [&_strong]:font-extrabold [&_strong]:text-[var(--text-primary,#1C1917)]">
+                          <ReactMarkdown>{turn.text}</ReactMarkdown>
+                        </div>
+                      ) : (
+                        <div className="whitespace-pre-wrap">{turn.text}</div>
+                      )}
+
+                      <div
+                        className={`text-[10px] mt-1.5 text-right ${
+                          turn.role === 'user' ? 'text-blue-100' : 'text-[var(--text-secondary,#78716C)]'
+                        }`}
+                      >
+                        {turn.timestamp}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                {isChatLoading && !hasReceivedFirstChunk && (
+                  <div className="flex justify-start">
+                    <div className="bg-white border border-[var(--border-hairline,#EFECE6)] rounded-2xl rounded-bl-sm px-4 py-3 flex items-center gap-2 text-xs font-bold text-[var(--text-secondary,#78716C)] shadow-2xs">
+                      <Loader2 size={14} className="animate-spin text-[var(--accent-primary,#2563EB)]" />
+                      <span>WELINK is thinking...</span>
+                    </div>
+                  </div>
+                )}
+
+                {chatError && (
+                  <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold flex items-center gap-2">
+                    <AlertCircle size={15} className="shrink-0 text-amber-600" />
+                    <span>{chatError}</span>
+                  </div>
+                )}
+
+                <div ref={chatEndRef} />
+              </div>
+
+              {/* Instant IndexedDB Cache Match Bar (from debounced input) */}
+              {instantCacheHit && chatInput.trim().length >= 3 && !isChatLoading && (
+                <div className="px-4 pb-1.5">
+                  <button
+                    type="button"
+                    onClick={() => handleSendMessage(chatInput)}
+                    className="w-full px-3 py-1.5 rounded-xl bg-teal-50/90 hover:bg-teal-100/80 border border-teal-200/80 text-[#0D9488] text-[11px] font-bold flex items-center justify-between gap-2 transition"
+                  >
+                    <span className="flex items-center gap-1.5 truncate">
+                      <Zap size={12} className="shrink-0" />
+                      <span className="truncate">Instant cached answer ready — press Enter or tap to view</span>
+                    </span>
+                    <span className="text-[10px] uppercase tracking-wider font-extrabold shrink-0">
+                      0ms
+                    </span>
+                  </button>
+                </div>
+              )}
+
+              {/* Quick Starter Prompts */}
+              {messages.length <= 2 && (
+                <div className="px-4 pb-2 flex gap-1.5 overflow-x-auto no-scrollbar">
+                  {QUICK_PROMPTS.map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      onClick={() => handleSendMessage(q)}
+                      className="shrink-0 px-3.5 py-2 rounded-full bg-white hover:bg-blue-50 text-[var(--text-primary,#1C1917)] hover:text-[var(--accent-primary,#2563EB)] border border-[var(--border-hairline,#EFECE6)] text-xs font-bold transition shadow-2xs"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Chat Input Bar (Debounced Input + Single Send Button) */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleSendMessage();
+                }}
+                className="p-3 bg-white border-t border-[var(--border-hairline,#EFECE6)] flex items-center gap-2"
+              >
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={handleChatInputChange}
+                  placeholder="Ask WELINK anything..."
+                  className="flex-1 min-h-[46px] px-4 py-2.5 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)] text-sm text-[var(--text-primary,#1C1917)] placeholder:text-[var(--text-secondary,#78716C)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary,#2563EB)]"
+                />
+                <button
+                  type="submit"
+                  disabled={!chatInput.trim() || isChatLoading}
+                  className="min-w-[46px] min-h-[46px] px-4 rounded-2xl bg-[var(--accent-primary,#2563EB)] hover:opacity-95 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition shadow-xs"
+                  title="Send to WELINK"
+                >
+                  <Send size={17} />
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* TAB 2: CREATE & EDIT IMAGES */}
+          {mode === 'image' && (
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {/* Daily Image Allowance Note */}
+              <div className="p-3.5 rounded-2xl bg-white border border-[var(--border-hairline,#EFECE6)] flex items-center justify-between gap-2 text-xs shadow-2xs">
+                <div className="flex items-center gap-2">
+                  <Sparkles size={16} className="text-[#0D9488] shrink-0" />
+                  <span className="text-[var(--text-primary,#1C1917)] font-semibold">
+                    {isProEffective
+                      ? `WaveLink Pro: ${Math.max(0, proDailyLimit - usedTodayCount)} AI images remaining today`
+                      : usedTodayCount < freeDailyLimit
+                      ? '1 free AI image available today'
+                      : "Today's 1 free AI image has been used"}
                   </span>
-                  <h3 className="text-xl font-extrabold text-[#0F172A]">
-                    Unlock WELINK AI Assistant
+                </div>
+                {!isProEffective && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenUpgrade();
+                    }}
+                    className="text-xs font-extrabold text-[var(--accent-primary,#2563EB)] hover:underline shrink-0"
+                  >
+                    Try Pro
+                  </button>
+                )}
+              </div>
+
+              {/* Gentle Try Pro Note when free user taps after using daily free image */}
+              {tryProNote && (
+                <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200 text-stone-800 text-xs flex items-center justify-between gap-3">
+                  <span>{tryProNote}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenUpgrade();
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-white border border-amber-300 text-amber-900 font-extrabold shrink-0 hover:bg-amber-100 transition"
+                  >
+                    Try Pro
+                  </button>
+                </div>
+              )}
+
+              <div className="bg-white rounded-3xl p-5 border border-[var(--border-hairline,#EFECE6)] shadow-xs space-y-4">
+                <div>
+                  <h3 className="text-base font-extrabold text-[var(--text-primary,#1C1917)]">
+                    Create an AI Image
                   </h3>
-                  <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-                    Meet <strong className="text-[#0F172A]">WELINK</strong> — your personal community guide, viral content strategist, and multimodal creative studio built exclusively for WaveLink Pro members.
+                  <p className="text-xs text-[var(--text-secondary,#78716C)] mt-0.5">
+                    Describe what you'd like to see, or attach a photo to restyle.
                   </p>
                 </div>
 
-                {/* Feature Highlights */}
-                <div className="grid grid-cols-1 gap-2.5 text-left pt-2">
-                  <div className="flex items-start gap-3 p-3 rounded-2xl bg-[#F8FAFC] border border-slate-200/70">
-                    <div className="p-2 rounded-xl bg-blue-100 text-[#2563eb] shrink-0">
-                      <MessageSquare size={16} />
-                    </div>
-                    <div>
-                      <div className="text-xs font-extrabold text-[#0F172A]">
-                        24/7 Community Guide & Content Coach
-                      </div>
-                      <p className="text-[11px] text-slate-500">
-                        Get instant answers about WaveLink, viral Reel scripts, captions, and event ideas.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-start gap-3 p-3 rounded-2xl bg-[#F8FAFC] border border-slate-200/70">
-                    <div className="p-2 rounded-xl bg-emerald-100 text-emerald-700 shrink-0">
-                      <ImageIcon size={16} />
-                    </div>
-                    <div>
-                      <div className="text-xs font-extrabold text-[#0F172A]">
-                        WELINK Image Studio & Video Lab
-                      </div>
-                      <p className="text-[11px] text-slate-500">
-                        Create & edit custom graphics or generate HD clips for your Wave Feed & Reels.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-start gap-3 p-3 rounded-2xl bg-[#F8FAFC] border border-slate-200/70">
-                    <div className="p-2 rounded-xl bg-amber-100 text-amber-700 shrink-0">
-                      <Mic size={16} />
-                    </div>
-                    <div>
-                      <div className="text-xs font-extrabold text-[#0F172A]">
-                        Real-Time Voice Conversations
-                      </div>
-                      <p className="text-[11px] text-slate-500">
-                        Speak naturally with WELINK Live for hands-free brainstorming and platform support.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <button
-                  onClick={() => {
-                    onClose();
-                    onOpenUpgrade();
-                  }}
-                  className="w-full py-3.5 px-5 rounded-2xl bg-gradient-to-r from-[#2563eb] to-[#10B981] hover:opacity-95 text-white font-extrabold text-sm shadow-md shadow-blue-500/20 flex items-center justify-center gap-2 transition active:scale-98"
-                >
-                  <Crown size={17} className="text-amber-200" />
-                  <span>Upgrade to WaveLink Pro (18,000 TZS)</span>
-                  <ArrowRight size={16} />
-                </button>
-              </div>
-
-              {/* Direct Official Coupon Pass Activation */}
-              <div className="bg-white rounded-3xl p-5 border border-slate-200/90 shadow-xs space-y-3">
-                <div className="flex items-center gap-2 text-[#0F172A]">
-                  <KeyRound size={16} className="text-[#2563eb]" />
-                  <h4 className="text-xs font-extrabold uppercase tracking-wider">
-                    Have an Official Pro Pass Code?
-                  </h4>
-                </div>
-                <p className="text-xs text-slate-500">
-                  Enter your official coupon code below to activate your pass.
-                </p>
-
-                <form onSubmit={handleRedeemCoupon} className="flex gap-2">
+                {/* Optional Reference Image Upload */}
+                <div>
                   <input
-                    type="text"
-                    value={couponInput}
-                    onChange={(e) => setCouponInput(e.target.value)}
-                    placeholder="Enter official coupon code..."
-                    className="flex-1 px-3.5 py-2.5 rounded-xl bg-[#F8FAFC] border border-slate-200 text-xs font-bold text-[#0F172A] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2563eb]"
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleSourceImageUpload}
+                    className="hidden"
                   />
-                  <button
-                    type="submit"
-                    disabled={isRedeeming || !couponInput.trim()}
-                    className="px-4 py-2.5 rounded-xl bg-[#0F172A] hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-extrabold transition shrink-0 flex items-center gap-1.5"
-                  >
-                    {isRedeeming ? <Loader2 size={14} className="animate-spin" /> : null}
-                    <span>Activate</span>
-                  </button>
-                </form>
+                  {!sourceImageBase64 ? (
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full min-h-[44px] py-2.5 px-4 rounded-2xl border border-dashed border-[var(--border-hairline,#EFECE6)] bg-[var(--bg-canvas,#FAF7F2)] text-xs font-bold text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] flex items-center justify-center gap-2 transition"
+                    >
+                      <Upload size={15} />
+                      <span>Optional: Attach a reference photo</span>
+                    </button>
+                  ) : (
+                    <div className="flex items-center justify-between p-2.5 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)]">
+                      <div className="flex items-center gap-2.5">
+                        <img
+                          src={sourceImageBase64}
+                          alt="Source preview"
+                          className="w-11 h-11 rounded-xl object-cover border border-[var(--border-hairline,#EFECE6)]"
+                        />
+                        <div>
+                          <div className="text-xs font-extrabold text-[var(--text-primary,#1C1917)]">
+                            Reference Photo Ready
+                          </div>
+                          <div className="text-[11px] text-[var(--text-secondary,#78716C)]">
+                            Describe how to restyle it below
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSourceImageBase64(null)}
+                        className="p-2 text-stone-400 hover:text-rose-600 rounded-xl"
+                        title="Remove photo"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  )}
+                </div>
 
-                {couponMessage && (
-                  <div
-                    className={`p-3 rounded-xl text-xs font-bold flex items-center gap-2 ${
-                      couponMessage.type === 'success'
-                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                        : 'bg-rose-50 text-rose-700 border border-rose-200'
-                    }`}
-                  >
-                    {couponMessage.type === 'success' ? (
-                      <CheckCircle2 size={15} className="shrink-0" />
-                    ) : (
-                      <AlertCircle size={15} className="shrink-0" />
-                    )}
-                    <span>{couponMessage.text}</span>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="pt-4 text-center text-[11px] text-slate-400 font-medium">
-              WaveLink Pro • Supporting community creators across Tanzania & beyond
-            </div>
-          </div>
-        ) : (
-          /* Pro User Authenticated View */
-          <div className="flex-1 flex flex-col min-h-0 bg-[#F8FAFC]">
-            {/* Mode Navigation Tabs */}
-            <div className="px-3 pt-3 pb-2 bg-white border-b border-slate-200/80 flex items-center gap-1.5 shrink-0">
-              <button
-                onClick={() => setMode('chat')}
-                className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                  mode === 'chat'
-                    ? 'bg-[#2563eb] text-white shadow-xs'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                <MessageSquare size={14} />
-                <span>Chat Guide</span>
-              </button>
-
-              <button
-                onClick={() => setMode('image')}
-                className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                  mode === 'image'
-                    ? 'bg-[#2563eb] text-white shadow-xs'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                <ImageIcon size={14} />
-                <span>Images</span>
-              </button>
-
-              <button
-                onClick={() => setMode('video')}
-                className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                  mode === 'video'
-                    ? 'bg-[#2563eb] text-white shadow-xs'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                <Film size={14} />
-                <span>Video</span>
-              </button>
-
-              <button
-                onClick={() => setMode('voice')}
-                className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                  mode === 'voice'
-                    ? 'bg-[#10B981] text-white shadow-xs'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                <Mic size={14} />
-                <span>Live Voice</span>
-              </button>
-            </div>
-
-            {/* TAB 1: MULTI-TURN CHAT GUIDE */}
-            {mode === 'chat' && (
-              <div className="flex-1 flex flex-col min-h-0">
-                {/* Model Selector Bar */}
-                <div className="px-4 py-2 bg-slate-50 border-b border-slate-200/70 flex items-center justify-between gap-2 text-[11px]">
-                  <span className="font-bold text-slate-500 flex items-center gap-1">
-                    <Bot size={13} className="text-[#2563eb]" />
-                    WELINK Engine:
+                {/* Aspect Ratio Selector */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-xs font-bold text-[var(--text-secondary,#78716C)] mr-1">
+                    Shape:
                   </span>
-                  <div className="flex items-center gap-1">
+                  {(['1:1', '16:9', '9:16', '4:3', '3:4'] as const).map((ratio) => (
                     <button
+                      key={ratio}
                       type="button"
-                      onClick={() => setSelectedModel('gemini-3.1-flash-lite')}
-                      className={`px-2 py-1 rounded-lg font-bold transition ${
-                        selectedModel === 'gemini-3.1-flash-lite'
-                          ? 'bg-blue-100 text-[#2563eb]'
-                          : 'text-slate-500 hover:bg-slate-200/60'
+                      onClick={() => setImageAspectRatio(ratio)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-extrabold transition ${
+                        imageAspectRatio === ratio
+                          ? 'bg-[var(--accent-primary,#2563EB)] text-white'
+                          : 'bg-[var(--bg-canvas,#FAF7F2)] text-[var(--text-secondary,#78716C)]'
                       }`}
                     >
-                      Fast Lite
+                      {ratio}
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedModel('gemini-3.8-flash')}
-                      className={`px-2 py-1 rounded-lg font-bold transition ${
-                        selectedModel === 'gemini-3.8-flash'
-                          ? 'bg-blue-100 text-[#2563eb]'
-                          : 'text-slate-500 hover:bg-slate-200/60'
-                      }`}
-                    >
-                      Flash 3.8
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedModel('gemini-4-argon')}
-                      className={`px-2 py-1 rounded-lg font-bold transition ${
-                        selectedModel === 'gemini-4-argon'
-                          ? 'bg-emerald-100 text-emerald-700'
-                          : 'text-slate-500 hover:bg-slate-200/60'
-                      }`}
-                    >
-                      Pro Argon
-                    </button>
-                  </div>
-                </div>
-
-                {/* Messages Scroll Thread */}
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {messages.map((turn) => (
-                    <div
-                      key={turn.id}
-                      className={`flex ${
-                        turn.role === 'user' ? 'justify-end' : 'justify-start'
-                      }`}
-                    >
-                      <div
-                        className={`max-w-[85%] rounded-2xl px-4 py-3 text-xs sm:text-sm leading-relaxed shadow-2xs ${
-                          turn.role === 'user'
-                            ? 'bg-[#2563eb] text-white rounded-br-xs'
-                            : 'bg-white text-[#0F172A] border border-slate-200/90 rounded-bl-xs'
-                        }`}
-                      >
-                        {turn.role === 'model' && (
-                          <div className="flex items-center gap-1.5 mb-1 text-[10px] font-extrabold text-[#2563eb] uppercase tracking-wider">
-                            <Waves size={11} />
-                            <span>WELINK Guide</span>
-                          </div>
-                        )}
-                        <div className="whitespace-pre-wrap">{turn.text}</div>
-                        <div
-                          className={`text-[10px] mt-1.5 text-right ${
-                            turn.role === 'user' ? 'text-blue-100' : 'text-slate-400'
-                          }`}
-                        >
-                          {turn.timestamp}
-                        </div>
-                      </div>
-                    </div>
                   ))}
-
-                  {isChatLoading && (
-                    <div className="flex justify-start">
-                      <div className="bg-white border border-slate-200/90 rounded-2xl rounded-bl-xs px-4 py-3 flex items-center gap-2 text-xs font-bold text-slate-600 shadow-2xs">
-                        <Loader2 size={14} className="animate-spin text-[#2563eb]" />
-                        <span>WELINK is thinking...</span>
-                      </div>
-                    </div>
-                  )}
-
-                  {chatError && (
-                    <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold flex items-center gap-2">
-                      <AlertCircle size={15} className="shrink-0" />
-                      <span>{chatError}</span>
-                    </div>
-                  )}
-
-                  <div ref={chatEndRef} />
                 </div>
 
-                {/* Quick Starter Prompts */}
-                {messages.length <= 2 && (
-                  <div className="px-4 pb-2 flex gap-1.5 overflow-x-auto no-scrollbar">
-                    {QUICK_PROMPTS.map((q) => (
-                      <button
-                        key={q}
-                        type="button"
-                        onClick={() => handleSendMessage(q)}
-                        className="shrink-0 px-3 py-1.5 rounded-full bg-white hover:bg-blue-50 text-[#0F172A] hover:text-[#2563eb] border border-slate-200 text-[11px] font-bold transition shadow-2xs"
-                      >
-                        {q}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {/* Chat Input Bar */}
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    handleSendMessage();
-                  }}
-                  className="p-3 bg-white border-t border-slate-200/90 flex items-center gap-2"
-                >
-                  <input
-                    type="text"
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="Ask WELINK about WaveLink or content ideas..."
-                    className="flex-1 px-4 py-2.5 rounded-2xl bg-[#F8FAFC] border border-slate-200 text-xs sm:text-sm text-[#0F172A] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2563eb]"
+                {/* Form with ONE main action button */}
+                <form onSubmit={handleGenerateImage} className="space-y-3">
+                  <textarea
+                    rows={3}
+                    value={imagePrompt}
+                    onChange={(e) => setImagePrompt(e.target.value)}
+                    placeholder="e.g., A warm golden sunrise over Zanzibar beach with dhows..."
+                    className="w-full p-3.5 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)] text-sm text-[var(--text-primary,#1C1917)] placeholder:text-[var(--text-secondary,#78716C)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary,#2563EB)]"
                   />
                   <button
                     type="submit"
-                    disabled={!chatInput.trim() || isChatLoading}
-                    className="p-2.5 rounded-2xl bg-[#2563eb] hover:bg-blue-700 disabled:opacity-50 text-white transition shadow-xs"
-                    title="Send to WELINK"
+                    disabled={isImageLoading || !imagePrompt.trim()}
+                    className="w-full min-h-[48px] py-3 rounded-2xl bg-[var(--accent-primary,#2563EB)] hover:opacity-95 disabled:opacity-40 text-white text-sm font-extrabold flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
                   >
-                    <Send size={17} />
+                    {isImageLoading ? (
+                      <>
+                        <Loader2 size={16} className="animate-spin" />
+                        <span>Creating your image...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles size={16} />
+                        <span>Create Image</span>
+                      </>
+                    )}
                   </button>
                 </form>
               </div>
-            )}
 
-            {/* TAB 2: CREATE & EDIT IMAGES (gemini-nano-banana-2.1) */}
-            {mode === 'image' && (
+              {imageError && (
+                <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs sm:text-sm font-bold flex items-center gap-2.5">
+                  <AlertCircle size={17} className="shrink-0 text-amber-600" />
+                  <span>{imageError}</span>
+                </div>
+              )}
+
+              {generatedImageUrl && (
+                <div className="bg-white rounded-3xl p-4 border border-[var(--border-hairline,#EFECE6)] shadow-xs space-y-3">
+                  <img
+                    src={generatedImageUrl}
+                    alt="Created with WELINK"
+                    className="w-full rounded-2xl object-contain max-h-80 bg-[var(--bg-canvas,#FAF7F2)]"
+                  />
+                  {generatedImageCaption && (
+                    <p className="text-xs text-[var(--text-secondary,#78716C)]">{generatedImageCaption}</p>
+                  )}
+                  <a
+                    href={generatedImageUrl}
+                    download={`wavelink-image-${Date.now()}.png`}
+                    className="w-full min-h-[44px] py-2.5 px-4 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] hover:bg-[var(--bg-subtle,#F5F1EA)] text-[var(--text-primary,#1C1917)] border border-[var(--border-hairline,#EFECE6)] text-xs font-extrabold flex items-center justify-center gap-2 transition"
+                  >
+                    <Download size={14} />
+                    <span>Save Image</span>
+                  </a>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB 3: LIVE VOICE CONVERSATION (USER <-> WELINK LIVE TALKING) */}
+          {mode === 'voice' && (
+            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+              {/* Top Voice Persona Bar */}
+              <div className="px-4 py-2.5 bg-[var(--bg-subtle,#F5F1EA)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between gap-2 shrink-0">
+                <div className="flex items-center gap-1.5 text-[11px] font-bold text-[var(--text-secondary,#78716C)]">
+                  <Radio size={13} className="text-[#0D9488]" />
+                  <span>WELINK Voice:</span>
+                </div>
+                <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
+                  {VOICE_PERSONAS.map((persona) => (
+                    <button
+                      key={persona.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedVoice(persona.id);
+                        if (isVoiceActive) {
+                          speakWithBrowserVoice(`Switched to ${persona.label} voice.`);
+                        }
+                      }}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-extrabold transition whitespace-nowrap ${
+                        selectedVoice === persona.id
+                          ? 'bg-[#0D9488] text-white shadow-2xs'
+                          : 'bg-white/70 text-[var(--text-secondary,#78716C)] hover:bg-white'
+                      }`}
+                      title={persona.desc}
+                    >
+                      {persona.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Main Scrollable Live Talking Stage */}
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                <div className="bg-white rounded-3xl p-4 border border-slate-200/90 shadow-2xs space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="text-sm font-extrabold text-[#0F172A]">
-                        WELINK Image Studio
-                      </h3>
-                      <p className="text-[11px] text-slate-500">
-                        Create custom visuals or upload an image to edit with AI
-                      </p>
-                    </div>
-                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-[#2563eb] border border-blue-200">
-                      Nano Banana 2.1
+                {/* Interactive Live Talking Visualizer Card */}
+                <div className="bg-white rounded-3xl p-5 border border-[var(--border-hairline,#EFECE6)] text-center space-y-4 shadow-xs relative overflow-hidden">
+                  {/* Live Status Pill & Timer */}
+                  <div className="flex items-center justify-between text-xs">
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-extrabold ${
+                        isVoiceActive
+                          ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
+                          : 'bg-stone-100 text-[#78716C]'
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isVoiceActive ? 'bg-[#0D9488] animate-ping' : 'bg-stone-400'
+                        }`}
+                      />
+                      <span>
+                        {isVoiceActive
+                          ? isMicMuted
+                            ? 'Mic Muted'
+                            : isWelinkSpeaking
+                            ? 'WELINK Speaking'
+                            : 'Live & Listening'
+                          : 'Ready to Talk'}
+                      </span>
                     </span>
-                  </div>
 
-                  {/* Optional Reference Image Upload */}
-                  <div>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="image/*"
-                      onChange={handleSourceImageUpload}
-                      className="hidden"
-                    />
-                    {!sourceImageBase64 ? (
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        className="w-full py-3 px-4 rounded-2xl border-2 border-dashed border-slate-200 hover:border-[#2563eb] bg-[#F8FAFC] text-xs font-bold text-slate-600 hover:text-[#2563eb] flex items-center justify-center gap-2 transition"
-                      >
-                        <Upload size={15} />
-                        <span>Optional: Upload a photo to edit or restyle</span>
-                      </button>
-                    ) : (
-                      <div className="flex items-center justify-between p-2.5 rounded-2xl bg-slate-50 border border-slate-200">
-                        <div className="flex items-center gap-2.5">
-                          <img
-                            src={sourceImageBase64}
-                            alt="Source preview"
-                            className="w-11 h-11 rounded-xl object-cover border border-slate-200"
-                          />
-                          <div>
-                            <div className="text-xs font-extrabold text-[#0F172A]">
-                              Reference Image Attached
-                            </div>
-                            <div className="text-[10px] text-slate-500">
-                              Describe how WELINK should edit this image
-                            </div>
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setSourceImageBase64(null)}
-                          className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg"
-                          title="Remove reference image"
-                        >
-                          <Trash2 size={15} />
-                        </button>
-                      </div>
+                    {isVoiceActive && (
+                      <span className="font-mono font-bold text-xs text-[#78716C] bg-[var(--bg-canvas,#FAF7F2)] px-2.5 py-1 rounded-xl border border-[var(--border-hairline,#EFECE6)]">
+                        {formatCallDuration(voiceCallSeconds)}
+                      </span>
                     )}
                   </div>
 
-                  {/* Aspect Ratio Selector */}
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[11px] font-bold text-slate-500 mr-1">
-                      Ratio:
-                    </span>
-                    {(['1:1', '16:9', '9:16', '4:3', '3:4'] as const).map((ratio) => (
-                      <button
-                        key={ratio}
-                        type="button"
-                        onClick={() => setImageAspectRatio(ratio)}
-                        className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold transition ${
-                          imageAspectRatio === ratio
-                            ? 'bg-[#2563eb] text-white'
-                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  {/* Animated Dual Avatar / Voice Orb Stage */}
+                  <div className="py-2 flex items-center justify-center gap-6">
+                    {/* User Avatar Node */}
+                    <div className="flex flex-col items-center gap-1.5">
+                      <div
+                        className={`relative w-14 h-14 rounded-full overflow-hidden border-2 transition-all duration-150 ${
+                          isVoiceActive && !isMicMuted && userAudioLevel > 8
+                            ? 'border-[#2563EB] ring-4 ring-blue-100 scale-105'
+                            : 'border-[var(--border-hairline,#EFECE6)]'
                         }`}
                       >
-                        {ratio}
-                      </button>
-                    ))}
-                  </div>
-
-                  <form onSubmit={handleGenerateImage} className="space-y-2.5">
-                    <textarea
-                      rows={3}
-                      value={imagePrompt}
-                      onChange={(e) => setImagePrompt(e.target.value)}
-                      placeholder={
-                        sourceImageBase64
-                          ? 'Describe your edit (e.g., Add a warm golden sunset background)...'
-                          : 'Describe the image you want to create for your Wave Feed...'
-                      }
-                      className="w-full p-3 rounded-2xl bg-[#F8FAFC] border border-slate-200 text-xs sm:text-sm text-[#0F172A] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2563eb]"
-                    />
-                    <button
-                      type="submit"
-                      disabled={isImageLoading || !imagePrompt.trim()}
-                      className="w-full py-3 rounded-2xl bg-gradient-to-r from-[#2563eb] to-[#10B981] hover:opacity-95 disabled:opacity-50 text-white text-xs font-extrabold flex items-center justify-center gap-2 shadow-sm transition"
-                    >
-                      {isImageLoading ? (
-                        <>
-                          <Loader2 size={15} className="animate-spin" />
-                          <span>Generating with WELINK Image Studio...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles size={15} />
-                          <span>{sourceImageBase64 ? 'Edit Image' : 'Create Image'}</span>
-                        </>
-                      )}
-                    </button>
-                  </form>
-                </div>
-
-                {imageError && (
-                  <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold flex items-center gap-2">
-                    <AlertCircle size={15} className="shrink-0" />
-                    <span>{imageError}</span>
-                  </div>
-                )}
-
-                {generatedImageUrl && (
-                  <div className="bg-white rounded-3xl p-4 border border-slate-200/90 shadow-sm space-y-3">
-                    <img
-                      src={generatedImageUrl}
-                      alt="Generated by WELINK"
-                      className="w-full rounded-2xl object-contain max-h-80 bg-slate-50 border border-slate-100"
-                    />
-                    {generatedImageCaption && (
-                      <p className="text-xs text-slate-600">{generatedImageCaption}</p>
-                    )}
-                    <a
-                      href={generatedImageUrl}
-                      download={`welink-image-${Date.now()}.png`}
-                      className="w-full py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-extrabold flex items-center justify-center gap-2 transition"
-                    >
-                      <Download size={14} />
-                      <span>Download Image</span>
-                    </a>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* TAB 3: GENERATE VIDEO (gemini-omni-1.1-flash) */}
-            {mode === 'video' && (
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                <div className="bg-white rounded-3xl p-4 border border-slate-200/90 shadow-2xs space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="text-sm font-extrabold text-[#0F172A]">
-                        WELINK Video Lab
-                      </h3>
-                      <p className="text-[11px] text-slate-500">
-                        Generate 720p videos from text prompts for Wave Reels
-                      </p>
+                        <img
+                          src={
+                            userProfile?.photoURL ||
+                            currentUser?.photoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
+                          }
+                          alt="You"
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                      <span className="text-[11px] font-bold text-[#1C1917]">You</span>
                     </div>
-                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                      Omni Flash
-                    </span>
-                  </div>
 
-                  {/* Aspect Ratio Selector */}
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setVideoAspectRatio('16:9')}
-                      className={`flex-1 py-2 px-3 rounded-xl text-xs font-extrabold border transition ${
-                        videoAspectRatio === '16:9'
-                          ? 'bg-[#2563eb] text-white border-[#2563eb]'
-                          : 'bg-[#F8FAFC] text-slate-600 border-slate-200'
-                      }`}
-                    >
-                      16:9 Landscape
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setVideoAspectRatio('9:16')}
-                      className={`flex-1 py-2 px-3 rounded-xl text-xs font-extrabold border transition ${
-                        videoAspectRatio === '9:16'
-                          ? 'bg-[#2563eb] text-white border-[#2563eb]'
-                          : 'bg-[#F8FAFC] text-slate-600 border-slate-200'
-                      }`}
-                    >
-                      9:16 Vertical Reel
-                    </button>
-                  </div>
+                    {/* Central Live Waveform / Connection Bridge */}
+                    <div className="flex items-center gap-1 h-12 px-2">
+                      {[0, 1, 2, 3, 4].map((barIdx) => {
+                        const activeHeight = isWelinkSpeaking
+                          ? 18 + ((barIdx * 11) % 22)
+                          : isVoiceActive && !isMicMuted
+                          ? Math.max(8, Math.min(40, Math.round((userAudioLevel * (barIdx + 2)) / 5)))
+                          : 8;
+                        return (
+                          <span
+                            key={barIdx}
+                            style={{ height: `${activeHeight}px` }}
+                            className={`w-1.5 rounded-full transition-all duration-150 ${
+                              isWelinkSpeaking
+                                ? 'bg-[#0D9488] animate-pulse'
+                                : isVoiceActive && !isMicMuted && userAudioLevel > 5
+                                ? 'bg-[#2563EB]'
+                                : 'bg-stone-200'
+                            }`}
+                          />
+                        );
+                      })}
+                    </div>
 
-                  <form onSubmit={handleGenerateVideo} className="space-y-2.5">
-                    <textarea
-                      rows={3}
-                      value={videoPrompt}
-                      onChange={(e) => setVideoPrompt(e.target.value)}
-                      placeholder="Describe the video scene (e.g., Aerial sunset flight over Dar es Salaam coastline with warm cinematic lighting)..."
-                      className="w-full p-3 rounded-2xl bg-[#F8FAFC] border border-slate-200 text-xs sm:text-sm text-[#0F172A] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2563eb]"
-                    />
-                    <button
-                      type="submit"
-                      disabled={isVideoLoading || !videoPrompt.trim()}
-                      className="w-full py-3 rounded-2xl bg-gradient-to-r from-[#2563eb] to-[#10B981] hover:opacity-95 disabled:opacity-50 text-white text-xs font-extrabold flex items-center justify-center gap-2 shadow-sm transition"
-                    >
-                      {isVideoLoading ? (
-                        <>
-                          <Loader2 size={15} className="animate-spin" />
-                          <span>Rendering 720p Video (may take ~20-40s)...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Film size={15} />
-                          <span>Generate Video Clip</span>
-                        </>
-                      )}
-                    </button>
-                  </form>
-                </div>
-
-                {videoError && (
-                  <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold flex items-center gap-2">
-                    <AlertCircle size={15} className="shrink-0" />
-                    <span>{videoError}</span>
-                  </div>
-                )}
-
-                {generatedVideoUrl && (
-                  <div className="bg-white rounded-3xl p-4 border border-slate-200/90 shadow-sm space-y-3">
-                    <video
-                      src={generatedVideoUrl}
-                      controls
-                      autoPlay
-                      loop
-                      className="w-full rounded-2xl max-h-80 bg-slate-900"
-                    />
-                    {generatedVideoCaption && (
-                      <p className="text-xs text-slate-600">{generatedVideoCaption}</p>
-                    )}
-                    <a
-                      href={generatedVideoUrl}
-                      download={`welink-video-${Date.now()}.mp4`}
-                      className="w-full py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-extrabold flex items-center justify-center gap-2 transition"
-                    >
-                      <Download size={14} />
-                      <span>Download MP4 Video</span>
-                    </a>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* TAB 4: LIVE VOICE CONVERSATION (gemini-3.8-live) */}
-            {mode === 'voice' && (
-              <div className="flex-1 overflow-y-auto p-5 flex flex-col justify-between">
-                <div className="bg-white rounded-3xl p-6 border border-slate-200/90 shadow-sm text-center space-y-5">
-                  <div className="relative mx-auto w-24 h-24 flex items-center justify-center">
-                    {isVoiceActive && (
-                      <span className="absolute inset-0 rounded-full bg-emerald-400/30 animate-ping" />
-                    )}
-                    <div
-                      className={`relative w-20 h-20 rounded-full flex items-center justify-center shadow-lg transition ${
-                        isVoiceActive
-                          ? 'bg-gradient-to-tr from-[#10B981] to-[#2563eb] text-white'
-                          : 'bg-slate-100 text-slate-500'
-                      }`}
-                    >
-                      {isVoiceActive ? <Volume2 size={32} /> : <Mic size={32} />}
+                    {/* WELINK AI Voice Orb */}
+                    <div className="flex flex-col items-center gap-1.5">
+                      <div
+                        className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-200 ${
+                          isWelinkSpeaking
+                            ? 'bg-gradient-to-tr from-[#0D9488] to-[#2563EB] text-white ring-6 ring-[#CCFBF1] scale-110'
+                            : isVoiceActive
+                            ? 'bg-[#0D9488] text-white ring-4 ring-teal-50'
+                            : 'bg-[var(--bg-canvas,#FAF7F2)] text-[#0D9488] border border-[var(--border-hairline,#EFECE6)]'
+                        }`}
+                      >
+                        {isWelinkSpeaking ? <Volume2 size={24} className="animate-bounce" /> : <Waves size={24} />}
+                      </div>
+                      <span className="text-[11px] font-bold text-[#0D9488]">
+                        WELINK ({selectedVoice})
+                      </span>
                     </div>
                   </div>
 
-                  <div className="space-y-1">
-                    <h3 className="text-base font-extrabold text-[#0F172A]">
-                      {isVoiceActive
-                        ? 'WELINK Live Voice Active'
+                  {/* Status Headline & Subtitle */}
+                  <div>
+                    <h3 className="text-base font-extrabold text-[var(--text-primary,#1C1917)]">
+                      {isWelinkSpeaking
+                        ? 'WELINK is talking to you...'
+                        : isWelinkThinkingVoice
+                        ? 'WELINK is thinking...'
+                        : isVoiceActive
+                        ? isMicMuted
+                          ? 'Microphone is muted'
+                          : 'Listening to your voice...'
                         : isVoiceConnecting
-                        ? 'Connecting to WELINK Live...'
-                        : 'Talk with WELINK Live'}
+                        ? 'Connecting Live Voice...'
+                        : 'Talk Live with WELINK'}
                     </h3>
-                    <p className="text-xs text-slate-500 max-w-xs mx-auto">
+                    <p className="text-xs text-[var(--text-secondary,#78716C)] max-w-xs mx-auto mt-1 leading-relaxed">
                       {isVoiceActive
-                        ? 'Speak naturally into your microphone. WELINK is listening and will reply in real time.'
-                        : 'Start a real-time voice conversation with WELINK for instant community guidance and brainstorming.'}
+                        ? 'Speak naturally into your mic, or tap a topic below to talk with WELINK in real time.'
+                        : 'Start a live two-way voice conversation with WELINK for instant ideas, advice, and community help.'}
                     </p>
                   </div>
 
+                  {/* Live Interim Speech Bubble while user is speaking */}
+                  {liveInterimText && (
+                    <div className="p-2.5 rounded-2xl bg-blue-50/90 border border-blue-200 text-xs text-[#1E40AF] font-semibold animate-fade-in">
+                      <span className="font-extrabold">Hearing you: </span>
+                      <span>&ldquo;{liveInterimText}...&rdquo;</span>
+                    </div>
+                  )}
+
+                  {/* Secondary Call Controls (Mute Mic, Mute Speaker, Interrupt) when active */}
+                  {isVoiceActive && (
+                    <div className="flex items-center justify-center gap-2.5 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setIsMicMuted((prev) => !prev)}
+                        className={`min-h-[42px] px-3.5 py-2 rounded-2xl text-xs font-extrabold flex items-center gap-1.5 border transition ${
+                          isMicMuted
+                            ? 'bg-amber-50 text-amber-800 border-amber-300'
+                            : 'bg-[var(--bg-canvas,#FAF7F2)] text-[#1C1917] border-[var(--border-hairline,#EFECE6)] hover:bg-stone-100'
+                        }`}
+                      >
+                        {isMicMuted ? <MicOff size={15} /> : <Mic size={15} />}
+                        <span>{isMicMuted ? 'Unmute Mic' : 'Mute Mic'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setIsSpeakerMuted((prev) => !prev)}
+                        className={`min-h-[42px] px-3.5 py-2 rounded-2xl text-xs font-extrabold flex items-center gap-1.5 border transition ${
+                          isSpeakerMuted
+                            ? 'bg-amber-50 text-amber-800 border-amber-300'
+                            : 'bg-[var(--bg-canvas,#FAF7F2)] text-[#1C1917] border-[var(--border-hairline,#EFECE6)] hover:bg-stone-100'
+                        }`}
+                      >
+                        {isSpeakerMuted ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                        <span>{isSpeakerMuted ? 'Speaker Off' : 'Speaker On'}</span>
+                      </button>
+
+                      {isWelinkSpeaking && (
+                        <button
+                          type="button"
+                          onClick={interruptWelinkSpeech}
+                          className="min-h-[42px] px-3.5 py-2 rounded-2xl bg-teal-50 text-[#0D9488] border border-teal-200 text-xs font-extrabold hover:bg-teal-100 transition"
+                        >
+                          Stop Speaking
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {voiceError && (
+                    <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold flex items-center gap-2 text-left">
+                      <AlertCircle size={15} className="shrink-0 text-amber-600" />
+                      <span>{voiceError}</span>
+                    </div>
+                  )}
+
+                  {/* Primary Call Action Button */}
                   {!isVoiceActive ? (
                     <button
                       type="button"
                       onClick={startVoiceSession}
                       disabled={isVoiceConnecting}
-                      className="w-full py-3.5 px-5 rounded-2xl bg-gradient-to-r from-[#10B981] to-[#2563eb] hover:opacity-95 disabled:opacity-50 text-white text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 shadow-md transition"
+                      className="w-full min-h-[50px] py-3.5 px-6 rounded-2xl bg-[#0D9488] hover:opacity-95 disabled:opacity-50 text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
                     >
                       {isVoiceConnecting ? (
                         <>
-                          <Loader2 size={16} className="animate-spin" />
-                          <span>Starting Live Session...</span>
+                          <Loader2 size={18} className="animate-spin" />
+                          <span>Connecting Live Voice...</span>
                         </>
                       ) : (
                         <>
-                          <Mic size={16} />
-                          <span>Start Voice Conversation</span>
+                          <PhoneCall size={18} />
+                          <span>Start Live Talking with WELINK</span>
                         </>
                       )}
                     </button>
@@ -1166,45 +1782,132 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
                     <button
                       type="button"
                       onClick={stopVoiceSession}
-                      className="w-full py-3.5 px-5 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 shadow-md transition"
+                      className="w-full min-h-[48px] py-3 px-6 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
                     >
-                      <MicOff size={16} />
-                      <span>End Voice Session</span>
+                      <PhoneOff size={17} />
+                      <span>End Live Voice Call</span>
                     </button>
-                  )}
-
-                  {voiceError && (
-                    <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold flex items-center gap-2 text-left">
-                      <AlertCircle size={15} className="shrink-0" />
-                      <span>{voiceError}</span>
-                    </div>
                   )}
                 </div>
 
-                {/* Live Transcripts */}
-                {voiceTranscripts.length > 0 && (
-                  <div className="mt-4 bg-white rounded-3xl p-4 border border-slate-200/90 max-h-56 overflow-y-auto space-y-2">
-                    <div className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
-                      Live Voice Transcript
-                    </div>
-                    {voiceTranscripts.map((item, idx) => (
-                      <div key={idx} className="text-xs">
-                        <span
-                          className={`font-extrabold mr-1.5 ${
-                            item.role === 'user' ? 'text-[#2563eb]' : 'text-emerald-600'
-                          }`}
-                        >
-                          {item.role === 'user' ? 'You:' : 'WELINK:'}
-                        </span>
-                        <span className="text-slate-700">{item.text}</span>
-                      </div>
+                {/* Quick Voice Conversation Starters (Tap to say out loud to WELINK) */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between px-1">
+                    <span className="text-[11px] font-extrabold uppercase tracking-wider text-[var(--text-secondary,#78716C)]">
+                      Tap a topic to talk out loud with WELINK
+                    </span>
+                  </div>
+                  <div className="flex gap-1.5 overflow-x-auto no-scrollbar pb-1">
+                    {LIVE_VOICE_STARTERS.map((topic) => (
+                      <button
+                        key={topic}
+                        type="button"
+                        onClick={async () => {
+                          if (!isVoiceActive && !isVoiceConnecting) {
+                            await startVoiceSession();
+                          }
+                          handleSendSpokenTurn(topic);
+                        }}
+                        className="shrink-0 px-3.5 py-2 rounded-2xl bg-white hover:bg-teal-50 text-[var(--text-primary,#1C1917)] hover:text-[#0D9488] border border-[var(--border-hairline,#EFECE6)] text-xs font-bold transition shadow-2xs"
+                      >
+                        🎙️ {topic}
+                      </button>
                     ))}
+                  </div>
+                </div>
+
+                {/* Live Two-Way Voice Transcript History */}
+                {voiceTranscripts.length > 0 && (
+                  <div className="bg-white rounded-3xl p-4 border border-[var(--border-hairline,#EFECE6)] shadow-xs space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-extrabold text-[var(--text-primary,#1C1917)]">
+                        Live Voice Transcript
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setVoiceTranscripts([])}
+                        className="text-[11px] font-bold text-[var(--text-secondary,#78716C)] hover:text-rose-600"
+                      >
+                        Clear
+                      </button>
+                    </div>
+
+                    <div className="max-h-52 overflow-y-auto space-y-2.5 pr-1">
+                      {voiceTranscripts.map((t, i) => (
+                        <div
+                          key={i}
+                          className={`flex ${t.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                        >
+                          <div
+                            className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
+                              t.role === 'user'
+                                ? 'bg-[#2563EB] text-white rounded-br-xs'
+                                : 'bg-[var(--bg-canvas,#FAF7F2)] text-[var(--text-primary,#1C1917)] border border-[var(--border-hairline,#EFECE6)] rounded-bl-xs'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <span
+                                className={`font-extrabold text-[10px] uppercase tracking-wider ${
+                                  t.role === 'user' ? 'text-blue-100' : 'text-[#0D9488]'
+                                }`}
+                              >
+                                {t.role === 'user' ? 'You (Voice)' : `WELINK (${selectedVoice})`}
+                              </span>
+                              {t.role === 'model' && (
+                                <button
+                                  type="button"
+                                  onClick={() => speakWithBrowserVoice(t.text)}
+                                  className="text-[10px] font-bold text-[#0D9488] hover:underline flex items-center gap-0.5"
+                                  title="Replay voice aloud"
+                                >
+                                  <Volume2 size={11} />
+                                  <span>Speak</span>
+                                </button>
+                              )}
+                            </div>
+                            <div className="whitespace-pre-wrap">{t.text}</div>
+                          </div>
+                        </div>
+                      ))}
+                      <div ref={transcriptEndRef} />
+                    </div>
                   </div>
                 )}
               </div>
-            )}
-          </div>
-        )}
+
+              {/* Bottom Voice-or-Type Input Bar so users can also speak a phrase by typing during a call */}
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const text = voiceQuickInput.trim();
+                  if (!text) return;
+                  setVoiceQuickInput('');
+                  if (!isVoiceActive && !isVoiceConnecting) {
+                    await startVoiceSession();
+                  }
+                  handleSendSpokenTurn(text);
+                }}
+                className="p-3 bg-white border-t border-[var(--border-hairline,#EFECE6)] flex items-center gap-2 shrink-0"
+              >
+                <input
+                  type="text"
+                  value={voiceQuickInput}
+                  onChange={(e) => setVoiceQuickInput(e.target.value)}
+                  placeholder="Or type something for WELINK to answer out loud..."
+                  className="flex-1 min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)] text-xs sm:text-sm text-[var(--text-primary,#1C1917)] placeholder:text-[var(--text-secondary,#78716C)] focus:outline-none focus:ring-2 focus:ring-[#0D9488]"
+                />
+                <button
+                  type="submit"
+                  disabled={!voiceQuickInput.trim() || isWelinkThinkingVoice}
+                  className="min-w-[44px] min-h-[44px] px-3.5 rounded-2xl bg-[#0D9488] hover:opacity-95 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 transition shadow-xs"
+                  title="Send & Speak Aloud"
+                >
+                  <Volume2 size={16} />
+                </button>
+              </form>
+            </div>
+          )}
+        </div>
       </aside>
     </div>
   );

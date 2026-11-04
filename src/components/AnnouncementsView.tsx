@@ -287,9 +287,9 @@ export const AnnouncementsView: React.FC = () => {
               setFormError(null);
               setIsCreateModalOpen(true);
             }}
-            className="px-5 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-600/20 active:scale-95 transition whitespace-nowrap"
+            className="min-h-[48px] px-6 py-3 rounded-2xl bg-[#059669] hover:bg-[#047857] text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-emerald-600/20 active:scale-95 transition whitespace-nowrap"
           >
-            <PlusCircle size={17} />
+            <PlusCircle size={18} />
             <span>Post Event / Notice</span>
           </button>
         </div>

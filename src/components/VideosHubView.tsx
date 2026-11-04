@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, storage, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
+import { db, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
 import {
   collection,
   query,
@@ -10,12 +10,21 @@ import {
   setDoc,
   updateDoc
 } from 'firebase/firestore';
-import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { Post } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { VideoPlayer } from './VideoPlayer';
 import { SongPlayerCard } from './SongPlayerCard';
-import { generateVideoThumbnail, saveVideoPost, cacheVideoLocally } from '../utils/mediaStorage';
+import {
+  generateVideoThumbnail,
+  saveVideoPost,
+  cacheVideoLocally,
+  cloneVideoFileToMemory,
+  validateVideoFileSize,
+  formatVideoFileSize,
+  FREE_MAX_VIDEO_MB,
+  PRO_MAX_VIDEO_MB
+} from '../utils/mediaStorage';
+import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import {
   Film,
   Heart,
@@ -38,7 +47,8 @@ interface VideosHubViewProps {
 }
 
 export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }) => {
-  const { currentUser, userProfile, toggleSavePost } = useAuth();
+  const { currentUser, userProfile, isAdmin, isProEffective, toggleSavePost } = useAuth();
+  const isProTier = Boolean(isProEffective || isAdmin);
   const [videoPosts, setVideoPosts] = useState<Post[]>([]);
   const [filter, setFilter] = useState<'all' | 'saved' | 'popular'>('all');
   const [isLoading, setIsLoading] = useState(true);
@@ -47,7 +57,7 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
   // Active playing video tracking
   const [muted, setMuted] = useState(true);
 
-  // Video Uploader state with Firebase Storage uploadBytesResumable & fallback retry
+  // Video Uploader state
   const [showUploadBox, setShowUploadBox] = useState(false);
   const [videoCaption, setVideoCaption] = useState('');
   const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
@@ -57,6 +67,11 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
   const [uploadStatusText, setUploadStatusText] = useState('Uploading video reel...');
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
+  const [sizeLimitWarning, setSizeLimitWarning] = useState<{
+    message: string;
+    canUpgrade: boolean;
+  } | null>(null);
+  const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
   const videoInputRef = useRef<HTMLInputElement>(null);
 
   // Real-time listener for posts that have videoUrl or mediaType === 'video'
@@ -83,91 +98,29 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
     return () => unsub();
   }, []);
 
-  const handleVideoFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !file.type.startsWith('video/')) return;
-    setSelectedVideoFile(file);
-    setVideoPreviewUrl(URL.createObjectURL(file));
-    setUploadError(null);
-    setShowUploadBox(true);
-    e.target.value = '';
-  };
+  const handleVideoFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const rawFile = e.target.files?.[0];
+    if (!rawFile || !rawFile.type.startsWith('video/')) return;
 
-  // Upload via Firebase Storage uploadBytesResumable with automatic retry & resilient Firestore fallback
-  const uploadViaResumableStorage = async (
-    postId: string,
-    file: File,
-    maxRetries = 2
-  ): Promise<string | null> => {
-    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_') || `${postId}.mp4`;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        if (attempt > 1) {
-          setUploadStatusText(`Retrying resumable upload (attempt ${attempt}/${maxRetries})...`);
-        } else {
-          setUploadStatusText('Uploading video via Firebase Storage...');
-        }
-
-        const storageRef = ref(storage, `reels/${postId}_${attempt}_${safeName}`);
-        const uploadTask = uploadBytesResumable(storageRef, file, {
-          contentType: file.type || 'video/mp4'
-        });
-
-        const url = await new Promise<string>((resolve, reject) => {
-          let lastBytes = -1;
-          let stallTimer: ReturnType<typeof setTimeout> | null = null;
-
-          const resetWatchdog = () => {
-            if (stallTimer) clearTimeout(stallTimer);
-            stallTimer = setTimeout(() => {
-              try {
-                uploadTask.cancel();
-              } catch {}
-              reject(new Error('Resumable upload stalled; triggering fallback retry'));
-            }, 5000);
-          };
-
-          resetWatchdog();
-
-          uploadTask.on(
-            'state_changed',
-            (snapshot) => {
-              if (snapshot.bytesTransferred !== lastBytes) {
-                lastBytes = snapshot.bytesTransferred;
-                resetWatchdog();
-              }
-              if (snapshot.totalBytes > 0) {
-                const pct = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-                setUploadProgress(Math.max(8, Math.min(95, pct)));
-              }
-            },
-            (err) => {
-              if (stallTimer) clearTimeout(stallTimer);
-              reject(err);
-            },
-            async () => {
-              if (stallTimer) clearTimeout(stallTimer);
-              try {
-                const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
-                resolve(downloadUrl);
-              } catch (dlErr) {
-                reject(dlErr);
-              }
-            }
-          );
-        });
-
-        if (url) {
-          setUploadProgress(98);
-          return url;
-        }
-      } catch (err) {
-        console.warn(`Resumable video upload attempt ${attempt} caught error:`, err);
-      }
+    // Validate tiered video size: Free = 0 KB to 4 MB, Pro = 0 KB to 100 MB (allows >10 MB)
+    const validation = validateVideoFileSize(rawFile, isProTier);
+    if (!validation.valid) {
+      e.target.value = '';
+      setSizeLimitWarning({
+        message: validation.error || 'Video exceeds your plan upload limit.',
+        canUpgrade: Boolean(validation.requiresProUpgrade)
+      });
+      return;
     }
 
-    return null;
+    setSizeLimitWarning(null);
+    // Clone file into memory BEFORE clearing input so mobile/desktop browsers never invalidate the file handle
+    const safeFile = await cloneVideoFileToMemory(rawFile);
+    e.target.value = '';
+    setSelectedVideoFile(safeFile);
+    setVideoPreviewUrl(URL.createObjectURL(safeFile));
+    setUploadError(null);
+    setShowUploadBox(true);
   };
 
   const handlePublishVideoToFirestore = async (e?: React.FormEvent) => {
@@ -187,37 +140,19 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
       // Cache locally immediately so playback is always instant
       await cacheVideoLocally(postId, selectedVideoFile);
       const thumb = await generateVideoThumbnail(selectedVideoFile);
-      setUploadProgress(12);
+      setUploadProgress(15);
 
-      // 1. Attempt Firebase Storage uploadBytesResumable with retry
-      let finalVideoUrl: string | undefined = undefined;
-      let finalHasVideoChunks = false;
+      setUploadStatusText('Uploading & syncing video stream...');
+      const saved = await saveVideoPost(
+        postId,
+        selectedVideoFile,
+        undefined,
+        'posts',
+        (pct) => setUploadProgress(Math.max(15, pct))
+      );
 
-      const resumableUrl = await uploadViaResumableStorage(postId, selectedVideoFile, 2);
-
-      if (resumableUrl) {
-        finalVideoUrl = resumableUrl;
-        finalHasVideoChunks = false;
-      } else {
-        // 2. Automatic fallback to chunked Firestore media storage so upload never gets stuck at 43%
-        setUploadStatusText('Syncing video stream via resilient fallback...');
-        const videoDataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = (ev) => resolve((ev.target?.result as string) || '');
-          reader.onerror = (err) => reject(err);
-          reader.readAsDataURL(selectedVideoFile);
-        });
-
-        const saved = await saveVideoPost(
-          postId,
-          selectedVideoFile,
-          videoDataUrl,
-          'posts',
-          (pct) => setUploadProgress(Math.max(15, pct))
-        );
-        finalVideoUrl = saved.videoUrl;
-        finalHasVideoChunks = saved.hasVideoChunks;
-      }
+      const finalVideoUrl = saved.videoUrl;
+      const finalHasVideoChunks = saved.hasVideoChunks;
 
       setUploadStatusText('Finalizing reel post...');
       setUploadProgress(98);
@@ -258,11 +193,13 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
       setShowUploadBox(false);
       setUploadNotice('Video reel uploaded & published successfully!');
       setTimeout(() => setUploadNotice(null), 4000);
-    } catch (err: any) {
-      console.error('Error uploading video reel:', err);
-      setUploadError(
-        err?.message || 'Video upload encountered a network interruption. Click Retry Upload below.'
-      );
+    } catch (err: unknown) {
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : 'Video upload encountered a temporary interruption. Please click Retry Upload.';
+      console.warn('Video reel upload notice:', errMsg);
+      setUploadError(errMsg);
     } finally {
       setIsUploadingVideo(false);
     }
@@ -318,15 +255,24 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
       {/* Header Banner */}
       <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-8 text-[#0F172A] shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] flex items-center justify-between flex-wrap gap-4">
         <div>
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-[#3B82F6] border border-blue-200/70 text-xs font-semibold uppercase tracking-wider mb-2">
-            <Film size={14} className="text-[#10B981]" />
-            <span>Wave Reels &amp; Video Hub</span>
+          <div className="flex items-center gap-2 flex-wrap mb-2">
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-[#3B82F6] border border-blue-200/70 text-xs font-semibold uppercase tracking-wider">
+              <Film size={14} className="text-[#10B981]" />
+              <span>Wave Reels &amp; Video Hub</span>
+            </div>
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200 text-xs font-bold">
+              {isProTier
+                ? `Pro Limit: Up to ${PRO_MAX_VIDEO_MB} MB`
+                : `Free Limit: 0 KB – ${FREE_MAX_VIDEO_MB} MB • Pro: ${PRO_MAX_VIDEO_MB} MB`}
+            </span>
           </div>
           <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-[#0F172A]">
             Community Video Showcase
           </h2>
           <p className="text-slate-600 text-xs sm:text-sm mt-1 max-w-xl">
-            Watch, like, save, and upload high-definition videos stored directly in Firestore.
+            {isProTier
+              ? `Upload high-definition videos over 10 MB up to ${PRO_MAX_VIDEO_MB} MB with WaveLink Pro.`
+              : `Upload videos from 0 KB to ${FREE_MAX_VIDEO_MB} MB on Free, or upgrade to WaveLink Pro for videos up to ${PRO_MAX_VIDEO_MB} MB.`}
           </p>
         </div>
 
@@ -334,13 +280,40 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
           <button
             type="button"
             onClick={() => videoInputRef.current?.click()}
-            className="px-5 py-2.5 rounded-2xl bg-[#3B82F6] text-white hover:bg-blue-600 font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 transition active:scale-95 shrink-0"
+            className="min-h-[48px] px-6 py-3 rounded-2xl bg-[#F43F5E] text-white hover:bg-[#E11D48] font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-rose-500/20 transition active:scale-95 shrink-0"
           >
             <Upload size={16} />
-            <span>Upload Video to Firestore</span>
+            <span>Create a Reel ({isProTier ? `Up to ${PRO_MAX_VIDEO_MB} MB` : `0 KB – ${FREE_MAX_VIDEO_MB} MB`})</span>
           </button>
         </div>
       </div>
+
+      {sizeLimitWarning && (
+        <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-950 text-xs sm:text-sm flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle size={18} className="text-amber-600 shrink-0" />
+            <span className="font-semibold">{sizeLimitWarning.message}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {sizeLimitWarning.canUpgrade && !isProTier && (
+              <button
+                type="button"
+                onClick={() => setIsPaymentModalOpen(true)}
+                className="px-3.5 py-2 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white font-extrabold text-xs transition"
+              >
+                Try Pro (100 MB Videos)
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setSizeLimitWarning(null)}
+              className="p-1.5 rounded-xl text-amber-700 hover:bg-amber-100"
+            >
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+      )}
 
       {uploadNotice && (
         <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold flex items-center justify-between">
@@ -360,11 +333,16 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
           onSubmit={handlePublishVideoToFirestore}
           className="bg-white border border-blue-200 rounded-3xl p-6 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] space-y-4"
         >
-          <div className="flex items-center justify-between">
-            <h3 className="font-extrabold text-base text-[#0F172A] flex items-center gap-2">
-              <VideoIcon size={18} className="text-[#3B82F6]" />
-              <span>Publish Video Reel to Firestore</span>
-            </h3>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="font-extrabold text-base text-[#0F172A] flex items-center gap-2">
+                <VideoIcon size={18} className="text-[#3B82F6]" />
+                <span>Publish Video Reel</span>
+              </h3>
+              <span className="px-2.5 py-0.5 rounded-full bg-blue-50 text-[#2563EB] border border-blue-200 text-xs font-bold">
+                {formatVideoFileSize(selectedVideoFile.size)} / {isProTier ? `${PRO_MAX_VIDEO_MB} MB Max` : `${FREE_MAX_VIDEO_MB} MB Max`}
+              </span>
+            </div>
             <button
               type="button"
               onClick={() => {
@@ -633,6 +611,16 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
             );
           })}
         </div>
+      )}
+
+      {isPaymentModalOpen && (
+        <MobileMoneyPaymentModal
+          onClose={() => setIsPaymentModalOpen(false)}
+          onSuccess={() => {
+            setIsPaymentModalOpen(false);
+            setSizeLimitWarning(null);
+          }}
+        />
       )}
     </div>
   );

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig } from '../firebase';
+import { db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders } from '../firebase';
 import {
   collection,
   onSnapshot,
@@ -9,9 +9,39 @@ import {
   setDoc,
   deleteDoc
 } from 'firebase/firestore';
-import { UserProfile, Post, SupportTicket, AppSettings, PaymentGatewayConfig, PendingVerification, PaymentRequest, SystemDomain } from '../types';
+import {
+  UserProfile,
+  Post,
+  SupportTicket,
+  AppSettings,
+  PaymentGatewayConfig,
+  PendingVerification,
+  PaymentRequest,
+  SystemDomain,
+  SupportBotConfig,
+  SupportBotLog,
+  ScheduledBotDraft,
+  ContentReport,
+  AdminAuditLog,
+  UpgradeFeedbackItem,
+  UpgradeStatus,
+  UpgradeSource,
+  UpgradeCategory
+} from '../types';
+import {
+  updateUpgradeFeedbackStatus,
+  recordUpgradeFeedback
+} from '../services/upgradeFeedbackService';
 import { approveVerification, rejectVerification, approvePaymentRequest, rejectPaymentRequest } from '../services/verificationService';
 import { CrystalBadge } from './CrystalBadge';
+import { SupportDeskView } from './SupportDeskView';
+import { AnnouncementsView } from './AnnouncementsView';
+import {
+  SUPPORT_BOT_ID,
+  SUPPORT_BOT_EMAIL,
+  SUPPORT_BOT_PROFILE,
+  sanitizeUserText
+} from '../utils/security';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -49,7 +79,17 @@ import {
   ExternalLink,
   Globe,
   FileCheck,
-  Check
+  Check,
+  Bot,
+  Flame,
+  Flag,
+  FileText,
+  Power,
+  Lightbulb,
+  Sparkles,
+  Filter,
+  Tag,
+  Trash2
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -57,14 +97,57 @@ interface AdminDashboardProps {
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }) => {
-  const { currentUser, isSuperAdmin, isSubAdmin, isAdmin, toggleSubAdmin, toggleVerifyUser } = useAuth();
+  const { currentUser, isSuperAdmin, isSubAdmin, isAdmin, toggleSubAdmin, toggleVerifyUser, recordAdminAuditLog } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'verifications' | 'members' | 'calls' | 'payments'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades'>('overview');
+  const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(true);
+
+  useEffect(() => {
+    if (!currentUser?.email) return;
+    getAuthHeaders()
+      .then((headers) =>
+        fetch('/api/admin/verify', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ email: currentUser.email, isSubAdmin })
+        })
+      )
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && typeof d.authorized === 'boolean') {
+          setServerAdminVerified(d.authorized);
+        }
+      })
+      .catch(() => {});
+  }, [currentUser?.email, isSubAdmin]);
 
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [posts, setPosts] = useState<Post[]>([]);
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+
+  // Support Bot Config, Logs, Scheduled Drafts, Content Reports & Audit Logs
+  const [botConfig, setBotConfig] = useState<SupportBotConfig>({
+    id: 'global',
+    enabled: true,
+    dailyGeminiCap: 250,
+    dailyGeminiUsed: 0,
+    usageDate: new Date().toISOString().slice(0, 10),
+    userRateLimitPerMinute: 8,
+    maxMessageLength: 600,
+    updatedAt: new Date().toISOString()
+  });
+  const [botLogs, setBotLogs] = useState<SupportBotLog[]>([]);
+  const [scheduledDrafts, setScheduledDrafts] = useState<ScheduledBotDraft[]>([]);
+  const [contentReports, setContentReports] = useState<ContentReport[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
+
+  // Scheduled Bot Draft Form State
+  const [draftType, setDraftType] = useState<'weekly_update' | 'spark_of_the_day'>('weekly_update');
+  const [draftTitle, setDraftTitle] = useState('');
+  const [draftContent, setDraftContent] = useState('');
+  const [draftScheduleTime, setDraftScheduleTime] = useState('');
+  const [isSavingDraft, setIsSavingDraft] = useState(false);
 
   // Manual Pro Verifications & Payment Requests & Domains state
   const [verifications, setVerifications] = useState<PendingVerification[]>([]);
@@ -76,6 +159,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [copiedTxnId, setCopiedTxnId] = useState<string | null>(null);
   const [copiedDomain, setCopiedDomain] = useState<string | null>(null);
+
+  // Upgrade Ideas & Feedback from AI's Live Talks, WELINK AI & WaveLink Support Bot
+  const [upgradeFeedbacks, setUpgradeFeedbacks] = useState<UpgradeFeedbackItem[]>([]);
+  const [feedbackStatusFilter, setFeedbackStatusFilter] = useState<'all' | 'new' | 'planned' | 'implemented' | 'archived'>('all');
+  const [feedbackSourceFilter, setFeedbackSourceFilter] = useState<'all' | UpgradeSource>('all');
+  const [feedbackCategoryFilter, setFeedbackCategoryFilter] = useState<'all' | UpgradeCategory>('all');
+  const [feedbackSearch, setFeedbackSearch] = useState('');
+  const [editingFeedbackNoteId, setEditingFeedbackNoteId] = useState<string | null>(null);
+  const [feedbackNoteText, setFeedbackNoteText] = useState('');
+  const [isUpdatingFeedback, setIsUpdatingFeedback] = useState(false);
+  const [showManualUpgradeModal, setShowManualUpgradeModal] = useState(false);
+  const [manualTitle, setManualTitle] = useState('');
+  const [manualSummary, setManualSummary] = useState('');
+  const [manualCategory, setManualCategory] = useState<UpgradeCategory>('features');
+  const [manualImpact, setManualImpact] = useState<'high' | 'medium' | 'low'>('high');
 
   // Payment Gateway Config State
   const [paymentConfig, setPaymentConfig] = useState<PaymentGatewayConfig>({
@@ -111,7 +209,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       const res = await fetch('/api/azampay/token', { method: 'POST' });
       const data = await res.json();
       if (data.success) {
-        setAzampayTestResult(`Token Active: ${data.tokenPreview} (expires in ${data.expiresIn}s)`);
+        setAzampayTestResult(`Gateway Connected (${data.payee || 'WaveLink'} - ${data.environment || 'sandbox'})`);
       } else {
         setAzampayTestResult(`Error: ${data.error || 'Authentication failed'}`);
       }
@@ -126,6 +224,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [warningUser, setWarningUser] = useState<UserProfile | null>(null);
   const [warningReason, setWarningReason] = useState('');
   const [isSubmittingWarning, setIsSubmittingWarning] = useState(false);
+
+  // Fetch initial Support Bot config from server
+  useEffect(() => {
+    if (!isAdmin) return;
+    fetch('/api/support-bot/config')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.config) {
+          setBotConfig((prev) => ({ ...prev, ...d.config }));
+        }
+      })
+      .catch(() => {});
+  }, [isAdmin]);
 
   // Listen to platform statistics & real data
   useEffect(() => {
@@ -192,6 +303,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setSystemDomains(list);
     });
 
+    const unsubBotConfig = onSnapshot(doc(db, 'supportBotConfig', 'global'), (snap) => {
+      if (snap.exists()) {
+        setBotConfig((prev) => ({ ...prev, ...(snap.data() as SupportBotConfig) }));
+      }
+    });
+
+    const unsubBotLogs = onSnapshot(collection(db, 'supportBotLogs'), (snap) => {
+      const list: SupportBotLog[] = [];
+      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as SupportBotLog));
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setBotLogs(list);
+    });
+
+    const unsubScheduledDrafts = onSnapshot(collection(db, 'scheduledBotDrafts'), (snap) => {
+      const list: ScheduledBotDraft[] = [];
+      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as ScheduledBotDraft));
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setScheduledDrafts(list);
+    });
+
+    const unsubReports = onSnapshot(collection(db, 'contentReports'), (snap) => {
+      const list: ContentReport[] = [];
+      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as ContentReport));
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setContentReports(list);
+    });
+
+    const unsubAuditLogs = onSnapshot(collection(db, 'adminAuditLogs'), (snap) => {
+      const list: AdminAuditLog[] = [];
+      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as AdminAuditLog));
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setAuditLogs(list);
+    });
+
+    const unsubUpgrades = onSnapshot(collection(db, 'upgrade_feedback'), (snap) => {
+      const list: UpgradeFeedbackItem[] = [];
+      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as UpgradeFeedbackItem));
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setUpgradeFeedbacks(list);
+    });
+
     return () => {
       unsubUsers();
       unsubPosts();
@@ -201,11 +353,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       unsubVerifications();
       unsubPaymentRequests();
       unsubDomains();
+      unsubBotConfig();
+      unsubBotLogs();
+      unsubScheduledDrafts();
+      unsubReports();
+      unsubAuditLogs();
+      unsubUpgrades();
     };
   }, [isAdmin]);
 
-  // Strict Admin Check: If not Super Admin or Sub-Admin, show 403 Forbidden
-  if (!isAdmin) {
+  // Strict Admin Check: Enforced on both client & server
+  if (!isAdmin || !serverAdminVerified) {
     return (
       <div className="min-h-[80vh] flex items-center justify-center p-4">
         <div className="w-full max-w-md bg-white dark:bg-[#131927] border border-rose-200 dark:border-rose-900/60 rounded-3xl p-8 text-center shadow-xl shadow-rose-950/5">
@@ -276,10 +434,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     if (!warningUser || !warningReason.trim()) return;
     setIsSubmittingWarning(true);
     try {
+      const cleanReason = sanitizeUserText(warningReason, 400);
       await updateDoc(doc(db, 'users', warningUser.id), {
         status: 'warned',
-        warningMessage: warningReason.trim(),
+        warningMessage: cleanReason,
         updatedAt: new Date().toISOString()
+      });
+      await recordAdminAuditLog({
+        action: 'warn_user',
+        targetId: warningUser.id,
+        targetLabel: warningUser.email,
+        details: `Issued warning: ${cleanReason}`
       });
       setWarningUser(null);
       setWarningReason('');
@@ -303,14 +468,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     }
   };
 
-  // Ban user
+  // Ban user (no window.prompt required)
   const handleBanUser = async (user: UserProfile) => {
     if (user.email === ADMIN_EMAIL) {
       console.warn('The primary platform administrator cannot be banned.');
       return;
     }
-    const reason = prompt(`Enter suspension reason for ${user.displayName}:`, 'Violation of community policies');
-    if (!reason) return;
+    const reason = 'Violation of WaveLink community safety policies';
 
     try {
       await updateDoc(doc(db, 'users', user.id), {
@@ -319,6 +483,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         warningMessage: reason,
         updatedAt: new Date().toISOString()
       });
+      await recordAdminAuditLog({
+        action: 'ban_user',
+        targetId: user.id,
+        targetLabel: user.email,
+        details: `Suspended account (${user.displayName}): ${reason}`
+      });
+      setActionFeedback(`Account ${user.displayName} (${user.email}) has been suspended and logged in the Audit Log.`);
+      setTimeout(() => setActionFeedback(null), 4000);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${user.id}`);
     }
@@ -326,6 +498,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Unban user
   const handleUnbanUser = async (userId: string) => {
+    const target = users.find((u) => u.id === userId);
     try {
       await updateDoc(doc(db, 'users', userId), {
         isBanned: false,
@@ -333,8 +506,265 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         warningMessage: '',
         updatedAt: new Date().toISOString()
       });
+      await recordAdminAuditLog({
+        action: 'unban_user',
+        targetId: userId,
+        targetLabel: target?.email,
+        details: `Restored account access for ${target?.displayName || userId}`
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${userId}`);
+    }
+  };
+
+  // Toggle WaveLink Support Bot ON / OFF
+  const handleToggleSupportBot = async () => {
+    const nextEnabled = !botConfig.enabled;
+    const updated: SupportBotConfig = {
+      ...botConfig,
+      id: 'global',
+      enabled: nextEnabled,
+      updatedAt: new Date().toISOString(),
+      updatedBy: currentUser?.email || ADMIN_EMAIL
+    };
+    setBotConfig(updated);
+
+    try {
+      const headers = await getAuthHeaders();
+      await fetch('/api/support-bot/config', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          adminEmail: currentUser?.email,
+          isSubAdmin,
+          enabled: nextEnabled,
+          dailyGeminiCap: updated.dailyGeminiCap,
+          maxMessageLength: updated.maxMessageLength
+        })
+      }).catch(() => {});
+
+      await setDoc(doc(db, 'supportBotConfig', 'global'), cleanFirestoreData(updated), { merge: true });
+      await recordAdminAuditLog({
+        action: 'bot_toggle',
+        targetId: SUPPORT_BOT_ID,
+        targetLabel: SUPPORT_BOT_EMAIL,
+        details: `Switched WaveLink Support Bot ${nextEnabled ? 'ON' : 'OFF'}`
+      });
+      setActionFeedback(`WaveLink Support Bot is now ${nextEnabled ? 'ENABLED (Active)' : 'DISABLED (Paused)'}.`);
+      setTimeout(() => setActionFeedback(null), 3500);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'supportBotConfig/global');
+    }
+  };
+
+  // Create a Scheduled Bot Draft (Weekly Community Update or Spark of the Day)
+  const handleCreateBotDraft = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const safeTitle = sanitizeUserText(draftTitle, 140);
+    const safeContent = sanitizeUserText(draftContent, 1500);
+    if (!safeTitle || !safeContent) return;
+
+    setIsSavingDraft(true);
+    try {
+      const draftId = `draft_${Date.now()}`;
+      const scheduledIso = draftScheduleTime
+        ? new Date(draftScheduleTime).toISOString()
+        : new Date(Date.now() + 3600 * 1000).toISOString();
+
+      const newDraft: ScheduledBotDraft = {
+        id: draftId,
+        type: draftType,
+        title: safeTitle,
+        content: safeContent,
+        status: 'draft',
+        scheduledFor: scheduledIso,
+        createdAt: new Date().toISOString()
+      };
+
+      await setDoc(doc(db, 'scheduledBotDrafts', draftId), cleanFirestoreData(newDraft));
+      setDraftTitle('');
+      setDraftContent('');
+      setDraftScheduleTime('');
+      setActionFeedback('Bot draft saved! Click "Approve Schedule" or "Publish Now" to let WaveLink Support post it.');
+      setTimeout(() => setActionFeedback(null), 4000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'scheduledBotDrafts');
+    } finally {
+      setIsSavingDraft(false);
+    }
+  };
+
+  // Approve a Scheduled Bot Draft so it runs automatically on schedule
+  const handleApproveBotDraft = async (draft: ScheduledBotDraft) => {
+    try {
+      await updateDoc(doc(db, 'scheduledBotDrafts', draft.id), {
+        status: 'approved',
+        approvedBy: currentUser?.email || ADMIN_EMAIL,
+        approvedAt: new Date().toISOString()
+      });
+      setActionFeedback(`Approved "${draft.title}" for scheduled posting by WaveLink Support Bot.`);
+      setTimeout(() => setActionFeedback(null), 3500);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `scheduledBotDrafts/${draft.id}`);
+    }
+  };
+
+  // Upgrade Feedback Handlers
+  const handleUpdateFeedbackStatus = async (id: string, status: UpgradeStatus) => {
+    setIsUpdatingFeedback(true);
+    try {
+      await updateUpgradeFeedbackStatus(id, status);
+      await recordAdminAuditLog({
+        action: 'upgrade_status_change',
+        targetId: id,
+        targetLabel: `Upgrade Idea Status -> ${status}`,
+        details: `Updated upgrade feedback item status to ${status}`
+      });
+      setActionFeedback(`Upgrade feedback status updated to "${status}".`);
+      setTimeout(() => setActionFeedback(null), 3500);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `upgrade_feedback/${id}`);
+    } finally {
+      setIsUpdatingFeedback(false);
+    }
+  };
+
+  const handleSaveFeedbackNote = async (id: string) => {
+    try {
+      await updateUpgradeFeedbackStatus(id, undefined, feedbackNoteText);
+      setEditingFeedbackNoteId(null);
+      setFeedbackNoteText('');
+      setActionFeedback('Implementation note saved to upgrade card.');
+      setTimeout(() => setActionFeedback(null), 3500);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `upgrade_feedback/${id}`);
+    }
+  };
+
+  const handleDeleteFeedback = async (id: string) => {
+    if (!window.confirm('Are you sure you want to delete this upgrade idea?')) return;
+    try {
+      await deleteDoc(doc(db, 'upgrade_feedback', id));
+      setActionFeedback('Upgrade idea removed.');
+      setTimeout(() => setActionFeedback(null), 3000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `upgrade_feedback/${id}`);
+    }
+  };
+
+  const handleCreateManualUpgrade = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!manualTitle.trim()) return;
+    try {
+      await recordUpgradeFeedback({
+        source: 'user_manual',
+        title: manualTitle.trim(),
+        summary: manualSummary.trim() || manualTitle.trim(),
+        userQuote: manualSummary.trim() || manualTitle.trim(),
+        category: manualCategory,
+        impact: manualImpact,
+        userId: currentUser?.uid,
+        userName: currentUser?.displayName || 'Platform Founder',
+        userEmail: currentUser?.email || undefined
+      });
+      setManualTitle('');
+      setManualSummary('');
+      setShowManualUpgradeModal(false);
+      setActionFeedback('💡 New platform upgrade idea recorded into Feedback Inbox!');
+      setTimeout(() => setActionFeedback(null), 4000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'upgrade_feedback');
+    }
+  };
+
+  // Publish an Approved/Draft Bot item as WaveLink Support (never using personal admin Gmail)
+  const handlePublishBotDraftNow = async (draft: ScheduledBotDraft) => {
+    try {
+      const nowIso = new Date().toISOString();
+      if (draft.type === 'weekly_update') {
+        const postId = `bot_weekly_${Date.now()}`;
+        await setDoc(doc(db, 'posts', postId), {
+          id: postId,
+          authorId: SUPPORT_BOT_ID,
+          authorEmail: SUPPORT_BOT_EMAIL,
+          authorName: SUPPORT_BOT_PROFILE.displayName,
+          authorUsername: SUPPORT_BOT_PROFILE.username,
+          authorPhotoURL: SUPPORT_BOT_PROFILE.photoURL,
+          content: `📢 [Weekly Community Update — ${draft.title}]\n\n${draft.content}\n\n— Automated post by WaveLink Support 🤖`,
+          likes: [],
+          likesCount: 0,
+          reactions: { like: [], heart: [], fire: [] },
+          reactionCounts: { like: 0, heart: 0, fire: 0 },
+          commentsCount: 0,
+          createdAt: nowIso
+        });
+      } else {
+        const sparkId = `bot_spark_${Date.now()}`;
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        await setDoc(doc(db, 'sparks', sparkId), {
+          id: sparkId,
+          userId: SUPPORT_BOT_ID,
+          userEmail: SUPPORT_BOT_EMAIL,
+          userName: SUPPORT_BOT_PROFILE.displayName,
+          userPhotoURL: SUPPORT_BOT_PROFILE.photoURL,
+          mediaUrl: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=1000&auto=format&fit=crop&q=80',
+          mediaType: 'image',
+          caption: `✨ Spark of the Day: ${draft.title} — ${draft.content}`,
+          items: [
+            {
+              id: `item_${Date.now()}`,
+              mediaUrl: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=1000&auto=format&fit=crop&q=80',
+              mediaType: 'image',
+              caption: `✨ Spark of the Day: ${draft.title} — ${draft.content}`,
+              createdAt: nowIso
+            }
+          ],
+          createdAt: nowIso,
+          expiresAt,
+          viewerIds: []
+        });
+      }
+
+      await updateDoc(doc(db, 'scheduledBotDrafts', draft.id), {
+        status: 'posted',
+        approvedBy: draft.approvedBy || currentUser?.email || ADMIN_EMAIL,
+        postedAt: nowIso
+      });
+      setActionFeedback(
+        `WaveLink Support Bot published ${draft.type === 'weekly_update' ? 'Weekly Community Update' : 'Spark of the Day'}: "${draft.title}"!`
+      );
+      setTimeout(() => setActionFeedback(null), 4000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `scheduledBotDrafts/${draft.id}`);
+    }
+  };
+
+  // Automatic scheduler: check every 30s if any approved bot draft is due to be published
+  useEffect(() => {
+    if (!isAdmin || !botConfig.enabled) return;
+    const dueDrafts = scheduledDrafts.filter(
+      (d) =>
+        d.status === 'approved' &&
+        d.scheduledFor &&
+        new Date(d.scheduledFor).getTime() <= Date.now()
+    );
+    if (dueDrafts.length > 0) {
+      dueDrafts.forEach((d) => {
+        handlePublishBotDraftNow(d);
+      });
+    }
+  }, [isAdmin, botConfig.enabled, scheduledDrafts]);
+
+  // Resolve a user/content safety report
+  const handleResolveReport = async (reportId: string) => {
+    try {
+      await updateDoc(doc(db, 'contentReports', reportId), {
+        status: 'reviewed'
+      });
+      setActionFeedback('Safety report marked as resolved.');
+      setTimeout(() => setActionFeedback(null), 3000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `contentReports/${reportId}`);
     }
   };
 
@@ -366,6 +796,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setActionFeedback(null);
     try {
       await approveVerification(verif, currentUser?.email || ADMIN_EMAIL);
+      await recordAdminAuditLog({
+        action: 'verify_user',
+        targetId: verif.userId,
+        targetLabel: verif.userEmail,
+        details: `Approved Mobile Money Txn ${verif.transactionId} (${verif.tierName})`
+      });
       setActionFeedback(`🎉 Approved! ${verif.userName} (${verif.userEmail}) is now WaveLink Pro with Verified Blue Star!`);
       setTimeout(() => setActionFeedback(null), 5000);
     } catch (err: any) {
@@ -378,11 +814,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Reject Manual Pro Verification
   const handleRejectVerification = async (verif: PendingVerification) => {
-    const reason = prompt(
-      `Enter reason for rejecting Txn ID ${verif.transactionId} (${verif.userName}):`,
-      'SMS Transaction ID could not be matched with statement'
-    );
-    if (!reason) return;
+    const reason = 'SMS Transaction ID could not be matched with statement';
 
     setRejectingId(verif.id);
     setActionFeedback(null);
@@ -404,6 +836,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setActionFeedback(null);
     try {
       await approvePaymentRequest(req, currentUser?.email || ADMIN_EMAIL);
+      await recordAdminAuditLog({
+        action: 'verify_user',
+        targetId: req.userId,
+        targetLabel: req.userEmail,
+        details: `Approved Payment Request Txn ${req.transactionId} (${req.plan})`
+      });
       setActionFeedback(`🎉 1-Click Approved! ${req.userName || 'Subscriber'} is now WaveLink Pro! All ads removed & Verified badge activated.`);
       setTimeout(() => setActionFeedback(null), 5000);
     } catch (err: any) {
@@ -416,11 +854,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Reject Payment Request
   const handleRejectPaymentRequest = async (req: PaymentRequest) => {
-    const reason = prompt(
-      `Enter reason for rejecting Txn ID ${req.transactionId} (${req.userName || req.userPhone}):`,
-      'SMS Transaction ID could not be matched with mobile money statement'
-    );
-    if (!reason) return;
+    const reason = 'SMS Transaction ID could not be matched with mobile money statement';
 
     setRejectingId(req.id);
     setActionFeedback(null);
@@ -461,6 +895,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const bannedUsers = users.filter((u) => u.isBanned).length;
   const proSubscribers = users.filter((u) => u.isPro).length;
   const openTickets = tickets.filter((t) => t.status === 'open').length;
+  const openReportsCount = contentReports.filter((r) => r.status === 'open').length;
+  const newUpgradesCount = upgradeFeedbacks.filter((u) => u.status === 'new').length;
 
   return (
     <div className="max-w-7xl mx-auto py-6 px-3 sm:px-6 space-y-6">
@@ -491,8 +927,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           </h2>
           <p className="text-xs sm:text-sm text-purple-200/80 mt-1 max-w-2xl">
             {isSuperAdmin
-              ? 'Strict governance desk for member moderation, administrative appointments, payment gateway credentials, and WebRTC system authorization.'
-              : 'Sub-administrative desk for member moderation, user warnings, and community oversight (with restricted credential access).'}
+              ? 'Strict governance desk for member moderation, WaveLink Support Bot automation, audit logs, payment gateway credentials, and WebRTC authorization.'
+              : 'Sub-administrative desk for member moderation, user warnings, support tickets, and community oversight.'}
           </p>
         </div>
 
@@ -509,87 +945,939 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       </div>
 
       {/* Navigation Tabs */}
-      <div className="flex rounded-2xl bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 p-1.5 text-xs font-semibold overflow-x-auto shadow-xs">
+      <div className="flex rounded-2xl bg-white border border-[#EFECE6] p-1.5 text-xs font-bold overflow-x-auto shadow-xs gap-1">
         <button
           onClick={() => setActiveTab('overview')}
           className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
             activeTab === 'overview'
-              ? 'bg-purple-600 text-white shadow-xs'
-              : 'text-gray-600 dark:text-gray-300 hover:text-gray-900'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
           }`}
         >
           <Users size={15} />
-          <span>Overview & Statistics</span>
+          <span>Activity Dashboard</span>
         </button>
 
         <button
-          onClick={() => setActiveTab('verifications')}
+          onClick={() => setActiveTab('upgrades')}
           className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'verifications'
-              ? 'bg-purple-600 text-white shadow-xs'
-              : 'text-gray-600 dark:text-gray-300 hover:text-gray-900'
+            activeTab === 'upgrades'
+              ? 'bg-amber-600 text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
           }`}
         >
-          <FileCheck size={15} />
-          <span>Manual Pro Verifications</span>
-          {pendingVerificationsCount > 0 ? (
-            <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500 text-slate-950 animate-pulse">
-              {pendingVerificationsCount} PENDING
-            </span>
-          ) : (
-            <span className="text-[10px] font-mono text-gray-400">({verifications.length})</span>
-          )}
+          <Lightbulb size={15} className={newUpgradesCount > 0 ? 'text-amber-300' : ''} />
+          <span>AI Upgrades &amp; Ideas {newUpgradesCount > 0 ? `(${newUpgradesCount} new)` : `(${upgradeFeedbacks.length})`}</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('complaints')}
+          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'complaints'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
+          }`}
+        >
+          <Bot size={15} />
+          <span>Support &amp; Bot ({openTickets})</span>
         </button>
 
         <button
           onClick={() => setActiveTab('members')}
           className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
             activeTab === 'members'
-              ? 'bg-purple-600 text-white shadow-xs'
-              : 'text-gray-600 dark:text-gray-300 hover:text-gray-900'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
           }`}
         >
           <UserCheck size={15} />
-          <span>Member Moderation ({totalUsers})</span>
+          <span>Banning &amp; Members ({totalUsers})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('audit')}
+          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'audit'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
+          }`}
+        >
+          <ShieldAlert size={15} />
+          <span>Audit Log &amp; Reports ({auditLogs.length + openReportsCount})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('updates_group')}
+          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'updates_group'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
+          }`}
+        >
+          <Rss size={15} />
+          <span>Admin-Only Updates Group</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('verifications')}
+          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'verifications'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
+          }`}
+        >
+          <FileCheck size={15} />
+          <span>Pro Approvals ({pendingVerificationsCount})</span>
         </button>
 
         <button
           onClick={() => setActiveTab('calls')}
           className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
             activeTab === 'calls'
-              ? 'bg-purple-600 text-white shadow-xs'
-              : 'text-gray-600 dark:text-gray-300 hover:text-gray-900'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
           }`}
         >
           <Video size={15} />
-          <span>WebRTC Calling Controls</span>
+          <span>Calling Controls</span>
         </button>
 
         <button
           onClick={() => setActiveTab('payments')}
           className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
             activeTab === 'payments'
-              ? 'bg-purple-600 text-white shadow-xs'
-              : 'text-gray-600 dark:text-gray-300 hover:text-gray-900'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
           }`}
         >
           <Key size={15} />
-          <span>Payment API Keys & Gateways</span>
+          <span>Payment Gateways</span>
         </button>
       </div>
 
       {actionFeedback && (
-        <div className="p-4 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs sm:text-sm flex items-center justify-between gap-3 animate-in fade-in">
+        <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs sm:text-sm flex items-center justify-between gap-3 animate-in fade-in">
           <span>{actionFeedback}</span>
           <button
             type="button"
             onClick={() => setActionFeedback(null)}
-            className="text-emerald-300 hover:text-white text-xs px-2 py-1 rounded-lg hover:bg-emerald-500/20"
+            className="text-emerald-700 hover:text-emerald-950 text-xs px-2 py-1 rounded-lg"
           >
             ✕
           </button>
         </div>
       )}
+
+      {/* Tab: AI Upgrades & Founder Feedback Inbox */}
+      {activeTab === 'upgrades' && (
+        <div className="space-y-6 animate-fade-in">
+          {/* Header Card */}
+          <div className="bg-gradient-to-r from-amber-500 via-orange-600 to-rose-600 rounded-3xl p-6 sm:p-8 text-white shadow-xl shadow-amber-950/20 flex items-center justify-between flex-wrap gap-4 border border-amber-300/30">
+            <div className="max-w-2xl">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="p-1 rounded-lg bg-white/20 text-white ring-1 ring-white/30 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1.5 px-2.5">
+                  <Lightbulb size={13} />
+                  AI Upgrade Intelligence Hub
+                </span>
+                <span className="text-xs text-amber-100">
+                  Direct Line for <span className="font-bold">{ADMIN_EMAIL}</span>
+                </span>
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
+                AI Upgrades &amp; Feature Feedback
+              </h2>
+              <p className="text-xs sm:text-sm text-amber-100/90 mt-1">
+                Real suggestions, requests, and ideas collected autonomously by AI's Live Talks, WELINK AI Assistant, and WaveLink Support Bot. Review ideas, update their status, and add implementation notes as you ship upgrades!
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowManualUpgradeModal(true)}
+                className="px-4 py-2.5 rounded-2xl bg-white text-stone-900 font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-md hover:bg-amber-50 transition active:scale-95"
+              >
+                <Sparkles size={16} className="text-amber-600" />
+                <span>+ Add Upgrade Idea</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Metric Stats Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="p-4 rounded-2xl bg-white border border-[#EFECE6] shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                Total Ideas Collected
+              </span>
+              <div className="text-2xl font-black font-mono text-[#1C1917] mt-1">
+                {upgradeFeedbacks.length}
+              </div>
+              <span className="text-[11px] text-[#2563EB] font-semibold">
+                Across all AI sources
+              </span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-amber-50/80 border border-amber-200/80 shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-amber-800 block">
+                New / Unreviewed
+              </span>
+              <div className="text-2xl font-black font-mono text-amber-900 mt-1">
+                {upgradeFeedbacks.filter((u) => u.status === 'new').length}
+              </div>
+              <span className="text-[11px] text-amber-700 font-semibold">
+                Awaiting review
+              </span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-purple-50/80 border border-purple-200/80 shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-purple-800 block">
+                Planned Updates
+              </span>
+              <div className="text-2xl font-black font-mono text-purple-900 mt-1">
+                {upgradeFeedbacks.filter((u) => u.status === 'planned').length}
+              </div>
+              <span className="text-[11px] text-purple-700 font-semibold">
+                In founder roadmap
+              </span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-emerald-50/80 border border-emerald-200/80 shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-emerald-800 block">
+                Shipped &amp; Implemented
+              </span>
+              <div className="text-2xl font-black font-mono text-emerald-900 mt-1">
+                {upgradeFeedbacks.filter((u) => u.status === 'implemented').length}
+              </div>
+              <span className="text-[11px] text-emerald-700 font-semibold">
+                Active in WaveLink
+              </span>
+            </div>
+          </div>
+
+          {/* Filter & Search Bar */}
+          <div className="bg-white border border-[#EFECE6] rounded-3xl p-4 sm:p-5 shadow-xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              {/* Status Filter Tabs */}
+              <div className="flex items-center gap-1 overflow-x-auto pb-1 sm:pb-0">
+                {(['all', 'new', 'planned', 'implemented', 'archived'] as const).map((st) => (
+                  <button
+                    key={st}
+                    type="button"
+                    onClick={() => setFeedbackStatusFilter(st)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-bold capitalize transition whitespace-nowrap ${
+                      feedbackStatusFilter === st
+                        ? 'bg-[#1C1917] text-white'
+                        : 'bg-[#FAF7F2] text-[#57534E] hover:text-[#1C1917]'
+                    }`}
+                  >
+                    {st === 'all'
+                      ? `All (${upgradeFeedbacks.length})`
+                      : st === 'new'
+                      ? `New (${upgradeFeedbacks.filter((u) => u.status === 'new').length})`
+                      : st === 'planned'
+                      ? `Planned (${upgradeFeedbacks.filter((u) => u.status === 'planned').length})`
+                      : st === 'implemented'
+                      ? `Implemented (${upgradeFeedbacks.filter((u) => u.status === 'implemented').length})`
+                      : `Archived (${upgradeFeedbacks.filter((u) => u.status === 'archived').length})`}
+                  </button>
+                ))}
+              </div>
+
+              {/* Search */}
+              <div className="relative min-w-[220px]">
+                <input
+                  type="text"
+                  value={feedbackSearch}
+                  onChange={(e) => setFeedbackSearch(e.target.value)}
+                  placeholder="Search upgrades..."
+                  className="w-full px-3 py-1.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-xs text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-amber-500"
+                />
+                {feedbackSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setFeedbackSearch('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600 text-xs"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Source Filter */}
+            <div className="flex items-center gap-2 flex-wrap pt-2 border-t border-[#EFECE6] text-xs">
+              <span className="text-[#57534E] font-semibold flex items-center gap-1">
+                <Filter size={13} />
+                Source:
+              </span>
+              {(['all', 'welink_ai', 'live_talk', 'support_bot', 'user_manual'] as const).map((src) => (
+                <button
+                  key={src}
+                  type="button"
+                  onClick={() => setFeedbackSourceFilter(src)}
+                  className={`px-2.5 py-1 rounded-lg font-medium transition ${
+                    feedbackSourceFilter === src
+                      ? 'bg-amber-100 text-amber-900 font-bold'
+                      : 'text-[#57534E] hover:bg-stone-100'
+                  }`}
+                >
+                  {src === 'all'
+                    ? 'All Sources'
+                    : src === 'welink_ai'
+                    ? '🤖 WELINK AI'
+                    : src === 'live_talk'
+                    ? '🎙️ Live Talk'
+                    : src === 'support_bot'
+                    ? '💬 Support Bot'
+                    : '✍️ Founder Note'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Feedback Cards List */}
+          <div className="space-y-3">
+            {upgradeFeedbacks
+              .filter((item) => {
+                if (feedbackStatusFilter !== 'all' && item.status !== feedbackStatusFilter) return false;
+                if (feedbackSourceFilter !== 'all' && item.source !== feedbackSourceFilter) return false;
+                if (feedbackCategoryFilter !== 'all' && item.category !== feedbackCategoryFilter) return false;
+                if (feedbackSearch.trim()) {
+                  const q = feedbackSearch.toLowerCase();
+                  const matchTitle = item.title.toLowerCase().includes(q);
+                  const matchSummary = item.summary.toLowerCase().includes(q);
+                  const matchQuote = item.userQuote?.toLowerCase().includes(q);
+                  const matchUser = item.userName?.toLowerCase().includes(q);
+                  if (!matchTitle && !matchSummary && !matchQuote && !matchUser) return false;
+                }
+                return true;
+              })
+              .map((item) => (
+                <div
+                  key={item.id}
+                  className="bg-white border border-[#EFECE6] rounded-3xl p-5 shadow-xs space-y-4 hover:border-amber-300 transition"
+                >
+                  {/* Card Top: Badges and Source */}
+                  <div className="flex items-start justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {/* Status Badge */}
+                      <span
+                        className={`text-[10px] font-extrabold uppercase px-2.5 py-1 rounded-full ${
+                          item.status === 'new'
+                            ? 'bg-blue-100 text-blue-800 border border-blue-200'
+                            : item.status === 'planned'
+                            ? 'bg-purple-100 text-purple-800 border border-purple-200'
+                            : item.status === 'implemented'
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                            : 'bg-stone-100 text-stone-700 border border-stone-200'
+                        }`}
+                      >
+                        ● {item.status}
+                      </span>
+
+                      {/* Source Tag */}
+                      <span className="text-[11px] font-bold px-2 py-0.5 rounded-lg bg-[#FAF7F2] border border-[#EFECE6] text-[#57534E] flex items-center gap-1">
+                        {item.source === 'live_talk' && '🎙️ Live Voice / Talk'}
+                        {item.source === 'welink_ai' && '🤖 WELINK AI Chat'}
+                        {item.source === 'support_bot' && '💬 Support Bot DM'}
+                        {item.source === 'user_manual' && '✍️ Founder Idea'}
+                      </span>
+
+                      {/* Category Tag */}
+                      <span className="text-[11px] font-semibold text-[#0D9488] bg-teal-50 px-2 py-0.5 rounded-lg border border-teal-200">
+                        {item.category}
+                      </span>
+
+                      {/* Impact Tag */}
+                      <span
+                        className={`text-[11px] font-bold px-2 py-0.5 rounded-lg ${
+                          item.impact === 'high'
+                            ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                            : item.impact === 'medium'
+                            ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                            : 'bg-stone-50 text-stone-700'
+                        }`}
+                      >
+                        {item.impact === 'high' ? '🔥 High Impact' : item.impact === 'medium' ? '⚡ Medium' : '💡 Polish'}
+                      </span>
+                    </div>
+
+                    <div className="text-right text-[11px] text-[#78716C]">
+                      {new Date(item.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    </div>
+                  </div>
+
+                  {/* Title & Summary */}
+                  <div>
+                    <h3 className="text-base font-extrabold text-[#1C1917] tracking-tight">
+                      {item.title}
+                    </h3>
+                    <p className="text-xs sm:text-sm text-[#57534E] mt-1 leading-relaxed">
+                      {item.summary}
+                    </p>
+                  </div>
+
+                  {/* Original User Quote / Prompt */}
+                  {item.userQuote && (
+                    <div className="p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-xs text-[#57534E] italic">
+                      <div className="text-[10px] font-bold uppercase text-[#78716C] not-italic mb-1">
+                        User Prompt / Voice Transcript from {item.userName || 'Member'}:
+                      </div>
+                      &ldquo;{item.userQuote}&rdquo;
+                    </div>
+                  )}
+
+                  {/* Implementation Notes by Founder */}
+                  {item.notes && editingFeedbackNoteId !== item.id && (
+                    <div className="p-3 rounded-2xl bg-amber-50/70 border border-amber-200 text-xs text-amber-950">
+                      <div className="text-[10px] font-extrabold uppercase text-amber-800 mb-0.5">
+                        📌 Founder Implementation Notes:
+                      </div>
+                      {item.notes}
+                    </div>
+                  )}
+
+                  {/* Inline Note Editor */}
+                  {editingFeedbackNoteId === item.id && (
+                    <div className="space-y-2 p-3 bg-amber-50/70 rounded-2xl border border-amber-200">
+                      <label className="text-[11px] font-bold text-amber-900 block">
+                        Implementation Notes &amp; Action Plan:
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={feedbackNoteText}
+                        onChange={(e) => setFeedbackNoteText(e.target.value)}
+                        placeholder="e.g. Added background video upload queue with progress bar; shipped in v2.4"
+                        className="w-full p-2.5 rounded-xl bg-white border border-amber-300 text-xs text-stone-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingFeedbackNoteId(null);
+                            setFeedbackNoteText('');
+                          }}
+                          className="px-3 py-1.5 text-xs text-stone-600 hover:text-stone-900"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleSaveFeedbackNote(item.id)}
+                          className="px-3 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs"
+                        >
+                          Save Note
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Action Buttons */}
+                  <div className="flex items-center justify-between flex-wrap gap-2 pt-2 border-t border-[#EFECE6] text-xs">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[11px] text-[#78716C] font-semibold">
+                        Change Status:
+                      </span>
+                      {item.status !== 'new' && (
+                        <button
+                          type="button"
+                          disabled={isUpdatingFeedback}
+                          onClick={() => handleUpdateFeedbackStatus(item.id, 'new')}
+                          className="px-2.5 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 font-bold transition"
+                        >
+                          Mark New
+                        </button>
+                      )}
+                      {item.status !== 'planned' && (
+                        <button
+                          type="button"
+                          disabled={isUpdatingFeedback}
+                          onClick={() => handleUpdateFeedbackStatus(item.id, 'planned')}
+                          className="px-2.5 py-1 rounded-lg bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold transition"
+                        >
+                          📌 Plan for Release
+                        </button>
+                      )}
+                      {item.status !== 'implemented' && (
+                        <button
+                          type="button"
+                          disabled={isUpdatingFeedback}
+                          onClick={() => handleUpdateFeedbackStatus(item.id, 'implemented')}
+                          className="px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-bold transition"
+                        >
+                          ✅ Mark Implemented
+                        </button>
+                      )}
+                      {item.status !== 'archived' && (
+                        <button
+                          type="button"
+                          disabled={isUpdatingFeedback}
+                          onClick={() => handleUpdateFeedbackStatus(item.id, 'archived')}
+                          className="px-2.5 py-1 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold transition"
+                        >
+                          Archive
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingFeedbackNoteId(item.id);
+                          setFeedbackNoteText(item.notes || '');
+                        }}
+                        className="text-xs font-bold text-[#2563EB] hover:underline"
+                      >
+                        {item.notes ? 'Edit Note' : '+ Add Note'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteFeedback(item.id)}
+                        className="text-stone-400 hover:text-rose-600 transition p-1"
+                        title="Delete this idea"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+            {upgradeFeedbacks.length === 0 && (
+              <div className="p-12 text-center bg-white border border-[#EFECE6] rounded-3xl space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 mx-auto flex items-center justify-center">
+                  <Lightbulb size={24} />
+                </div>
+                <h3 className="font-extrabold text-base text-[#1C1917]">
+                  No Upgrade Ideas in Feedback Inbox Yet
+                </h3>
+                <p className="text-xs text-[#57534E] max-w-md mx-auto">
+                  When members talk to WELINK AI, speak in Live Talks voice mode, or ask questions to WaveLink Support Bot, platform upgrade ideas and feature suggestions will appear here automatically!
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setShowManualUpgradeModal(true)}
+                  className="px-4 py-2 rounded-xl bg-amber-600 text-white font-bold text-xs hover:bg-amber-700 transition"
+                >
+                  + Add Your First Upgrade Idea
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Tab: Support Section (Tickets, WaveLink Support Bot Switch, Scheduled Bot Posts, Bot Conversation Logs) */}
+      {activeTab === 'complaints' && (
+        <div className="space-y-6">
+          {/* 1. WaveLink Support Bot Master Control & Daily Gemini Quota Card */}
+          <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-5">
+            <div className="flex items-start justify-between flex-wrap gap-4 border-b border-[#EFECE6] pb-4">
+              <div className="flex items-center gap-3.5">
+                <div className="w-12 h-12 rounded-2xl bg-teal-50 text-[#0D9488] border border-teal-200 flex items-center justify-center shrink-0">
+                  <Bot size={24} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <CrystalBadge
+                      email={SUPPORT_BOT_EMAIL}
+                      name={SUPPORT_BOT_PROFILE.displayName}
+                      isBot={true}
+                      size="md"
+                    />
+                    <span className="text-xs font-mono text-[#57534E]">
+                      ({SUPPORT_BOT_EMAIL} • Zero Admin Powers)
+                    </span>
+                  </div>
+                  <p className="text-xs text-[#57534E] mt-1 max-w-2xl">
+                    Dedicated automated support assistant in English &amp; Swahili. Answers questions about Sparks, Reels, chats, Pro, themes, payments &amp; safety, and automatically creates escalated tickets for human follow-up.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <div className="text-right">
+                  <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                    Bot Status
+                  </span>
+                  <span
+                    className={`text-xs font-extrabold ${
+                      botConfig.enabled ? 'text-[#0D9488]' : 'text-rose-600'
+                    }`}
+                  >
+                    {botConfig.enabled ? 'ACTIVE (Answering DMs)' : 'PAUSED (Human Queue Only)'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleToggleSupportBot}
+                  className={`px-4 py-2.5 rounded-2xl font-extrabold text-xs flex items-center gap-2 transition shadow-xs ${
+                    botConfig.enabled
+                      ? 'bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200'
+                      : 'bg-[#0D9488] hover:bg-teal-700 text-white'
+                  }`}
+                >
+                  <Power size={15} />
+                  <span>{botConfig.enabled ? 'Turn Bot OFF' : 'Turn Bot ON'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Credit Protection & Rate Limit Metrics */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6]">
+                <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                  Daily Gemini Credit Cap
+                </span>
+                <div className="text-lg font-black font-mono text-[#1C1917] mt-1">
+                  {botConfig.dailyGeminiUsed || 0} / {botConfig.dailyGeminiCap || 250} replies
+                </div>
+                <span className="text-[11px] text-[#0D9488] font-semibold">
+                  Credits protected • Auto-falls back to KB when full
+                </span>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6]">
+                <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                  Per-User Rate &amp; Length Limits
+                </span>
+                <div className="text-lg font-black font-mono text-[#1C1917] mt-1">
+                  {botConfig.userRateLimitPerMinute || 8} msgs / min • Max {botConfig.maxMessageLength || 600} chars
+                </div>
+                <span className="text-[11px] text-[#57534E]">
+                  Strict anti-abuse &amp; prompt-injection guard
+                </span>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6]">
+                <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                  Logged Bot Replies &amp; Reports
+                </span>
+                <div className="text-lg font-black font-mono text-[#1C1917] mt-1">
+                  {botLogs.length} logged • {botLogs.filter((l) => l.reportedBadReply).length} reported
+                </div>
+                <span className="text-[11px] text-[#57534E]">
+                  Every bot reply is audited below
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* 2. Scheduled Bot Posts (Weekly Community Update & Spark of the Day) */}
+          <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-5">
+            <div>
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200 text-xs font-bold uppercase tracking-wider mb-1.5">
+                <Flame size={13} />
+                <span>Scheduled Bot Publishing</span>
+              </span>
+              <h3 className="text-lg font-extrabold text-[#1C1917]">
+                Weekly Community Update &amp; Spark of the Day Drafts
+              </h3>
+              <p className="text-xs text-[#57534E] mt-0.5">
+                Create and approve drafts for <strong>WaveLink Support</strong> to post on a schedule. Never uses your personal admin account.
+              </p>
+            </div>
+
+            <form onSubmit={handleCreateBotDraft} className="grid grid-cols-1 md:grid-cols-12 gap-3 p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6]">
+              <div className="md:col-span-3">
+                <label className="block text-[11px] font-bold text-[#1C1917] mb-1">Post Type</label>
+                <select
+                  value={draftType}
+                  onChange={(e) => setDraftType(e.target.value as 'weekly_update' | 'spark_of_the_day')}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-[#D6D3CD] text-xs font-bold text-[#1C1917]"
+                >
+                  <option value="weekly_update">📢 Weekly Community Update</option>
+                  <option value="spark_of_the_day">✨ Spark of the Day (24h)</option>
+                </select>
+              </div>
+
+              <div className="md:col-span-4">
+                <label className="block text-[11px] font-bold text-[#1C1917] mb-1">Headline / Title</label>
+                <input
+                  type="text"
+                  required
+                  value={draftTitle}
+                  onChange={(e) => setDraftTitle(e.target.value)}
+                  placeholder="e.g. Friday Creator Spotlight & Tips"
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-[#D6D3CD] text-xs text-[#1C1917]"
+                />
+              </div>
+
+              <div className="md:col-span-5">
+                <label className="block text-[11px] font-bold text-[#1C1917] mb-1">Schedule Time (Optional)</label>
+                <input
+                  type="datetime-local"
+                  value={draftScheduleTime}
+                  onChange={(e) => setDraftScheduleTime(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-[#D6D3CD] text-xs text-[#1C1917]"
+                />
+              </div>
+
+              <div className="md:col-span-9">
+                <input
+                  type="text"
+                  required
+                  value={draftContent}
+                  onChange={(e) => setDraftContent(e.target.value)}
+                  placeholder="Write the community update or Spark of the Day message (English / Swahili)..."
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-[#D6D3CD] text-xs text-[#1C1917]"
+                />
+              </div>
+
+              <div className="md:col-span-3">
+                <button
+                  type="submit"
+                  disabled={isSavingDraft || !draftTitle.trim() || !draftContent.trim()}
+                  className="w-full h-full min-h-[38px] px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-extrabold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-50"
+                >
+                  <Save size={14} />
+                  <span>Save Draft</span>
+                </button>
+              </div>
+            </form>
+
+            {scheduledDrafts.length > 0 && (
+              <div className="space-y-2.5">
+                {scheduledDrafts.slice(0, 8).map((draft) => (
+                  <div
+                    key={draft.id}
+                    className="p-3.5 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] flex items-center justify-between gap-3 flex-wrap"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-teal-50 text-[#0D9488] border border-teal-200">
+                          {draft.type === 'weekly_update' ? 'Weekly Update' : 'Spark of the Day'}
+                        </span>
+                        <span className="font-extrabold text-xs text-[#1C1917]">{draft.title}</span>
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                            draft.status === 'posted'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : draft.status === 'approved'
+                              ? 'bg-blue-100 text-[#2563EB]'
+                              : 'bg-amber-100 text-amber-800'
+                          }`}
+                        >
+                          {draft.status}
+                        </span>
+                      </div>
+                      <p className="text-xs text-[#57534E] mt-1 line-clamp-2">{draft.content}</p>
+                      <span className="text-[10px] text-[#78716C] block mt-0.5">
+                        Scheduled: {new Date(draft.scheduledFor).toLocaleString()}
+                        {draft.approvedBy ? ` • Approved by ${draft.approvedBy}` : ''}
+                      </span>
+                    </div>
+
+                    {draft.status !== 'posted' && (
+                      <div className="flex items-center gap-2 shrink-0">
+                        {draft.status === 'draft' && (
+                          <button
+                            type="button"
+                            onClick={() => handleApproveBotDraft(draft)}
+                            className="px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-[#2563EB] border border-blue-200 text-xs font-bold transition"
+                          >
+                            Approve Schedule
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handlePublishBotDraftNow(draft)}
+                          className="px-3 py-1.5 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white text-xs font-bold transition flex items-center gap-1"
+                        >
+                          <Send size={12} />
+                          <span>Publish Now</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 3. Support Tickets & One-Tap Reply Inbox */}
+          <SupportDeskView />
+
+          {/* 4. Logged Bot Conversations & Reported Bad Replies */}
+          <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h3 className="text-base font-extrabold text-[#1C1917] flex items-center gap-2">
+                  <Bot size={18} className="text-[#0D9488]" />
+                  <span>WaveLink Support Bot Conversation Audit Log ({botLogs.length})</span>
+                </h3>
+                <p className="text-xs text-[#57534E]">
+                  Every automated bot answer is logged here for quality review. User-reported bad replies are highlighted in rose.
+                </p>
+              </div>
+            </div>
+
+            {botLogs.length === 0 ? (
+              <div className="py-8 text-center text-xs text-[#57534E]">
+                No bot conversations recorded yet. Send a message to WaveLink Support in Direct Messages to test!
+              </div>
+            ) : (
+              <div className="space-y-2.5 max-h-96 overflow-y-auto">
+                {botLogs.slice(0, 30).map((log) => (
+                  <div
+                    key={log.id}
+                    className={`p-4 rounded-2xl border text-xs space-y-1.5 ${
+                      log.reportedBadReply
+                        ? 'bg-rose-50/70 border-rose-300'
+                        : log.escalatedToTicketId
+                        ? 'bg-amber-50/60 border-amber-200'
+                        : 'bg-[#FAF7F2] border-[#EFECE6]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-[#1C1917]">{log.userName || log.userEmail}</span>
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-white border border-[#EFECE6] text-[#57534E]">
+                          {log.language === 'sw' ? 'Swahili' : 'English'}
+                        </span>
+                        {log.escalatedToTicketId && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">
+                            Escalated to Ticket ({log.escalatedToTicketId})
+                          </span>
+                        )}
+                        {log.reportedBadReply && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-600 text-white">
+                            ⚠️ Reported Bad Reply {log.reportReason ? `(${log.reportReason})` : ''}
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[11px] font-mono text-[#78716C]">
+                        {new Date(log.createdAt).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="text-[#57534E]">
+                      <strong className="text-[#1C1917]">User:</strong> {log.userMessage}
+                    </div>
+                    <div className="text-[#0D9488] font-medium">
+                      <strong className="text-[#1C1917]">Bot Reply:</strong> {log.botReply}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Tab: Admin Audit Log & Content Safety Reports */}
+      {activeTab === 'audit' && (
+        <div className="space-y-6">
+          {/* Content & User Safety Reports */}
+          <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h3 className="text-base font-extrabold text-[#1C1917] flex items-center gap-2">
+                  <Flag size={18} className="text-rose-600" />
+                  <span>User, Post &amp; Bot Safety Reports ({contentReports.length})</span>
+                </h3>
+                <p className="text-xs text-[#57534E]">
+                  Reports submitted by community members on posts, user profiles, or bot replies.
+                </p>
+              </div>
+            </div>
+
+            {contentReports.length === 0 ? (
+              <div className="py-8 text-center text-xs text-[#57534E]">
+                No safety reports pending.
+              </div>
+            ) : (
+              <div className="space-y-2.5 max-h-80 overflow-y-auto">
+                {contentReports.map((rep) => (
+                  <div
+                    key={rep.id}
+                    className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] flex items-center justify-between gap-4 flex-wrap text-xs"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-rose-100 text-rose-800">
+                          {rep.targetType}
+                        </span>
+                        <span className="font-bold text-[#1C1917]">
+                          Target: {rep.targetSummary || rep.targetId}
+                        </span>
+                        <span className="text-[11px] text-[#78716C]">
+                          • Reported by {rep.reporterEmail || rep.reporterId}
+                        </span>
+                      </div>
+                      <p className="text-[#57534E]">Reason: {rep.reason}</p>
+                      <span className="text-[10px] font-mono text-[#78716C] block">
+                        {new Date(rep.createdAt).toLocaleString()}
+                      </span>
+                    </div>
+
+                    {rep.status === 'open' ? (
+                      <button
+                        type="button"
+                        onClick={() => handleResolveReport(rep.id)}
+                        className="px-3 py-1.5 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs transition"
+                      >
+                        Mark Resolved
+                      </button>
+                    ) : (
+                      <span className="px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
+                        Resolved
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Immutable Admin Audit Log */}
+          <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-4">
+            <div>
+              <h3 className="text-base font-extrabold text-[#1C1917] flex items-center gap-2">
+                <FileText size={18} className="text-[#2563EB]" />
+                <span>Security &amp; Admin Audit Log ({auditLogs.length})</span>
+              </h3>
+              <p className="text-xs text-[#57534E]">
+                Permanent security record of bans, unbans, role changes, verifications, account deletions, and bot state changes.
+              </p>
+            </div>
+
+            {auditLogs.length === 0 ? (
+              <div className="py-8 text-center text-xs text-[#57534E]">
+                No administrative audit events recorded yet.
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-96 overflow-y-auto">
+                {auditLogs.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="p-3.5 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] flex items-center justify-between gap-3 flex-wrap text-xs"
+                  >
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-blue-50 text-[#2563EB] border border-blue-200">
+                          {entry.action.replace(/_/g, ' ')}
+                        </span>
+                        <span className="font-bold text-[#1C1917]">{entry.details}</span>
+                      </div>
+                      <span className="text-[11px] text-[#78716C] block">
+                        Actor: <strong className="font-mono">{entry.actorEmail}</strong>
+                        {entry.targetLabel ? ` → Target: ${entry.targetLabel}` : ''}
+                      </span>
+                    </div>
+                    <span className="text-[11px] font-mono text-[#78716C]">
+                      {new Date(entry.createdAt).toLocaleString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Tab: Admin-Only Updates Group */}
+      {activeTab === 'updates_group' && <AnnouncementsView />}
 
       {/* Tab 1: Overview */}
       {activeTab === 'overview' && (
@@ -707,7 +1995,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                   Payment Requests &amp; Transaction Verifications
                 </h3>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  1-Click approval queue for user payments sent to <strong>0787473334</strong>. Approving instantly grants <strong>user.isPro = true</strong>, adds the Verified Blue Star Pro badge, and strips all ads across their account.
+                  1-Click approval queue for user payments sent to <strong>WaveLink</strong>. Approving instantly grants <strong>user.isPro = true</strong>, adds the Verified Blue Star Pro badge, and strips all ads across their account.
                 </p>
               </div>
 
@@ -1797,6 +3085,112 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Modal: Add Manual Upgrade Idea */}
+      {showManualUpgradeModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-fade-in">
+          <form
+            onSubmit={handleCreateManualUpgrade}
+            className="w-full max-w-lg bg-white rounded-3xl p-6 shadow-2xl space-y-4 border border-[#EFECE6]"
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-amber-700">
+                <Lightbulb size={20} />
+                <h3 className="font-extrabold text-base text-stone-900">
+                  Record Platform Upgrade Idea
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowManualUpgradeModal(false)}
+                className="text-stone-400 hover:text-stone-600"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-stone-700 mb-1">
+                Upgrade Title:
+              </label>
+              <input
+                type="text"
+                required
+                value={manualTitle}
+                onChange={(e) => setManualTitle(e.target.value)}
+                placeholder="e.g. Group Video Calling with Screen Share"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-stone-50 border border-stone-200 text-xs sm:text-sm text-stone-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Category:
+                </label>
+                <select
+                  value={manualCategory}
+                  onChange={(e) => setManualCategory(e.target.value as UpgradeCategory)}
+                  className="w-full px-3 py-2 rounded-xl bg-stone-50 border border-stone-200 text-xs font-medium text-stone-900"
+                >
+                  <option value="features">Features</option>
+                  <option value="ui_ux">UI / UX Design</option>
+                  <option value="media_sparks">Media &amp; Sparks</option>
+                  <option value="video_calls">Video Calls &amp; Audio</option>
+                  <option value="performance">Speed &amp; Performance</option>
+                  <option value="monetization">Pro &amp; Monetization</option>
+                  <option value="other">General Idea</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Impact Rating:
+                </label>
+                <select
+                  value={manualImpact}
+                  onChange={(e) => setManualImpact(e.target.value as 'high' | 'medium' | 'low')}
+                  className="w-full px-3 py-2 rounded-xl bg-stone-50 border border-stone-200 text-xs font-medium text-stone-900"
+                >
+                  <option value="high">High Impact 🔥</option>
+                  <option value="medium">Medium Impact ⚡</option>
+                  <option value="low">Polish / Nice to have 💡</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-stone-700 mb-1">
+                Idea Summary &amp; Implementation Plan:
+              </label>
+              <textarea
+                rows={3}
+                value={manualSummary}
+                onChange={(e) => setManualSummary(e.target.value)}
+                placeholder="Describe how this feature should work and what value it brings to WaveLink creators..."
+                className="w-full p-3 rounded-xl bg-stone-50 border border-stone-200 text-xs sm:text-sm text-stone-900 focus:outline-none focus:ring-2 focus:ring-amber-500 resize-none"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowManualUpgradeModal(false)}
+                className="px-4 py-2 text-xs font-semibold rounded-xl text-stone-600 hover:bg-stone-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!manualTitle.trim()}
+                className="px-5 py-2.5 text-xs font-bold rounded-xl bg-amber-600 hover:bg-amber-700 text-white transition disabled:opacity-50"
+              >
+                Save to Feedback Inbox
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>

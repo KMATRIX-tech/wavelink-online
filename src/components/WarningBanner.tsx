@@ -10,17 +10,17 @@ export const WarningBanner: React.FC = () => {
   }
 
   return (
-    <div className="bg-amber-500/15 dark:bg-amber-950/40 border-b border-amber-500/30 px-4 py-3 text-amber-900 dark:text-amber-200">
+    <div className="bg-amber-50 border-b border-amber-200 px-4 py-3 text-amber-900">
       <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="p-1.5 rounded-lg bg-amber-500 text-white shrink-0">
             <AlertTriangle size={18} />
           </div>
           <div>
-            <p className="text-xs sm:text-sm font-bold">
+            <p className="text-xs sm:text-sm font-bold text-[#1C1917]">
               Account Notice from WaveLink Administration:
             </p>
-            <p className="text-xs sm:text-sm text-amber-800 dark:text-amber-300">
+            <p className="text-xs sm:text-sm text-amber-800 font-medium">
               "{userProfile.warningMessage}"
             </p>
           </div>

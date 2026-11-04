@@ -1,6 +1,7 @@
 import React from 'react';
-import { Sparkles, ShieldCheck, CheckCircle2, Star } from 'lucide-react';
+import { ShieldCheck, Star, Bot } from 'lucide-react';
 import { isAdminEmail } from '../firebase';
+import { isSupportBotUser } from '../utils/security';
 
 interface CrystalBadgeProps {
   email?: string | null;
@@ -10,7 +11,8 @@ interface CrystalBadgeProps {
   isPro?: boolean;
   hasBlueStar?: boolean;
   isSubAdmin?: boolean;
-  role?: 'super_admin' | 'sub_admin' | 'user';
+  isBot?: boolean;
+  role?: 'super_admin' | 'sub_admin' | 'user' | 'bot';
   proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
   size?: 'sm' | 'md' | 'lg';
 }
@@ -23,80 +25,71 @@ export const CrystalBadge: React.FC<CrystalBadgeProps> = ({
   isPro = false,
   hasBlueStar = false,
   isSubAdmin = false,
+  isBot = false,
   role,
-  proBadge = 'verified',
   size = 'md'
 }) => {
-  // STRICT RULE: Crystal sparkle is strictly and solely reserved for keylanmbilinyi5@gmail.com
-  const isSuperAdmin = isAdminEmail(email);
-  const isModerator = !isSuperAdmin && (isSubAdmin || role === 'sub_admin');
-  const hasVerifiedBlueStar = isPro || hasBlueStar;
+  const isAutomatedBot = Boolean(isBot || role === 'bot' || isSupportBotUser(email));
+  const isSuperAdmin = !isAutomatedBot && isAdminEmail(email);
+  const isModerator = !isAutomatedBot && !isSuperAdmin && (isSubAdmin || role === 'sub_admin');
+  const hasProBadge = !isAutomatedBot && (isPro || hasBlueStar);
 
   const textSize = size === 'sm' ? 'text-xs' : size === 'lg' ? 'text-lg' : 'text-sm sm:text-base';
-  const iconSize = size === 'sm' ? 12 : size === 'lg' ? 18 : 14;
 
-  // 1. Super Admin (keylanmbilinyi5@gmail.com) - Exclusive custom .crystal-sparkle CSS badge
-  if (isSuperAdmin) {
+  if (isAutomatedBot) {
     return (
       <span className={`inline-flex items-center gap-1.5 flex-wrap ${className}`}>
-        <span className="crystal-sparkle-container">
-          <Sparkles size={iconSize} className="sparkle-icon" />
-          <span className={`crystal-sparkle ${textSize}`}>
-            {name}
-          </span>
-        </span>
-        {showAdminTag && (
-          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold tracking-wide uppercase rounded-full bg-gradient-to-r from-purple-600 via-indigo-600 to-pink-500 text-white shadow-sm ring-1 ring-purple-400/40">
-            <ShieldCheck size={11} className="text-white" />
-            Super Admin
-          </span>
-        )}
-      </span>
-    );
-  }
-
-  // 2. Sub-Admin / Moderator (Appointed by Super Admin with limited powers)
-  if (isModerator) {
-    return (
-      <span className={`inline-flex items-center gap-1.5 flex-wrap ${className}`}>
-        <span className={`font-semibold text-gray-900 dark:text-gray-100 ${textSize}`}>
+        <span className={`font-bold text-[#1C1917] ${textSize}`}>
           {name}
         </span>
         <span
-          title="Appointed Moderator (Sub-Admin)"
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300 ring-1 ring-indigo-400/40"
+          title="Automated WaveLink Support Assistant (No Admin Powers)"
+          className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide rounded-full bg-teal-50 text-[#0D9488] border border-teal-300"
         >
-          <ShieldCheck size={11} className="text-indigo-600 dark:text-indigo-400" />
-          <span>Moderator</span>
+          <Bot size={11} className="text-[#0D9488]" />
+          <span>Bot</span>
         </span>
       </span>
     );
   }
 
-  // 3. Verified Blue Star Member (WaveLink Pro / Verified Subscribers)
-  if (hasVerifiedBlueStar) {
+  // Single small badge rule: never stack multiple admin/pro badges
+  if ((isSuperAdmin || isModerator) && showAdminTag) {
     return (
       <span className={`inline-flex items-center gap-1.5 flex-wrap ${className}`}>
-        <span className={`font-semibold text-gray-900 dark:text-gray-100 ${textSize}`}>
+        <span className={`font-bold text-[#1C1917] ${textSize}`}>
           {name}
         </span>
         <span
-          title="Verified Blue Star Subscriber - WaveLink Pro"
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold tracking-wider bg-sky-50 dark:bg-sky-950/60 text-sky-600 dark:text-sky-300 ring-1 ring-sky-400/50 shadow-xs"
+          title="WaveLink Admin"
+          className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold rounded-full bg-blue-50 text-[#2563EB] border border-blue-200/80"
         >
-          <Star
-            size={12}
-            className="text-sky-500 fill-sky-400 drop-shadow-[0_0_6px_rgba(14,165,233,0.7)] animate-pulse"
-          />
-          <span className="font-mono text-[9px] uppercase font-black">BLUE STAR</span>
+          <ShieldCheck size={11} className="text-[#2563EB]" />
+          <span>Admin</span>
         </span>
       </span>
     );
   }
 
-  // Standard Community Member
+  if (hasProBadge) {
+    return (
+      <span className={`inline-flex items-center gap-1.5 flex-wrap ${className}`}>
+        <span className={`font-bold text-[#1C1917] ${textSize}`}>
+          {name}
+        </span>
+        <span
+          title="WaveLink Pro Member"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200/80"
+        >
+          <Star size={10} className="text-[#0D9488] fill-[#0D9488]" />
+          <span>Pro</span>
+        </span>
+      </span>
+    );
+  }
+
   return (
-    <span className={`font-semibold text-gray-900 dark:text-gray-100 ${textSize} ${className}`}>
+    <span className={`font-bold text-[#1C1917] ${textSize} ${className}`}>
       {name}
     </span>
   );

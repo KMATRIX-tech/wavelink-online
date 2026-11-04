@@ -4,13 +4,14 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { ThemeProvider } from './context/ThemeContext';
+import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
-import { testConnection, isOwnerEmail, ADMIN_EMAIL } from './firebase';
+import { db, testConnection } from './firebase';
+import { collection, query, where, onSnapshot, updateDoc, doc } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
+import { triggerHaptic } from './utils/haptics';
 import { ActiveTab, CallRecipient } from './types';
 import { AuthPage } from './components/AuthPage';
-import { Sidebar } from './components/Sidebar';
 import { TopHeader } from './components/TopHeader';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { WarningBanner } from './components/WarningBanner';
@@ -26,34 +27,123 @@ import { SettingsView } from './components/SettingsView';
 import { CreatorAnalyticsView } from './components/CreatorAnalyticsView';
 import { MonetizationHub } from './components/MonetizationHub';
 import { CallingModal } from './components/CallingModal';
-import { AdsterraManager } from './components/AdsterraManager';
-import { AdsterraAdBanner } from './components/AdsterraAdBanner';
 import { WelinkAssistantDrawer } from './components/WelinkAssistantDrawer';
-import { Waves, Sparkles, Crown } from 'lucide-react';
+import { SparkUploadQueueBanner } from './components/SparkUploadQueueBanner';
+import { Waves, PhoneCall, PhoneOff, Video } from 'lucide-react';
+
+interface IncomingCallData {
+  callId: string;
+  callerId: string;
+  callerName: string;
+  callerPhotoURL?: string;
+  callType: 'video' | 'voice';
+  offer?: any;
+}
 
 function MainApp() {
-  const { currentUser, userProfile, isLoading, isProEffective } = useAuth();
+  const { currentUser, userProfile, isLoading } = useAuth();
+  const { appearanceTheme, setAppearanceTheme } = useTheme();
 
   // Remember user's session tab from where they left off
   const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
     const saved = localStorage.getItem('wavelink_last_active_tab') as ActiveTab;
-    const validTabs: ActiveTab[] = ['feed', 'studio', 'videos', 'monetization', 'announcements', 'chat', 'directory', 'analytics', 'admin', 'settings'];
-    return (saved && validTabs.includes(saved)) ? saved : 'feed';
+    const validTabs: ActiveTab[] = [
+      'feed',
+      'studio',
+      'videos',
+      'monetization',
+      'announcements',
+      'chat',
+      'directory',
+      'analytics',
+      'admin',
+      'settings'
+    ];
+    return saved && validTabs.includes(saved) ? saved : 'feed';
   });
-
 
   const [targetChatUserId, setTargetChatUserId] = useState<string | undefined>(() => {
     return localStorage.getItem('wavelink_last_chat_target') || undefined;
   });
 
-  const [activeCall, setActiveCall] = useState<{ type: 'video' | 'voice'; recipient?: CallRecipient } | null>(null);
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [incomingCall, setIncomingCall] = useState<IncomingCallData | null>(null);
+  const [activeCall, setActiveCall] = useState<{
+    type: 'video' | 'voice';
+    recipient?: CallRecipient;
+    isInitiator?: boolean;
+    callId?: string;
+    initialOffer?: any;
+  } | null>(null);
   const [selectedHashtag, setSelectedHashtag] = useState<string | null>(null);
   const [isWelinkOpen, setIsWelinkOpen] = useState(false);
+  const [welinkInitialMode, setWelinkInitialMode] = useState<'chat' | 'image' | 'voice'>('chat');
+  const [unreadNotificationIds, setUnreadNotificationIds] = useState<string[]>([]);
+
+  // Global delegated haptic feedback for button and interactive tab interactions
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const handleGlobalInteractiveClick = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      const interactiveEl = target.closest(
+        'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), [role="tab"]:not([aria-disabled="true"])'
+      ) as HTMLElement | null;
+      if (interactiveEl) {
+        const isTabRole = interactiveEl.getAttribute('role') === 'tab';
+        triggerHaptic(isTabRole ? 'tab' : 'light');
+      }
+    };
+    document.addEventListener('click', handleGlobalInteractiveClick, { passive: true });
+    return () => {
+      document.removeEventListener('click', handleGlobalInteractiveClick);
+    };
+  }, []);
+
+  // Sync user's saved appearanceTheme from Firestore across devices
+  useEffect(() => {
+    if (userProfile?.appearanceTheme && userProfile.appearanceTheme !== appearanceTheme) {
+      setAppearanceTheme(userProfile.appearanceTheme);
+    }
+  }, [userProfile?.appearanceTheme]);
+
+  // Listen for unread reaction/reply notifications to display a small notification dot
+  useEffect(() => {
+    if (!currentUser?.uid) {
+      setUnreadNotificationIds([]);
+      return;
+    }
+    const q = query(
+      collection(db, 'notifications'),
+      where('recipientId', '==', currentUser.uid)
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const unread: string[] = [];
+        snap.forEach((d) => {
+          const data = d.data();
+          if (data && data.read === false) {
+            unread.push(d.id);
+          }
+        });
+        setUnreadNotificationIds(unread);
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [currentUser?.uid]);
 
   const setActiveTab = (tab: ActiveTab) => {
+    triggerHaptic(tab === 'studio' ? 'medium' : 'tab');
     setActiveTabState(tab);
     localStorage.setItem('wavelink_last_active_tab', tab);
+
+    // Clear unread notification dot when user checks Home or Profile
+    if ((tab === 'feed' || tab === 'settings') && unreadNotificationIds.length > 0) {
+      unreadNotificationIds.slice(0, 10).forEach((id) => {
+        updateDoc(doc(db, 'notifications', id), { read: true }).catch(() => {});
+      });
+    }
   };
 
   const handleStartChatWithUser = (userId: string) => {
@@ -62,155 +152,361 @@ function MainApp() {
     setActiveTab('chat');
   };
 
-  // Test Firestore connection on boot and record current domain in Firebase
   useEffect(() => {
     testConnection();
     recordSystemDomain();
   }, []);
 
+
+
+  // Soft pleasant Web Audio Ringtone loop for incoming calls
+  useEffect(() => {
+    if (!incomingCall) return;
+
+    let isPlaying = true;
+    let timer: any = null;
+    let audioCtx: AudioContext | null = null;
+
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioContextClass) {
+        audioCtx = new AudioContextClass();
+
+        const playChime = () => {
+          if (!isPlaying || !audioCtx || audioCtx.state === 'closed') return;
+          try {
+            const now = audioCtx.currentTime;
+            const osc1 = audioCtx.createOscillator();
+            const osc2 = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+
+            osc1.type = 'sine';
+            osc2.type = 'triangle';
+            osc1.frequency.setValueAtTime(523.25, now); // C5
+            osc1.frequency.setValueAtTime(659.25, now + 0.2); // E5
+            osc2.frequency.setValueAtTime(783.99, now + 0.4); // G5
+
+            gain.gain.setValueAtTime(0.06, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 1.2);
+
+            osc1.connect(gain);
+            osc2.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            osc1.start(now);
+            osc2.start(now + 0.2);
+            osc1.stop(now + 1.2);
+            osc2.stop(now + 1.2);
+
+            triggerHaptic('medium');
+          } catch (e) {
+            // Audio policy exception handling
+          }
+
+          timer = setTimeout(playChime, 2600);
+        };
+
+        playChime();
+      }
+    } catch {
+      // AudioContext unavailable
+    }
+
+    return () => {
+      isPlaying = false;
+      if (timer) clearTimeout(timer);
+      if (audioCtx && audioCtx.state !== 'closed') {
+        audioCtx.close().catch(() => {});
+      }
+    };
+  }, [Boolean(incomingCall)]);
+
+  // Real-time listener for incoming call signals via WebSocket
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    let isCleanedUp = false;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/chat/ws`;
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      if (isCleanedUp) return;
+      ws.send(
+        JSON.stringify({
+          type: 'chat:join',
+          channelId: `user_${currentUser.uid}`,
+          userId: currentUser.uid,
+          name: userProfile?.displayName || currentUser.displayName || 'Waver'
+        })
+      );
+    };
+
+    ws.onmessage = (event) => {
+      if (isCleanedUp) return;
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
+          if (data.signalType === 'offer') {
+            setIncomingCall({
+              callId: data.callId,
+              callerId: data.senderId,
+              callerName: data.senderName,
+              callerPhotoURL: data.senderPhotoURL,
+              callType: data.callType || 'video',
+              offer: data.sdp
+            });
+          } else if (data.signalType === 'end' || data.signalType === 'declined') {
+            setIncomingCall((prev) => (prev?.callId === data.callId ? null : prev));
+          }
+        }
+      } catch (err) {
+        console.warn('Incoming call signal parse notice:', err);
+      }
+    };
+
+    return () => {
+      isCleanedUp = true;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    };
+  }, [currentUser?.uid]);
+
+  const handleOpenCall = (type: 'video' | 'voice', recipient?: CallRecipient) => {
+    triggerHaptic('medium');
+    // Single popup rule: close any open drawer before opening call modal
+    setIsWelinkOpen(false);
+    const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    setActiveCall({
+      type,
+      recipient,
+      isInitiator: true,
+      callId
+    });
+  };
+
+  const handleAcceptIncomingCall = () => {
+    if (!incomingCall) return;
+    const { callId, callerId, callerName, callerPhotoURL, callType, offer } = incomingCall;
+    setIncomingCall(null);
+    setIsWelinkOpen(false);
+    setActiveCall({
+      type: callType,
+      recipient: {
+        id: callerId,
+        name: callerName,
+        photoURL: callerPhotoURL
+      },
+      isInitiator: false,
+      callId,
+      initialOffer: offer
+    });
+  };
+
+  const handleDeclineIncomingCall = () => {
+    if (!incomingCall) return;
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
+      ws.onopen = () => {
+        ws.send(
+          JSON.stringify({
+            type: 'call:signal',
+            callId: incomingCall.callId,
+            senderId: currentUser?.uid,
+            senderName: userProfile?.displayName || currentUser?.displayName || 'Waver',
+            targetUserId: incomingCall.callerId,
+            signalType: 'declined'
+          })
+        );
+        setTimeout(() => ws.close(), 300);
+      };
+    } catch {
+      // ws send error
+    }
+    setIncomingCall(null);
+  };
+
+  const handleOpenWelink = (mode: 'chat' | 'image' | 'voice' = 'chat') => {
+    triggerHaptic('medium');
+    // Single popup rule: close any active call modal before opening WELINK drawer
+    setActiveCall(null);
+    setWelinkInitialMode(mode);
+    setIsWelinkOpen(true);
+  };
+
   if (isLoading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A]">
-        <div className="p-4 rounded-3xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] text-white shadow-xl shadow-blue-500/20 mb-4 animate-bounce">
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+        <div className="p-4 rounded-3xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white shadow-lg mb-4 animate-bounce">
           <Waves size={36} />
         </div>
-        <h2 className="text-xl font-extrabold tracking-tight text-[#0F172A]">
+        <h2 className="text-xl font-extrabold tracking-tight text-[#1C1917]">
           WaveLink
         </h2>
-        <p className="text-xs text-slate-500 mt-1 font-medium">Opening your bright social space...</p>
+        <p className="text-xs text-[#78716C] mt-1 font-medium">
+          Opening your welcoming community space...
+        </p>
       </div>
     );
   }
 
-  // Unauthenticated user -> Unified AuthPage
   if (!currentUser) {
     return <AuthPage />;
   }
 
-  // Account suspended by admin
   if (userProfile?.isBanned) {
     return <BannedView onOpenSupport={() => setActiveTab('settings')} />;
   }
 
   return (
-    <div className="min-h-screen flex flex-row bg-[#F8FAFC] text-[#0F172A] antialiased">
-      {/* Modern Desktop Sidebar & Mobile Drawer Navigation */}
-      <Sidebar
+    <div className="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)] antialiased transition-colors duration-300">
+      {/* Top in-app warning notice if issued by admin */}
+      <WarningBanner />
+
+      {/* Top Header Bar (with non-floating WELINK button) */}
+      <TopHeader
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        isOpenMobile={isMobileMenuOpen}
-        onCloseMobile={() => setIsMobileMenuOpen(false)}
-        onOpenWelink={() => setIsWelinkOpen(true)}
+        onOpenMobileMenu={() => {}}
+        onNavigateTab={(tab) => setActiveTab(tab)}
+        onStartChat={handleStartChatWithUser}
+        onOpenWelink={handleOpenWelink}
+        hasUnreadNotifications={unreadNotificationIds.length > 0}
+        onSelectHashtag={(tag) => {
+          setSelectedHashtag(tag);
+          setActiveTab('feed');
+        }}
       />
 
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col min-w-0 min-h-screen bg-[#F8FAFC]">
-        {/* Top in-app warning notice if issued by admin */}
-        <WarningBanner />
+      {/* Main Body View */}
+      <main
+        className={`flex-1 w-full max-w-full overflow-x-hidden ${
+          activeTab === 'chat' ? 'pb-18' : 'pb-24'
+        }`}
+      >
+        {activeTab === 'feed' && (
+          <FeedView
+            onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
+            initialFilterTag={selectedHashtag}
+            onClearFilterTag={() => setSelectedHashtag(null)}
+            onOpenWelink={handleOpenWelink}
+            onStartChat={handleStartChatWithUser}
+          />
+        )}
+        {activeTab === 'studio' && (
+          <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
+        )}
+        {activeTab === 'videos' && (
+          <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
+        )}
+        {activeTab === 'announcements' && <AnnouncementsView />}
+        {activeTab === 'chat' && (
+          <ChatChannelsView
+            onOpenCall={handleOpenCall}
+            initialTargetUserId={targetChatUserId}
+          />
+        )}
+        {activeTab === 'directory' && (
+          <UserDirectoryView onStartChat={handleStartChatWithUser} />
+        )}
+        {activeTab === 'analytics' && (
+          <CreatorAnalyticsView onOpenUpgradeModal={() => setActiveTab('settings')} />
+        )}
+        {activeTab === 'monetization' && (
+          <MonetizationHub onNavigateToFeed={() => setActiveTab('feed')} />
+        )}
+        {activeTab === 'admin' && (
+          <AdminDashboard onReturnToFeed={() => setActiveTab('settings')} />
+        )}
+        {activeTab === 'settings' && (
+          <SettingsView onOpenAdminPanel={() => setActiveTab('admin')} />
+        )}
+      </main>
 
-        {/* Top Header Bar */}
-        <TopHeader
-          activeTab={activeTab}
-          onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
-          onNavigateTab={(tab) => setActiveTab(tab)}
-          onStartChat={handleStartChatWithUser}
-          onSelectHashtag={(tag) => {
-            setSelectedHashtag(tag);
-            setActiveTab('feed');
-          }}
-        />
+      {/* Non-blocking Background Spark Upload Queue Progress Tracker */}
+      <SparkUploadQueueBanner variant="floating" />
 
-        {/* Main Body View based on tab */}
-        <main className="flex-1 pb-24 md:pb-8 w-full max-w-full overflow-x-hidden">
-          {activeTab === 'feed' && (
-            <FeedView
-              onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
-              initialFilterTag={selectedHashtag}
-              onClearFilterTag={() => setSelectedHashtag(null)}
-            />
-          )}
-          {activeTab === 'studio' && (
-            <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
-          )}
-          {activeTab === 'videos' && (
-            <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
-          )}
-          {activeTab === 'announcements' && <AnnouncementsView />}
-          {activeTab === 'chat' && (
-            <ChatChannelsView
-              onOpenCall={(type, recipient) => setActiveCall({ type, recipient })}
-              initialTargetUserId={targetChatUserId}
-            />
-          )}
-          {activeTab === 'directory' && (
-            <UserDirectoryView onStartChat={handleStartChatWithUser} />
-          )}
-          {activeTab === 'analytics' && (
-            <CreatorAnalyticsView onOpenUpgradeModal={() => setActiveTab('monetization')} />
-          )}
-          {activeTab === 'monetization' && (
-            <MonetizationHub onNavigateToFeed={() => setActiveTab('feed')} />
-          )}
-          {activeTab === 'admin' && (
-            <AdminDashboard onReturnToFeed={() => setActiveTab('feed')} />
-          )}
-          {activeTab === 'settings' && <SettingsView />}
-
-        </main>
-      </div>
-
-      {/* Mobile Bottom Navigation Bar */}
+      {/* Bottom Tab Bar as the only main navigation */}
       <MobileBottomNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        hasUnreadNotifications={unreadNotificationIds.length > 0}
       />
 
-      {/* Floating WELINK AI Assistant Button */}
-      <button
-        type="button"
-        onClick={() => setIsWelinkOpen(true)}
-        className="fixed bottom-20 md:bottom-6 right-4 sm:right-6 z-40 group flex items-center gap-2.5 pl-3.5 pr-4 py-3 rounded-full bg-gradient-to-r from-[#2563eb] via-[#3B82F6] to-[#10B981] text-white shadow-xl shadow-blue-600/30 hover:shadow-blue-600/45 hover:scale-105 active:scale-95 transition-all duration-200 border border-white/30"
-        title="Open WELINK AI Community Guide"
-      >
-        <div className="relative flex items-center justify-center">
-          <Waves size={20} className="text-white" />
-          <Sparkles size={11} className="text-amber-200 absolute -top-1.5 -right-1.5 animate-pulse" />
-        </div>
-        <div className="flex flex-col items-start leading-none">
-          <span className="text-xs font-extrabold tracking-tight flex items-center gap-1">
-            <span>WELINK</span>
-            <Crown size={11} className="text-amber-200" />
-          </span>
-          <span className="text-[9px] font-bold text-blue-50">
-            {isProEffective ? 'Pro AI Guide' : 'Unlock Pro AI'}
-          </span>
-        </div>
-      </button>
-
-      {/* WELINK AI Assistant Drawer */}
+      {/* WELINK AI Assistant Drawer (Only one popup/drawer at a time, with clear close button) */}
       <WelinkAssistantDrawer
-        isOpen={isWelinkOpen}
+        isOpen={isWelinkOpen && !activeCall}
         onClose={() => setIsWelinkOpen(false)}
-        onOpenUpgrade={() => setActiveTab('monetization')}
+        onOpenUpgrade={() => setActiveTab('settings')}
+        initialMode={welinkInitialMode}
       />
 
-      {/* WebRTC Video & Voice Calling Overlay Modal (Only for person you chat with) */}
-      {activeCall && (
+      {/* Incoming Call Notification Ringing Alert Dialog */}
+      {incomingCall && !activeCall && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in">
+          <div className="w-full max-w-sm bg-white rounded-3xl p-6 shadow-2xl border border-stone-200 text-center space-y-4">
+            <div className="relative mx-auto w-24 h-24">
+              <div className="absolute inset-0 rounded-full bg-emerald-500/20 animate-ping" />
+              <img
+                src={
+                  incomingCall.callerPhotoURL ||
+                  `https://api.dicebear.com/7.x/shapes/svg?seed=${incomingCall.callerId}`
+                }
+                alt={incomingCall.callerName}
+                className="w-full h-full rounded-full object-cover ring-4 ring-emerald-500 shadow-lg relative bg-white"
+              />
+              <div className="absolute -bottom-1 -right-1 p-2 rounded-full bg-emerald-500 text-white shadow-md">
+                {incomingCall.callType === 'video' ? <Video size={16} /> : <PhoneCall size={16} />}
+              </div>
+            </div>
+
+            <div>
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-extrabold uppercase tracking-wider mb-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <span>Incoming {incomingCall.callType === 'video' ? 'Video' : 'Voice'} Call</span>
+              </span>
+              <h3 className="text-xl font-black text-stone-900 tracking-tight">
+                {incomingCall.callerName}
+              </h3>
+              <p className="text-xs text-stone-500 mt-1">
+                Wants to connect with you via live {incomingCall.callType} call!
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 pt-2">
+              <button
+                type="button"
+                onClick={handleDeclineIncomingCall}
+                className="min-h-[44px] py-3 px-4 rounded-2xl bg-stone-100 hover:bg-stone-200 text-rose-600 font-extrabold text-xs flex items-center justify-center gap-1.5 transition active:scale-95"
+              >
+                <PhoneOff size={16} />
+                <span>Decline</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleAcceptIncomingCall}
+                className="min-h-[44px] py-3 px-4 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-600/30 transition active:scale-95 animate-pulse"
+              >
+                <PhoneCall size={16} />
+                <span>Accept</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* WebRTC Video & Voice Calling Overlay Modal (Single popup discipline) */}
+      {activeCall && !isWelinkOpen && (
         <CallingModal
           initialType={activeCall.type}
           recipient={activeCall.recipient}
+          isInitiator={activeCall.isInitiator}
+          callId={activeCall.callId}
+          initialOffer={activeCall.initialOffer}
           onClose={() => setActiveCall(null)}
         />
       )}
-
-      {/* Global Adsterra Script & Ad Unit Lifecycle Controller (Hidden for Pro, Blue Star & Admin) */}
-      <AdsterraManager />
-
-      {/* Adsterra Social Bar Banner (Visible only for free users, instant auto-hide when upgrading to Pro) */}
-      <AdsterraAdBanner
-        variant="social_bar"
-        onOpenUpgradeModal={() => setActiveTab('monetization')}
-      />
     </div>
   );
 }

@@ -1,24 +1,28 @@
 import React, { useState, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
-import { doc, setDoc } from 'firebase/firestore';
 import { OnlineSong } from '../types';
-import { saveVideoPost, compressImage, generateVideoThumbnail } from '../utils/mediaStorage';
+import {
+  compressImage,
+  cloneVideoFileToMemory,
+  validateSparkMediaBeforeUpload,
+  formatSparkDuration,
+  SPARK_MAX_FILE_MB,
+  FREE_SPARK_MAX_SECONDS,
+  PRO_SPARK_MAX_SECONDS,
+  SparkVideoMetadata
+} from '../utils/mediaStorage';
+import { enqueueSparkUploadJob } from '../services/sparkUploadQueue';
 import { SongSelectorModal } from './SongSelectorModal';
 import {
   Flame,
   Zap,
   Camera,
   Image as ImageIcon,
-  Video as VideoIcon,
   Music,
   X,
   Upload,
   Clock,
-  Sparkles,
-  Trophy,
-  Check,
-  Disc
+  Trophy
 } from 'lucide-react';
 
 interface SparkComposerModalProps {
@@ -43,14 +47,21 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
   onClose,
   onSparkCreated
 }) => {
-  const { currentUser, userProfile } = useAuth();
+  const { currentUser, userProfile, isAdmin, isProEffective } = useAuth();
+  const isProTier = Boolean(isProEffective || isAdmin);
 
   const [mediaDataUrl, setMediaDataUrl] = useState<string>('');
   const [mediaType, setMediaType] = useState<'image' | 'video' | 'none'>('none');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [videoMeta, setVideoMeta] = useState<SparkVideoMetadata | null>(null);
   const [selectedTag, setSelectedTag] = useState(LEGENDARY_TAGS[0]);
   const [customTag, setCustomTag] = useState('');
   const [caption, setCaption] = useState('');
+
+  const [feedbackNotice, setFeedbackNotice] = useState<{
+    text: string;
+    showTryProNote?: boolean;
+  } | null>(null);
 
   // Attached online song
   const [attachedSong, setAttachedSong] = useState<OnlineSong | null>(null);
@@ -59,32 +70,45 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
   // Uploading state & real-time progress percentage
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatusText, setUploadStatusText] = useState('');
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
-  const videoInputRef = useRef<HTMLInputElement | null>(null);
 
   if (!isOpen) return null;
 
   const handleFileSelect = async (file: File) => {
-    const isVideo = file.type.startsWith('video/');
-    const isImage = file.type.startsWith('image/');
+    setFeedbackNotice(null);
+    const validation = await validateSparkMediaBeforeUpload(file, isProTier);
 
-    if (!isVideo && !isImage) {
-      console.warn('Please select an image or video file from your phone/device.');
+    if (!validation.valid) {
+      setFeedbackNotice({
+        text:
+          validation.error ||
+          (!isProTier
+            ? 'Free Sparks can be up to 60 seconds. Go Pro for 90.'
+            : 'Please select a valid photo or video file.'),
+        showTryProNote: Boolean(validation.showTryProNote)
+      });
       return;
     }
 
-    setSelectedFile(file);
-    setMediaType(isVideo ? 'video' : 'image');
-
-    if (isImage) {
-      // Automatically compress image client-side to ensure it safely fits well within Firestore limits
+    if (validation.mediaType === 'image') {
+      setSelectedFile(file);
+      setMediaType('image');
+      setVideoMeta(null);
       const compressed = await compressImage(file, 1280, 1280, 0.78);
       setMediaDataUrl(compressed);
     } else {
-      // For video preview, use object URL for instant zero-latency preview
-      const previewUrl = URL.createObjectURL(file);
+      const safeVideo = await cloneVideoFileToMemory(file);
+      setSelectedFile(safeVideo);
+      setMediaType('video');
+      setVideoMeta({
+        durationSeconds: validation.durationSeconds || 3,
+        width: validation.width || 720,
+        height: validation.height || 1280
+      });
+      const previewUrl = URL.createObjectURL(safeVideo);
       setMediaDataUrl(previewUrl);
     }
   };
@@ -93,105 +117,62 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
     setMediaDataUrl('');
     setMediaType('none');
     setSelectedFile(null);
+    setVideoMeta(null);
+    setFeedbackNotice(null);
   };
 
   const handleCreateSpark = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentUser || !mediaDataUrl) {
-      console.warn('Please select a photo or video for your legendary Spark moment.');
+    if (!currentUser || !mediaDataUrl || mediaType === 'none') {
       return;
     }
 
     setIsUploading(true);
-    setUploadProgress(10);
+    setUploadProgress(15);
+    setUploadStatusText('Queuing Spark for background upload...');
+    setFeedbackNotice(null);
 
-    try {
-      const sparkId = `spark_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      const now = new Date();
-      // Strictly 24 hours lifetime
-      const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+    const finalTag = customTag.trim() || selectedTag;
 
-      const finalTag = customTag.trim() || selectedTag;
-
-      const sparkPayload: Record<string, any> = {
-        id: sparkId,
-        authorId: currentUser.uid,
-        authorEmail: currentUser.email || '',
-        authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
-        authorUsername: userProfile?.username || `@${currentUser.email?.split('@')[0] || 'waver'}`,
-        authorPhotoURL:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
-        legendaryTag: finalTag,
-        caption: caption.trim(),
-        mediaType: mediaType,
-        likes: [],
-        likesCount: 0,
-        createdAt: now.toISOString(),
-        expiresAt: expiresAt
-      };
-
-      if (attachedSong) {
-        sparkPayload.songTitle = attachedSong.trackName;
-        sparkPayload.songArtist = attachedSong.artistName;
-        sparkPayload.songAlbumArt = attachedSong.artworkUrl100;
-        sparkPayload.songPreviewUrl = attachedSong.previewUrl;
-      }
-
-      if (mediaType === 'image') {
-        let finalImageUrl = mediaDataUrl;
-        // Strict volumetric constraint: compress image if needed
-        if (selectedFile && (!finalImageUrl || finalImageUrl.length > 600 * 1024)) {
-          finalImageUrl = await compressImage(selectedFile, 1280, 1280, 0.75);
+    enqueueSparkUploadJob({
+      authorId: currentUser.uid,
+      authorEmail: currentUser.email || '',
+      authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
+      authorUsername: userProfile?.username || `@${currentUser.email?.split('@')[0] || 'waver'}`,
+      authorPhotoURL:
+        userProfile?.photoURL ||
+        currentUser.photoURL ||
+        `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+      isProTier,
+      attachedSong,
+      slides: [
+        {
+          id: `slide_${Date.now()}`,
+          mediaDataUrl,
+          mediaType,
+          file: selectedFile,
+          videoMeta: videoMeta || undefined,
+          caption: caption.trim(),
+          legendaryTag: finalTag
         }
-        sparkPayload.mediaUrl = finalImageUrl;
-        setUploadProgress(80);
-      } else if (mediaType === 'video' && selectedFile) {
-        sparkPayload.videoFileName = selectedFile.name;
+      ],
+      onComplete: onSparkCreated
+    });
 
-        // Generate lightweight video poster thumbnail (~20KB)
-        const thumbnail = await generateVideoThumbnail(selectedFile);
-
-        // Convert video to data URL for chunking
-        const videoDataUrl = await new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = (e) => resolve(e.target?.result as string);
-          reader.onerror = () => resolve('');
-          reader.readAsDataURL(selectedFile);
-        });
-
-        // Fast concurrent chunk upload with live progress reporting
-        const { videoUrl: directUrl, hasVideoChunks } = await saveVideoPost(
-          sparkId,
-          selectedFile,
-          videoDataUrl,
-          'sparks',
-          (pct) => setUploadProgress(pct)
-        );
-
-        // If video fits in root (<650KB) use directUrl; otherwise use thumbnail and chunk flags
-        sparkPayload.mediaUrl = directUrl || thumbnail || '';
-        sparkPayload.hasVideoChunks = hasVideoChunks;
-      }
-
-      await setDoc(doc(db, 'sparks', sparkId), cleanFirestoreData(sparkPayload));
-      setUploadProgress(100);
-
-      if (onSparkCreated) onSparkCreated();
-      onClose();
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'sparks');
-    } finally {
-      setIsUploading(false);
-      setUploadProgress(0);
-    }
+    handleClearMedia();
+    setCaption('');
+    setCustomTag('');
+    setAttachedSong(null);
+    setIsUploading(false);
+    setUploadProgress(0);
+    setUploadStatusText('');
+    onClose();
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
       {/* Backdrop */}
-      <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm transition-opacity" onClick={onClose} />
+      <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm transition-opacity" onClick={isUploading ? undefined : onClose} />
 
       {/* Modal Dialog */}
       <div className="relative w-full max-w-xl bg-white rounded-3xl border border-slate-200/80 shadow-[0_12px_40px_-8px_rgba(15,23,42,0.14)] overflow-hidden z-10 animate-fade-in my-auto">
@@ -224,11 +205,36 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
 
           <p className="relative z-10 text-slate-600 text-xs mt-2 font-medium flex items-center gap-1.5">
             <Clock size={13} className="shrink-0 text-[#3B82F6]" />
-            <span>Sparks vanish automatically after 24 hours. Perfect for your greatest moments, clutch plays, and daily highlights!</span>
+            <span>
+              Sparks vanish automatically after 24 hours •{' '}
+              {isProTier
+                ? `Pro Video up to ${PRO_SPARK_MAX_SECONDS}s (Max ${SPARK_MAX_FILE_MB} MB)`
+                : `Free Video up to ${FREE_SPARK_MAX_SECONDS}s • Pro up to ${PRO_SPARK_MAX_SECONDS}s`}
+            </span>
           </p>
         </div>
 
         <form onSubmit={handleCreateSpark} className="p-5 sm:p-6 space-y-4">
+          {feedbackNotice && (
+            <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-slate-900 text-xs font-bold space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span>{feedbackNotice.text}</span>
+                <button
+                  type="button"
+                  onClick={() => setFeedbackNotice(null)}
+                  className="p-1 text-slate-400 hover:text-slate-700"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+              {feedbackNotice.showTryProNote && (
+                <div className="pt-1 text-[11px] font-semibold text-[#0D9488] border-t border-amber-200/70">
+                  ✨ Try Pro: Post up to 90-second HD Sparks, get your Verified Blue Star &amp; browse ad-free.
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Media Picker / Preview */}
           {!mediaDataUrl ? (
             <div className="border-2 border-dashed border-blue-200 rounded-2xl p-6 text-center bg-[#F8FAFC] hover:border-[#3B82F6] transition">
@@ -239,18 +245,18 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
                 Upload Moment from Phone or Computer
               </h4>
               <p className="text-xs text-slate-500 max-w-xs mx-auto mb-4">
-                Choose a high-energy photo or video clip from your device gallery or camera.
+                Choose a photo or video clip ({isProTier ? `up to ${PRO_SPARK_MAX_SECONDS}s` : `up to ${FREE_SPARK_MAX_SECONDS}s`}, 720p HD, max {SPARK_MAX_FILE_MB} MB).
               </p>
 
               <div className="flex items-center justify-center gap-2 flex-wrap">
-                {/* Standard File Picker */}
                 <input
                   type="file"
                   ref={fileInputRef}
-                  accept="image/*,video/*"
+                  accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/ogg,video/x-m4v,video/3gpp"
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     if (f) handleFileSelect(f);
+                    e.target.value = '';
                   }}
                   className="hidden"
                 />
@@ -263,15 +269,15 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
                   <span>Choose Photo / Video</span>
                 </button>
 
-                {/* Mobile Camera Direct Capture */}
                 <input
                   type="file"
                   ref={cameraInputRef}
-                  accept="image/*,video/*"
+                  accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime"
                   capture="environment"
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     if (f) handleFileSelect(f);
+                    e.target.value = '';
                   }}
                   className="hidden"
                 />
@@ -291,6 +297,7 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
                 <video
                   src={mediaDataUrl}
                   controls
+                  playsInline
                   className="w-full h-auto max-h-72 object-contain"
                 />
               ) : (
@@ -301,9 +308,13 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
                 />
               )}
 
-              <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-white/90 backdrop-blur-md text-[11px] font-bold text-[#0F172A] flex items-center gap-1 shadow-xs">
+              <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-white/90 backdrop-blur-md text-[11px] font-bold text-[#0F172A] flex items-center gap-1.5 shadow-xs">
                 <Flame size={12} className="text-[#3B82F6]" />
-                <span>{mediaType === 'video' ? 'Video Moment' : 'Photo Moment'}</span>
+                <span>
+                  {mediaType === 'video'
+                    ? `Video (${formatSparkDuration(videoMeta?.durationSeconds)})`
+                    : 'Photo Moment'}
+                </span>
               </div>
 
               <button
@@ -347,7 +358,7 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
               type="text"
               value={customTag}
               onChange={(e) => setCustomTag(e.target.value)}
-              placeholder="Or write a custom legendary title (e.g. 50-Bomb Victory, Sunset in Santorini)..."
+              placeholder="Or write a custom legendary title (e.g. 50-Bomb Victory, Sunset in Zanzibar)..."
               maxLength={60}
               className="w-full px-3 py-2 rounded-xl bg-[#F8FAFC] border border-slate-200 text-xs text-[#0F172A] placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#3B82F6]"
             />
@@ -412,13 +423,13 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
             </div>
           </div>
 
-          {/* Fast Upload Progress Bar */}
+          {/* Resumable Firebase Storage Upload Progress Bar */}
           {isUploading && (
             <div className="space-y-1.5 p-3 rounded-xl bg-blue-50 border border-blue-200">
               <div className="flex items-center justify-between text-xs font-bold text-[#0F172A]">
                 <span className="flex items-center gap-1.5">
                   <Flame size={14} className="animate-bounce text-[#3B82F6]" />
-                  <span>Posting Spark Fast Upload...</span>
+                  <span>{uploadStatusText || 'Uploading Spark to Firebase Storage...'}</span>
                 </span>
                 <span className="font-mono tabular-numbers">{uploadProgress}%</span>
               </div>
@@ -448,7 +459,7 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
               className="px-6 py-2.5 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition disabled:opacity-40"
             >
               <Flame size={16} />
-              <span>{isUploading ? 'Igniting Spark...' : 'Publish 24h Spark 🔥'}</span>
+              <span>{isUploading ? 'Uploading Spark...' : 'Publish 24h Spark 🔥'}</span>
             </button>
           </div>
         </form>

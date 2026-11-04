@@ -1,42 +1,91 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { collection, query, orderBy, onSnapshot } from 'firebase/firestore';
-import { Spark } from '../types';
+import { Post, Spark } from '../types';
 import { SparkViewerModal } from './SparkViewerModal';
-import { SparkComposerModal } from './SparkComposerModal';
+import {
+  MultiSparkPosterModal,
+  groupSparksByAuthor,
+  UserSparkGroup
+} from './MultiSparkPoster';
+import { deleteSparkAndStorageFile } from '../utils/mediaStorage';
+import { useSparkUploadQueue } from '../services/sparkUploadQueue';
+import { SparkUploadQueueBanner } from './SparkUploadQueueBanner';
 import {
   Flame,
   Plus,
-  Clock,
   Sparkles,
-  Zap,
-  Play
+  Play,
+  Layers,
+  Loader2
 } from 'lucide-react';
 
-export const SparkTray: React.FC = () => {
-  const { currentUser, userProfile } = useAuth();
-  const [activeSparks, setActiveSparks] = useState<Spark[]>([]);
-  const [selectedSparkIndex, setSelectedSparkIndex] = useState<number | null>(null);
-  const [isComposerOpen, setIsComposerOpen] = useState(false);
+const WEEKLY_SPARK_THEMES = [
+  'Share a quiet moment of gratitude today 🌿',
+  'A favorite local meal or tea spot ☕',
+  'Something small that made you smile this week ☀️',
+  'A view from your neighborhood walk 🌅',
+  'A song or creative project inspiring you 🎶',
+  'Weekend plans or peaceful rest ahead 🌊',
+  'A kind shout-out to someone in the community 🤝'
+];
 
-  // Real-time listener for sparks
+interface SparkTrayProps {
+  externalPostsToShare?: Post[] | null;
+  onClearExternalPosts?: () => void;
+  onStartChat?: (userId: string) => void;
+}
+
+export const SparkTray: React.FC<SparkTrayProps> = ({
+  externalPostsToShare,
+  onClearExternalPosts,
+  onStartChat
+}) => {
+  const { currentUser, userProfile } = useAuth();
+  const { isUploadingAny, overallProgress } = useSparkUploadQueue();
+  const [activeSparks, setActiveSparks] = useState<Spark[]>([]);
+  const [viewingGroup, setViewingGroup] = useState<UserSparkGroup | null>(null);
+  const [isMultiPosterOpen, setIsMultiPosterOpen] = useState(false);
+
+  const dayOfWeek = new Date().getDay();
+  const todayTheme = WEEKLY_SPARK_THEMES[dayOfWeek % WEEKLY_SPARK_THEMES.length];
+
+  // Open MultiSparkPosterModal automatically when external posts are passed from FeedView
+  useEffect(() => {
+    if (externalPostsToShare && externalPostsToShare.length > 0) {
+      setIsMultiPosterOpen(true);
+    }
+  }, [externalPostsToShare]);
+
+  // Real-time listener for sparks + automatic 24-hour expiry & Firebase Storage file cleanup
   useEffect(() => {
     const q = query(collection(db, 'sparks'), orderBy('createdAt', 'desc'));
     const unsub = onSnapshot(
       q,
       (snapshot) => {
-        const now = new Date().getTime();
+        const now = Date.now();
         const list: Spark[] = [];
+        const expiredList: Spark[] = [];
+
         snapshot.forEach((docSnap) => {
-          const data = docSnap.data() as Spark;
-          // Filter strictly: only sparks that have not expired (< 24 hours)
+          const data = { ...(docSnap.data() as Spark), id: docSnap.id };
           const expiresAtTime = new Date(data.expiresAt).getTime();
           if (expiresAtTime > now) {
-            list.push({ ...data, id: docSnap.id });
+            list.push(data);
+          } else {
+            expiredList.push(data);
           }
         });
+
         setActiveSparks(list);
+
+        // Delete expired Spark files from Firebase Storage and remove expired Spark documents
+        if (expiredList.length > 0 && currentUser) {
+          expiredList.forEach((expiredSpark) => {
+            deleteSparkAndStorageFile(expiredSpark, true);
+          });
+        }
       },
       (error) => {
         handleFirestoreError(error, OperationType.LIST, 'sparks');
@@ -44,164 +93,221 @@ export const SparkTray: React.FC = () => {
     );
 
     return () => unsub();
-  }, []);
+  }, [currentUser?.uid]);
 
-  // Periodic tick to remove expired sparks client-side every minute
+  // Periodic tick every minute to expire 24-hour Sparks and delete their Storage files
   useEffect(() => {
     const timer = setInterval(() => {
-      const now = new Date().getTime();
-      setActiveSparks((prev) =>
-        prev.filter((spark) => new Date(spark.expiresAt).getTime() > now)
-      );
+      const now = Date.now();
+      setActiveSparks((prev) => {
+        const stillActive: Spark[] = [];
+        prev.forEach((spark) => {
+          if (new Date(spark.expiresAt).getTime() > now) {
+            stillActive.push(spark);
+          } else {
+            deleteSparkAndStorageFile(spark, true);
+          }
+        });
+        return stillActive.length === prev.length ? prev : stillActive;
+      });
     }, 60000);
 
     return () => clearInterval(timer);
   }, []);
 
-  // Calculate short remaining time
+  // Group sparks by authorId so multiple posts by the same user appear together as their Spark story
+  const userSparkGroups = useMemo(
+    () => groupSparksByAuthor(activeSparks, currentUser?.uid),
+    [activeSparks, currentUser?.uid]
+  );
+
+  // Keep viewingGroup in sync if live data updates
+  const activeViewingSparks = useMemo(() => {
+    if (!viewingGroup) return null;
+    const updatedGroup = userSparkGroups.find((g) => g.authorId === viewingGroup.authorId);
+    return updatedGroup ? updatedGroup.sparks : viewingGroup.sparks;
+  }, [viewingGroup, userSparkGroups]);
+
   const getHoursLeft = (expiresAt: string) => {
     const diff = new Date(expiresAt).getTime() - Date.now();
     if (diff <= 0) return '0m';
     const hours = Math.floor(diff / (1000 * 60 * 60));
     const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-    if (hours > 0) return `${hours}h left`;
-    return `${minutes}m left`;
+    if (hours > 0) return `${hours}h`;
+    return `${minutes}m`;
+  };
+
+  const handleCloseModal = () => {
+    setIsMultiPosterOpen(false);
+    if (onClearExternalPosts) onClearExternalPosts();
   };
 
   return (
     <>
-      <div className="bg-[#FFFFFF] dark:bg-[#131927] border border-slate-200/80 dark:border-gray-800 rounded-3xl p-5 sm:p-6 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)]">
-        {/* Tray Header */}
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2.5">
-            <div className="p-2 rounded-2xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] text-white shadow-xs">
-              <Flame size={16} />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs sm:text-sm font-extrabold text-[#0F172A] dark:text-white tracking-tight">
-                  Sparks (24h Moments)
-                </span>
-                <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-[#10B981] border border-emerald-200 font-extrabold text-[10px] uppercase tracking-wider flex items-center gap-1">
-                  <Zap size={10} className="fill-[#10B981] text-[#10B981]" />
-                  <span>Live 24H</span>
-                </span>
-              </div>
-            </div>
+      <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-3.5 sm:p-4 shadow-2xs space-y-3">
+        {/* Weekly Community Challenge & Multi-Post Spark Button */}
+        <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex-wrap">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <Sparkles size={15} className="text-[#D97706] shrink-0" />
+            <p className="text-xs font-semibold text-[#1C1917] truncate">
+              <span className="font-bold text-[#D97706]">Spark of the Day:</span> {todayTheme}
+            </p>
           </div>
-
           <button
-            onClick={() => setIsComposerOpen(true)}
-            className="px-4 py-2 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm shadow-blue-500/20 transition active:scale-95"
+            type="button"
+            onClick={() => setIsMultiPosterOpen(true)}
+            className="px-2.5 py-1 rounded-lg bg-[#2563EB]/10 hover:bg-[#2563EB]/15 text-[11px] font-extrabold text-[#2563EB] flex items-center gap-1 shrink-0 transition"
           >
-            <Plus size={14} />
-            <span>Post Spark</span>
+            <Layers size={12} />
+            <span>Post Multi-Spark</span>
           </button>
         </div>
 
-        {/* Horizontal Carousel Tray */}
-        <div className="flex items-center gap-4 overflow-x-auto pb-2 scrollbar-none pt-1">
-          {/* Item 1: Current user "+ Add Spark" Button */}
-          <div
-            onClick={() => setIsComposerOpen(true)}
-            className="flex flex-col items-center gap-1.5 shrink-0 cursor-pointer group"
+        {/* Inline Background Spark Upload Queue Progress */}
+        <SparkUploadQueueBanner variant="inline" />
+
+        {/* Slim Horizontal Sparks Row (Grouped by User) */}
+        <div className="flex items-center gap-3.5 overflow-x-auto pb-1 scrollbar-none">
+          {/* Add / Queue Multiple Spark Posts Button */}
+          <button
+            type="button"
+            onClick={() => setIsMultiPosterOpen(true)}
+            className="flex flex-col items-center gap-1 shrink-0 group focus:outline-none"
           >
-            <div className="relative w-16 h-16 rounded-full p-0.5 bg-gradient-to-tr from-[#3B82F6] to-[#10B981] transition-transform group-hover:scale-105 shadow-sm">
-              <div className="w-full h-full rounded-full bg-white dark:bg-[#131927] p-0.5 flex items-center justify-center overflow-hidden">
+            <div
+              className={`relative w-14 h-14 rounded-full p-0.5 bg-gradient-to-tr from-[#2563EB] to-[#0D9488] transition-transform group-hover:scale-105 ${
+                isUploadingAny ? 'ring-2 ring-[#2563EB] ring-offset-1' : ''
+              }`}
+            >
+              <div className="w-full h-full rounded-full bg-white p-0.5 flex items-center justify-center overflow-hidden relative">
                 <img
                   src={
                     userProfile?.photoURL ||
                     currentUser?.photoURL ||
                     `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                   }
-                  alt="Your Spark"
-                  className="w-full h-full rounded-full object-cover opacity-90 group-hover:opacity-100 transition-opacity"
+                  alt="Add Spark"
+                  className="w-full h-full rounded-full object-cover"
                 />
+                {isUploadingAny && (
+                  <div className="absolute inset-0 bg-stone-900/45 flex items-center justify-center text-white text-[10px] font-extrabold font-mono">
+                    {overallProgress}%
+                  </div>
+                )}
               </div>
-
-              {/* Plus Badge */}
-              <div className="absolute bottom-0 right-0 w-5 h-5 rounded-full bg-[#10B981] border-2 border-white dark:border-[#131927] text-white flex items-center justify-center shadow-xs">
-                <Plus size={12} className="stroke-[3]" />
+              <div className="absolute bottom-0 right-0 w-5 h-5 rounded-full bg-[#0D9488] border-2 border-white text-white flex items-center justify-center">
+                {isUploadingAny ? (
+                  <Loader2 size={10} className="animate-spin" />
+                ) : (
+                  <Plus size={11} className="stroke-[3]" />
+                )}
               </div>
             </div>
-
-            <span className="text-[11px] font-bold text-[#0F172A] dark:text-gray-300 max-w-[70px] truncate text-center">
-              Your Spark
+            <span className="text-[11px] font-bold text-[#1C1917] max-w-[68px] truncate">
+              {isUploadingAny ? `Posting ${overallProgress}%` : 'Add Spark'}
             </span>
-          </div>
+          </button>
 
-          {/* Active Sparks posted by community within 24h */}
-          {activeSparks.map((spark, index) => {
-            const isMine = spark.authorId === currentUser?.uid;
+          {/* Active Community Sparks (Grouped by Author so Multi-Post Sparks show as 1 story with count badge) */}
+          {userSparkGroups.map((group) => {
+            const isMine = group.authorId === currentUser?.uid;
+            const postCount = group.sparks.length;
+            const latestSpark = group.sparks[group.sparks.length - 1];
 
             return (
-              <div
-                key={spark.id}
-                onClick={() => setSelectedSparkIndex(index)}
-                className="flex flex-col items-center gap-1.5 shrink-0 cursor-pointer group"
+              <button
+                key={group.authorId}
+                type="button"
+                onClick={() => setViewingGroup(group)}
+                className="flex flex-col items-center gap-1 shrink-0 group focus:outline-none"
+                title={
+                  postCount > 1
+                    ? `${group.authorName}'s Spark (${postCount} posts)`
+                    : `${group.authorName}'s Spark`
+                }
               >
-                {/* Glowing Ring Avatar */}
-                <div className="relative w-16 h-16 rounded-full p-0.75 bg-gradient-to-tr from-[#3B82F6] to-[#10B981] transition-transform group-hover:scale-105 shadow-md shadow-blue-500/15">
-                  <div className="w-full h-full rounded-full bg-slate-100 overflow-hidden ring-2 ring-white dark:ring-[#131927] relative">
-                    {spark.mediaType === 'video' ? (
-                      <div className="w-full h-full bg-slate-900 flex items-center justify-center relative">
+                <div
+                  className={`relative w-14 h-14 rounded-full p-0.5 transition-transform group-hover:scale-105 ${
+                    postCount > 1
+                      ? 'bg-gradient-to-tr from-[#2563EB] via-[#0D9488] to-[#D97706]'
+                      : 'bg-gradient-to-tr from-[#2563EB] to-[#0D9488]'
+                  }`}
+                >
+                  <div className="w-full h-full rounded-full bg-[#FAF7F2] overflow-hidden ring-2 ring-white relative">
+                    {latestSpark.mediaType === 'video' ? (
+                      <div className="w-full h-full bg-stone-800 flex items-center justify-center relative">
                         <img
-                          src={spark.authorPhotoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${spark.authorId}`}
-                          alt={spark.authorName}
-                          className="w-full h-full object-cover opacity-80"
+                          src={
+                            latestSpark.thumbnailUrl ||
+                            group.authorPhotoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${group.authorId}`
+                          }
+                          alt={group.authorName}
+                          className="w-full h-full object-cover opacity-85"
                         />
-                        <div className="absolute inset-0 bg-black/25 flex items-center justify-center">
-                          <Play size={14} className="fill-white text-white" />
+                        <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
+                          <Play size={12} className="fill-white text-white" />
                         </div>
                       </div>
                     ) : (
                       <img
-                        src={spark.mediaUrl}
-                        alt="Spark Moment"
+                        src={latestSpark.mediaUrl}
+                        alt="Spark"
                         className="w-full h-full object-cover"
                       />
                     )}
                   </div>
 
-                  {/* Flame Badge */}
-                  <div className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-[#3B82F6] border-2 border-white dark:border-[#131927] text-white flex items-center justify-center shadow-xs">
-                    <Flame size={11} className="fill-white text-white" />
-                  </div>
+                  {/* Badge showing multi-post count or Flame */}
+                  {postCount > 1 ? (
+                    <div className="absolute -top-1 -right-1 px-1.5 min-w-[20px] h-5 rounded-full bg-[#2563EB] border-2 border-white text-white text-[10px] font-extrabold flex items-center justify-center shadow-2xs">
+                      {postCount}
+                    </div>
+                  ) : (
+                    <div className="absolute -top-0.5 -right-0.5 w-4 h-4 rounded-full bg-[#2563EB] border border-white text-white flex items-center justify-center">
+                      <Flame size={9} className="fill-white text-white" />
+                    </div>
+                  )}
                 </div>
 
-                {/* Author Name + Time Remaining */}
-                <div className="flex flex-col items-center max-w-[72px]">
-                  <span className="text-[11px] font-bold text-[#0F172A] dark:text-gray-200 truncate w-full text-center">
-                    {isMine ? 'You' : spark.authorName.split(' ')[0]}
+                <div className="flex items-center gap-1 max-w-[74px]">
+                  <span className="text-[11px] font-semibold text-[#1C1917] truncate">
+                    {isMine ? 'Your Spark' : group.authorName.split(' ')[0]}
                   </span>
-                  <span className="text-[9px] font-mono text-[#10B981] font-bold truncate">
-                    {getHoursLeft(spark.expiresAt)}
+                  <span className="text-[9px] text-[#0D9488] font-bold">
+                    {postCount > 1 ? `${postCount}p` : getHoursLeft(group.latestExpiresAt)}
                   </span>
                 </div>
-              </div>
+              </button>
             );
           })}
 
-          {activeSparks.length === 0 && (
-            <div className="flex items-center gap-3 pl-3 pr-6 py-2 text-xs text-slate-500 dark:text-gray-400">
-              <span>Share a photo or short clip to light up today&apos;s community Sparks!</span>
+          {userSparkGroups.length === 0 && (
+            <div className="text-xs text-[#78716C] pl-2 py-2">
+              Tap <strong className="text-[#1C1917]">Add Spark</strong> or{' '}
+              <strong className="text-[#2563EB]">Post Multi-Spark</strong> to share multiple posts in
+              your 24-hour Spark!
             </div>
           )}
         </div>
       </div>
 
-      {/* Spark Composer Modal */}
-      <SparkComposerModal
-        isOpen={isComposerOpen}
-        onClose={() => setIsComposerOpen(false)}
+      <MultiSparkPosterModal
+        isOpen={isMultiPosterOpen}
+        onClose={handleCloseModal}
+        initialPostsToShare={externalPostsToShare || undefined}
       />
 
-      {/* Fullscreen Spark Story Viewer Modal */}
-      {selectedSparkIndex !== null && activeSparks.length > 0 && (
+      {viewingGroup && activeViewingSparks && activeViewingSparks.length > 0 && (
         <SparkViewerModal
-          sparks={activeSparks}
-          initialIndex={selectedSparkIndex}
-          onClose={() => setSelectedSparkIndex(null)}
+          sparks={activeViewingSparks}
+          initialIndex={0}
+          onClose={() => setViewingGroup(null)}
+          onAddMorePosts={() => {
+            setViewingGroup(null);
+            setIsMultiPosterOpen(true);
+          }}
+          onStartChat={onStartChat}
         />
       )}
     </>

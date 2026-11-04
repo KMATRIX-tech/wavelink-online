@@ -177,8 +177,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <Crown size={15} className="text-amber-200" />
               </div>
               <div className="min-w-0">
-                <span className="text-xs font-black block tracking-tight">Upgrade to Pro</span>
-                <span className="text-[10px] text-blue-50 block truncate">18,000 TZS • 0787473334</span>
+                <span className="text-xs font-black block tracking-tight">WaveLink Pro</span>
+                <span className="text-[10px] text-blue-50 block truncate">18,000 TZS • WaveLink</span>
               </div>
             </div>
             <Sparkles size={14} className="text-amber-200 shrink-0 group-hover:rotate-12 transition-transform" />

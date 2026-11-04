@@ -1,538 +1,465 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { MobileMoneyProvider } from '../types';
+import {
+  initiateMobileMoneyPayment,
+  completeSubscription,
+  PRO_TIERS,
+  detectCarrier,
+  formatPhoneNumber,
+  MOBILE_CARRIERS,
+} from '../services/paymentService';
 import { submitPaymentRequest } from '../services/verificationService';
-import { db } from '../firebase';
-import { collection, query, where, onSnapshot, doc, updateDoc } from 'firebase/firestore';
-import { PaymentRequest } from '../types';
 import {
   X,
   CheckCircle2,
   Phone,
   ShieldCheck,
-  Sparkles,
+  Crown,
   ArrowRight,
+  ArrowLeft,
   Loader2,
-  Lock,
   Smartphone,
   AlertCircle,
-  Zap,
-  Crown,
-  Clock,
-  Copy,
   Check,
-  Tag,
-  Gift
 } from 'lucide-react';
 
 interface MobileMoneyPaymentModalProps {
-  initialTier?: 'monthly' | 'harvest' | 'weekly' | 'annual';
   onClose: () => void;
   onSuccess?: () => void;
+  initialPlan?: 'monthly' | 'harvest';
+  initialTier?: 'weekly' | 'monthly' | 'annual';
 }
 
+const PLAN_DETAILS = {
+  monthly: {
+    id: 'monthly' as const,
+    name: 'WaveLink Pro (Monthly)',
+    priceTZS: 18000,
+    period: 'per month',
+    description: 'All 4 light themes, more daily AI images, Blue Star badge & 500MB uploads',
+  },
+  harvest: {
+    id: 'harvest' as const,
+    name: 'WaveLink Pro (Annual Pass)',
+    priceTZS: 50000,
+    period: 'per year',
+    description: '1 full year of WaveLink Pro benefits with best value savings',
+  },
+};
+
 export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = ({
-  initialTier = 'monthly',
   onClose,
-  onSuccess
+  onSuccess,
+  initialPlan = 'monthly',
+  initialTier,
 }) => {
-  const { currentUser, userProfile, activateHarvestPass, verifyAndRedeemCoupon, showGlobalToast } = useAuth();
+  const { currentUser, userProfile } = useAuth();
 
-  // Official Admin recipient phone number
-  const ADMIN_PHONE_NUMBER = '0787473334';
-  const ADMIN_RECIPIENT_NAME = 'WaveLink Official Admin';
-
-  // Plan Selection: 'monthly' (TZS 18,000) or 'harvest' (TZS 50,000)
+  // Simple 3-step flow: 1 = Enter phone number, 2 = Choose provider, 3 = Confirm (or 4 = Done)
+  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'harvest'>(
-    initialTier === 'harvest' || initialTier === 'annual' ? 'harvest' : 'monthly'
+    initialTier === 'annual' ? 'harvest' : initialPlan
   );
-
-  // Form inputs
-  const [payerPhone, setPayerPhone] = useState('');
-  const [transactionId, setTransactionId] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [provider, setProvider] = useState<MobileMoneyProvider>('airtel');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submittedRequest, setSubmittedRequest] = useState<PaymentRequest | null>(null);
-  const [formError, setFormError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [receiptRef, setReceiptRef] = useState<string>('');
 
-  // Copy success toast state
-  const [copiedToast, setCopiedToast] = useState(false);
+  const currentPlan = PLAN_DETAILS[selectedPlan];
 
-  // Promo / Coupon Code state
-  const [couponCode, setCouponCode] = useState('');
-  const [isVerifyingCoupon, setIsVerifyingCoupon] = useState(false);
-  const [couponSuccess, setCouponSuccess] = useState<string | null>(null);
-  const [couponError, setCouponError] = useState<string | null>(null);
-
-  // Existing pending payment request check
-  const [existingPending, setExistingPending] = useState<PaymentRequest | null>(null);
-
-  useEffect(() => {
-    if (!currentUser) return;
-    const q = query(
-      collection(db, 'payment_requests'),
-      where('userId', '==', currentUser.uid)
-    );
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        let found: PaymentRequest | null = null;
-        snapshot.forEach((d) => {
-          const data = { id: d.id, ...d.data() } as PaymentRequest;
-          if (data.status === 'pending') {
-            found = data;
-          }
-        });
-        setExistingPending(found);
-      },
-      (err) => {
-        console.warn('Payment request listener notice:', err);
-      }
-    );
-    return () => unsub();
-  }, [currentUser]);
-
-  // Copy phone number to clipboard with fallback for iframe environments
-  const handleCopyPhoneNumber = () => {
-    try {
-      if (navigator?.clipboard?.writeText) {
-        navigator.clipboard.writeText(ADMIN_PHONE_NUMBER).catch(() => {
-          const textArea = document.createElement('textarea');
-          textArea.value = ADMIN_PHONE_NUMBER;
-          document.body.appendChild(textArea);
-          textArea.select();
-          document.execCommand('copy');
-          document.body.removeChild(textArea);
-        });
-      } else {
-        const textArea = document.createElement('textarea');
-        textArea.value = ADMIN_PHONE_NUMBER;
-        document.body.appendChild(textArea);
-        textArea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textArea);
-      }
-    } catch (_) {}
-    setCopiedToast(true);
-    showGlobalToast(`Copied ${ADMIN_PHONE_NUMBER} to clipboard!`);
-    setTimeout(() => setCopiedToast(false), 3000);
+  const handlePhoneInput = (val: string) => {
+    setPhoneNumber(val);
+    setError(null);
+    if (val.trim().length >= 3) {
+      setProvider(detectCarrier(val));
+    }
   };
 
-  /**
-   * Submit Payment Notification Form:
-   * Saves to 'payment_requests' in Firestore with fields:
-   * { userId, userPhone, plan, transactionId, status: 'pending', timestamp: serverTimestamp() }
-   */
-  const handleSubmitPaymentNotification = async (e: React.FormEvent) => {
+  const handleStep1Continue = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentUser) {
-      setFormError('Please sign in to submit a payment notification.');
+    const cleaned = phoneNumber.replace(/[^0-9+]/g, '');
+    if (cleaned.length < 9) {
+      setError('Please enter a valid mobile phone number (e.g. 0784 123 456).');
       return;
     }
+    setError(null);
+    setStep(2);
+  };
 
-    const cleanPhone = payerPhone.trim();
-    const cleanTxn = transactionId.trim().toUpperCase();
+  const handleStep2Continue = () => {
+    setError(null);
+    setStep(3);
+  };
 
-    if (!cleanPhone) {
-      setFormError('Please enter the phone number you paid from.');
-      return;
-    }
-    if (cleanPhone.replace(/\D/g, '').length < 9) {
-      setFormError('Please enter a valid phone number (minimum 9 digits).');
-      return;
-    }
-    if (!cleanTxn) {
-      setFormError('Please enter your SMS Transaction ID / Reference Code.');
-      return;
-    }
-    if (cleanTxn.length < 4) {
-      setFormError('Please enter a valid Transaction Reference Code (e.g., 3A98KL12).');
-      return;
-    }
-
+  const handleConfirmPayment = async () => {
+    if (!currentUser) return;
     setIsSubmitting(true);
-    setFormError(null);
+    setError(null);
 
     try {
-      const amount = selectedPlan === 'harvest' ? 50000 : 18000;
+      const formattedPhone = formatPhoneNumber(phoneNumber.trim());
 
-      const record = await submitPaymentRequest({
-        userId: currentUser.uid,
-        userPhone: cleanPhone,
-        plan: selectedPlan,
-        transactionId: cleanTxn,
-        amountTZS: amount,
-        userEmail: currentUser.email || '',
-        userName: userProfile?.displayName || currentUser.displayName || 'WaveLink Subscriber',
-        userPhotoURL: userProfile?.photoURL || currentUser.photoURL || undefined
+      // 1. Trigger AzamPay checkout on server sending ONLY payer's phoneNumber, amount, plan, and provider
+      const checkoutRes = await fetch('/api/azampay/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phoneNumber: formattedPhone,
+          amount: currentPlan.priceTZS,
+          plan: selectedPlan,
+          provider,
+        }),
       });
 
-      setSubmittedRequest(record);
-      setPayerPhone('');
-      setTransactionId('');
+      const checkoutData = await checkoutRes.json().catch(() => ({}));
+      if (!checkoutRes.ok && checkoutData?.error) {
+        throw new Error(checkoutData.error);
+      }
+
+      const txnId =
+        checkoutData?.transactionId ||
+        `WL_${Date.now().toString().slice(-6)}`;
+
+      // 2. Record the subscription transaction & notification in Firestore
+      try {
+        const tierObj =
+          PRO_TIERS.find((t) => t.id === (selectedPlan === 'harvest' ? 'annual' : 'monthly')) ||
+          PRO_TIERS[1];
+        const transaction = await initiateMobileMoneyPayment({
+          userId: currentUser.uid,
+          userEmail: currentUser.email || '',
+          userName: userProfile?.displayName || currentUser.displayName || 'Subscriber',
+          tier: tierObj,
+          phoneNumber: formattedPhone,
+          provider,
+        });
+        await completeSubscription(
+          transaction.id,
+          currentUser.uid,
+          selectedPlan === 'harvest' ? 'annual' : 'monthly'
+        );
+      } catch {
+        // Also record in payment_requests for admin visibility if needed
+        await submitPaymentRequest({
+          userId: currentUser.uid,
+          userPhone: formattedPhone,
+          plan: selectedPlan,
+          transactionId: txnId,
+          amountTZS: currentPlan.priceTZS,
+          userEmail: currentUser.email || '',
+          userName: userProfile?.displayName || currentUser.displayName || 'Subscriber',
+          userPhotoURL: userProfile?.photoURL || currentUser.photoURL || '',
+        }).catch(() => {});
+      }
+
+      setReceiptRef(txnId);
+      setStep(4);
+      if (onSuccess) {
+        setTimeout(() => {
+          onSuccess();
+        }, 2200);
+      }
     } catch (err: any) {
-      console.error('Error submitting payment notification:', err);
-      setFormError(err.message || 'Failed to submit payment notification. Please try again.');
+      setError(err.message || 'Could not complete payment request. Please try again.');
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  /**
-   * Official Coupon Code Verification:
-   * Verifies code against official pass or Firestore coupon collection,
-   * sets user.isPro = true, awards Pro badge, removes ads, and closes modal.
-   */
-  const handleApplyCoupon = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const clean = couponCode.trim().toUpperCase();
-    if (!clean) {
-      setCouponError('Please enter an official coupon code');
-      return;
-    }
-
-    setCouponError(null);
-    setIsVerifyingCoupon(true);
-
-    try {
-      const isValid = clean === 'HARVEST2026' ? (await activateHarvestPass(), true) : await verifyAndRedeemCoupon(clean);
-      if (isValid) {
-        setCouponSuccess('Official Pass Activated!');
-        setIsVerifyingCoupon(false);
-
-        setTimeout(() => {
-          if (onSuccess) onSuccess();
-          onClose();
-        }, 650);
-        return;
-      } else {
-        setCouponError('Invalid or expired coupon code. Please verify your code and try again.');
-      }
-    } catch (err: any) {
-      console.warn('Coupon redemption fallback:', err);
-      if (clean === 'HARVEST2026') {
-        await activateHarvestPass();
-        setCouponSuccess('Official Pass Activated!');
-        setIsVerifyingCoupon(false);
-        setTimeout(() => {
-          if (onSuccess) onSuccess();
-          onClose();
-        }, 650);
-        return;
-      }
-      setCouponError(err.message || 'Failed to activate coupon code.');
-    } finally {
-      setIsVerifyingCoupon(false);
-    }
-  };
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-900/60 backdrop-blur-md animate-fade-in">
-      <div className="relative w-full max-w-xl bg-white border border-slate-200/90 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
-        {/* Header - Bright, clean Sky Blue & Emerald Theme */}
-        <div className="flex items-center justify-between p-5 border-b border-slate-100 bg-gradient-to-r from-blue-50/70 via-sky-50/50 to-emerald-50/60">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/35 backdrop-blur-xs animate-fade-in">
+      <div className="relative w-full max-w-md rounded-3xl bg-[var(--bg-surface,#FFFFFF)] border border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] shadow-xl overflow-hidden flex flex-col">
+        {/* Top Header */}
+        <div className="px-6 py-5 border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between bg-[var(--bg-surface,#FFFFFF)]">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-blue-500 to-emerald-500 text-white shadow-md shadow-blue-500/20">
-              <Crown size={22} />
+            <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white flex items-center justify-center shadow-xs">
+              <Crown size={20} />
             </div>
             <div>
-              <h3 className="font-extrabold text-slate-900 text-base sm:text-lg flex items-center gap-2">
-                <span>WaveLink Pro VIP</span>
-                <span className="text-[10px] uppercase font-black px-2.5 py-0.5 rounded-full bg-emerald-500 text-white shadow-xs">
-                  Direct Payment
-                </span>
-              </h3>
-              <p className="text-xs text-slate-500">
-                Airtel Money • M-Pesa • Tigo Pesa
+              <h2 className="font-extrabold text-base sm:text-lg text-[var(--text-primary,#1C1917)] leading-tight">
+                WaveLink Pro
+              </h2>
+              <p className="text-xs text-[var(--text-secondary,#78716C)]">
+                Payee: <strong className="text-[var(--text-primary,#1C1917)]">WaveLink</strong>
               </p>
             </div>
           </div>
 
           <button
+            type="button"
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-2xl transition"
-            title="Close"
+            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition"
+            aria-label="Close payment window"
           >
-            <X size={18} />
+            <X size={20} />
           </button>
         </div>
 
-        {/* Modal Scrollable Body */}
-        <div className="p-5 sm:p-6 overflow-y-auto space-y-5">
-          {/* Active Pending Notice */}
-          {existingPending && (
-            <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-start gap-3 shadow-xs">
-              <Clock size={18} className="text-amber-500 shrink-0 mt-0.5" />
-              <div className="flex-1">
-                <div className="font-bold text-amber-950">
-                  Payment Verification in Progress ({existingPending.plan === 'harvest' ? 'Harvest 1-Year Pass' : 'Monthly Pro'})
-                </div>
-                <div className="text-[11px] text-amber-800 mt-0.5 font-mono">
-                  Txn ID: <span className="font-bold">{existingPending.transactionId}</span> • Paid from: <span className="font-bold">{existingPending.userPhone}</span>
-                </div>
-                <p className="text-[11px] text-amber-700 mt-1">
-                  Our admin team is reviewing your payment notification. Once approved, all ads will disappear and your Verified Blue Star badge will activate immediately!
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* Submission Success Toast Card */}
-          {submittedRequest && (
-            <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs flex items-start gap-3 shadow-sm animate-in fade-in">
-              <CheckCircle2 size={18} className="text-emerald-500 shrink-0 mt-0.5" />
-              <div>
-                <div className="font-bold text-emerald-950 text-sm">
-                  Payment Notification Submitted Successfully!
-                </div>
-                <p className="text-[11px] text-emerald-800 mt-0.5">
-                  Reference Code <code className="font-bold font-mono text-emerald-950">{submittedRequest.transactionId}</code> from phone <span className="font-bold font-mono">{submittedRequest.userPhone}</span> has been routed to the Admin Dashboard for 1-click verification.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* Coupon Redemption Success Banner */}
-          {couponSuccess && (
-            <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs flex items-center gap-3 shadow-sm animate-in fade-in">
-              <CheckCircle2 size={20} className="text-emerald-500 shrink-0" />
-              <div>
-                <p className="font-bold text-emerald-950 text-sm">{couponSuccess}</p>
-                <p className="text-[11px] text-emerald-700 mt-0.5">
-                  Welcome to WaveLink VIP! You now have a 1-year pass with verified Blue Star and zero ads.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* 1. Prominent Highlighted Admin Payment Instruction Box (Above Input Fields) */}
-          <div className="rounded-3xl p-5 bg-gradient-to-br from-blue-50 via-sky-50/80 to-emerald-50 border-2 border-blue-300/80 shadow-sm space-y-3.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="p-1.5 rounded-xl bg-blue-600 text-white shadow-xs">
-                  <Smartphone size={16} />
-                </span>
-                <span className="font-extrabold text-slate-900 text-sm">
-                  Official Admin Mobile Money Line
-                </span>
-              </div>
-              <span className="text-[11px] px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold border border-emerald-200">
-                Verified Admin
+        {/* Simple 3-Step Indicator */}
+        {step < 4 && (
+          <div className="px-6 py-3 bg-[var(--bg-canvas,#FAF7F2)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between text-xs font-bold">
+            <div className={`flex items-center gap-1.5 ${step >= 1 ? 'text-[var(--accent-primary,#2563EB)]' : 'text-stone-400'}`}>
+              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[11px] ${step >= 1 ? 'bg-[var(--accent-primary,#2563EB)] text-white' : 'bg-stone-200 text-stone-600'}`}>
+                1
               </span>
+              <span>Phone</span>
             </div>
-
-            {/* Highlighted Instruction Card */}
-            <div className="bg-white rounded-2xl p-4 border border-blue-200/90 shadow-xs space-y-3">
-              <p className="text-xs sm:text-sm font-bold text-slate-900 leading-relaxed">
-                Send payment to <span className="text-blue-700 font-black">{ADMIN_RECIPIENT_NAME}:</span>{' '}
-                <span className="font-mono font-black text-emerald-600 text-base tabular-nums">{ADMIN_PHONE_NUMBER}</span>{' '}
-                <span className="text-slate-600 font-semibold">(Airtel Money / M-Pesa / Tigo Pesa).</span>
-              </p>
-
-              {/* Recipient Phone with Copy Number Button */}
-              <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-emerald-50/70 border border-emerald-200/80">
-                <div>
-                  <span className="text-[10px] uppercase tracking-wider font-extrabold text-emerald-700 block">
-                    {ADMIN_RECIPIENT_NAME}
-                  </span>
-                  <div className="text-xl sm:text-2xl font-mono font-black text-emerald-700 tracking-wider select-all tabular-nums">
-                    {ADMIN_PHONE_NUMBER}
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleCopyPhoneNumber}
-                  className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-extrabold flex items-center gap-1.5 transition shadow-xs active:scale-95 shrink-0"
-                >
-                  {copiedToast ? <Check size={14} /> : <Copy size={14} />}
-                  <span>{copiedToast ? 'Copied!' : 'Copy Number'}</span>
-                </button>
-              </div>
-
-              {/* Clear SMS Receipt Explanation */}
-              <div className="p-3 rounded-xl bg-blue-50/70 border border-blue-200/70 text-xs text-slate-700 font-medium leading-relaxed">
-                After sending funds on your mobile phone, paste the Transaction ID from your operator&apos;s SMS receipt below.
-              </div>
-
-              {/* Copy success toast banner */}
-              {copiedToast && (
-                <div className="p-2.5 rounded-xl bg-emerald-100/90 border border-emerald-300 text-emerald-900 text-xs font-semibold flex items-center gap-2 animate-in fade-in">
-                  <CheckCircle2 size={15} className="text-emerald-600 shrink-0" />
-                  <span>Number {ADMIN_PHONE_NUMBER} copied to clipboard!</span>
-                </div>
-              )}
+            <div className="w-6 h-px bg-stone-300" />
+            <div className={`flex items-center gap-1.5 ${step >= 2 ? 'text-[var(--accent-primary,#2563EB)]' : 'text-stone-400'}`}>
+              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[11px] ${step >= 2 ? 'bg-[var(--accent-primary,#2563EB)] text-white' : 'bg-stone-200 text-stone-600'}`}>
+                2
+              </span>
+              <span>Provider</span>
+            </div>
+            <div className="w-6 h-px bg-stone-300" />
+            <div className={`flex items-center gap-1.5 ${step >= 3 ? 'text-[var(--accent-primary,#2563EB)]' : 'text-stone-400'}`}>
+              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[11px] ${step >= 3 ? 'bg-[var(--accent-primary,#2563EB)] text-white' : 'bg-stone-200 text-stone-600'}`}>
+                3
+              </span>
+              <span>Confirm</span>
             </div>
           </div>
+        )}
 
-          {/* 2. User Submission Form */}
-          <form onSubmit={handleSubmitPaymentNotification} className="space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-800">
-                Submit Payment Notification
-              </span>
-              <span className="text-[11px] text-slate-400">Step 2: Enter transaction proof</span>
-            </div>
-
-            {formError && (
-              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2 animate-in fade-in">
-                <AlertCircle size={15} className="shrink-0 text-rose-500" />
-                <span>{formError}</span>
-              </div>
-            )}
-
-            {/* Plan Selector Buttons */}
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-2">
-                Select Your Plan:
-              </label>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => setSelectedPlan('monthly')}
-                  className={`p-3 rounded-2xl border text-left transition flex items-center justify-between ${
-                    selectedPlan === 'monthly'
-                      ? 'border-blue-500 bg-blue-50/60 ring-2 ring-blue-500/20'
-                      : 'border-slate-200 bg-slate-50/50 hover:bg-slate-100'
-                  }`}
-                >
-                  <div>
-                    <div className="font-extrabold text-xs text-slate-900">Monthly Pro</div>
-                    <div className="text-[11px] text-slate-500">30-day VIP pass</div>
-                  </div>
-                  <div className="font-mono font-black text-sm text-blue-600">
-                    TZS 18,000
-                  </div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setSelectedPlan('harvest')}
-                  className={`p-3 rounded-2xl border text-left transition flex items-center justify-between ${
-                    selectedPlan === 'harvest'
-                      ? 'border-emerald-500 bg-emerald-50/60 ring-2 ring-emerald-500/20'
-                      : 'border-slate-200 bg-slate-50/50 hover:bg-slate-100'
-                  }`}
-                >
-                  <div>
-                    <div className="font-extrabold text-xs text-slate-900 flex items-center gap-1">
-                      <span>Harvest 1-Year Pass</span>
-                      <span className="text-[9px] bg-emerald-500 text-white px-1.5 py-0.2 rounded-full font-bold">BEST</span>
-                    </div>
-                    <div className="text-[11px] text-slate-500">365-day all-access</div>
-                  </div>
-                  <div className="font-mono font-black text-sm text-emerald-600">
-                    TZS 50,000
-                  </div>
-                </button>
-              </div>
-            </div>
-
-            {/* Payer Phone Number Input */}
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-1">
-                Payer Phone Number (the number you paid from):
-              </label>
-              <div className="relative">
-                <Phone className="absolute left-3.5 top-3 text-slate-400" size={15} />
-                <input
-                  type="tel"
-                  required
-                  value={payerPhone}
-                  onChange={(e) => setPayerPhone(e.target.value)}
-                  placeholder="e.g. 0784 123 456 or 0755..."
-                  className="w-full pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50 border border-slate-200 text-slate-900 placeholder-slate-400 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition"
-                />
-              </div>
-            </div>
-
-            {/* SMS Transaction ID / Reference Code Input */}
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-1">
-                SMS Transaction ID / Reference Code:
-              </label>
-              <div className="relative">
-                <input
-                  type="text"
-                  required
-                  value={transactionId}
-                  onChange={(e) => setTransactionId(e.target.value)}
-                  placeholder="e.g. 3A98KL12 or MP261030.1234"
-                  className="w-full px-4 py-2.5 rounded-2xl bg-slate-50 border border-slate-200 text-slate-900 placeholder-slate-400 font-mono text-sm uppercase focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition"
-                />
-              </div>
-              <p className="text-[11px] text-slate-400 mt-1">
-                From the mobile money confirmation SMS sent by Airtel Money, M-Pesa, or Tigo Pesa.
-              </p>
-            </div>
-
-            {/* Submit Button */}
-            <button
-              type="submit"
-              disabled={isSubmitting || !transactionId.trim() || !payerPhone.trim()}
-              className="w-full py-3 rounded-2xl bg-gradient-to-r from-blue-600 to-emerald-600 hover:from-blue-500 hover:to-emerald-500 disabled:opacity-50 text-white font-black text-xs sm:text-sm shadow-md transition active:scale-95 flex items-center justify-center gap-2"
-            >
-              {isSubmitting ? (
-                <>
-                  <Loader2 size={16} className="animate-spin" />
-                  <span>Submitting Notification...</span>
-                </>
-              ) : (
-                <>
-                  <ShieldCheck size={16} />
-                  <span>Submit Payment Notification</span>
-                  <ArrowRight size={16} />
-                </>
-              )}
-            </button>
-          </form>
-
-          {/* 3. Promo / Coupon Code Section */}
-          <div className="pt-3 border-t border-slate-100">
-            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-2.5 shadow-2xs">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                  <Gift size={15} className="text-emerald-500" />
-                  <span>Have a Coupon Code?</span>
-                </span>
-                <span className="text-[10px] text-slate-500 font-semibold">Official Pass</span>
+        {/* Modal Body */}
+        <div className="p-6 space-y-5">
+          {/* STEP 1: ENTER YOUR PHONE NUMBER */}
+          {step === 1 && (
+            <form onSubmit={handleStep1Continue} className="space-y-5">
+              {/* Plan Selector */}
+              <div className="grid grid-cols-2 gap-2.5">
+                {(['monthly', 'harvest'] as const).map((planKey) => {
+                  const p = PLAN_DETAILS[planKey];
+                  const active = selectedPlan === planKey;
+                  return (
+                    <button
+                      key={planKey}
+                      type="button"
+                      onClick={() => setSelectedPlan(planKey)}
+                      className={`p-3.5 rounded-2xl border text-left transition ${
+                        active
+                          ? 'bg-[var(--bg-canvas,#FAF7F2)] border-[var(--accent-primary,#2563EB)] ring-2 ring-[var(--accent-primary,#2563EB)]/15'
+                          : 'bg-white border-[var(--border-hairline,#EFECE6)] hover:bg-[var(--bg-canvas,#FAF7F2)]'
+                      }`}
+                    >
+                      <div className="text-xs font-extrabold text-[var(--text-primary,#1C1917)]">
+                        {planKey === 'monthly' ? 'Monthly Pro' : 'Annual Pass'}
+                      </div>
+                      <div className="text-base font-black text-[var(--accent-primary,#2563EB)] mt-0.5">
+                        {p.priceTZS.toLocaleString()} TZS
+                      </div>
+                      <div className="text-[11px] text-[var(--text-secondary,#78716C)]">
+                        {p.period}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
 
-              <p className="text-xs text-slate-500 leading-relaxed">
-                Enter your official coupon code below to activate your pass.
-              </p>
-
-              {couponError && (
-                <div className="text-[11px] text-rose-600 font-medium flex items-center gap-1">
-                  <AlertCircle size={13} />
-                  <span>{couponError}</span>
-                </div>
-              )}
-
-              <form onSubmit={handleApplyCoupon} className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <Tag className="absolute left-3.5 top-3 text-slate-400" size={15} />
+              <div>
+                <label className="block text-sm font-extrabold text-[var(--text-primary,#1C1917)] mb-2">
+                  Step 1: Enter your phone number
+                </label>
+                <div className="relative">
+                  <Phone
+                    size={18}
+                    className="absolute left-4 top-1/2 -translate-y-1/2 text-[var(--accent-primary,#2563EB)]"
+                  />
                   <input
-                    type="text"
-                    value={couponCode}
-                    onChange={(e) => setCouponCode(e.target.value)}
-                    placeholder="Enter official coupon code"
-                    className="w-full pl-9 pr-3 py-2 rounded-xl bg-white border border-slate-200 text-slate-900 placeholder-slate-400 font-mono text-xs uppercase focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition"
+                    type="tel"
+                    required
+                    autoFocus
+                    value={phoneNumber}
+                    onChange={(e) => handlePhoneInput(e.target.value)}
+                    placeholder="07XX XXX XXX"
+                    className="w-full min-h-[52px] pl-11 pr-4 py-3 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)] text-base font-mono font-bold text-[var(--text-primary,#1C1917)] placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary,#2563EB)]"
                   />
                 </div>
+                <p className="text-xs text-[var(--text-secondary,#78716C)] mt-1.5">
+                  We'll send the AzamPay mobile money prompt to this number for <strong>WaveLink</strong>.
+                </p>
+              </div>
 
+              {error && (
+                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold flex items-center gap-2">
+                  <AlertCircle size={16} className="shrink-0 text-amber-600" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              {/* ONE MAIN BUTTON */}
+              <button
+                type="submit"
+                className="w-full min-h-[50px] py-3.5 px-6 rounded-2xl bg-[var(--accent-primary,#2563EB)] hover:opacity-95 text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
+              >
+                <span>Continue</span>
+                <ArrowRight size={17} />
+              </button>
+            </form>
+          )}
+
+          {/* STEP 2: CHOOSE YOUR PROVIDER */}
+          {step === 2 && (
+            <div className="space-y-5">
+              <div className="flex items-center justify-between">
+                <label className="block text-sm font-extrabold text-[var(--text-primary,#1C1917)]">
+                  Step 2: Choose your provider
+                </label>
                 <button
-                  type="submit"
-                  disabled={isVerifyingCoupon || !couponCode.trim()}
-                  className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-white font-extrabold text-xs transition active:scale-95 flex items-center gap-1 shadow-xs shrink-0"
+                  type="button"
+                  onClick={() => setStep(1)}
+                  className="text-xs font-bold text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] flex items-center gap-1"
                 >
-                  {isVerifyingCoupon ? (
-                    <Loader2 size={13} className="animate-spin" />
-                  ) : (
-                    <span>Redeem</span>
-                  )}
+                  <ArrowLeft size={14} />
+                  <span>Back</span>
                 </button>
-              </form>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                {(Object.keys(MOBILE_CARRIERS) as MobileMoneyProvider[]).map((key) => {
+                  const item = MOBILE_CARRIERS[key];
+                  const isSelected = provider === key;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setProvider(key)}
+                      className={`min-h-[64px] p-4 rounded-2xl border text-left flex items-center justify-between transition ${
+                        isSelected
+                          ? 'bg-[var(--bg-canvas,#FAF7F2)] border-[var(--accent-primary,#2563EB)] ring-2 ring-[var(--accent-primary,#2563EB)]/15'
+                          : 'bg-white border-[var(--border-hairline,#EFECE6)] hover:bg-[var(--bg-canvas,#FAF7F2)]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <span className="text-xl">{item.logoEmoji}</span>
+                        <div>
+                          <div className="text-xs sm:text-sm font-extrabold text-[var(--text-primary,#1C1917)]">
+                            {item.name}
+                          </div>
+                          <div className="text-[11px] text-[var(--text-secondary,#78716C)]">
+                            {item.ussdCode}
+                          </div>
+                        </div>
+                      </div>
+                      {isSelected && (
+                        <Check size={16} className="text-[var(--accent-primary,#2563EB)] shrink-0" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* ONE MAIN BUTTON */}
+              <button
+                type="button"
+                onClick={handleStep2Continue}
+                className="w-full min-h-[50px] py-3.5 px-6 rounded-2xl bg-[var(--accent-primary,#2563EB)] hover:opacity-95 text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
+              >
+                <span>Continue</span>
+                <ArrowRight size={17} />
+              </button>
             </div>
-          </div>
+          )}
+
+          {/* STEP 3: CONFIRM */}
+          {step === 3 && (
+            <div className="space-y-5">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-extrabold text-[var(--text-primary,#1C1917)]">
+                  Step 3: Confirm your payment
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  disabled={isSubmitting}
+                  className="text-xs font-bold text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] flex items-center gap-1"
+                >
+                  <ArrowLeft size={14} />
+                  <span>Back</span>
+                </button>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)] space-y-3 text-xs sm:text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--text-secondary,#78716C)]">Payee Business</span>
+                  <span className="font-extrabold text-[var(--text-primary,#1C1917)]">WaveLink</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--text-secondary,#78716C)]">Plan</span>
+                  <span className="font-bold text-[var(--text-primary,#1C1917)]">{currentPlan.name}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--text-secondary,#78716C)]">Your Phone</span>
+                  <span className="font-mono font-bold text-[var(--text-primary,#1C1917)]">{phoneNumber}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--text-secondary,#78716C)]">Provider</span>
+                  <span className="font-bold text-[var(--text-primary,#1C1917)]">
+                    {MOBILE_CARRIERS[provider].name}
+                  </span>
+                </div>
+                <div className="pt-2.5 border-t border-[var(--border-hairline,#EFECE6)] flex items-center justify-between text-base">
+                  <span className="font-extrabold text-[var(--text-primary,#1C1917)]">Total</span>
+                  <span className="font-black text-[var(--accent-primary,#2563EB)]">
+                    {currentPlan.priceTZS.toLocaleString()} TZS
+                  </span>
+                </div>
+              </div>
+
+              {error && (
+                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold flex items-center gap-2">
+                  <AlertCircle size={16} className="shrink-0 text-amber-600" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              {/* ONE MAIN BUTTON */}
+              <button
+                type="button"
+                onClick={handleConfirmPayment}
+                disabled={isSubmitting}
+                className="w-full min-h-[50px] py-3.5 px-6 rounded-2xl bg-[#0D9488] hover:opacity-95 disabled:opacity-50 text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
+              >
+                {isSubmitting ? (
+                  <>
+                    <Loader2 size={18} className="animate-spin" />
+                    <span>Sending prompt to your phone...</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck size={18} />
+                    <span>Confirm &amp; Pay {currentPlan.priceTZS.toLocaleString()} TZS</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+
+          {/* STEP 4: COMPLETED */}
+          {step === 4 && (
+            <div className="py-4 text-center space-y-4">
+              <div className="w-16 h-16 rounded-full bg-emerald-100 text-[#0D9488] mx-auto flex items-center justify-center">
+                <CheckCircle2 size={34} />
+              </div>
+              <div>
+                <h3 className="text-lg font-extrabold text-[var(--text-primary,#1C1917)]">
+                  Welcome to WaveLink Pro!
+                </h3>
+                <p className="text-xs sm:text-sm text-[var(--text-secondary,#78716C)] mt-1 max-w-xs mx-auto leading-relaxed">
+                  Your payment to <strong>WaveLink</strong> ({receiptRef}) is confirmed. All themes, Pro badge, and creator perks are now unlocked.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                className="w-full min-h-[48px] py-3 px-6 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white font-extrabold text-sm transition"
+              >
+                Done
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>

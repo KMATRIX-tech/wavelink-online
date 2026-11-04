@@ -15,7 +15,7 @@ import {
   arrayUnion,
   arrayRemove
 } from 'firebase/firestore';
-import { Post, PostComment, Announcement, ReactionType } from '../types';
+import { Post, PostComment, Announcement, ReactionType, UserProfile } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { VideoPlayer } from './VideoPlayer';
 import { SongPlayerCard } from './SongPlayerCard';
@@ -62,7 +62,10 @@ import {
   PlusCircle,
   Hash,
   CalendarDays,
-  CheckCircle2
+  CheckCircle2,
+  Mic,
+  Flag,
+  Ban
 } from 'lucide-react';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { CreatorTipModal } from './CreatorTipModal';
@@ -71,7 +74,22 @@ import { RightSidebar } from './RightSidebar';
 import { PostSkeleton } from './PostSkeleton';
 import { LegalFooter } from './LegalModals';
 import { sendNotification } from '../services/notificationService';
-import { compressImage, generateVideoThumbnail, saveVideoPost } from '../utils/mediaStorage';
+import {
+  preloadUpcomingFeedPosts,
+  getPreloadedMediaInfo,
+  PreloadedMediaInfo
+} from '../services/preloadService';
+import { sanitizeUserText, SUPPORT_BOT_ID } from '../utils/security';
+import {
+  compressImage,
+  generateVideoThumbnail,
+  saveVideoPost,
+  cloneVideoFileToMemory,
+  validateVideoFileSize,
+  formatVideoFileSize,
+  FREE_MAX_VIDEO_MB,
+  PRO_MAX_VIDEO_MB
+} from '../utils/mediaStorage';
 
 const SPONSORED_ADS: Post[] = [
   {
@@ -152,14 +170,29 @@ interface FeedViewProps {
   onNavigateTab?: (tab: string) => void;
   initialFilterTag?: string | null;
   onClearFilterTag?: () => void;
+  onOpenWelink?: (mode?: 'chat' | 'image' | 'voice') => void;
+  onStartChat?: (userId: string) => void;
 }
 
 export const FeedView: React.FC<FeedViewProps> = ({
   onNavigateTab,
   initialFilterTag,
-  onClearFilterTag
+  onClearFilterTag,
+  onOpenWelink,
+  onStartChat
 }) => {
-  const { currentUser, userProfile, isAdmin, isProEffective, toggleSavePost } = useAuth();
+  const {
+    currentUser,
+    userProfile,
+    isAdmin,
+    isProEffective,
+    toggleSavePost,
+    updateUserProfile,
+    recordPointTransaction,
+    toggleBlockUser,
+    reportContent,
+    recordAdminAuditLog
+  } = useAuth();
 
   // Ads Rule: HIDE if user.isPro === true, user has Blue Star, or user is admin. SHOW only to regular free users.
   const showAds = shouldShowAds(userProfile, isAdmin, isProEffective);
@@ -186,9 +219,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [postNotice, setPostNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Monetization modals
+  // Monetization modals, Post Detail reader & Multi-Spark post sharing
   const [tippingPost, setTippingPost] = useState<Post | null>(null);
   const [boostingPost, setBoostingPost] = useState<Post | null>(null);
+  const [postsForSpark, setPostsForSpark] = useState<Post[] | null>(null);
+  const [focusedPost, setFocusedPost] = useState<Post | null>(null);
+  const [detailReadProgress, setDetailReadProgress] = useState<number>(0);
+
+  // Feed Reading Progress state (0–100% and count of waves consumed)
+  const [feedReadProgress, setFeedReadProgress] = useState<number>(0);
+  const [consumedPostsCount, setConsumedPostsCount] = useState<number>(0);
+  const [preloadedDimensions, setPreloadedDimensions] = useState<Record<string, PreloadedMediaInfo>>({});
 
   // Comments state: map of postId -> PostComment[]
   const [expandedComments, setExpandedComments] = useState<Record<string, boolean>>({});
@@ -200,6 +241,90 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [animatingReactions, setAnimatingReactions] = useState<Record<string, boolean>>({});
   const [floatingBursts, setFloatingBursts] = useState<Record<string, number>>({});
   const [sponsoredReactions, setSponsoredReactions] = useState<Record<string, Post>>({});
+
+  // Kind Engagement: Skippable first-time welcome card & Suggested community members
+  const [showWelcomeFlow, setShowWelcomeFlow] = useState<boolean>(() => {
+    if (!currentUser?.uid) return false;
+    return !localStorage.getItem(`wavelink_welcome_skipped_${currentUser.uid}`);
+  });
+  const [suggestedMembers, setSuggestedMembers] = useState<UserProfile[]>([]);
+  const [followedIds, setFollowedIds] = useState<string[]>(userProfile?.followingIds || []);
+  const [checkInDoneToday, setCheckInDoneToday] = useState<boolean>(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    return localStorage.getItem(`wavelink_checkin_${currentUser?.uid}_${today}`) === '1';
+  });
+
+  useEffect(() => {
+    if (userProfile?.followingIds) {
+      setFollowedIds(userProfile.followingIds);
+    }
+  }, [userProfile?.followingIds]);
+
+  useEffect(() => {
+    if (!currentUser?.uid || !showWelcomeFlow) return;
+    const q = query(collection(db, 'users'), limit(6));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: UserProfile[] = [];
+        snap.forEach((d) => {
+          const u = { ...(d.data() as UserProfile), id: d.id };
+          if (u.id !== currentUser.uid && list.length < 3) {
+            list.push(u);
+          }
+        });
+        setSuggestedMembers(list);
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [currentUser?.uid, showWelcomeFlow]);
+
+  const handleDismissWelcome = () => {
+    if (currentUser?.uid) {
+      localStorage.setItem(`wavelink_welcome_skipped_${currentUser.uid}`, '1');
+    }
+    setShowWelcomeFlow(false);
+  };
+
+  const handleFollowMember = async (targetUser: UserProfile) => {
+    if (!currentUser) return;
+    const isAlreadyFollowing = followedIds.includes(targetUser.id);
+    const nextFollowing = isAlreadyFollowing
+      ? followedIds.filter((id) => id !== targetUser.id)
+      : [...followedIds, targetUser.id];
+    setFollowedIds(nextFollowing);
+    try {
+      await updateUserProfile({ followingIds: nextFollowing });
+      if (!isAlreadyFollowing) {
+        await setDoc(doc(db, 'follows', `${currentUser.uid}_${targetUser.id}`), {
+          followerId: currentUser.uid,
+          followingId: targetUser.id,
+          createdAt: new Date().toISOString()
+        });
+      }
+    } catch (err) {
+      console.warn('Follow update notice:', err);
+    }
+  };
+
+  const handleDailyCheckIn = async () => {
+    if (!currentUser || checkInDoneToday) return;
+    const today = new Date().toISOString().slice(0, 10);
+    localStorage.setItem(`wavelink_checkin_${currentUser.uid}_${today}`, '1');
+    setCheckInDoneToday(true);
+    try {
+      await recordPointTransaction({
+        type: 'earned',
+        category: 'daily_reward',
+        title: 'Daily Community Check-In',
+        description: 'Friendly daily check-in bonus',
+        amount: 15
+      });
+    } catch (err) {
+      console.warn('Check-in points notice:', err);
+    }
+  };
 
   // Real-time listener for posts
   useEffect(() => {
@@ -458,11 +583,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   // Save edited post
   const handleSavePostEdit = async (postId: string) => {
-    if (!editPostContent.trim()) return;
+    const cleanContent = sanitizeUserText(editPostContent, 2000);
+    if (!cleanContent) return;
     setIsSavingPostEdit(true);
     try {
       await updateDoc(doc(db, 'posts', postId), {
-        content: editPostContent.trim(),
+        content: cleanContent,
         isEdited: true,
         updatedAt: new Date().toISOString()
       });
@@ -477,9 +603,19 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   // Delete post
   const handleDeletePost = async (postId: string) => {
-    if (!confirm('Are you sure you want to delete this wave?')) return;
+    const targetPost = posts.find((p) => p.id === postId);
     try {
       await deleteDoc(doc(db, 'posts', postId));
+      if (isAdmin && targetPost && targetPost.authorId !== currentUser?.uid) {
+        await recordAdminAuditLog({
+          action: 'delete_post',
+          targetId: targetPost.authorId,
+          targetLabel: targetPost.authorEmail,
+          details: `Admin deleted post ${postId}`
+        });
+      }
+      setPostNotice({ type: 'success', text: 'Wave removed.' });
+      setTimeout(() => setPostNotice(null), 3000);
     } catch (error) {
       handleFirestoreError(error, OperationType.DELETE, `posts/${postId}`);
     }
@@ -497,26 +633,43 @@ export const FeedView: React.FC<FeedViewProps> = ({
       return;
     }
 
+    if (isVideo) {
+      const canUploadLarge = Boolean(isProEffective || isAdmin);
+      const validation = validateVideoFileSize(file, canUploadLarge);
+      if (!validation.valid) {
+        e.target.value = '';
+        setPostNotice({
+          type: 'error',
+          text: validation.error || 'Video exceeds your plan upload limit.'
+        });
+        return;
+      }
+
+      setPostNotice(null);
+      setInlineMediaType('video');
+      // Clone video file into memory before clearing input so browser never invalidates the file handle
+      const safeVideoFile = await cloneVideoFileToMemory(file);
+      e.target.value = '';
+      setInlineMediaFile(safeVideoFile);
+      const videoObjectUrl = URL.createObjectURL(safeVideoFile);
+      setInlineMediaPreview(videoObjectUrl);
+      return;
+    }
+
     setPostNotice(null);
     setInlineMediaFile(file);
-    setInlineMediaType(isVideo ? 'video' : 'image');
+    setInlineMediaType('image');
 
-    if (isImage) {
-      try {
-        const compressedDataUrl = await compressImage(file, 1280, 1280, 0.82);
-        setInlineMediaPreview(compressedDataUrl);
-      } catch (err) {
-        console.error('Error compressing image:', err);
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          setInlineMediaPreview(event.target?.result as string);
-        };
-        reader.readAsDataURL(file);
-      }
-    } else {
-      // Video preview via object URL while keeping the File ready for chunked Firestore upload
-      const videoObjectUrl = URL.createObjectURL(file);
-      setInlineMediaPreview(videoObjectUrl);
+    try {
+      const compressedDataUrl = await compressImage(file, 1280, 1280, 0.82);
+      setInlineMediaPreview(compressedDataUrl);
+    } catch (err) {
+      console.error('Error compressing image:', err);
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        setInlineMediaPreview(event.target?.result as string);
+      };
+      reader.readAsDataURL(file);
     }
 
     e.target.value = '';
@@ -556,18 +709,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
         finalThumbnailUrl = thumb || undefined;
         finalImageUrl = thumb || undefined;
 
-        // 2. Read video file as base64 dataURL and store in Firestore via saveVideoPost (chunked in posts/{postId}/chunks)
-        const videoDataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = (ev) => resolve((ev.target?.result as string) || '');
-          reader.onerror = (err) => reject(err);
-          reader.readAsDataURL(inlineMediaFile);
-        });
-
+        // 2. Store in Firestore / local cache via resilient saveVideoPost
         const savedVideo = await saveVideoPost(
           postId,
           inlineMediaFile,
-          videoDataUrl,
+          undefined,
           'posts',
           (pct) => setUploadProgress(pct)
         );
@@ -588,7 +734,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
           userProfile?.photoURL ||
           currentUser.photoURL ||
           `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
-        content: inlineContent.trim(),
+        content: sanitizeUserText(inlineContent, 2000),
         imageUrl: finalImageUrl,
         thumbnailUrl: finalThumbnailUrl,
         videoUrl: finalVideoUrl,
@@ -738,7 +884,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   // Add Comment
   const handleAddComment = async (postId: string) => {
-    const text = commentInput[postId]?.trim();
+    const text = sanitizeUserText(commentInput[postId] || '', 800);
     if (!text || !currentUser) return;
 
     try {
@@ -790,12 +936,16 @@ export const FeedView: React.FC<FeedViewProps> = ({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  // Priority sorting: Boosted posts first, then newest
-  const sortedPosts = [...posts].sort((a, b) => {
-    if (a.isBoosted && !b.isBoosted) return -1;
-    if (!a.isBoosted && b.isBoosted) return 1;
-    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-  });
+  const blockedIds = userProfile?.blockedUserIds || [];
+
+  // Priority sorting: Boosted posts first, then newest (filtering out blocked users)
+  const sortedPosts = [...posts]
+    .filter((p) => !blockedIds.includes(p.authorId))
+    .sort((a, b) => {
+      if (a.isBoosted && !b.isBoosted) return -1;
+      if (!a.isBoosted && b.isBoosted) return 1;
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+    });
 
   // If hashtag filter active from global search
   const filteredSortedPosts = initialFilterTag
@@ -819,8 +969,89 @@ export const FeedView: React.FC<FeedViewProps> = ({
     combinedFeed.push(SPONSORED_ADS[0]);
   }
 
+  const handleMediaDimensionsReady = (url: string, info: PreloadedMediaInfo) => {
+    setPreloadedDimensions((prev) => {
+      if (prev[url]) return prev;
+      return { ...prev, [url]: info };
+    });
+  };
+
+  // Preload initial feed items and next 3 upcoming posts as soon as feed data arrives
+  useEffect(() => {
+    if (isLoading || combinedFeed.length === 0) return;
+    preloadUpcomingFeedPosts(combinedFeed, 0, 3, handleMediaDimensionsReady);
+  }, [combinedFeed.length, isLoading]);
+
+  // Track window scroll progress, how many feed posts have been viewed, and preload the next 3 upcoming items
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const updateReadingProgress = () => {
+      const scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
+      const docHeight = Math.max(
+        document.documentElement.scrollHeight,
+        document.body.scrollHeight
+      );
+      const winHeight = window.innerHeight || 1;
+      const maxScrollable = Math.max(1, docHeight - winHeight);
+      const rawPercent = Math.min(100, Math.max(0, Math.round((scrollTop / maxScrollable) * 100)));
+      setFeedReadProgress(scrollTop <= 8 ? 0 : rawPercent);
+
+      const postElements = document.querySelectorAll('[data-wave-feed-item="true"]');
+      if (postElements.length === 0) {
+        setConsumedPostsCount(0);
+        return;
+      }
+      const viewportThreshold = winHeight * 0.65;
+      let viewed = 0;
+      let lastVisibleIdx = 0;
+      postElements.forEach((el, idx) => {
+        const rect = el.getBoundingClientRect();
+        if (rect.top < viewportThreshold) {
+          viewed += 1;
+          lastVisibleIdx = idx;
+        }
+      });
+      setConsumedPostsCount(Math.min(postElements.length, viewed));
+
+      // Smart lookahead: preload the next 3 upcoming posts after the current visible item
+      preloadUpcomingFeedPosts(combinedFeed, lastVisibleIdx + 1, 3, handleMediaDimensionsReady);
+    };
+
+    updateReadingProgress();
+    window.addEventListener('scroll', updateReadingProgress, { passive: true });
+    window.addEventListener('resize', updateReadingProgress, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', updateReadingProgress);
+      window.removeEventListener('resize', updateReadingProgress);
+    };
+  }, [combinedFeed.length, isLoading]);
+
+  const handleOpenPostDetail = (post: Post) => {
+    setFocusedPost(post);
+    setDetailReadProgress(15);
+    if (!expandedComments[post.id]) {
+      toggleComments(post.id);
+    }
+  };
+
   return (
-    <div className="w-full max-w-7xl mx-auto px-3 sm:px-5 md:px-8 py-5 sm:py-7">
+    <div className="w-full max-w-7xl mx-auto px-3 sm:px-5 md:px-8 py-5 sm:py-7 relative">
+      {/* Top Viewport Visual Reading Progress Bar */}
+      <div
+        role="progressbar"
+        aria-label="Feed reading progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={feedReadProgress}
+        className="fixed top-0 left-0 right-0 z-40 h-1 bg-stone-200/40 pointer-events-none overflow-hidden"
+      >
+        <div
+          className="h-full bg-gradient-to-r from-[#2563EB] via-[#0D9488] to-[#10B981] transition-all duration-150 ease-out"
+          style={{ width: `${feedReadProgress}%` }}
+        />
+      </div>
+
       <div className="flex flex-row gap-7 items-start justify-center">
         {/* Center Main Feed (Width < 768px: Full Width, Width >= 768px: max-w-2xl) */}
         <div className="flex-1 min-w-0 max-w-full md:max-w-2xl w-full space-y-6 overflow-hidden">
@@ -850,83 +1081,195 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Crisp Pure White Welcome Hero & Profile Header Card */}
-          <div className="relative overflow-hidden rounded-3xl p-6 sm:p-7 bg-[#FFFFFF] border border-slate-200/90 shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] text-[#0F172A]">
-            <div className="relative z-10 flex items-center justify-between flex-wrap gap-4">
-              <div>
-                <div className="flex items-center gap-2 flex-wrap mb-2.5">
-                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-[#3B82F6] text-[11px] font-extrabold uppercase tracking-wider border border-blue-200/80">
-                    <Sparkles size={12} className="text-[#10B981]" />
-                    <span>WaveLink Community Feed</span>
-                  </div>
+          {/* Minimal Calm Friendly Greeting + Non-overlapping WELINK AI button */}
+          <div className="pt-1 pb-1 px-1 flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <h1 className="text-2xl sm:text-3xl font-extrabold text-[#1C1917] tracking-tight">
+                {(() => {
+                  const hour = new Date().getHours();
+                  const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Friend';
+                  const timeGreeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+                  return `${timeGreeting}, ${name} 👋`;
+                })()}
+              </h1>
+              <p className="text-xs sm:text-sm text-[#78716C] mt-0.5 font-medium">
+                Welcome back to your community.
+              </p>
+            </div>
 
-                  {/* Daily Login Bonus & Streak Header Pill */}
-                  <button
-                    type="button"
-                    onClick={() => onNavigateTab && onNavigateTab('settings')}
-                    className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 hover:bg-amber-100/80 text-amber-800 border border-amber-200/90 text-[11px] font-extrabold transition"
-                    title="View your Daily Login Reward & Streak in Profile"
-                  >
-                    <Coins size={12} className="text-amber-500" />
-                    <span>{(userProfile?.wavePoints ?? 10).toLocaleString()} WavePoints</span>
-                    <span className="text-slate-300">•</span>
-                    <Flame size={12} className="fill-orange-500 text-orange-500" />
-                    <span>{Math.max(1, userProfile?.loginStreak ?? 1)}-Day Streak</span>
-                    <span className="px-1.5 py-0.2 rounded-full bg-emerald-100 text-[#10B981] text-[10px]">
-                      +{userProfile?.lastDailyRewardAmount ?? 10} Today ✓
-                    </span>
-                  </button>
+            {onOpenWelink && (
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => onOpenWelink('voice')}
+                  className="min-h-[42px] px-3.5 py-2 rounded-2xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
+                  title="Talk Live by Voice with WELINK"
+                >
+                  <Mic size={15} className="text-[#0D9488]" />
+                  <span>Live Talk</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenWelink('chat')}
+                  className="min-h-[42px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-2 shadow-2xs transition active:scale-95"
+                  title="Open WELINK AI Guide"
+                >
+                  <Sparkles size={15} className="text-[#0D9488]" />
+                  <span>WELINK Guide</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Skippable First-Time Welcome Flow */}
+          {showWelcomeFlow && (
+            <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-2xs space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
+                    Welcome to WaveLink
+                  </span>
+                  <h2 className="text-base sm:text-lg font-extrabold text-[#1C1917] mt-1">
+                    Make yourself at home 🌿
+                  </h2>
+                  <p className="text-xs text-[#78716C] mt-0.5">
+                    Say hello to a few neighbors or share your first wave whenever you feel ready.
+                  </p>
                 </div>
-
-                <h2 className="text-xl sm:text-2xl lg:text-[26px] font-extrabold tracking-tight text-[#0F172A]">
-                  Welcome back, {userProfile?.displayName?.split(' ')[0] || 'Friend'}!
-                </h2>
-                <p className="text-slate-600 text-xs sm:text-sm mt-1 max-w-xl font-medium leading-relaxed">
-                  Share high-resolution photos, upload video reels directly to Firestore, and post official events on the community notice board.
-                </p>
+                <button
+                  type="button"
+                  onClick={handleDismissWelcome}
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold text-[#78716C] hover:text-[#1C1917] hover:bg-[var(--bg-subtle)] transition"
+                >
+                  Skip
+                </button>
               </div>
 
-              <div className="flex items-center gap-2 flex-wrap">
-                {onNavigateTab && (
-                  <>
-                    <button
-                      onClick={() => onNavigateTab('announcements')}
-                      className="px-4 py-2.5 rounded-2xl bg-[#F8FAFC] hover:bg-slate-100 text-[#0F172A] border border-slate-200/90 font-bold text-xs flex items-center gap-1.5 shadow-2xs active:scale-95 transition"
-                    >
-                      <CalendarDays size={14} className="text-[#3B82F6]" />
-                      <span>Notice Board &amp; Events</span>
-                    </button>
-                    <button
-                      onClick={() => onNavigateTab('videos')}
-                      className="px-4 py-2.5 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs flex items-center gap-2 transition shadow-sm shadow-blue-500/20 active:scale-95"
-                    >
-                      <VideoIcon size={14} />
-                      <span>Explore Reels</span>
-                    </button>
-                  </>
-                )}
+              {suggestedMembers.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {suggestedMembers.map((member) => {
+                    const isFollowing = followedIds.includes(member.id);
+                    return (
+                      <div
+                        key={member.id}
+                        className="p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-2"
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <img
+                            src={
+                              member.photoURL ||
+                              `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
+                            }
+                            alt={member.displayName}
+                            className="w-9 h-9 rounded-full object-cover shrink-0"
+                          />
+                          <div className="min-w-0">
+                            <span className="text-xs font-bold text-[#1C1917] block truncate">
+                              {member.displayName || 'Community Member'}
+                            </span>
+                            <span className="text-[10px] text-[#78716C] block truncate">
+                              {member.username || '@member'}
+                            </span>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleFollowMember(member)}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-bold transition shrink-0 ${
+                            isFollowing
+                              ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
+                              : 'bg-[#2563EB] text-white hover:bg-[#1D4ED8]'
+                          }`}
+                        >
+                          {isFollowing ? 'Following' : 'Follow'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-1 flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInlineContent('Hello everyone! Happy to be here on WaveLink 👋');
+                    handleDismissWelcome();
+                  }}
+                  className="text-xs font-bold text-[#2563EB] hover:underline"
+                >
+                  Write your first hello post →
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDismissWelcome}
+                  className="text-xs text-[#78716C] hover:text-[#1C1917]"
+                >
+                  Done
+                </button>
               </div>
             </div>
+          )}
+
+          {/* Friendly Daily Check-In Card */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-4 shadow-2xs flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-amber-50 text-[#D97706] border border-amber-200/70 flex items-center justify-center shrink-0">
+                <Flame size={18} />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs sm:text-sm font-bold text-[#1C1917]">
+                    Daily Check-In
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-[#D97706] border border-amber-200/80">
+                    {Math.max(1, userProfile?.loginStreak ?? 1)}-day streak
+                  </span>
+                </div>
+                <p className="text-xs text-[#78716C]">
+                  {checkInDoneToday
+                    ? `Checked in for today • ${(userProfile?.wavePoints ?? 10).toLocaleString()} WavePoints`
+                    : `Tap to check in and earn +15 WavePoints • ${(userProfile?.wavePoints ?? 10).toLocaleString()} pts`}
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleDailyCheckIn}
+              disabled={checkInDoneToday}
+              className={`min-h-[38px] px-4 py-1.5 rounded-xl text-xs font-bold transition ${
+                checkInDoneToday
+                  ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
+                  : 'bg-[#0D9488] hover:bg-teal-700 text-white active:scale-95'
+              }`}
+            >
+              {checkInDoneToday ? 'Checked In ✓' : 'Check In (+15 pts)'}
+            </button>
           </div>
 
-          {/* 24-Hour Moments Spark Tray */}
+          {/* Slim Sparks Row */}
           <div className="w-full max-w-full overflow-hidden">
-            <SparkTray />
+            <SparkTray
+              externalPostsToShare={postsForSpark}
+              onClearExternalPosts={() => setPostsForSpark(null)}
+              onStartChat={onStartChat}
+            />
           </div>
 
-          {/* Pinned Community Announcement Banner for Admins & Verified Organizations */}
-          {pinnedAnnouncement && (
+          {/* One Compact Pinned Notice Card with a single small badge */}
+          {(pinnedAnnouncement || latestAnnouncement) && (
             <div className="w-full max-w-full">
               <RichEventCard
-                announcement={pinnedAnnouncement}
+                announcement={(pinnedAnnouncement || latestAnnouncement)!}
                 isFeedBanner={true}
                 onRsvp={handleToggleAnnouncementRsvp}
               />
             </div>
           )}
 
-          {/* Center Main Feed: Pure White Post Creation Card with Firestore Photo & Video Upload */}
-          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border border-slate-200/90 rounded-3xl p-5 sm:p-6 shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] transition">
+          {/* Center Main Feed: Calm Post Creation Card with ONE main button */}
+          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border border-[#EFECE6] rounded-3xl p-5 shadow-xs transition">
             <div className="flex items-start gap-3.5">
               <img
                 src={
@@ -935,47 +1278,34 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                 }
                 alt="User"
-                className="w-11 h-11 rounded-full object-cover ring-2 ring-[#3B82F6]/20 shrink-0 mt-0.5"
+                className="w-11 h-11 rounded-full object-cover ring-2 ring-[#2563EB]/15 shrink-0 mt-0.5"
               />
               <div className="flex-1 min-w-0">
                 <textarea
                   value={inlineContent}
                   onChange={(e) => setInlineContent(e.target.value)}
-                  placeholder={`What's making waves today, ${userProfile?.displayName?.split(' ')[0] || 'Friend'}? Share a photo, video clip, or update...`}
-                  rows={3}
-                  className="w-full max-w-full bg-[#F8FAFC] rounded-2xl p-3.5 border border-slate-200/90 resize-none text-sm text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#3B82F6] focus:ring-2 focus:ring-[#3B82F6]/15 break-words leading-relaxed transition"
+                  placeholder={`What's on your mind today, ${userProfile?.displayName?.split(' ')[0] || 'Friend'}?`}
+                  rows={inlineContent || inlineMediaPreview ? 3 : 2}
+                  className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-3.5 border border-[#EFECE6] resize-none text-sm text-[#1C1917] placeholder-[#A8A29E] focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition"
                 />
 
                 {inlineMediaPreview && (
-                  <div className="relative rounded-2xl overflow-hidden my-3 border border-slate-200 max-h-72 bg-slate-950">
+                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] max-h-72 bg-[#1C1917]">
                     {inlineMediaType === 'video' ? (
                       <video src={inlineMediaPreview} controls className="w-full h-auto max-h-72 object-contain" />
                     ) : (
                       <img src={inlineMediaPreview} alt="Preview" className="w-full h-auto max-h-72 object-cover" />
                     )}
-                    <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-full bg-white/90 backdrop-blur-md text-[#0F172A] text-[10px] font-extrabold uppercase tracking-wider flex items-center gap-1 shadow-xs">
-                      {inlineMediaType === 'video' ? (
-                        <>
-                          <VideoIcon size={12} className="text-[#10B981]" />
-                          <span>Ready for Firestore Video Storage</span>
-                        </>
-                      ) : (
-                        <>
-                          <ImageIcon size={12} className="text-[#3B82F6]" />
-                          <span>Compressed HD Photo Ready</span>
-                        </>
-                      )}
-                    </div>
                     <button
                       type="button"
                       onClick={() => {
                         setInlineMediaFile(null);
                         setInlineMediaPreview(null);
                       }}
-                      className="absolute top-2.5 right-2.5 p-1.5 rounded-full bg-slate-900/80 text-white hover:bg-slate-900 transition"
+                      className="absolute top-2.5 right-2.5 min-w-[36px] min-h-[36px] p-2 rounded-full bg-stone-900/80 text-white hover:bg-stone-900 flex items-center justify-center transition"
                       title="Remove attachment"
                     >
-                      <X size={14} />
+                      <X size={16} />
                     </button>
                   </div>
                 )}
@@ -983,17 +1313,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 {/* Live Firestore Upload Progress Bar */}
                 {isSubmittingPost && uploadProgress > 0 && (
                   <div className="my-3 p-3 rounded-2xl bg-blue-50/70 border border-blue-200/80">
-                    <div className="flex items-center justify-between text-xs font-bold text-[#0F172A] mb-1.5">
-                      <span>
-                        {inlineMediaType === 'video' && inlineMediaFile
-                          ? 'Uploading video chunks to Firestore...'
-                          : 'Saving wave to Firestore...'}
-                      </span>
-                      <span className="font-mono text-[#3B82F6]">{uploadProgress}%</span>
+                    <div className="flex items-center justify-between text-xs font-bold text-[#1C1917] mb-1.5">
+                      <span>Uploading to community feed...</span>
+                      <span className="font-mono text-[#2563EB]">{uploadProgress}%</span>
                     </div>
                     <div className="w-full h-2 rounded-full bg-blue-100 overflow-hidden">
                       <div
-                        className="h-full bg-gradient-to-r from-[#3B82F6] to-[#10B981] transition-all duration-300"
+                        className="h-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] transition-all duration-300"
                         style={{ width: `${uploadProgress}%` }}
                       />
                     </div>
@@ -1012,22 +1338,22 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     <div className="flex items-center gap-2">
                       <CheckCircle2
                         size={15}
-                        className={postNotice.type === 'success' ? 'text-[#10B981]' : 'text-rose-600'}
+                        className={postNotice.type === 'success' ? 'text-[#0D9488]' : 'text-rose-600'}
                       />
                       <span>{postNotice.text}</span>
                     </div>
                     <button
                       type="button"
                       onClick={() => setPostNotice(null)}
-                      className="text-slate-400 hover:text-slate-700"
+                      className="text-stone-400 hover:text-stone-700 p-1"
                     >
-                      <X size={13} />
+                      <X size={14} />
                     </button>
                   </div>
                 )}
 
-                <div className="flex items-center justify-between pt-3.5 mt-2 border-t border-slate-100 flex-wrap gap-2">
-                  <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center justify-between pt-3 mt-2 border-t border-[#EFECE6] flex-wrap gap-2">
+                  <div className="flex items-center gap-2">
                     <input
                       type="file"
                       ref={fileInputRef}
@@ -1043,9 +1369,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           fileInputRef.current.click();
                         }
                       }}
-                      className="px-3.5 py-2 rounded-xl bg-blue-50 hover:bg-blue-100/80 text-[#3B82F6] border border-blue-200/60 text-xs font-bold flex items-center gap-1.5 transition"
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
-                      <ImageIcon size={15} />
+                      <ImageIcon size={16} />
                       <span>Photo</span>
                     </button>
 
@@ -1057,45 +1383,32 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           fileInputRef.current.click();
                         }
                       }}
-                      className="px-3.5 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100/80 text-[#10B981] border border-emerald-200/60 text-xs font-bold flex items-center gap-1.5 transition"
+                      title={
+                        isProEffective || isAdmin
+                          ? `Upload video up to ${PRO_MAX_VIDEO_MB} MB (WaveLink Pro)`
+                          : `Upload video from 0 KB to ${FREE_MAX_VIDEO_MB} MB (Pro unlocks ${PRO_MAX_VIDEO_MB} MB)`
+                      }
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
-                      <VideoIcon size={15} />
-                      <span>Video / Reel</span>
+                      <VideoIcon size={16} />
+                      <span>
+                        Video ({isProEffective || isAdmin ? `Up to ${PRO_MAX_VIDEO_MB}MB` : `0–${FREE_MAX_VIDEO_MB}MB`})
+                      </span>
                     </button>
-
-                    {onNavigateTab && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => onNavigateTab('studio')}
-                          className="px-3.5 py-2 rounded-xl bg-[#F8FAFC] hover:bg-slate-100 text-[#0F172A] border border-slate-200/80 text-xs font-bold flex items-center gap-1.5 transition"
-                        >
-                          <Wand2 size={15} className="text-[#3B82F6]" />
-                          <span>Studio</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onNavigateTab('announcements')}
-                          className="px-3.5 py-2 rounded-xl bg-[#F8FAFC] hover:bg-slate-100 text-[#0F172A] border border-slate-200/80 text-xs font-bold flex items-center gap-1.5 transition"
-                        >
-                          <CalendarDays size={15} className="text-[#10B981]" />
-                          <span>Post Event</span>
-                        </button>
-                      </>
-                    )}
                   </div>
 
+                  {/* ONE MAIN BUTTON ON SCREEN */}
                   <button
                     type="button"
                     onClick={handleCreatePost}
                     disabled={isSubmittingPost || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)}
-                    className="px-6 py-2.5 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition"
+                    className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition"
                   >
                     {isSubmittingPost ? (
-                      <span>Uploading...</span>
+                      <span>Sharing...</span>
                     ) : (
                       <>
-                        <Send size={14} />
+                        <Send size={15} />
                         <span>Share Wave</span>
                       </>
                     )}
@@ -1105,33 +1418,48 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           </div>
 
-          {/* Wave Studio Quick Action */}
-          <div className="bg-[#FFFFFF] border border-slate-200/90 rounded-3xl p-5 shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] flex items-center justify-between flex-wrap gap-4">
-            <div className="flex items-center gap-3.5">
-              <div className="p-3 rounded-2xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] text-white shadow-sm shadow-blue-500/20">
-                <Wand2 size={22} className="text-white" />
+          {/* Feed Reading Progress Strip above Posts Stream */}
+          {!isLoading && combinedFeed.length > 0 && (
+            <div className="sticky top-2 md:top-18 z-10 bg-[var(--bg-surface)]/95 backdrop-blur-md border border-[var(--border-hairline)] rounded-2xl px-4 py-2.5 shadow-2xs transition-all">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Eye size={14} className="text-[#0D9488] shrink-0" />
+                  <span className="font-bold text-[#1C1917] truncate">
+                    {feedReadProgress >= 95
+                      ? 'All caught up on this feed!'
+                      : `Reading progress • ${Math.max(1, consumedPostsCount)} of ${combinedFeed.length} waves`}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2.5 shrink-0">
+                  <span className="font-mono font-bold text-[11px] text-[#2563EB] tabular-nums">
+                    {feedReadProgress}%
+                  </span>
+                  {feedReadProgress > 20 && (
+                    <button
+                      type="button"
+                      onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+                      className="text-[11px] font-semibold text-[#78716C] hover:text-[#1C1917] underline cursor-pointer"
+                    >
+                      Top ↑
+                    </button>
+                  )}
+                </div>
               </div>
-              <div>
-                <h3 className="font-extrabold text-sm sm:text-base text-[#0F172A] flex items-center gap-1.5">
-                  <span>Wave Media Studio</span>
-                  <Sparkles size={14} className="text-[#10B981]" />
-                </h3>
-                <p className="text-xs text-slate-600 max-w-md">
-                  Edit photos &amp; videos, add text overlays, vibe stickers, and soundtracks before publishing to Firestore.
-                </p>
+              <div className="w-full h-1.5 bg-[#FAF7F2] rounded-full overflow-hidden mt-1.5 border border-[#EFECE6]">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] transition-all duration-200 ease-out"
+                  style={{
+                    width: `${Math.max(
+                      feedReadProgress,
+                      combinedFeed.length > 0
+                        ? Math.round((Math.max(1, consumedPostsCount) / combinedFeed.length) * 100)
+                        : 0
+                    )}%`
+                  }}
+                />
               </div>
             </div>
-
-            {onNavigateTab && (
-              <button
-                onClick={() => onNavigateTab('studio')}
-                className="px-5 py-2.5 rounded-2xl bg-[#0F172A] hover:bg-slate-800 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-xs active:scale-95 transition"
-              >
-                <Wand2 size={15} />
-                <span>Open Media Studio</span>
-              </button>
-            )}
-          </div>
+          )}
 
           {/* Posts Stream */}
           <div className="space-y-5">
@@ -1172,6 +1500,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   return (
                     <div
                       key={post.id}
+                      data-wave-feed-item="true"
                       className="w-full my-4 rounded-3xl border border-slate-200/90 bg-white p-5 sm:p-6 overflow-hidden text-[#0F172A] shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] transition hover:border-blue-300"
                     >
                       {/* Sponsored Header */}
@@ -1208,12 +1537,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         {post.content}
                       </p>
 
-                      {/* Image */}
+                      {/* Image (with preloaded aspect ratio reservation to prevent layout shift) */}
                       {post.imageUrl && (
-                        <div className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 bg-slate-50 flex items-center justify-center">
+                        <div
+                          className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 min-h-[180px] bg-slate-50 flex items-center justify-center"
+                          style={
+                            (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))
+                              ? {
+                                  aspectRatio: String(
+                                    (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))!.aspectRatio
+                                  ),
+                                }
+                              : undefined
+                          }
+                        >
                           <img
                             src={post.imageUrl}
                             alt="Sponsored item"
+                            decoding="async"
                             className="w-full h-auto max-h-96 object-cover"
                           />
                         </div>
@@ -1280,6 +1621,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 return (
                   <article
                     key={post.id}
+                    data-wave-feed-item="true"
                     className={`w-full max-w-full overflow-hidden break-words bg-[#FFFFFF] border rounded-3xl p-5 sm:p-6 shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] transition ${
                       post.isBoosted
                         ? 'border-amber-400 ring-2 ring-amber-400/20 shadow-md shadow-amber-500/10'
@@ -1302,6 +1644,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             <CrystalBadge
                               email={post.authorEmail}
                               name={post.authorName}
+                              isBot={post.authorId === SUPPORT_BOT_ID}
                               size="md"
                             />
                             {post.authorUsername && (
@@ -1334,7 +1677,15 @@ export const FeedView: React.FC<FeedViewProps> = ({
                               })}
                             </span>
                             <span aria-hidden="true">·</span>
-                            <span>Wave</span>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenPostDetail(post)}
+                              className="inline-flex items-center gap-1 text-[#2563EB] hover:underline font-semibold"
+                              title="Open Post Detail Reader View"
+                            >
+                              <Eye size={11} />
+                              <span>Read View</span>
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -1360,6 +1711,48 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           >
                             <Edit2 size={15} />
                           </button>
+                        )}
+
+                        {/* Report & Block buttons for non-authors */}
+                        {!isAuthor && post.authorId !== SUPPORT_BOT_ID && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await reportContent({
+                                  targetType: 'post',
+                                  targetId: post.id,
+                                  targetAuthorId: post.authorId,
+                                  targetSummary: post.authorName,
+                                  reason: 'Reported post from community feed'
+                                });
+                                setPostNotice({
+                                  type: 'success',
+                                  text: `Reported wave by ${post.authorName} to platform moderators.`
+                                });
+                                setTimeout(() => setPostNotice(null), 3500);
+                              }}
+                              className="p-1.5 text-slate-400 hover:text-amber-600 rounded-xl transition"
+                              title="Report Post"
+                            >
+                              <Flag size={15} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await toggleBlockUser(post.authorId);
+                                setPostNotice({
+                                  type: 'success',
+                                  text: `Blocked ${post.authorName}. You can manage blocked users in Privacy Settings.`
+                                });
+                                setTimeout(() => setPostNotice(null), 3500);
+                              }}
+                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition"
+                              title={`Block ${post.authorName}`}
+                            >
+                              <Ban size={15} />
+                            </button>
+                          </>
                         )}
 
                         {canDelete && (
@@ -1439,12 +1832,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       </div>
                     )}
 
-                    {/* Attached Image from Firestore */}
+                    {/* Attached Image from Firestore (with preloaded aspect-ratio stabilization) */}
                     {post.imageUrl && !post.videoUrl && !post.hasVideoChunks && post.mediaType !== 'video' && (
-                      <div className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-[460px] bg-[#F8FAFC] flex items-center justify-center">
+                      <div
+                        className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-[460px] min-h-[200px] bg-[#F8FAFC] flex items-center justify-center"
+                        style={
+                          (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))
+                            ? {
+                                aspectRatio: String(
+                                  (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))!.aspectRatio
+                                ),
+                              }
+                            : undefined
+                        }
+                      >
                         <img
                           src={post.imageUrl}
                           alt="Wave attachment"
+                          decoding="async"
                           className="w-full h-auto max-h-[460px] object-cover"
                           onError={(e) => {
                             (e.target as HTMLElement).style.display = 'none';
@@ -1495,6 +1900,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           <Bookmark size={16} className={isSaved ? 'fill-[#3B82F6] text-[#3B82F6]' : ''} />
                           <span className="font-mono tabular-numbers">{post.savesCount || 0}</span>
                         </button>
+
+                        {/* Add Post to Your Multi-Spark */}
+                        <button
+                          type="button"
+                          onClick={() => setPostsForSpark([post])}
+                          className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl transition hover:bg-teal-50 text-[#0D9488] font-bold active:scale-95 border border-teal-200/70"
+                          title="Add this post (and more) to your 24-hour Spark"
+                        >
+                          <Flame size={15} className="text-[#0D9488]" />
+                          <span>Add to Spark</span>
+                        </button>
                       </div>
 
                       <button
@@ -1512,7 +1928,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
                     {/* Collapsible Comments Section */}
                     {isExpanded && (
-                      <div className="mt-4 pt-3.5 border-t border-gray-100 dark:border-gray-800 space-y-3">
+                      <div className="mt-4 pt-3.5 border-t border-[#EFECE6] space-y-3">
                         <div className="flex items-center gap-2">
                           <input
                             type="text"
@@ -1524,19 +1940,19 @@ export const FeedView: React.FC<FeedViewProps> = ({
                               if (e.key === 'Enter') handleAddComment(post.id);
                             }}
                             placeholder="Write a reply..."
-                            className="flex-1 py-2 px-3.5 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            className="flex-1 py-2 px-3.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-xs text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                           />
                           <button
                             onClick={() => handleAddComment(post.id)}
                             disabled={!commentInput[post.id]?.trim()}
-                            className="p-2 rounded-xl bg-gradient-to-r from-blue-600 to-emerald-600 text-white disabled:opacity-40 hover:from-blue-500 hover:to-emerald-500 transition shadow-xs"
+                            className="p-2 rounded-xl bg-[#2563EB] text-white disabled:opacity-40 hover:bg-[#1D4ED8] transition shadow-xs"
                           >
                             <Send size={14} />
                           </button>
                         </div>
 
                         {comments.length === 0 ? (
-                          <p className="text-[11px] text-gray-400 italic py-1">
+                          <p className="text-[11px] text-[#78716C] italic py-1">
                             No replies yet. Be the first to chime in!
                           </p>
                         ) : (
@@ -1544,7 +1960,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             {comments.map((comment) => (
                               <div
                                 key={comment.id}
-                                className="flex items-start gap-2.5 p-3 rounded-2xl bg-gray-50/70 dark:bg-gray-800/40 text-xs"
+                                className="flex items-start gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] text-xs"
                               >
                                 <img
                                   src={
@@ -1561,14 +1977,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                       name={comment.authorName}
                                       size="sm"
                                     />
-                                    <span className="text-[10px] text-gray-400 font-mono tabular-numbers">
+                                    <span className="text-[10px] text-[#78716C] font-mono tabular-numbers">
                                       {new Date(comment.createdAt).toLocaleTimeString([], {
                                         hour: '2-digit',
                                         minute: '2-digit'
                                       })}
                                     </span>
                                   </div>
-                                  <p className="mt-1 text-gray-700 dark:text-gray-300 leading-relaxed">
+                                  <p className="mt-1 text-[#1C1917] leading-relaxed">
                                     {comment.content}
                                   </p>
                                 </div>
@@ -1582,13 +1998,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 );
               })
             )}
-
-            {/* Adsterra Native In-Feed Banner (Visible only for free users, instant auto-hide when upgrading to Pro) */}
-            <AdsterraAdBanner
-              variant="feed"
-              slotId="feed_bottom"
-              onOpenUpgradeModal={() => setIsPaymentModalOpen(true)}
-            />
           </div>
 
           {/* Legal Footer for Privacy, Terms & Refund policies */}
@@ -1629,6 +2038,153 @@ export const FeedView: React.FC<FeedViewProps> = ({
             // refresh or keep
           }}
         />
+      )}
+
+      {/* Post Detail Reader Modal with Top Visual Reading Progress Bar */}
+      {focusedPost && (
+        <div
+          className="fixed inset-0 z-50 bg-stone-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
+          onClick={() => setFocusedPost(null)}
+        >
+          <div
+            className="w-full max-w-2xl max-h-[88vh] bg-white rounded-3xl border border-stone-200 shadow-2xl overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Top Visual Reading Progress Bar for Post Detail View */}
+            <div className="w-full h-1.5 bg-stone-100 overflow-hidden shrink-0">
+              <div
+                className="h-full bg-gradient-to-r from-[#2563EB] via-[#0D9488] to-[#10B981] transition-all duration-150"
+                style={{ width: `${detailReadProgress}%` }}
+              />
+            </div>
+
+            {/* Reader Modal Header */}
+            <div className="px-5 py-3.5 border-b border-stone-100 flex items-center justify-between gap-3 shrink-0 bg-stone-50/70">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Eye size={16} className="text-[#2563EB] shrink-0" />
+                <span className="text-xs font-extrabold text-[#1C1917] truncate">
+                  Wave Reader • {focusedPost.authorName}
+                </span>
+                <span className="px-2 py-0.5 rounded-md bg-blue-50 text-[#2563EB] font-mono font-bold text-[11px]">
+                  {detailReadProgress}% read
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFocusedPost(null)}
+                className="p-1.5 rounded-xl text-stone-500 hover:text-stone-800 hover:bg-stone-200/60 transition"
+                title="Close Reader"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Scrollable Post Detail & Thread Content */}
+            <div
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                const maxScroll = el.scrollHeight - el.clientHeight;
+                if (maxScroll <= 4) {
+                  setDetailReadProgress(100);
+                } else {
+                  const pct = Math.min(100, Math.max(10, Math.round((el.scrollTop / maxScroll) * 100)));
+                  setDetailReadProgress(pct);
+                }
+              }}
+              className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4"
+            >
+              <div className="flex items-center gap-3">
+                <img
+                  src={
+                    focusedPost.authorPhotoURL ||
+                    `https://api.dicebear.com/7.x/shapes/svg?seed=${focusedPost.authorId}`
+                  }
+                  alt={focusedPost.authorName}
+                  className="w-11 h-11 rounded-full object-cover ring-2 ring-[#2563EB]/20"
+                />
+                <div>
+                  <CrystalBadge
+                    email={focusedPost.authorEmail}
+                    name={focusedPost.authorName}
+                    isBot={focusedPost.authorId === SUPPORT_BOT_ID}
+                    size="md"
+                  />
+                  <div className="text-xs text-stone-400 font-mono mt-0.5">
+                    {new Date(focusedPost.createdAt).toLocaleString()}
+                  </div>
+                </div>
+              </div>
+
+              {focusedPost.content && (
+                <p className="text-base text-[#1C1917] whitespace-pre-wrap leading-relaxed">
+                  {focusedPost.content}
+                </p>
+              )}
+
+              {(focusedPost.videoUrl || focusedPost.hasVideoChunks || focusedPost.mediaType === 'video') && (
+                <VideoPlayer
+                  postId={focusedPost.id}
+                  videoUrl={focusedPost.videoUrl}
+                  hasVideoChunks={focusedPost.hasVideoChunks}
+                  thumbnailUrl={focusedPost.thumbnailUrl || focusedPost.imageUrl}
+                />
+              )}
+
+              {focusedPost.imageUrl && !focusedPost.videoUrl && !focusedPost.hasVideoChunks && focusedPost.mediaType !== 'video' && (
+                <div className="rounded-2xl overflow-hidden border border-stone-200 bg-stone-50">
+                  <img
+                    src={focusedPost.imageUrl}
+                    alt="Post media"
+                    className="w-full h-auto max-h-[480px] object-contain mx-auto"
+                  />
+                </div>
+              )}
+
+              <div className="pt-4 border-t border-stone-100 space-y-3">
+                <h4 className="text-xs font-extrabold uppercase tracking-wider text-stone-500">
+                  Replies ({(commentsMap[focusedPost.id] || []).length})
+                </h4>
+                {(commentsMap[focusedPost.id] || []).length === 0 ? (
+                  <p className="text-xs text-stone-400 italic">No replies yet on this wave.</p>
+                ) : (
+                  <div className="space-y-2.5">
+                    {(commentsMap[focusedPost.id] || []).map((comment) => (
+                      <div
+                        key={comment.id}
+                        className="flex items-start gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] text-xs"
+                      >
+                        <img
+                          src={
+                            comment.authorPhotoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${comment.authorId}`
+                          }
+                          alt={comment.authorName}
+                          className="w-7 h-7 rounded-full object-cover shrink-0 mt-0.5"
+                        />
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between">
+                            <CrystalBadge
+                              email={comment.authorEmail}
+                              name={comment.authorName}
+                              size="sm"
+                            />
+                            <span className="text-[10px] text-[#78716C] font-mono">
+                              {new Date(comment.createdAt).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit'
+                              })}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[#1C1917] leading-relaxed">{comment.content}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -7,9 +7,15 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signOut as fbSignOut,
-  updateProfile as fbUpdateProfile
+  updateProfile as fbUpdateProfile,
+  updatePassword as fbUpdatePassword,
+  sendPasswordResetEmail as fbSendPasswordResetEmail,
+  sendEmailVerification as fbSendEmailVerification,
+  deleteUser as fbDeleteUser,
+  EmailAuthProvider,
+  reauthenticateWithCredential
 } from 'firebase/auth';
-import { doc, getDoc, setDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, setDoc, deleteDoc, collection, query, where, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
 import {
   auth,
   db,
@@ -21,9 +27,27 @@ import {
   OperationType,
   cleanFirestoreData,
   isAuthNetworkError,
-  getFriendlyAuthErrorMessage
+  getFriendlyAuthErrorMessage,
+  getAuthHeaders
 } from '../firebase';
-import { UserProfile, PointTransaction, PointTransactionCategory, PointTransactionType } from '../types';
+import {
+  UserProfile,
+  PointTransaction,
+  PointTransactionCategory,
+  PointTransactionType,
+  AppearanceTheme,
+  UserPrivacySettings,
+  UserTermsAgreement,
+  AuditActionType
+} from '../types';
+import {
+  sanitizeUserText,
+  validateStrongPassword,
+  checkClientLoginLockout,
+  recordClientFailedLogin,
+  clearClientFailedLogins,
+  SUPPORT_BOT_ID
+} from '../utils/security';
 
 export const DAILY_REWARD_SCHEDULE = [10, 15, 20, 25, 30, 40, 50];
 
@@ -264,6 +288,8 @@ interface AuthContextType {
   quickSignIn: (email: string, pass: string, displayName?: string, username?: string) => Promise<void>;
   authenticateSeamlessly: (email: string, pass: string) => Promise<void>;
   signOut: () => Promise<void>;
+  changeUserPassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  sendPasswordReset: (email?: string) => Promise<void>;
   updateUserProfile: (data: {
     displayName?: string;
     username?: string;
@@ -272,8 +298,28 @@ interface AuthContextType {
     proBorderEffect?: 'aura-gold' | 'neon-pulse' | 'cosmic-glow' | 'emerald-ring' | 'none';
     proAccentColor?: 'purple' | 'gold' | 'emerald' | 'neon' | 'crimson';
     proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
+    appearanceTheme?: AppearanceTheme;
+    followingIds?: string[];
+    privacySettings?: UserPrivacySettings;
+    termsAgreement?: UserTermsAgreement;
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
+  toggleBlockUser: (targetUserId: string) => Promise<boolean>;
+  reportContent: (params: {
+    targetType: 'user' | 'post' | 'bot_reply';
+    targetId: string;
+    targetAuthorId?: string;
+    targetSummary?: string;
+    reason: string;
+  }) => Promise<void>;
+  sendVerificationEmail: () => Promise<void>;
+  deleteMyAccount: (currentPassword?: string) => Promise<void>;
+  recordAdminAuditLog: (params: {
+    action: AuditActionType;
+    targetId: string;
+    targetLabel?: string;
+    details: string;
+  }) => Promise<void>;
   dismissWarning: () => Promise<void>;
   toggleSubAdmin: (targetUserId: string, makeSubAdmin: boolean) => Promise<void>;
   toggleVerifyUser: (targetUserId: string, verify: boolean) => Promise<void>;
@@ -732,28 +778,50 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const signInWithEmail = async (email: string, pass: string) => {
+    const lockout = checkClientLoginLockout();
+    if (lockout.locked) {
+      throw new Error(
+        `Too many failed login attempts. Please wait ${lockout.remainingSeconds} seconds before trying again.`
+      );
+    }
     try {
       const cleanEmail = email.trim();
       const res = await withAuthNetworkRetry(() =>
         signInWithEmailAndPassword(auth, cleanEmail, pass)
       );
+      clearClientFailedLogins();
       await syncUserProfileDoc(res.user);
     } catch (err: unknown) {
+      const attempt = recordClientFailedLogin();
       console.warn('Email Sign-In Notice:', err);
+      if (attempt.locked) {
+        throw new Error(
+          `Too many failed login attempts. Login is temporarily locked for ${attempt.remainingSeconds} seconds.`
+        );
+      }
       throw err;
     }
   };
 
   const registerWithEmail = async (email: string, pass: string, displayName: string, username?: string) => {
+    const pwCheck = validateStrongPassword(pass);
+    if (!pwCheck.valid) {
+      throw new Error(pwCheck.message || 'Please choose a stronger password (at least 8 characters with letters and numbers).');
+    }
     try {
       const cleanEmail = email.trim();
+      const safeDisplayName = sanitizeUserText(displayName, 80);
+      const safeUsername = username ? sanitizeUserText(username, 40) : undefined;
       const res = await withAuthNetworkRetry(() =>
         createUserWithEmailAndPassword(auth, cleanEmail, pass)
       );
-      if (displayName) {
-        await fbUpdateProfile(res.user, { displayName });
+      if (safeDisplayName) {
+        await fbUpdateProfile(res.user, { displayName: safeDisplayName });
       }
-      await syncUserProfileDoc(res.user, displayName, username);
+      // Send verification email automatically on registration (non-blocking)
+      fbSendEmailVerification(res.user).catch(() => {});
+      clearClientFailedLogins();
+      await syncUserProfileDoc(res.user, safeDisplayName, safeUsername);
     } catch (err: unknown) {
       console.warn('Registration Notice:', err);
       throw err;
@@ -835,11 +903,71 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signOut = async () => {
     try {
+      if (currentUser?.uid) {
+        await setDoc(
+          doc(db, 'users', currentUser.uid),
+          { isOnline: false, lastSeenAt: new Date().toISOString() },
+          { merge: true }
+        ).catch(() => {});
+      }
       await fbSignOut(auth);
       setUserProfile(null);
     } catch (err) {
       console.error('Sign Out Error:', err);
     }
+  };
+
+  const changeUserPassword = async (currentPassword: string, newPassword: string) => {
+    if (!currentUser) {
+      throw new Error('You must be signed in to change your password.');
+    }
+    const cleanNew = newPassword.trim();
+    const pwCheck = validateStrongPassword(cleanNew);
+    if (!pwCheck.valid) {
+      throw new Error(pwCheck.message || 'New password must be at least 8 characters long and include letters and numbers.');
+    }
+
+    // Re-authenticate first if currentPassword is provided and user has an email
+    if (currentPassword.trim() && currentUser.email) {
+      try {
+        const credential = EmailAuthProvider.credential(currentUser.email, currentPassword.trim());
+        await reauthenticateWithCredential(currentUser, credential);
+      } catch (reauthErr: any) {
+        const code = reauthErr?.code || '';
+        if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+          throw new Error('Your current password is incorrect. Please check and try again.');
+        }
+      }
+    }
+
+    try {
+      await fbUpdatePassword(currentUser, cleanNew);
+      await setDoc(
+        doc(db, 'users', currentUser.uid),
+        { passwordUpdatedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        { merge: true }
+      ).catch(() => {});
+    } catch (err: any) {
+      const code = err?.code || '';
+      if (code === 'auth/requires-recent-login') {
+        if (currentPassword.trim() && currentUser.email) {
+          const credential = EmailAuthProvider.credential(currentUser.email, currentPassword.trim());
+          await reauthenticateWithCredential(currentUser, credential);
+          await fbUpdatePassword(currentUser, cleanNew);
+          return;
+        }
+        throw new Error('For security, please enter your Current Password above to confirm changing your password.');
+      }
+      throw new Error(getFriendlyAuthErrorMessage(err));
+    }
+  };
+
+  const sendPasswordReset = async (email?: string) => {
+    const targetEmail = (email || currentUser?.email || userProfile?.email || '').trim();
+    if (!targetEmail) {
+      throw new Error('No email address is linked to this account.');
+    }
+    await fbSendPasswordResetEmail(auth, targetEmail);
   };
 
   const updateUserProfile = async (data: {
@@ -850,6 +978,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     proBorderEffect?: 'aura-gold' | 'neon-pulse' | 'cosmic-glow' | 'emerald-ring' | 'none';
     proAccentColor?: 'purple' | 'gold' | 'emerald' | 'neon' | 'crimson';
     proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
+    appearanceTheme?: AppearanceTheme;
+    followingIds?: string[];
+    privacySettings?: UserPrivacySettings;
+    termsAgreement?: UserTermsAgreement;
   }) => {
     if (!currentUser) return;
     try {
@@ -864,20 +996,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const updatePayload: Record<string, any> = {
         updatedAt: new Date().toISOString()
       };
-      if (data.displayName !== undefined) updatePayload.displayName = data.displayName;
-      if (formattedUsername !== undefined) updatePayload.username = formattedUsername;
-      if (data.bio !== undefined) updatePayload.bio = data.bio;
+      if (data.displayName !== undefined) updatePayload.displayName = sanitizeUserText(data.displayName, 80);
+      if (formattedUsername !== undefined) updatePayload.username = sanitizeUserText(formattedUsername, 40);
+      if (data.bio !== undefined) updatePayload.bio = sanitizeUserText(data.bio, 280);
       if (data.photoURL !== undefined) updatePayload.photoURL = data.photoURL;
       if (data.proBorderEffect !== undefined) updatePayload.proBorderEffect = data.proBorderEffect;
       if (data.proAccentColor !== undefined) updatePayload.proAccentColor = data.proAccentColor;
       if (data.proBadge !== undefined) updatePayload.proBadge = data.proBadge;
+      if (data.appearanceTheme !== undefined) updatePayload.appearanceTheme = data.appearanceTheme;
+      if (data.followingIds !== undefined) updatePayload.followingIds = data.followingIds;
+      if (data.privacySettings !== undefined) {
+        updatePayload.privacySettings = data.privacySettings;
+        updatePayload.isOnline = data.privacySettings.showOnlineStatus;
+      }
+      if (data.termsAgreement !== undefined) {
+        updatePayload.termsAgreement = data.termsAgreement;
+      }
 
       const sanitized = cleanFirestoreData(updatePayload);
       await setDoc(userRef, sanitized, { merge: true });
 
       if (data.displayName || data.photoURL) {
         await fbUpdateProfile(currentUser, {
-          displayName: data.displayName || currentUser.displayName,
+          displayName: updatePayload.displayName || currentUser.displayName,
           photoURL: data.photoURL || currentUser.photoURL,
         });
       }
@@ -886,6 +1027,160 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `users/${currentUser.uid}`);
     }
+  };
+
+  const toggleBlockUser = async (targetUserId: string): Promise<boolean> => {
+    if (!currentUser || !userProfile || !targetUserId || targetUserId === currentUser.uid) {
+      return false;
+    }
+    const existingBlocked = userProfile.blockedUserIds || [];
+    const isAlreadyBlocked = existingBlocked.includes(targetUserId);
+    const nextBlocked = isAlreadyBlocked
+      ? existingBlocked.filter((id) => id !== targetUserId)
+      : [...existingBlocked, targetUserId];
+
+    try {
+      await setDoc(
+        doc(db, 'users', currentUser.uid),
+        { blockedUserIds: nextBlocked, updatedAt: new Date().toISOString() },
+        { merge: true }
+      );
+      setUserProfile((prev) => (prev ? { ...prev, blockedUserIds: nextBlocked } : null));
+      showGlobalToast(
+        isAlreadyBlocked ? 'User unblocked.' : 'User blocked. You will no longer see their posts or messages.'
+      );
+      return !isAlreadyBlocked;
+    } catch (err) {
+      console.error('Error toggling block user:', err);
+      return isAlreadyBlocked;
+    }
+  };
+
+  const reportContent = async (params: {
+    targetType: 'user' | 'post' | 'bot_reply';
+    targetId: string;
+    targetAuthorId?: string;
+    targetSummary?: string;
+    reason: string;
+  }) => {
+    if (!currentUser) return;
+    const reportId = `rep_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const nowIso = new Date().toISOString();
+    const cleanReason = sanitizeUserText(params.reason || 'Reported for safety review', 500);
+    const cleanSummary = sanitizeUserText(params.targetSummary || '', 400);
+
+    await setDoc(
+      doc(db, 'contentReports', reportId),
+      cleanFirestoreData({
+        id: reportId,
+        reporterId: currentUser.uid,
+        reporterEmail: currentUser.email || 'user',
+        reporterName: userProfile?.displayName || currentUser.displayName || 'WaveLink Member',
+        targetType: params.targetType,
+        targetId: params.targetId,
+        targetAuthorId: params.targetAuthorId,
+        targetSummary: cleanSummary,
+        reason: cleanReason,
+        status: 'open',
+        createdAt: nowIso
+      })
+    );
+    showGlobalToast('Thank you. Your report has been sent to the WaveLink safety team.');
+  };
+
+  const sendVerificationEmail = async () => {
+    if (!currentUser) {
+      throw new Error('Please sign in first.');
+    }
+    await fbSendEmailVerification(currentUser);
+    showGlobalToast(`Verification email sent to ${currentUser.email}!`);
+  };
+
+  const recordAdminAuditLog = async (params: {
+    action: AuditActionType;
+    targetId: string;
+    targetLabel?: string;
+    details: string;
+  }) => {
+    if (!currentUser) return;
+    try {
+      const auditId = `audit_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      await setDoc(
+        doc(db, 'adminAuditLogs', auditId),
+        cleanFirestoreData({
+          id: auditId,
+          actorId: currentUser.uid,
+          actorEmail: currentUser.email || 'unknown',
+          actorName: userProfile?.displayName || currentUser.displayName || 'Administrator',
+          action: params.action,
+          targetId: params.targetId,
+          targetLabel: params.targetLabel ? sanitizeUserText(params.targetLabel, 140) : undefined,
+          details: sanitizeUserText(params.details, 800),
+          createdAt: new Date().toISOString()
+        })
+      );
+    } catch (err) {
+      console.warn('Audit log write notice:', err);
+    }
+  };
+
+  const deleteMyAccount = async (currentPassword?: string) => {
+    if (!currentUser) {
+      throw new Error('You must be signed in to delete your account.');
+    }
+    const uid = currentUser.uid;
+    const email = currentUser.email || '';
+
+    if (currentPassword && currentPassword.trim() && email) {
+      const credential = EmailAuthProvider.credential(email, currentPassword.trim());
+      await reauthenticateWithCredential(currentUser, credential);
+    }
+
+    // 1. Record deletion in audit log
+    await recordAdminAuditLog({
+      action: 'delete_account',
+      targetId: uid,
+      targetLabel: email,
+      details: `User permanently deleted their own account (${email}).`
+    });
+
+    // 2. Delete user's posts and sparks
+    try {
+      const postsSnap = await getDocs(query(collection(db, 'posts'), where('authorId', '==', uid)));
+      for (const p of postsSnap.docs) {
+        await deleteDoc(doc(db, 'posts', p.id)).catch(() => {});
+      }
+      const sparksSnap = await getDocs(query(collection(db, 'sparks'), where('authorId', '==', uid)));
+      for (const s of sparksSnap.docs) {
+        await deleteDoc(doc(db, 'sparks', s.id)).catch(() => {});
+      }
+    } catch {
+      // continue cleanup
+    }
+
+    // 3. Delete user profile document
+    await deleteDoc(doc(db, 'users', uid)).catch(() => {});
+
+    // 4. Clear local storage caches
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(`wavelink_daily_reward_${uid}`);
+        localStorage.removeItem(`wavelink_point_transactions_${uid}`);
+        localStorage.removeItem(`wavelink_pro_pass_${uid}`);
+        localStorage.removeItem(`wavelink_privacy_${uid}`);
+        localStorage.removeItem(`wavelink_terms_${uid}`);
+      }
+    } catch {
+      // ignore
+    }
+
+    // 5. Delete Firebase Auth user or sign out if recent login is required
+    try {
+      await fbDeleteUser(currentUser);
+    } catch {
+      await fbSignOut(auth);
+    }
+    setUserProfile(null);
   };
 
 
@@ -950,13 +1245,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // Only admins or verified people with the blue star can talk to the admin
   const canTalkToAdmin = isSuperAdmin || isSubAdmin || isVerified || Boolean(userProfile?.isPro);
 
-  // Admin capability to appoint/demote sub-admins
+  // Admin capability to appoint/demote sub-admins (enforced on server + Firestore + audit log)
   const toggleSubAdmin = async (targetUserId: string, makeSubAdmin: boolean) => {
     if (!isSuperAdmin) {
       console.warn('Permission denied: Only Platform Owner (keylanmbilinyi5@gmail.com) can manage administrators.');
       return;
     }
+    if (targetUserId === SUPPORT_BOT_ID) {
+      showGlobalToast('WaveLink Support Bot cannot be granted admin privileges.');
+      return;
+    }
     try {
+      const headers = await getAuthHeaders();
+      await fetch('/api/admin/role', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          callerEmail: currentUser?.email,
+          targetUserId,
+          makeSubAdmin
+        })
+      }).catch(() => {});
+
       const targetUserRef = doc(db, 'users', targetUserId);
       await setDoc(
         targetUserRef,
@@ -967,6 +1277,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         },
         { merge: true }
       );
+
+      await recordAdminAuditLog({
+        action: 'role_change',
+        targetId: targetUserId,
+        details: `${makeSubAdmin ? 'Promoted user to Sub-Admin' : 'Demoted Sub-Admin to standard User'}`
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${targetUserId}`);
     }
@@ -978,6 +1294,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.warn('Permission denied: Only administrators can verify members.');
       return;
     }
+    if (targetUserId === SUPPORT_BOT_ID) return;
     try {
       const targetUserRef = doc(db, 'users', targetUserId);
       await setDoc(
@@ -992,6 +1309,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         },
         { merge: true }
       );
+
+      await recordAdminAuditLog({
+        action: 'verify_user',
+        targetId: targetUserId,
+        details: `${verify ? 'Granted Blue Star verification & Pro status' : 'Revoked verification & Pro status'}`
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${targetUserId}`);
     }
@@ -1116,8 +1439,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         quickSignIn,
         authenticateSeamlessly,
         signOut,
+        changeUserPassword,
+        sendPasswordReset,
         updateUserProfile,
         toggleSavePost,
+        toggleBlockUser,
+        reportContent,
+        sendVerificationEmail,
+        deleteMyAccount,
+        recordAdminAuditLog,
         dismissWarning,
         toggleSubAdmin,
         toggleVerifyUser,

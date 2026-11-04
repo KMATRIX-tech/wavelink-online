@@ -1,69 +1,86 @@
-# Implementation Plan: WaveLink Monetization Modal, Promo Code Engine & Real-Time Sync
+# Implementation Plan: WaveLink Mobile-First Calm & Welcoming Redesign
 
-## 1. Goal & Scope
-Fix the monetization payment instructions, the `"HARVEST2026"` promo code redemption engine, and the real-time Firestore feed, online member badges, and chat sync across all WaveLink deployment domains (`wavelink-online.netlify.app` and `wavelink-social.netlify.app`).
+## 1. Goal & Architecture
+Redesign WaveLink to deliver a mobile-first, simple, calm, and welcoming social experience without dark mode, featuring:
+1. **Light Warm Theme**: Warm cream canvas (`#FAF7F2`), pure white cards (`#FFFFFF`), soft borders (`#EFECE6`), friendly blue (`#2563EB`) and teal (`#0D9488`) main accents, gentle coral (`#F43F5E`) and amber (`#F59E0B`) highlights.
+2. **Section Soft Tints**:
+   - Home Feed: `#FAF7F2` (warm cream) with ocean blue & teal accents
+   - Studio Editor: `#FAF8FC` (soft lavender) with vibrant violet accents
+   - Video Reels: `#FCF8F7` (soft warm blush) with coral accents
+   - Messages: `#F5F9FD` (soft sky blue) with azure accents
+   - Notice Board: `#F5FAF7` (soft sage) with emerald accents
+   - Profile & Pro: `#FAF8F3` (soft warm linen) with amber/gold accents
+3. **Ergonomics & Large Tap Targets**: Rounded corners (`rounded-2xl`, `rounded-3xl`), minimum 44–48px touch targets, generous spacing, readable typography.
+4. **Minimal Home Screen**: Short friendly greeting (`"Good morning / Welcome back, {name} 👋"`), 24h moments tray, then the feed, and nothing else.
+5. **Mobile Navigation**: Primary mobile navigation strictly via the 5-tab `MobileBottomNav` (Home, Reels, Create, Messages, Profile).
+6. **Non-Overlapping Layers & Single-Modal Discipline**: Floating buttons and social bar banners removed from mobile feed overlays; popups coordinated so only one popup/drawer shows at a time with a clear $\ge 44\text{px}$ close button.
+7. **Pro Placement & Free Daily Taste**:
+   - Pro lives quietly in its dedicated tab on the Profile page.
+   - Free users can use all free features without pushy banners.
+   - Free users receive **1 free AI image per day** in WELINK AI Studio, with a gentle note when they've used today's image.
+8. **One Main Button per Screen**:
+   - Home Feed: `Share Wave`
+   - Studio Editor: `Publish Wave`
+   - Video Reels: `Create a Reel`
+   - Messages: `Send` (in conversation) / `New Group`
+   - Notice Board: `Post Event / Notice`
+   - Profile: `Save Profile Changes`
 
-### User Review Required & Confirmed Decisions
-- **Payment Modal & Monetization Hub Alignment**: Both the Payment Modal (`MobileMoneyPaymentModal.tsx`) and the Monetization Hub page card (`MonetizationHub.tsx`) will display the official admin number `0787473334` (`WaveLink Official Admin`) with a 1-click `"Copy Number"` button and remove any legacy `[YOUR_TILL_NUMBER]` placeholders.
-- **Cross-Domain Real-Time Read/Write Rules**: Firestore security rules (`firestore.rules`) will allow public reads (`allow read: if true`) on global posts, user profiles/online badges, sparks, and announcements while keeping writes authenticated (`allow write: if isSignedIn()`), and allow authenticated members to read/write direct and channel messages without permission errors during auth hydration across `wavelink-online.netlify.app` and `wavelink-social.netlify.app`.
+## 2. Key Files Updated
+- `src/index.css`: Replaced harsh white and rainbow animations with warm cream tokens (`#FAF7F2`, `#FAF8F5`, `#1C1917`, `#2563EB`, `#0D9488`, `#F43F5E`, `#F59E0B`).
+- `src/context/ThemeContext.tsx`: Enforced warm cream light theme `#FAF7F2` and stone typography `#1C1917` across the root and body elements.
+- `src/components/MobileBottomNav.tsx`: 5-tab ergonomic mobile navigation bar with active color states, rounded pills, and $\ge 48\text{px}$ touch targets.
+- `src/components/TopHeader.tsx`: Hidden on mobile feed so greeting takes center stage; displays calm titles, search, and compact points on desktop/sub-views.
+- `src/App.tsx`: Added section soft background tints, single-modal coordination (`activeCall`, `isWelinkOpen`), removed overlapping floating social bar banner and floating buttons from mobile viewport.
+- `src/components/FeedView.tsx`: Simplified home screen with minimal greeting and single "Share Wave" composer button; removed clutter and duplicate promo cards.
+- `src/components/WelinkAssistantDrawer.tsx`: Removed blocking paywall for free users; unlocked AI Chat Guide for everyone; added 1 free daily AI image taste; replaced header with warm styling and $\ge 44\text{px}$ close button; provided gentle Pro notes for Video/Voice.
+- `src/components/SettingsView.tsx`: Quiet Pro presentation under the "WaveLink Pro" tab, daily reward bonus tracking, and single "Save Profile Changes" button.
+- `src/components/StudioEditorView.tsx`, `VideosHubView.tsx`, `AnnouncementsView.tsx`, `ChatChannelsView.tsx`: Styled with soft tints, section accents, and single main button per view.
 
----
+## 3. Spark Audience & WebRTC Calling Features
+- **Spark Viewers & Likers Drawer**:
+  - Automatically records viewer entry (`userId`, `name`, `username`, `photoURL`, `viewedAt`) in Firestore when a user watches another member's 24h Spark.
+  - Automatically records likers (`userId`, `name`, `username`, `photoURL`, `likedAt`) and sends in-app notification to the Spark creator.
+  - Interactive "👁️ X views • 🔥 Y likes" audience pill opens slide-up connections drawer with tabs for Watched and Liked.
+  - Quick action buttons to directly "Message" (`onStartChat`) or "Follow" viewers and likers.
+  - Creator encouragement banner prompting new Spark creations.
+- **WebRTC Peer-to-Peer Calling & Incoming Call Alert**:
+  - WebSocket `/api/chat/ws` relays `call:signal` events (`offer`, `answer`, `candidate`, `end`, `declined`).
+  - Google STUN servers (`stun.l.google.com:19302`) with peer connection ICE candidate handling.
+  - Local and remote camera/microphone media tracks with full toggle, screen sharing, and audio playback.
+  - Incoming call notification and ringing alert modal with pleasant Web Audio synthesizer ringtone, caller avatar, and one-tap Accept / Decline buttons.
 
-## 2. Aesthetic & Structural Direction
-- **Taxonomy & Design Paradigm**: Atmospheric Minimalism & High-Craft Light UI (`#F8FAFC` / `#FFFFFF` surfaces, `#0F172A` crisp slate typography, `#3B82F6` sky blue and `#10B981` emerald accents).
-- **Tabular Numerals**: Enforce `tabular-nums` / `font-mono` on phone numbers (`0787473334`), pricing tiers (`TZS 18,000` / `TZS 50,000`), and transaction reference inputs.
-- **Toast & Modal Ergonomics**: Prominent sky-blue/emerald highlighted instruction banner at the top of the Payment Modal, instant tactile feedback on `"Copy Number"` and `"Redeem"`, and non-blocking toast notifications (`"Harvest Pass Activated!"`).
+## 4. AI Upgrade Intelligence & Founder Feedback Collection
+- **Autonomous Upgrade Detection**:
+  - `src/services/upgradeFeedbackService.ts`: Analyzes user inputs across AI touchpoints for feature requests, speed issues, new tools, UI suggestions, and monetization requests (`detectUpgradeIdea`).
+  - Auto-classifies category (`features`, `ui_ux`, `media_sparks`, `video_calls`, `performance`, `monetization`, `other`) and assesses impact (`high`, `medium`, `low`).
+  - Saves to Firestore `upgrade_feedback` collection with author details, quote, and status (`new`, `planned`, `implemented`, `archived`).
+  - Automatically dispatches in-app notification to Platform Owner Keylan Mbilinyi (`keylanmbilinyi5@gmail.com`).
+- **AI Touchpoints Wired**:
+  - `WelinkAssistantDrawer.tsx`:
+    - Chat submissions run `detectUpgradeIdea` -> `recordUpgradeFeedback` (`source: 'welink_ai'`).
+    - Live Talk voice turns run `detectUpgradeIdea` -> `recordUpgradeFeedback` (`source: 'live_talk'`).
+    - WebSocket native speech recognition runs `detectUpgradeIdea`.
+    - Added toast banner acknowledging captured feedback for Founder Keylan.
+    - Added starter prompts for suggesting platform upgrades.
+  - `ChatChannelsView.tsx` & `server.ts`:
+    - Messages sent to `@wavelink_support` run `detectUpgradeIdea` -> `recordUpgradeFeedback` (`source: 'support_bot'`).
+    - Updated bot instructions to warmly acknowledge user suggestions and confirm they are saved for Keylan.
+- **Dedicated Founder Feedback Desks**:
+  - `AdminDashboard.tsx`:
+    - Added "💡 AI Upgrades & Ideas" tab with unreviewed badge counter.
+    - Metrics overview: Total Ideas, New / Unreviewed, Planned Updates, Shipped & Implemented.
+    - Filter pills by status (`All`, `New`, `Planned`, `Implemented`, `Archived`) and source (`All`, `WELINK AI`, `Live Voice`, `Support Bot`, `Founder Note`).
+    - Search bar over titles, summaries, quotes, and usernames.
+    - Status updater buttons ("📌 Plan for Release", "✅ Mark Implemented", "Archive").
+    - Inline implementation notes editor for Keylan to record updates and progress.
+    - "+ Add Upgrade Idea" manual creation modal.
+  - `SettingsView.tsx`:
+    - Added "AI Ideas" section accessible directly from Settings/Profile.
+    - Displays recent community upgrade feedback with live Firestore listener.
+    - Embedded user submission form allowing users to directly send ideas to Founder's Feedback.
 
----
-
-## 3. Proposed Changes
-
-### A. Payment Modal Header & Official Admin Instructions
-- **File**: `/src/components/MobileMoneyPaymentModal.tsx`
-- **Changes**:
-  - Place a prominent, highlighted instruction box at the top of the modal (above the form input fields) displaying:
-    - `"Send payment to WaveLink Official Admin: 0787473334 (Airtel Money / M-Pesa / Tigo Pesa)."`
-    - A dedicated `"Copy Number"` button that copies `0787473334` to the clipboard (using `navigator.clipboard.writeText` with a `document.execCommand('copy')` fallback for iframe compatibility) and shows a `"Copied!"` confirmation toast.
-    - Clear instruction copy below the number: `"After sending funds on your mobile phone, paste the Transaction ID from your operator's SMS receipt below."`
-
-### B. Instant `"HARVEST2026"` Promo Code Engine & Ad Removal
-- **Files**:
-  - `/src/context/AuthContext.tsx`
-  - `/src/components/MobileMoneyPaymentModal.tsx`
-  - `/src/components/MonetizationHub.tsx`
-- **Changes**:
-  - Add an `activateProPass(planName?: string, durationDays?: number)` helper to `AuthContext` that:
-    1. Immediately updates `userProfile` in React state with `isPro: true`, `hasBlueStar: true`, `proPlan: 'harvest_1year'`, `proBadge: 'blue_star'`, and `proExpiresAt` (+365 days), plus persists a local fallback in `localStorage` (`wavelink_pro_pass_${uid}`) so Pro status and Blue Star badge survive reloads even if offline.
-    2. Purges any active Adsterra scripts/DOM containers immediately via `AdsterraManager` / `AdsterraAdBanner` reactive `userProfile?.isPro || userProfile?.hasBlueStar` checks.
-    3. Writes to Firestore (`setDoc(doc(db, 'users', user.uid), ..., { merge: true })`) inside a non-blocking `Promise.race` with a 2.5-second timeout so network latency or backend rule checks never block the UI.
-  - Update `handleApplyCoupon` in `MobileMoneyPaymentModal.tsx` so entering `"HARVEST2026"` (case-insensitive):
-    - Never hangs or spins indefinitely (`isVerifyingCoupon` resolves immediately after local + timed-out Firestore sync).
-    - Displays a prominent `"Harvest Pass Activated!"` toast notification.
-    - Calls both `onSuccess?.()` and `onClose()` so the modal closes reliably from every parent view (`FeedView`, `ChatChannelsView`, `UserDirectoryView`, `SettingsView`, `MonetizationHub`).
-  - Update `MonetizationHub.tsx` to replace `[YOUR_TILL_NUMBER]` with `0787473334` (`WaveLink Official Admin`), include a `"Copy Number"` button, and wire the `"HARVEST2026"` promo code input directly on the hub card as well.
-
-### C. Real-Time Feed, Online Member Badges & Chat Sync Across Domains
-- **Files**:
-  - `/firestore.rules`
-  - `/src/context/AuthContext.tsx`
-  - `/src/services/verificationService.ts`
-  - `/src/components/FeedView.tsx`
-  - `/src/components/ChatChannelsView.tsx`
-  - `/src/components/UserDirectoryView.tsx`
-- **Changes**:
-  - Update `/firestore.rules` and deploy via Firebase Rules deployment:
-    - Allow public read (`allow read: if true`) on `/users/{userId}`, `/posts/{postId}` (and subcollections `/comments` and `/chunks`), `/sparks/{sparkId}`, `/announcements/{announcementId}`, `/follows/{followId}`, and `/appSettings/{settingId}`.
-    - Allow authenticated users (`isSignedIn()`) to create and update their own `/users/{userId}` document (including `isPro`, `hasBlueStar`, `proPlan`, `proExpiresAt`, `proBadge`, `isOnline`, `lastSeenAt`) without restrictive field-diff rejections.
-    - Allow authenticated users to read and write `/channels/{channelId}/messages/{messageId}`, `/groups/{groupId}`, and `/groupMessages/{messageId}` so direct messages, channel chats, and online badges work seamlessly.
-    - Keep `/payment_requests/{requestId}` strictly private (`request.auth.uid == resource.data.userId || isAdmin()`).
-  - Update `AuthContext.tsx` and `verificationService.ts` to register `wavelink-online.netlify.app`, `wavelink-social.netlify.app`, and `window.location.hostname`, and maintain a live `isOnline: true` / `lastSeenAt` heartbeat on the signed-in user's profile so online member badges update in real time across `FeedView`, `UserDirectoryView`, and `ChatChannelsView`.
-
----
-
-## 4. Verification Plan
-1. **Static & Type Verification**: Run `lint_applet` (`tsc --noEmit`) and `compile_applet` (`npm run build`) to confirm zero TypeScript or bundle errors.
-2. **Firestore Security Rules Deployment**: Deploy updated `firestore.rules` to `formal-photon-n48x0` (`ai-studio-remixremixwaveli-0bcdbee7-e3d1-46ba-ab1a-3448613d34ac`).
-3. **Functional Checks**:
-   - Verify the Payment Modal header displays `0787473334` (`WaveLink Official Admin`), the `"Copy Number"` button copies `0787473334`, and the SMS receipt instructions are clearly shown above the inputs.
-   - Verify entering `"HARVEST2026"` (any casing) immediately activates `user.isPro = true` and `hasBlueStar = true`, shows `"Harvest Pass Activated!"`, closes the modal, and hides all Adsterra ads without hanging.
-   - Verify `onSnapshot` subscriptions for global feed posts, online users, and direct/channel messages stream cleanly with zero permission errors.
+## 5. Verification
+- `tsc --noEmit`: 0 TypeScript errors.
+- `npm run build`: Vite build passes cleanly.
+- Dev server running on port 3000.

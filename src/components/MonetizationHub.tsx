@@ -85,14 +85,14 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
   const [hubPromoError, setHubPromoError] = useState<string | null>(null);
 
   const handleCopyAdminNumber = () => {
-    const adminNum = '0787473334';
+    const businessPayee = 'WaveLink';
     try {
       if (navigator?.clipboard?.writeText) {
-        navigator.clipboard.writeText(adminNum).catch(() => {});
+        navigator.clipboard.writeText(businessPayee).catch(() => {});
       }
     } catch (_) {}
     setCopiedAdminPhone(true);
-    showGlobalToast('Copied 0787473334 to clipboard!');
+    showGlobalToast('Payee: WaveLink');
     setTimeout(() => setCopiedAdminPhone(false), 3000);
   };
 
@@ -893,9 +893,9 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
                 </div>
                 <div>
                   <h4 className="font-extrabold text-base sm:text-lg text-[#0F172A] flex items-center gap-2 flex-wrap">
-                    <span>WaveLink Official Admin Mobile Money</span>
-                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-emerald-100 text-emerald-800 border border-emerald-200 font-mono tabular-nums">
-                      0787473334
+                    <span>WaveLink Mobile Money Checkout</span>
+                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-emerald-100 text-emerald-800 border border-emerald-200">
+                      WaveLink
                     </span>
                   </h4>
                   <p className="text-xs text-slate-500 mt-0.5">
@@ -916,30 +916,30 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
               </div>
             </div>
 
-            {/* Official Admin Number & Promo Box */}
+            {/* Official Payee & Promo Box */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
               <div className="p-6 rounded-2xl bg-gradient-to-br from-blue-50/70 via-sky-50/40 to-emerald-50/50 border border-blue-200/80 shadow-[0_2px_14px_-4px_rgba(37,99,235,0.08)] space-y-3.5">
                 <div className="text-xs font-bold text-slate-800 leading-relaxed">
-                  Send payment to <strong className="text-[#2563eb] font-black">WaveLink Official Admin:</strong>{' '}
-                  <span className="font-mono font-black text-emerald-600 tabular-nums">0787473334</span>{' '}
+                  Complete your mobile money checkout with official payee{' '}
+                  <strong className="text-[#2563eb] font-black">WaveLink</strong>{' '}
                   <span className="text-slate-600">(Airtel Money / M-Pesa / Tigo Pesa).</span>
                 </div>
                 <div className="flex items-center justify-between gap-3 p-3.5 rounded-2xl bg-white border border-emerald-200/80 shadow-2xs">
                   <div>
                     <div className="text-[10px] uppercase font-extrabold text-emerald-700 tracking-wider">
-                      WaveLink Official Admin
+                      Official Business Payee
                     </div>
-                    <div className="text-2xl font-black font-mono text-emerald-600 tracking-wider tabular-nums select-all">
-                      0787473334
+                    <div className="text-2xl font-black text-emerald-600 tracking-tight select-all">
+                      WaveLink
                     </div>
                   </div>
                   <button
                     type="button"
-                    onClick={handleCopyAdminNumber}
+                    onClick={() => setIsGeneralModalOpen(true)}
                     className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95 shrink-0 shadow-xs"
                   >
-                    {copiedAdminPhone ? <Check size={14} /> : <Copy size={14} />}
-                    <span>{copiedAdminPhone ? 'Copied!' : 'Copy Number'}</span>
+                    <Check size={14} />
+                    <span>Pay Now</span>
                   </button>
                 </div>
                 <div className="text-xs text-slate-600 leading-relaxed">

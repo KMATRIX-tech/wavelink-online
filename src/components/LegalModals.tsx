@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ShieldCheck, FileText, RefreshCw, X, HelpCircle, CheckCircle2, Waves, Lock } from 'lucide-react';
 
-export type LegalDocType = 'privacy' | 'terms' | 'refund';
+export type LegalDocType = 'privacy' | 'terms' | 'refund' | 'security';
 
 interface LegalModalProps {
   isOpen: boolean;
@@ -19,35 +19,35 @@ export const LegalModal: React.FC<LegalModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/75 backdrop-blur-xs animate-fade-in">
-      <div className="relative w-full max-w-2xl max-h-[90vh] flex flex-col rounded-3xl bg-[#0f1422] border border-purple-500/30 text-white shadow-2xl overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-stone-900/40 backdrop-blur-xs animate-fade-in">
+      <div className="relative w-full max-w-2xl max-h-[90vh] flex flex-col rounded-3xl bg-white border border-[var(--border-subtle)] text-[#1C1917] shadow-2xl overflow-hidden">
         {/* Modal Header */}
-        <div className="p-5 border-b border-gray-800 flex items-center justify-between bg-gradient-to-r from-purple-950/40 to-slate-900/60">
+        <div className="p-5 border-b border-[var(--border-subtle)] flex items-center justify-between bg-[#FAF7F2]">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-purple-600/30 text-purple-300">
+            <div className="p-2 rounded-xl bg-[#2563EB]/10 text-[#2563EB]">
               <Waves size={20} />
             </div>
             <div>
-              <h2 className="font-extrabold text-base sm:text-lg text-white">WaveLink Legal Center</h2>
-              <p className="text-xs text-purple-300/80">Compliance, Transparency &amp; Privacy</p>
+              <h2 className="font-extrabold text-base sm:text-lg text-[#1C1917]">WaveLink Legal &amp; Security Center</h2>
+              <p className="text-xs text-[#57534E] font-medium">Plain, Friendly Privacy, Terms &amp; Account Safety</p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-gray-300 hover:text-white transition"
+            className="p-2 rounded-xl bg-white border border-[var(--border-subtle)] hover:bg-stone-100 text-[#57534E] hover:text-[#1C1917] transition"
           >
             <X size={18} />
           </button>
         </div>
 
         {/* Tab Navigation */}
-        <div className="flex border-b border-gray-800 bg-slate-900/60 px-4 pt-2 gap-2 overflow-x-auto scrollbar-none">
+        <div className="flex border-b border-[var(--border-subtle)] bg-[#FAF7F2]/60 px-4 pt-2 gap-2 overflow-x-auto scrollbar-none">
           <button
             onClick={() => setActiveDoc('privacy')}
             className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-bold flex items-center gap-2 border-b-2 transition whitespace-nowrap ${
               activeDoc === 'privacy'
-                ? 'border-purple-500 text-purple-300 bg-purple-500/10'
-                : 'border-transparent text-gray-400 hover:text-gray-200'
+                ? 'border-[#2563EB] text-[#2563EB] bg-[#2563EB]/5'
+                : 'border-transparent text-[#57534E] hover:text-[#1C1917]'
             }`}
           >
             <ShieldCheck size={15} />
@@ -57,19 +57,30 @@ export const LegalModal: React.FC<LegalModalProps> = ({
             onClick={() => setActiveDoc('terms')}
             className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-bold flex items-center gap-2 border-b-2 transition whitespace-nowrap ${
               activeDoc === 'terms'
-                ? 'border-indigo-500 text-indigo-300 bg-indigo-500/10'
-                : 'border-transparent text-gray-400 hover:text-gray-200'
+                ? 'border-[#0D9488] text-[#0D9488] bg-[#0D9488]/5'
+                : 'border-transparent text-[#57534E] hover:text-[#1C1917]'
             }`}
           >
             <FileText size={15} />
             <span>Terms of Service</span>
           </button>
           <button
+            onClick={() => setActiveDoc('security')}
+            className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-bold flex items-center gap-2 border-b-2 transition whitespace-nowrap ${
+              activeDoc === 'security'
+                ? 'border-[#2563EB] text-[#2563EB] bg-[#2563EB]/5'
+                : 'border-transparent text-[#57534E] hover:text-[#1C1917]'
+            }`}
+          >
+            <Lock size={15} />
+            <span>Security Guide</span>
+          </button>
+          <button
             onClick={() => setActiveDoc('refund')}
             className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-bold flex items-center gap-2 border-b-2 transition whitespace-nowrap ${
               activeDoc === 'refund'
-                ? 'border-emerald-500 text-emerald-300 bg-emerald-500/10'
-                : 'border-transparent text-gray-400 hover:text-gray-200'
+                ? 'border-emerald-600 text-emerald-700 bg-emerald-50'
+                : 'border-transparent text-[#57534E] hover:text-[#1C1917]'
             }`}
           >
             <RefreshCw size={15} />
@@ -78,51 +89,51 @@ export const LegalModal: React.FC<LegalModalProps> = ({
         </div>
 
         {/* Scrollable Document Content */}
-        <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4 text-xs sm:text-sm text-slate-300 leading-relaxed">
+        <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4 text-xs sm:text-sm text-[#57534E] leading-relaxed bg-white">
           {activeDoc === 'privacy' && (
             <div className="space-y-4">
-              <div className="p-3.5 rounded-2xl bg-purple-950/40 border border-purple-500/20 text-purple-200 text-xs flex items-center gap-2.5">
-                <Lock size={16} className="text-purple-400 shrink-0" />
-                <span>Last Updated: October 2026. Compliant with Tanzania Data Protection Act &amp; international privacy standards.</span>
+              <div className="p-3.5 rounded-2xl bg-[#EEF2FF] border border-[#2563EB]/20 text-[#1E40AF] text-xs font-medium flex items-center gap-2.5">
+                <Lock size={16} className="text-[#2563EB] shrink-0" />
+                <span>Written in plain language. Compliant with Tanzania Data Protection Act &amp; international privacy standards.</span>
               </div>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
                   1. Information We Collect
                 </h3>
                 <p>
-                  When you register and use WaveLink, we collect your profile information (display name, email address, profile photo), published content (waves, comments, images, video reels), and transactional receipts for mobile payments.
+                  When you register and use WaveLink, we store your profile information (display name, email address, profile photo), published content (waves, comments, Sparks, video reels), and transaction reference IDs for Mobile Money upgrades.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
-                  2. Chat &amp; Communication Privacy
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  2. Private Chats &amp; Member-Only Access
                 </h3>
                 <p>
-                  Direct peer-to-peer messages and WebRTC audio/video calls are private between conversation participants. We enforce role-based Firestore security rules that prevent unauthorized third parties from querying or accessing private user chats.
+                  Direct messages and group conversations are strictly readable only by their members. Our Firebase Security Rules enforce participant checks so no outside account can read your private conversations.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
                   3. Zero Sale of Personal Information
                 </h3>
                 <p>
-                  WaveLink never sells, rents, or licenses your personal data to external marketing brokers. Native ads on WaveLink are curated brand placements, and user data is never shared with advertisers.
+                  WaveLink never sells, rents, or shares your personal data with data brokers or advertisers.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
-                  4. Data Security &amp; Deletion Rights
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  4. Delete My Account Anytime
                 </h3>
                 <p>
-                  All database records are protected by Google Cloud infrastructure with encrypted data in transit and at rest. You retain full rights to delete your posts, update profile settings, or request permanent account erasure via the Helpdesk.
+                  You are in full control of your data. You can delete any post or comment at any time, or use the <strong>Delete My Account</strong> button in Settings → Password &amp; Security to permanently remove your profile, posts, and sparks.
                 </p>
               </section>
             </div>
@@ -130,48 +141,97 @@ export const LegalModal: React.FC<LegalModalProps> = ({
 
           {activeDoc === 'terms' && (
             <div className="space-y-4">
-              <div className="p-3.5 rounded-2xl bg-indigo-950/40 border border-indigo-500/20 text-indigo-200 text-xs flex items-center gap-2.5">
-                <FileText size={16} className="text-indigo-400 shrink-0" />
-                <span>Effective Date: 2026. By accessing WaveLink, you agree to abide by these Terms of Service.</span>
+              <div className="p-3.5 rounded-2xl bg-[#F0FDFA] border border-[#0D9488]/20 text-[#0F766E] text-xs font-medium flex items-center gap-2.5">
+                <FileText size={16} className="text-[#0D9488] shrink-0" />
+                <span>Effective Date: 2026. Friendly rules that keep WaveLink welcoming for everyone.</span>
               </div>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-indigo-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#2563EB]" />
                   1. Community Standards &amp; Acceptable Use
                 </h3>
                 <p>
-                  WaveLink is dedicated to positive creative expression. Users must not publish defamatory, abusive, fraudulent, or harassing content. Impersonation of other creators, hate speech, or automated bot spam will lead to immediate account suspension.
+                  WaveLink is dedicated to positive creative expression. Harassment, hate speech, impersonation, or scams are not allowed. You can report or block any user or post with one tap.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-indigo-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#2563EB]" />
                   2. Content Ownership &amp; Intellectual Property
                 </h3>
                 <p>
-                  You own the videos, music remixes, and graphics you create using Wave Studio. By posting publicly, you grant WaveLink a non-exclusive license to display your media to other users in the global feed and explore reels.
+                  You own the photos, videos, Sparks, and music mixes you create and share on WaveLink. By posting publicly, you allow WaveLink to display your content in the community feed and reels.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-indigo-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#2563EB]" />
                   3. Creator Tipping &amp; Platform Fees
                 </h3>
                 <p>
-                  Fans can send instant tips to creators via Airtel Money and AzamPay. A transparent 10% platform maintenance fee is deducted to cover network gateway costs and server infrastructure. The remaining 90% is credited directly to the creator.
+                  Supporters can send tips to creators via Mobile Money. 90% goes to the creator and a transparent 10% platform maintenance fee covers gateway and server costs.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-indigo-400" />
-                  4. Account Suspension &amp; Governance
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#2563EB]" />
+                  4. Account Governance &amp; Audit Logs
                 </h3>
                 <p>
-                  WaveLink administrators and moderators maintain active moderation queues. Accounts flagged for egregious violations may receive warning banners or temporary/permanent bans.
+                  Every moderation action (warnings, bans, role changes, and verifications) is recorded in a tamper-resistant Admin Audit Log.
+                </p>
+              </section>
+            </div>
+          )}
+
+          {activeDoc === 'security' && (
+            <div className="space-y-4">
+              <div className="p-3.5 rounded-2xl bg-blue-50 border border-blue-200 text-[#1E40AF] text-xs font-medium flex items-center gap-2.5">
+                <ShieldCheck size={16} className="text-[#2563EB] shrink-0" />
+                <span>How we protect your WaveLink account, chats, and payments every day.</span>
+              </div>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  1. Never Share Your Password, PIN, or OTP
+                </h3>
+                <p>
+                  WaveLink admins and our automated <strong>WaveLink Support</strong> bot will <strong>NEVER</strong> ask for your password, Mobile Money PIN, OTP code, or card details.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  2. Strong Passwords, Email Verification &amp; Login Lockout
+                </h3>
+                <p>
+                  Accounts require strong passwords (8+ characters with letters and numbers), support email verification and instant password reset emails, and automatically lock out repeated failed login attempts to stop brute-force bots.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  3. XSS Content Sanitization &amp; Server-Verified Uploads
+                </h3>
+                <p>
+                  All posts, comments, bios, and chat messages are sanitized against HTML/script injection. Uploaded media files are checked for safe MIME types and tier size limits (0–4 MB on Free, up to 100 MB on Pro) on both the app and server.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  4. Server-Side Secrets &amp; Rate-Limited AI
+                </h3>
+                <p>
+                  All API keys and payment credentials stay strictly on the backend server. AI and chat routes are rate-limited per user with daily credit caps and Firebase App Check protection.
                 </p>
               </section>
             </div>
@@ -179,24 +239,24 @@ export const LegalModal: React.FC<LegalModalProps> = ({
 
           {activeDoc === 'refund' && (
             <div className="space-y-4">
-              <div className="p-3.5 rounded-2xl bg-emerald-950/40 border border-emerald-500/20 text-emerald-200 text-xs flex items-center gap-2.5">
-                <RefreshCw size={16} className="text-emerald-400 shrink-0" />
+              <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-medium flex items-center gap-2.5">
+                <RefreshCw size={16} className="text-emerald-600 shrink-0" />
                 <span>Fair &amp; Transparent Billing for Mobile Money &amp; Subscriptions.</span>
               </div>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-emerald-600" />
                   1. WaveLink Pro Subscriptions (18,000 TZS / mo)
                 </h3>
                 <p>
-                  Pro memberships unlock 500MB media uploads, 1080p WebRTC calling, and ad-free experience. If your Airtel Money or AzamPay wallet was charged multiple times due to a network glitch, or if features failed to activate, we issue a 100% refund within 48 business hours upon verification.
+                  Pro memberships unlock 100MB video uploads (compared to 0 KB – 4 MB on Free), 1080p WebRTC calling, and ad-free experience. If your Airtel Money or AzamPay wallet was charged multiple times due to a network glitch, or if features failed to activate, we issue a 100% refund within 48 business hours upon verification.
                 </p>
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-emerald-600" />
                   2. Post Boosts (2,000 TZS)
                 </h3>
                 <p>
@@ -205,8 +265,8 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-emerald-600" />
                   3. Creator Tips
                 </h3>
                 <p>
@@ -215,12 +275,12 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               </section>
 
               <section className="space-y-2">
-                <h3 className="font-extrabold text-white text-sm sm:text-base flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-emerald-600" />
                   4. How to Request a Refund
                 </h3>
                 <p>
-                  Submit your Mobile Money transaction reference ID and phone number through the in-app Support Desk (under Settings) or email support@wavelink.tz. Our team reviews all requests within 24 hours.
+                  Message our <strong>WaveLink Support</strong> bot in Direct Messages or submit a ticket in the Support Desk with your Mobile Money transaction reference ID. A human administrator will follow up within 24 hours.
                 </p>
               </section>
             </div>
@@ -228,11 +288,11 @@ export const LegalModal: React.FC<LegalModalProps> = ({
         </div>
 
         {/* Modal Footer */}
-        <div className="p-4 border-t border-gray-800 bg-slate-900/80 flex items-center justify-between">
-          <span className="text-[11px] text-gray-400">Questions? Reach out to support@wavelink.tz</span>
+        <div className="p-4 border-t border-[var(--border-subtle)] bg-[#FAF7F2] flex items-center justify-between">
+          <span className="text-xs font-medium text-[#57534E]">Questions? Message WaveLink Support in Chats</span>
           <button
             onClick={onClose}
-            className="px-5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition"
+            className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-white font-bold text-xs transition"
           >
             Close
           </button>
@@ -254,34 +314,41 @@ export const LegalFooter: React.FC<{ className?: string }> = ({ className = '' }
 
   return (
     <>
-      <footer className={`w-full py-6 px-4 border-t border-gray-200/80 dark:border-gray-800/80 text-xs text-gray-500 dark:text-gray-400 transition-colors ${className}`}>
+      <footer className={`w-full py-6 px-4 border-t border-[var(--border-subtle)] text-xs text-[#57534E] transition-colors ${className}`}>
         <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
-            <div className="p-1 rounded-lg bg-gradient-to-tr from-purple-600 to-pink-500 text-white">
+            <div className="p-1 rounded-lg bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white">
               <Waves size={14} />
             </div>
-            <span className="font-bold text-gray-700 dark:text-gray-300">WaveLink</span>
-            <span className="text-[11px]">© 2026. Empowering East African Creators.</span>
+            <span className="font-bold text-[#1C1917]">WaveLink</span>
+            <span className="text-[11px] text-[#57534E]">© 2026. Empowering East African Creators.</span>
           </div>
 
           <div className="flex items-center gap-4 flex-wrap justify-center font-medium">
             <button
               onClick={() => openDoc('privacy')}
-              className="hover:text-purple-600 dark:hover:text-purple-400 transition hover:underline"
+              className="hover:text-[#2563EB] transition hover:underline"
             >
               Privacy Policy
             </button>
             <span>•</span>
             <button
               onClick={() => openDoc('terms')}
-              className="hover:text-purple-600 dark:hover:text-purple-400 transition hover:underline"
+              className="hover:text-[#2563EB] transition hover:underline"
             >
               Terms of Service
             </button>
             <span>•</span>
             <button
+              onClick={() => openDoc('security')}
+              className="hover:text-[#2563EB] transition hover:underline"
+            >
+              Security
+            </button>
+            <span>•</span>
+            <button
               onClick={() => openDoc('refund')}
-              className="hover:text-purple-600 dark:hover:text-purple-400 transition hover:underline"
+              className="hover:text-[#2563EB] transition hover:underline"
             >
               Refund Policy
             </button>

@@ -201,13 +201,8 @@ export async function initiateAzamPayAirtelCheckout(
       body: JSON.stringify({
         phoneNumber: params.phoneNumber,
         amount: params.tier.priceTZS,
-        currency: 'TZS',
-        provider: azamProvider,
-        reference,
-        planId: params.tier.id,
-        userId: params.userId,
-        userName: params.userName,
-        userEmail: params.userEmail
+        plan: params.tier.id,
+        provider: params.provider || 'airtel'
       })
     });
 

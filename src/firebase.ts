@@ -2,6 +2,7 @@ import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore, setLogLevel, doc, getDoc } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
+import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
 
 export const firebaseConfig = firebaseAppletConfig;
@@ -16,6 +17,67 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 
 export const storage = getStorage(app);
+try {
+  storage.maxUploadRetryTime = 4000;
+  storage.maxOperationRetryTime = 4000;
+} catch {
+  // ignore if read-only in environment
+}
+
+// Initialize Firebase App Check when VITE_FIREBASE_APPCHECK_KEY is configured
+let appCheckInstance: ReturnType<typeof initializeAppCheck> | null = null;
+try {
+  const recaptchaSiteKey =
+    typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_APPCHECK_KEY
+      ? String((import.meta as any).env.VITE_FIREBASE_APPCHECK_KEY).trim()
+      : '';
+  if (typeof window !== 'undefined' && recaptchaSiteKey) {
+    appCheckInstance = initializeAppCheck(app, {
+      provider: new ReCaptchaV3Provider(recaptchaSiteKey),
+      isTokenAutoRefreshEnabled: true
+    });
+  }
+} catch {
+  // App Check optional in local preview when site key is not set
+}
+
+/**
+ * Builds authenticated headers including Firebase ID Token (Bearer) and App Check token
+ * for protected server routes.
+ */
+export async function getAuthHeaders(extraHeaders: Record<string, string> = {}): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...extraHeaders
+  };
+  try {
+    if (auth.currentUser) {
+      const idToken = await auth.currentUser.getIdToken();
+      if (idToken) {
+        headers['Authorization'] = `Bearer ${idToken}`;
+      }
+      if (auth.currentUser.uid) {
+        headers['X-WaveLink-Uid'] = auth.currentUser.uid;
+      }
+      if (auth.currentUser.email) {
+        headers['X-WaveLink-Email'] = auth.currentUser.email;
+      }
+    }
+  } catch {
+    // fallback if offline
+  }
+  try {
+    if (appCheckInstance) {
+      const appCheckRes = await getAppCheckToken(appCheckInstance, false);
+      if (appCheckRes?.token) {
+        headers['X-Firebase-AppCheck'] = appCheckRes.token;
+      }
+    }
+  } catch {
+    // ignore App Check token error in preview
+  }
+  return headers;
+}
 
 export const ADMIN_EMAIL = 'keylanmbilinyi5@gmail.com';
 export const ADMIN_EMAIL_ALT = 'keylanmbilinyi5@gnail.com';

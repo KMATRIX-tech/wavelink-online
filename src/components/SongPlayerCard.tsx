@@ -197,19 +197,19 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
     return (
       <div
         ref={cardRef}
-        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-50 dark:bg-blue-950/60 border border-blue-200 dark:border-blue-800/60 shadow-2xs"
+        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-50 border border-blue-200 shadow-2xs"
       >
         <button
           type="button"
           onClick={handleTogglePlay}
-          className="w-6 h-6 rounded-full bg-[#3B82F6] text-white flex items-center justify-center shrink-0 hover:bg-blue-600 transition active:scale-95"
+          className="w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shrink-0 hover:bg-[#1D4ED8] transition active:scale-95"
         >
           {isPlaying ? <Pause size={10} /> : <Play size={10} className="ml-0.5 fill-white" />}
         </button>
-        <span className="text-xs font-bold text-[#0F172A] dark:text-blue-200 truncate max-w-[140px]">
+        <span className="text-xs font-bold text-[#1C1917] truncate max-w-[140px]">
           {title}
         </span>
-        <span className="text-[10px] text-[#3B82F6] dark:text-blue-400 truncate max-w-[90px]">
+        <span className="text-[11px] font-medium text-[#2563EB] truncate max-w-[90px]">
           • {artist}
         </span>
       </div>
@@ -219,16 +219,16 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
   return (
     <div
       ref={cardRef}
-      className={`relative overflow-hidden rounded-2xl p-3.5 sm:p-4 bg-[#F8FAFC] dark:bg-slate-900/60 border transition duration-300 ${
+      className={`relative overflow-hidden rounded-2xl p-3.5 sm:p-4 bg-[#FAF7F2] border transition duration-300 ${
         isPlaying
-          ? 'border-[#3B82F6] shadow-md shadow-blue-500/10'
-          : 'border-slate-200/90 dark:border-slate-800 shadow-2xs hover:border-blue-300'
+          ? 'border-[#2563EB] shadow-sm'
+          : 'border-[#EFECE6] shadow-2xs hover:border-[#2563EB]/40'
       }`}
     >
       <div className="flex items-center justify-between gap-3">
         {/* Left: Album Art & Spinning Disc */}
         <div className="flex items-center gap-3 min-w-0 flex-1">
-          <div className="relative w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-slate-900 shadow-sm">
+          <div className="relative w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-blue-50 border border-[#EFECE6] shadow-2xs">
             {albumArt ? (
               <img
                 src={albumArt}
@@ -238,7 +238,7 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
                 }`}
               />
             ) : (
-              <div className="w-full h-full bg-gradient-to-tr from-[#3B82F6] to-[#10B981] flex items-center justify-center text-white">
+              <div className="w-full h-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] flex items-center justify-center text-white">
                 <Music size={20} />
               </div>
             )}
@@ -256,25 +256,25 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
           {/* Song Details & Animated Equalizer */}
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-[#3B82F6] flex items-center gap-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[#2563EB] flex items-center gap-1">
                 <Music size={11} />
                 <span>Track Soundtrack</span>
               </span>
 
               {isPlaying && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-[#10B981] border border-emerald-200 text-[9px] font-extrabold animate-pulse">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200 text-[9px] font-extrabold animate-pulse">
                   <Radio size={9} />
                   <span>Now Playing</span>
                 </span>
               )}
             </div>
 
-            <h4 className="text-xs sm:text-sm font-black text-[#0F172A] dark:text-white truncate mt-0.5">
+            <h4 className="text-xs sm:text-sm font-extrabold text-[#1C1917] truncate mt-0.5">
               {title}
             </h4>
-            <p className="text-[11px] font-semibold text-slate-600 dark:text-gray-300 truncate">
+            <p className="text-xs font-semibold text-[#57534E] truncate">
               {artist}
-              {albumName && <span className="text-slate-400 font-normal"> • {albumName}</span>}
+              {albumName && <span className="text-[#57534E] font-normal"> • {albumName}</span>}
             </p>
           </div>
         </div>
@@ -284,19 +284,19 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
           <button
             type="button"
             onClick={handleToggleMute}
-            className="p-1.5 rounded-xl text-slate-400 hover:text-[#3B82F6] hover:bg-white dark:hover:bg-gray-800 transition"
+            className="p-2 rounded-xl text-[#57534E] hover:text-[#2563EB] hover:bg-white transition"
             title={isMuted ? 'Unmute' : 'Mute'}
           >
-            {isMuted ? <VolumeX size={15} className="text-rose-500" /> : <Volume2 size={15} />}
+            {isMuted ? <VolumeX size={15} className="text-rose-600" /> : <Volume2 size={15} />}
           </button>
 
           <button
             type="button"
             onClick={handleTogglePlay}
-            className={`w-10 h-10 rounded-2xl flex items-center justify-center transition shadow-md active:scale-95 ${
+            className={`w-10 h-10 rounded-2xl flex items-center justify-center transition shadow-xs active:scale-95 ${
               isPlaying
-                ? 'bg-[#10B981] hover:bg-emerald-600 text-white shadow-emerald-500/25'
-                : 'bg-[#3B82F6] hover:bg-blue-600 text-white shadow-blue-500/25'
+                ? 'bg-[#0D9488] hover:bg-teal-700 text-white'
+                : 'bg-[#2563EB] hover:bg-[#1D4ED8] text-white'
             }`}
             title={isPlaying ? 'Pause song' : 'Play online soundtrack'}
           >
@@ -312,19 +312,19 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
       {/* Interactive Progress Timeline */}
       <div
         onClick={handleSeek}
-        className="mt-2.5 h-1.5 w-full bg-slate-200 dark:bg-gray-700/80 rounded-full overflow-hidden cursor-pointer relative group"
+        className="mt-2.5 h-1.5 w-full bg-[#EFECE6] rounded-full overflow-hidden cursor-pointer relative group"
         title="Seek soundtrack"
       >
         <div
-          className="h-full bg-gradient-to-r from-[#3B82F6] to-[#10B981] rounded-full transition-all duration-150"
+          className="h-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] rounded-full transition-all duration-150"
           style={{ width: `${progressPercent}%` }}
         />
       </div>
 
-      <div className="flex items-center justify-between text-[9px] font-mono text-slate-400 mt-1 tabular-numbers">
+      <div className="flex items-center justify-between text-[10px] font-mono text-[#57534E] mt-1 tabular-nums">
         <span>0:{Math.floor(currentTime).toString().padStart(2, '0')}</span>
         <span className="flex items-center gap-1">
-          <Sparkles size={9} className="text-[#3B82F6]" />
+          <Sparkles size={9} className="text-[#2563EB]" />
           <span>Auto-plays as you reach post</span>
         </span>
       </div>
