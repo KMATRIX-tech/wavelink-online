@@ -1,3 +1,5 @@
+import { getAuthHeaders } from '../firebase';
+
 export const WELINK_SYSTEM_INSTRUCTION = `You are WELINK, the warm, intelligent, and official AI Community Guide & Creative Assistant built directly into the WaveLink social platform.
 Your role:
 1. Guide users on how to use every WaveLink feature:
@@ -143,9 +145,10 @@ export async function sendWelinkChatMessage(params: {
 }): Promise<{ reply: string; model: string }> {
   const normalizedMessages = normalizeTurnsForRequest(params.messages);
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       signal: params.signal,
       body: JSON.stringify({
         model: params.model || 'gemini-3.8-flash',
@@ -187,9 +190,10 @@ export async function sendWelinkChatMessageStream(params: {
 }): Promise<{ fullText: string; model: string }> {
   const normalizedMessages = normalizeTurnsForRequest(params.messages);
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/chat-stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       signal: params.signal,
       body: JSON.stringify({
         model: params.model || 'gemini-3.8-flash',
@@ -381,9 +385,10 @@ export async function generateWelinkImage(params: {
   imageSize?: '1K' | '2K';
 }): Promise<{ imageUrl: string; caption: string; model: string }> {
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/image', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         prompt: params.prompt,
         imageBase64: params.imageBase64 || null,
@@ -444,9 +449,10 @@ export async function sendWelinkVoiceTurn(params: {
   const cleanTranscript = String(params.transcript || '').trim();
   const history = Array.isArray(params.history) ? params.history : [];
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/voice-turn', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         transcript: cleanTranscript,
         history,
@@ -467,5 +473,115 @@ export async function sendWelinkVoiceTurn(params: {
     reply: fallback,
     spokenText: fallback.replace(/[*#_`~]+/g, ''),
   };
+}
+
+/**
+ * Request 3 AI caption suggestions from the server-side Gemini endpoint (/api/ai/post-assist)
+ * Includes friendly rate-limit and error messages.
+ */
+export async function suggestPostCaptions(params: {
+  text?: string;
+  mediaType?: 'text' | 'image' | 'video';
+  tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
+  isPro?: boolean;
+}): Promise<{ suggestions: string[] }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch('/api/ai/post-assist', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      mode: 'captions',
+      text: params.text || '',
+      mediaType: params.mediaType || 'text',
+      tone: params.tone || 'engaging',
+      isPro: Boolean(params.isPro),
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 429) {
+    throw new Error(
+      data.error || 'AI Caption limit reached (max 10 requests/minute). Please wait a few seconds and try again.'
+    );
+  }
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || 'Could not generate caption suggestions right now. Please try again.');
+  }
+  return {
+    suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
+  };
+}
+
+/**
+ * Polish and improve a user's post draft via the server-side Gemini endpoint (/api/ai/post-assist)
+ * Includes friendly rate-limit and error messages.
+ */
+export async function improvePostDraft(params: {
+  text: string;
+  mediaType?: 'text' | 'image' | 'video';
+  tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
+  isPro?: boolean;
+}): Promise<{ improvedText: string }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch('/api/ai/post-assist', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      mode: 'improve',
+      text: params.text || '',
+      mediaType: params.mediaType || 'text',
+      tone: params.tone || 'engaging',
+      isPro: Boolean(params.isPro),
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 429) {
+    throw new Error(
+      data.error || 'AI Post Improver limit reached (max 10 requests/minute). Please wait a few seconds and try again.'
+    );
+  }
+  if (!res.ok || !data.success || !data.improvedText) {
+    throw new Error(data.error || 'Could not improve post draft right now. Please try again.');
+  }
+  return {
+    improvedText: String(data.improvedText),
+  };
+}
+
+/**
+ * Moderate post or comment text via the server-side safety endpoint (/api/ai/moderate)
+ */
+export async function moderatePostContent(text: string): Promise<{
+  flagged: boolean;
+  category: string;
+  reason: string;
+}> {
+  const clean = String(text || '').trim();
+  if (!clean) {
+    return { flagged: false, category: 'safe', reason: '' };
+  }
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/ai/moderate', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ text: clean }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 429) {
+      throw new Error(data.error || 'Moderation rate limit reached. Please wait a moment before posting.');
+    }
+    if (res.ok && data.success) {
+      return {
+        flagged: Boolean(data.flagged),
+        category: String(data.category || 'safe'),
+        reason: String(data.reason || ''),
+      };
+    }
+  } catch (err: any) {
+    if (err?.message?.includes('rate limit')) {
+      throw err;
+    }
+  }
+  return { flagged: false, category: 'safe', reason: '' };
 }
 

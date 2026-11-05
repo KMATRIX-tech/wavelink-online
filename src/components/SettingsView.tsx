@@ -46,8 +46,12 @@ import {
   Ban,
   BatteryCharging,
   Zap,
-  Lightbulb
+  Lightbulb,
+  UserPlus,
+  Moon,
+  Sun
 } from 'lucide-react';
+import { inviteFriends } from '../utils/share';
 
 import { LegalModal, LegalDocType } from './LegalModals';
 import { compressImage } from '../utils/mediaStorage';
@@ -187,7 +191,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     deleteMyAccount,
     signOut
   } = useAuth();
-  const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
+  const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver, isDark, toggleDarkMode, setTheme } = useTheme();
 
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>('profile');
   const [selectedLegalDoc, setSelectedLegalDoc] = useState<LegalDocType | null>(null);
@@ -570,6 +574,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     }
   };
 
+  const [inviteToast, setInviteToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const handleInviteFriends = () => {
+    try {
+      const res = inviteFriends();
+      setInviteToast({ type: 'success', text: res?.message || 'Invite opened in WhatsApp!' });
+      setTimeout(() => setInviteToast(null), 2800);
+    } catch {
+      setInviteToast({ type: 'error', text: "Couldn't open invite" });
+      setTimeout(() => setInviteToast(null), 2800);
+    }
+  };
+
   const borderOptions: { id: ProBorderEffect; name: string; ringClass: string }[] = [
     { id: 'aura-gold', name: 'Golden Aura ✨', ringClass: 'pro-aura-gold ring-4 ring-amber-400' },
     { id: 'neon-pulse', name: 'Teal Breeze 🌊', ringClass: 'pro-aura-neon ring-4 ring-teal-400' },
@@ -650,6 +667,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
 
             <button
               type="button"
+              onClick={handleInviteFriends}
+              className="px-3.5 py-2 rounded-2xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 flex items-center gap-1.5 text-xs font-extrabold transition active:scale-95"
+              title="Invite Friends on WhatsApp"
+            >
+              <UserPlus size={14} className="text-emerald-600" />
+              <span>Invite Friends</span>
+            </button>
+
+            <button
+              type="button"
               onClick={handleLogOut}
               disabled={isLoggingOut}
               className="px-3.5 py-2 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1.5 text-xs font-extrabold transition active:scale-95 disabled:opacity-50"
@@ -660,6 +687,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             </button>
           </div>
         </div>
+
+        {inviteToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`px-3.5 py-2 rounded-2xl text-xs font-bold flex items-center gap-2 border ${
+              inviteToast.type === 'success'
+                ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                : 'bg-rose-50 text-rose-800 border-rose-200'
+            }`}
+          >
+            {inviteToast.type === 'success' ? (
+              <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
+            ) : (
+              <AlertCircle size={14} className="text-rose-600 shrink-0" />
+            )}
+            <span>{inviteToast.text}</span>
+          </div>
+        )}
 
         {/* Quiet Navigation Rows: WaveLink Pro & Admin Panel (only for admins) */}
         <div className="space-y-2.5 pt-2 border-t border-[var(--border-hairline)]">
@@ -1853,7 +1899,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             </div>
           </div>
 
-          {/* Appearance Section: 4 Light Themes saved to Firestore */}
+          {/* Appearance Section: Dark Mode + 4 Light Themes saved to Firestore */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <div className="flex items-center gap-2.5">
@@ -1862,25 +1908,43 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                 </div>
                 <div>
                   <h3 className="font-extrabold text-[#1C1917] text-base">
-                    Appearance
+                    Appearance &amp; Dark Mode
                   </h3>
                   <p className="text-xs text-[#78716C]">
-                    Choose a warm, light theme. Saved to your profile across all your devices.
+                    Switch between Dark Mode and Light Themes. Saved across all your devices.
                   </p>
                 </div>
               </div>
+
+              <button
+                type="button"
+                role="switch"
+                aria-checked={isDark}
+                onClick={toggleDarkMode}
+                className={`min-h-[42px] px-4 py-2 rounded-2xl font-extrabold text-xs flex items-center gap-2 transition cursor-pointer shrink-0 ${
+                  isDark
+                    ? 'bg-[#2563EB] text-white shadow-2xs'
+                    : 'bg-[var(--bg-subtle)] hover:bg-stone-200/70 text-[#1C1917] border border-[var(--border-hairline)]'
+                }`}
+              >
+                {isDark ? <Sun size={14} className="text-amber-300" /> : <Moon size={14} className="text-[#2563EB]" />}
+                <span>{isDark ? 'Dark Mode On (Tap for Light)' : 'Enable Dark Mode'}</span>
+              </button>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {APPEARANCE_THEMES.map((item) => {
-                const isSelected = appearanceTheme === item.id;
+                const isSelected = !isDark && appearanceTheme === item.id;
                 const isLocked = item.proOnly && !isProUser && !isAdmin;
 
                 return (
                   <button
                     key={item.id}
                     type="button"
-                    onClick={() => handleSelectAppearanceTheme(item.id, item.proOnly)}
+                    onClick={() => {
+                      setTheme('light');
+                      handleSelectAppearanceTheme(item.id, item.proOnly);
+                    }}
                     className={`min-h-[68px] p-4 rounded-2xl border text-left transition flex items-center justify-between gap-3 ${
                       isSelected
                         ? 'border-[#2563EB] bg-[var(--bg-subtle)] ring-2 ring-[#2563EB]/15'

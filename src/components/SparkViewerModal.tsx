@@ -80,6 +80,8 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const bgAudioRef = useRef<HTMLAudioElement | null>(null);
   const progressIntervalRef = useRef<any>(null);
+  const likeCooldownRef = useRef<number>(0);
+  const notifiedSparkLikesRef = useRef<Set<string>>(new Set());
 
   // Listen to current user's follows
   useEffect(() => {
@@ -115,10 +117,18 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
         viewedAt: new Date().toISOString()
       };
 
+      const deduplicatedViewerUsers = [
+        ...(currentSpark.viewerUsers || []).filter((u) => u.userId !== currentUser.uid),
+        viewerEntry
+      ];
+      const deduplicatedViewerIds = Array.from(
+        new Set([...(currentSpark.viewers || []), currentUser.uid])
+      );
+
       updateDoc(doc(db, 'sparks', currentSpark.id), {
-        viewers: arrayUnion(currentUser.uid),
-        viewersCount: (currentSpark.viewersCount || 0) + 1,
-        viewerUsers: arrayUnion(viewerEntry)
+        viewers: deduplicatedViewerIds,
+        viewersCount: deduplicatedViewerIds.length,
+        viewerUsers: deduplicatedViewerUsers
       }).catch((err) => {
         console.warn('Spark view registration notice:', err);
       });
@@ -330,10 +340,16 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
 
   const handleToggleLike = async () => {
     if (!currentUser || !currentSpark) return;
+
+    // Anti-abuse rapid toggle debounce (1.2s cooldown)
+    const now = Date.now();
+    if (now - likeCooldownRef.current < 1200) return;
+    likeCooldownRef.current = now;
+
     const isLiked = currentSpark.likes?.includes(currentUser.uid);
     const updatedLikes = isLiked
       ? (currentSpark.likes || []).filter((id) => id !== currentUser.uid)
-      : [...(currentSpark.likes || []), currentUser.uid];
+      : Array.from(new Set([...(currentSpark.likes || []), currentUser.uid]));
 
     triggerReaction('🔥');
 
@@ -346,13 +362,17 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
     };
 
     try {
+      const remainingLikers = (currentSpark.likedUsers || []).filter((u) => u.userId !== currentUser.uid);
       if (!isLiked) {
+        const deduplicatedLikers = [...remainingLikers, likeEntry];
         await updateDoc(doc(db, 'sparks', currentSpark.id), {
           likes: updatedLikes,
           likesCount: updatedLikes.length,
-          likedUsers: arrayUnion(likeEntry)
+          likedUsers: deduplicatedLikers
         });
-        if (currentSpark.authorId !== currentUser.uid) {
+        // Only notify author once per session per Spark to prevent like/unlike notification spam
+        if (currentSpark.authorId !== currentUser.uid && !notifiedSparkLikesRef.current.has(currentSpark.id)) {
+          notifiedSparkLikesRef.current.add(currentSpark.id);
           sendNotification({
             recipientId: currentSpark.authorId,
             actorId: currentUser.uid,
@@ -365,7 +385,6 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
           }).catch(() => {});
         }
       } else {
-        const remainingLikers = (currentSpark.likedUsers || []).filter((u) => u.userId !== currentUser.uid);
         await updateDoc(doc(db, 'sparks', currentSpark.id), {
           likes: updatedLikes,
           likesCount: updatedLikes.length,

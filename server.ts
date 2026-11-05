@@ -940,6 +940,18 @@ const SupportBotConfigUpdateSchema = z.object({
   maxMessageLength: z.number().int().min(100).max(2500).optional(),
 });
 
+const AiPostAssistSchema = z.object({
+  mode: z.enum(['captions', 'improve']),
+  text: z.string().max(2000).optional().default(''),
+  mediaType: z.enum(['text', 'image', 'video']).optional().default('text'),
+  tone: z.enum(['engaging', 'professional', 'fun', 'inspiring']).optional().default('engaging'),
+  isPro: z.boolean().optional(),
+});
+
+const AiModerationSchema = z.object({
+  text: z.string().min(1).max(4000),
+});
+
 async function startServer() {
   const app = express();
   const httpServer = createHttpServer(app);
@@ -1331,6 +1343,265 @@ async function startServer() {
         model: 'gemini-3.8-flash',
       });
     }
+  });
+
+  // ============================================================================
+  // 1A-2. AI POST ASSISTANT (Caption Suggestions, Post Improvement & Moderation)
+  // ============================================================================
+  const rateLimitPostAi = createRateLimiter({
+    windowMs: 60 * 1000,
+    maxRequests: 10,
+    errorMessage: 'AI Writing Assistant rate limit reached (max 10 requests/min). Please wait a few seconds and try again.',
+  });
+
+  /**
+   * POST /api/ai/post-assist
+   * Server-side Gemini function for Caption Suggestions ('captions') and Post Improvement ('improve').
+   * Keeps GEMINI_API_KEY strictly on the server and enforces per-user rate limits.
+   */
+  app.post('/api/ai/post-assist', rateLimitPostAi, async (req, res) => {
+    const parsed = AiPostAssistSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide valid post text (up to 2,000 characters) for AI assistance.',
+      });
+    }
+
+    const { mode, text, mediaType, tone, isPro } = parsed.data;
+    const cleanDraft = sanitizeServerString(text || '', 2000);
+    const clientKey = getClientKey(req);
+    const quota = checkAndIncrementUserAiQuota(clientKey, 'chat', Boolean(isPro));
+    if (!quota.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: quota.error || 'Daily AI assistant limit reached. Please try again tomorrow.',
+      });
+    }
+
+    const buildFallbackSuggestions = (): string[] => {
+      const topic = cleanDraft ? cleanDraft.slice(0, 80) : 'sharing this moment with the WaveLink community';
+      if (mediaType === 'video') {
+        return [
+          `🎬 Caught this moment in motion — ${topic}! Drop a 🔥 if you vibe with this! #WaveLink #WaveReels #CreatorLife`,
+          `✨ Real energy, real community. What do you think of this clip? Let's talk in the comments 👇 #WaveLinkCommunity #DailyWave`,
+          `🌊 Behind the scenes & good vibes only! Tag a friend who needs to see this today 🚀 #WaveLink #TrendingNow`,
+        ];
+      }
+      if (mediaType === 'image') {
+        return [
+          `📸 Every picture tells a story — ${topic} ✨ #WaveLink #PhotoOfTheDay #CommunityVibes`,
+          `🌊 New wave, fresh perspective! Rate this shot 1–10 in the comments 👇🔥 #WaveLinkCreators #GoodEnergy`,
+          `✨ Grateful for moments like this with the best community on WaveLink 💙 #WaveLink #DailySpark`,
+        ];
+      }
+      return [
+        `🌊 ${cleanDraft || 'Sharing a quick thought with the WaveLink family today!'} ✨ What's your take? Drop a comment below 👇 #WaveLink #CommunityFirst`,
+        `💡 Big energy today: ${cleanDraft || 'Building, learning, and connecting one wave at a time.'} 🚀 #WaveLinkCreators #GrowthMindset`,
+        `🔥 Let's start a conversation — ${cleanDraft || 'What is one goal you are excited about this week?'} Share below! #WaveLink`,
+      ];
+    };
+
+    const buildFallbackImproved = (): string => {
+      if (!cleanDraft) {
+        return '🌊 Excited to share a new update with the WaveLink community today! What are you working on this week? Drop your thoughts below 👇✨ #WaveLink #CommunityFirst';
+      }
+      const hasHashtag = /#\w+/.test(cleanDraft);
+      const polished = cleanDraft.charAt(0).toUpperCase() + cleanDraft.slice(1);
+      return `${polished}${/[.!?]$/.test(polished) ? '' : '!'} ✨🌊${
+        hasHashtag ? '' : '\n\n#WaveLink #CommunityVibes #CreatorEnergy'
+      }`;
+    };
+
+    const apiKey = getServerGeminiKey();
+    if (!apiKey) {
+      if (mode === 'captions') {
+        return res.json({
+          success: true,
+          mode,
+          suggestions: buildFallbackSuggestions(),
+        });
+      }
+      return res.json({
+        success: true,
+        mode,
+        improvedText: buildFallbackImproved(),
+      });
+    }
+
+    try {
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+      });
+
+      const promptText =
+        mode === 'captions'
+          ? `Generate 3 distinct, engaging social media captions (with 2-3 relevant hashtags each) for a WaveLink ${mediaType} post.
+Tone: ${tone}.
+User context/draft: "${cleanDraft || 'Sharing a great moment on WaveLink'}".
+Return ONLY a JSON array of 3 strings, e.g. ["caption 1", "caption 2", "caption 3"].`
+          : `Improve and polish this social media post draft for WaveLink while preserving the author's original meaning and voice. Make it clear, engaging (${tone} tone), well-formatted, and add 2-3 relevant hashtags if none are present.
+Original draft: "${cleanDraft}"
+Return ONLY the improved post text without surrounding quotes or markdown explanation.`;
+
+      const candidateModels = getCandidateTextModels('gemini-3.8-flash');
+      for (const modelName of candidateModels) {
+        try {
+          const reply = await generateFastGeminiReply(
+            ai,
+            modelName,
+            [{ role: 'user', parts: [{ text: promptText }] }],
+            'You are WELINK AI Writing Assistant on WaveLink. Keep outputs safe, uplifting, concise, and ready to publish.',
+            4200,
+            400
+          );
+          if (reply) {
+            if (mode === 'captions') {
+              const jsonMatch = reply.match(/\[[\s\S]*\]/);
+              if (jsonMatch) {
+                const parsedArr = JSON.parse(jsonMatch[0]);
+                if (Array.isArray(parsedArr) && parsedArr.length > 0) {
+                  return res.json({
+                    success: true,
+                    mode,
+                    suggestions: parsedArr.map((s) => sanitizeServerString(String(s), 600)).filter(Boolean).slice(0, 3),
+                  });
+                }
+              }
+              const lines = reply
+                .split('\n')
+                .map((l) => l.replace(/^(\d+[.)]|[-*])\s*/, '').trim())
+                .filter((l) => l.length > 10)
+                .slice(0, 3);
+              if (lines.length > 0) {
+                return res.json({
+                  success: true,
+                  mode,
+                  suggestions: lines,
+                });
+              }
+            } else {
+              return res.json({
+                success: true,
+                mode,
+                improvedText: reply.replace(/^["']|["']$/g, '').trim(),
+              });
+            }
+          }
+        } catch {
+          // try next model
+        }
+      }
+    } catch {
+      // fall through to deterministic fallback
+    }
+
+    if (mode === 'captions') {
+      return res.json({
+        success: true,
+        mode,
+        suggestions: buildFallbackSuggestions(),
+      });
+    }
+    return res.json({
+      success: true,
+      mode,
+      improvedText: buildFallbackImproved(),
+    });
+  });
+
+  /**
+   * POST /api/ai/moderate
+   * Server-side content safety moderation before publishing posts/comments/sparks.
+   * Combines fast deterministic scam/abuse rules with Gemini safety classification.
+   */
+  app.post('/api/ai/moderate', rateLimitPostAi, async (req, res) => {
+    const parsed = AiModerationSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter valid text to check.',
+      });
+    }
+
+    const cleanText = sanitizeServerString(parsed.data.text, 4000);
+    const lower = cleanText.toLowerCase();
+
+    // 1. Instant deterministic checks for credential phishing, PIN harvesting, or severe abuse
+    const scamPatterns = [
+      /\b(send|share|give)\s+(me\s+)?(your\s+)?(mpesa|airtel|tigo|halopesa|mobile\s+money)?\s*(pin|password|otp|secret\s+code)\b/i,
+      /\b(free\s+money\s+multiplier|double\s+your\s+tzs\s+instantly)\b/i,
+    ];
+    for (const pat of scamPatterns) {
+      if (pat.test(lower)) {
+        return res.json({
+          success: true,
+          flagged: true,
+          category: 'phishing_or_scam',
+          reason: 'This post appears to ask for private PINs, passwords, or OTP codes, which violates WaveLink Community Safety Rules.',
+        });
+      }
+    }
+
+    const severeHatePatterns = [
+      /\b(kill\s+yourself|kys|i\s+will\s+doxx\s+you)\b/i,
+    ];
+    for (const pat of severeHatePatterns) {
+      if (pat.test(lower)) {
+        return res.json({
+          success: true,
+          flagged: true,
+          category: 'harassment_or_harm',
+          reason: 'This content contains harmful or threatening language that goes against WaveLink Community Guidelines.',
+        });
+      }
+    }
+
+    // 2. Optional Gemini AI moderation check when GEMINI_API_KEY is available
+    const apiKey = getServerGeminiKey();
+    if (apiKey && cleanText.length > 12) {
+      try {
+        const ai = new GoogleGenAI({
+          apiKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+        });
+        const modPrompt = `Analyze this social media post for severe community guideline violations (hate speech, explicit violence, phishing/scams asking for PINs/passwords, or severe harassment).
+Post text: "${cleanText.slice(0, 1200)}"
+Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" | "harassment" | "hate_speech" | "explicit", "reason": "short user-friendly explanation if flagged, else empty"}`;
+        const reply = await generateFastGeminiReply(
+          ai,
+          'gemini-3.1-flash-lite',
+          [{ role: 'user', parts: [{ text: modPrompt }] }],
+          'You are a fair, accurate content safety moderator for WaveLink. Only flag genuinely harmful, abusive, or scam content.',
+          2500,
+          150
+        );
+        const jsonMatch = reply.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const modResult = JSON.parse(jsonMatch[0]);
+          if (typeof modResult.flagged === 'boolean') {
+            return res.json({
+              success: true,
+              flagged: Boolean(modResult.flagged),
+              category: String(modResult.category || 'safe'),
+              reason: modResult.flagged
+                ? sanitizeServerString(modResult.reason || 'Content flagged by WaveLink AI Safety Check.', 240)
+                : '',
+            });
+          }
+        }
+      } catch {
+        // Proceed with deterministic pass if upstream AI times out
+      }
+    }
+
+    return res.json({
+      success: true,
+      flagged: false,
+      category: 'safe',
+      reason: '',
+    });
   });
 
   // ============================================================================

@@ -3,7 +3,8 @@ import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { ActiveTab } from '../types';
 import { triggerHaptic } from '../utils/haptics';
-import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging } from 'lucide-react';
+import { inviteFriends } from '../utils/share';
+import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus, Check, X, Moon, Sun } from 'lucide-react';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { CompactPointsDisplay } from './CompactPointsDisplay';
 
@@ -39,7 +40,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   hasUnreadNotifications = false
 }) => {
   const { currentUser, userProfile, isProEffective, isExemptFromPayments } = useAuth();
-  const { isBatterySaver } = useTheme();
+  const { isBatterySaver, isDark, toggleDarkMode } = useTheme();
   const isProUser = isProEffective || isExemptFromPayments;
   const currentTabInfo = TAB_TITLES[activeTab] || { title: 'WaveLink', subtitle: 'Community' };
 
@@ -47,6 +48,19 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [justReconnected, setJustReconnected] = useState<boolean>(false);
+  const [inviteToast, setInviteToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const handleInviteFriends = () => {
+    try {
+      triggerHaptic('light');
+      const res = inviteFriends();
+      setInviteToast({ type: 'success', text: res?.message || 'Invite opened in WhatsApp!' });
+      setTimeout(() => setInviteToast(null), 2800);
+    } catch {
+      setInviteToast({ type: 'error', text: "Couldn't open invite" });
+      setTimeout(() => setInviteToast(null), 2800);
+    }
+  };
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -231,8 +245,32 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
             />
           </div>
 
-          {/* Right: Non-floating WELINK Guide & Live Voice Buttons, Points & Profile Shortcut */}
+          {/* Right: Non-floating WELINK Guide & Live Voice Buttons, Invite Friends, Dark Mode, Points & Profile Shortcut */}
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                toggleDarkMode();
+              }}
+              className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-blue-50/60 text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+              title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              aria-label={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+            >
+              {isDark ? <Sun size={14} className="text-amber-400" /> : <Moon size={14} className="text-[#2563EB]" />}
+              <span className="hidden xl:inline">{isDark ? 'Light' : 'Dark'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleInviteFriends}
+              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95"
+              title="Invite Friends on WhatsApp"
+            >
+              <UserPlus size={14} className="text-emerald-600" />
+              <span className="hidden lg:inline">Invite Friends</span>
+            </button>
+
             {onOpenWelink && (
               <>
                 <button
@@ -300,6 +338,25 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
           </div>
         </div>
       </div>
+
+      {inviteToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl shadow-lg border text-xs font-bold transition-all ${
+            inviteToast.type === 'success'
+              ? 'bg-emerald-600 text-white border-emerald-500'
+              : 'bg-rose-600 text-white border-rose-500'
+          }`}
+        >
+          {inviteToast.type === 'success' ? (
+            <Check size={14} className="shrink-0" />
+          ) : (
+            <X size={14} className="shrink-0" />
+          )}
+          <span>{inviteToast.text}</span>
+        </div>
+      )}
     </header>
   );
 };

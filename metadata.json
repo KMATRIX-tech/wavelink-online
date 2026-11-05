@@ -1,6 +1,1 @@
-{
-  "name": "WaveLink",
-  "description": "WaveLink is a modern social network featuring real-time feed, Airtel Money & AzamPay mobile payments, creator tipping, post boosting, and native monetization.",
-  "requestFramePermissions": ["microphone", "camera"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
+{"name":"Untitled","description":"WaveLink is a modern social network featuring real-time feed, Airtel Money \u0026 AzamPay mobile payments, creator tipping, post boosting, and native monetization.","requestFramePermissions":["microphone","camera"],"majorCapabilities":["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]}

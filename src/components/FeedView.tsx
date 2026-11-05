@@ -65,8 +65,20 @@ import {
   CheckCircle2,
   Mic,
   Flag,
-  Ban
+  Ban,
+  Download,
+  Moon,
+  Sun,
+  Loader2,
+  AlertTriangle
 } from 'lucide-react';
+import { downloadPost, sharePost } from '../utils/share';
+import { useTheme } from '../context/ThemeContext';
+import {
+  suggestPostCaptions,
+  improvePostDraft,
+  moderatePostContent
+} from '../services/geminiService';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { CreatorTipModal } from './CreatorTipModal';
 import { PostBoostModal } from './PostBoostModal';
@@ -210,10 +222,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
 
   // Post creation state for center feed creation box
+  const { isDark, toggleDarkMode } = useTheme();
   const [inlineContent, setInlineContent] = useState('');
   const [inlineMediaFile, setInlineMediaFile] = useState<File | null>(null);
   const [inlineMediaPreview, setInlineMediaPreview] = useState<string | null>(null);
   const [inlineMediaType, setInlineMediaType] = useState<'image' | 'video'>('image');
+  const [compressionBadge, setCompressionBadge] = useState<string | null>(null);
+  const [aiCaptionSuggestions, setAiCaptionSuggestions] = useState<string[]>([]);
+  const [isAiAssisting, setIsAiAssisting] = useState<'captions' | 'improve' | null>(null);
   const [isSubmittingPost, setIsSubmittingPost] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [postNotice, setPostNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -236,6 +252,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [commentsMap, setCommentsMap] = useState<Record<string, PostComment[]>>({});
   const [commentInput, setCommentInput] = useState<Record<string, string>>({});
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [actionToast, setActionToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Reaction animation & optimistic state
   const [animatingReactions, setAnimatingReactions] = useState<Record<string, boolean>>({});
@@ -538,6 +555,21 @@ export const FeedView: React.FC<FeedViewProps> = ({
       fire: nextFires.length
     };
 
+    // Optimistic local state update so likes/reactions respond in 0ms
+    setPosts((prev) =>
+      prev.map((p) =>
+        p.id === rawPost.id
+          ? {
+              ...p,
+              reactions: updatedReactions,
+              reactionCounts: updatedReactionCounts,
+              likes: nextHearts,
+              likesCount: nextHearts.length
+            }
+          : p
+      )
+    );
+
     try {
       await updateDoc(doc(db, 'posts', rawPost.id), {
         reactions: updatedReactions,
@@ -657,12 +689,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
 
     setPostNotice(null);
+    setCompressionBadge(null);
     setInlineMediaFile(file);
     setInlineMediaType('image');
 
     try {
+      const originalKB = Math.max(1, Math.round(file.size / 1024));
       const compressedDataUrl = await compressImage(file, 1280, 1280, 0.82);
       setInlineMediaPreview(compressedDataUrl);
+      const compressedBytes = Math.round((compressedDataUrl.length * 3) / 4);
+      const compressedKB = Math.max(1, Math.round(compressedBytes / 1024));
+      if (compressedKB < originalKB) {
+        const savedPct = Math.min(98, Math.max(5, Math.round((1 - compressedKB / originalKB) * 100)));
+        setCompressionBadge(
+          `Optimized: ${formatVideoFileSize(file.size)} → ${compressedKB} KB (${savedPct}% smaller)`
+        );
+      } else {
+        setCompressionBadge(`Ready: ${compressedKB} KB`);
+      }
     } catch (err) {
       console.error('Error compressing image:', err);
       const reader = new FileReader();
@@ -675,7 +719,67 @@ export const FeedView: React.FC<FeedViewProps> = ({
     e.target.value = '';
   };
 
-  // Submit inline post with Firestore picture & chunked video storage
+  // AI Caption Suggestions handler (Server-side Gemini with rate-limit handling)
+  const handleSuggestCaptions = async () => {
+    if (isAiAssisting) return;
+    setIsAiAssisting('captions');
+    setPostNotice(null);
+    try {
+      const mediaKind = inlineMediaPreview ? inlineMediaType : 'text';
+      const { suggestions } = await suggestPostCaptions({
+        text: inlineContent,
+        mediaType: mediaKind,
+        tone: 'engaging',
+        isPro: Boolean(isProEffective || isAdmin)
+      });
+      setAiCaptionSuggestions(suggestions);
+      if (suggestions.length === 0) {
+        setPostNotice({ type: 'error', text: 'No caption suggestions returned. Try adding a few words first.' });
+      }
+    } catch (err: any) {
+      setPostNotice({
+        type: 'error',
+        text: err?.message || 'Could not generate captions right now. Please try again in a moment.'
+      });
+    } finally {
+      setIsAiAssisting(null);
+    }
+  };
+
+  // AI Post Improvement handler (Server-side Gemini with rate-limit handling)
+  const handleImprovePostDraft = async () => {
+    if (isAiAssisting) return;
+    if (!inlineContent.trim()) {
+      setPostNotice({
+        type: 'error',
+        text: 'Write a rough draft or a few words first, then tap Improve Post!'
+      });
+      return;
+    }
+    setIsAiAssisting('improve');
+    setPostNotice(null);
+    try {
+      const mediaKind = inlineMediaPreview ? inlineMediaType : 'text';
+      const { improvedText } = await improvePostDraft({
+        text: inlineContent,
+        mediaType: mediaKind,
+        tone: 'engaging',
+        isPro: Boolean(isProEffective || isAdmin)
+      });
+      setInlineContent(improvedText);
+      setPostNotice({ type: 'success', text: '✨ Post polished with WELINK AI!' });
+      setTimeout(() => setPostNotice(null), 3200);
+    } catch (err: any) {
+      setPostNotice({
+        type: 'error',
+        text: err?.message || 'Could not improve post right now. Please wait a moment and try again.'
+      });
+    } finally {
+      setIsAiAssisting(null);
+    }
+  };
+
+  // Submit inline post with AI Moderation check, Firestore picture & chunked video storage
   const handleCreatePost = async () => {
     if (!currentUser || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)) return;
     setIsSubmittingPost(true);
@@ -683,6 +787,20 @@ export const FeedView: React.FC<FeedViewProps> = ({
     setPostNotice(null);
 
     try {
+      // Pre-publish server-side AI content moderation check
+      if (inlineContent.trim()) {
+        const modCheck = await moderatePostContent(inlineContent.trim());
+        if (modCheck.flagged) {
+          setPostNotice({
+            type: 'error',
+            text: modCheck.reason || 'Post blocked by WaveLink AI Safety Moderation. Please revise your text.'
+          });
+          setIsSubmittingPost(false);
+          setUploadProgress(0);
+          return;
+        }
+      }
+
       const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
       const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
 
@@ -756,6 +874,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
       setInlineContent('');
       setInlineMediaFile(null);
       setInlineMediaPreview(null);
+      setCompressionBadge(null);
+      setAiCaptionSuggestions([]);
       setPostNotice({
         type: 'success',
         text:
@@ -882,12 +1002,22 @@ export const FeedView: React.FC<FeedViewProps> = ({
   };
 
 
-  // Add Comment
+  // Add Comment (with AI Moderation & instant real-time counter update)
   const handleAddComment = async (postId: string) => {
     const text = sanitizeUserText(commentInput[postId] || '', 800);
     if (!text || !currentUser) return;
 
     try {
+      const modCheck = await moderatePostContent(text);
+      if (modCheck.flagged) {
+        setActionToast({
+          type: 'error',
+          text: modCheck.reason || 'Reply blocked by WaveLink AI Moderation.'
+        });
+        setTimeout(() => setActionToast(null), 4000);
+        return;
+      }
+
       const commentData = {
         postId,
         authorId: currentUser.uid,
@@ -930,10 +1060,43 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  const copyPostLink = (postId: string) => {
+  const copyPostLink = async (postId: string) => {
+    const targetPost = combinedFeed.find((p) => p.id === postId) || posts.find((p) => p.id === postId);
+    if (targetPost) {
+      await handleSharePost(targetPost);
+      return;
+    }
     navigator.clipboard.writeText(`${window.location.origin}/#post-${postId}`);
     setCopiedId(postId);
     setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const handleDownloadPost = async (post: Post) => {
+    try {
+      const res = await downloadPost(post);
+      setActionToast({ type: 'success', text: res.message || 'Downloaded!' });
+      setTimeout(() => setActionToast(null), 3000);
+    } catch {
+      setActionToast({ type: 'error', text: "Couldn't download" });
+      setTimeout(() => setActionToast(null), 3000);
+    }
+  };
+
+  const handleSharePost = async (post: Post) => {
+    try {
+      const res = await sharePost(post);
+      if (res.success) {
+        setCopiedId(post.id);
+        setTimeout(() => setCopiedId(null), 2000);
+        if (res.message) {
+          setActionToast({ type: 'success', text: res.message });
+          setTimeout(() => setActionToast(null), 3000);
+        }
+      }
+    } catch {
+      setActionToast({ type: 'error', text: "Couldn't share" });
+      setTimeout(() => setActionToast(null), 3000);
+    }
   };
 
   const blockedIds = userProfile?.blockedUserIds || [];
@@ -1097,28 +1260,40 @@ export const FeedView: React.FC<FeedViewProps> = ({
               </p>
             </div>
 
-            {onOpenWelink && (
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => onOpenWelink('voice')}
-                  className="min-h-[42px] px-3.5 py-2 rounded-2xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
-                  title="Talk Live by Voice with WELINK"
-                >
-                  <Mic size={15} className="text-[#0D9488]" />
-                  <span>Live Talk</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onOpenWelink('chat')}
-                  className="min-h-[42px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-2 shadow-2xs transition active:scale-95"
-                  title="Open WELINK AI Guide"
-                >
-                  <Sparkles size={15} className="text-[#0D9488]" />
-                  <span>WELINK Guide</span>
-                </button>
-              </div>
-            )}
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={toggleDarkMode}
+                className="min-h-[42px] px-3 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
+                title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              >
+                {isDark ? <Sun size={15} className="text-amber-400" /> : <Moon size={15} className="text-[#2563EB]" />}
+                <span>{isDark ? 'Light' : 'Dark'}</span>
+              </button>
+
+              {onOpenWelink && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => onOpenWelink('voice')}
+                    className="min-h-[42px] px-3.5 py-2 rounded-2xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
+                    title="Talk Live by Voice with WELINK"
+                  >
+                    <Mic size={15} className="text-[#0D9488]" />
+                    <span>Live Talk</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenWelink('chat')}
+                    className="min-h-[42px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-2 shadow-2xs transition active:scale-95"
+                    title="Open WELINK AI Guide"
+                  >
+                    <Sparkles size={15} className="text-[#0D9488]" />
+                    <span>WELINK Guide</span>
+                  </button>
+                </>
+              )}
+            </div>
           </div>
 
           {/* Skippable First-Time Welcome Flow */}
@@ -1296,17 +1471,57 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     ) : (
                       <img src={inlineMediaPreview} alt="Preview" className="w-full h-auto max-h-72 object-cover" />
                     )}
+                    {compressionBadge && inlineMediaType === 'image' && (
+                      <span className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded-xl bg-stone-900/80 text-emerald-300 text-[10px] font-mono font-bold backdrop-blur-xs">
+                        ⚡ {compressionBadge}
+                      </span>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
                         setInlineMediaFile(null);
                         setInlineMediaPreview(null);
+                        setCompressionBadge(null);
                       }}
                       className="absolute top-2.5 right-2.5 min-w-[36px] min-h-[36px] p-2 rounded-full bg-stone-900/80 text-white hover:bg-stone-900 flex items-center justify-center transition"
                       title="Remove attachment"
                     >
                       <X size={16} />
                     </button>
+                  </div>
+                )}
+
+                {/* AI Caption Suggestions Chips */}
+                {aiCaptionSuggestions.length > 0 && (
+                  <div className="my-2.5 p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-extrabold text-[#0D9488] flex items-center gap-1.5">
+                        <Sparkles size={13} />
+                        <span>AI Caption Ideas (Tap to use)</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setAiCaptionSuggestions([])}
+                        className="text-[11px] text-[#78716C] hover:text-[#1C1917]"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                    <div className="space-y-1.5">
+                      {aiCaptionSuggestions.map((suggestion, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => {
+                            setInlineContent(suggestion);
+                            setAiCaptionSuggestions([]);
+                          }}
+                          className="w-full text-left p-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-[#2563EB] border border-[var(--border-hairline)] text-xs text-[var(--text-primary)] leading-relaxed transition"
+                        >
+                          {suggestion}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
 
@@ -1353,7 +1568,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 )}
 
                 <div className="flex items-center justify-between pt-3 mt-2 border-t border-[#EFECE6] flex-wrap gap-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
                     <input
                       type="file"
                       ref={fileInputRef}
@@ -1369,9 +1584,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           fileInputRef.current.click();
                         }
                       }}
-                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
-                      <ImageIcon size={16} />
+                      <ImageIcon size={15} />
                       <span>Photo</span>
                     </button>
 
@@ -1388,12 +1603,44 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           ? `Upload video up to ${PRO_MAX_VIDEO_MB} MB (WaveLink Pro)`
                           : `Upload video from 0 KB to ${FREE_MAX_VIDEO_MB} MB (Pro unlocks ${PRO_MAX_VIDEO_MB} MB)`
                       }
-                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
-                      <VideoIcon size={16} />
+                      <VideoIcon size={15} />
                       <span>
                         Video ({isProEffective || isAdmin ? `Up to ${PRO_MAX_VIDEO_MB}MB` : `0–${FREE_MAX_VIDEO_MB}MB`})
                       </span>
+                    </button>
+
+                    {/* AI Caption Suggestions Button */}
+                    <button
+                      type="button"
+                      onClick={handleSuggestCaptions}
+                      disabled={Boolean(isAiAssisting)}
+                      title="Generate 3 AI caption ideas with hashtags"
+                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-teal-50/80 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-xs font-bold flex items-center gap-1.5 transition active:scale-95 disabled:opacity-50"
+                    >
+                      {isAiAssisting === 'captions' ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <Sparkles size={14} />
+                      )}
+                      <span>AI Captions</span>
+                    </button>
+
+                    {/* AI Post Improvement Button */}
+                    <button
+                      type="button"
+                      onClick={handleImprovePostDraft}
+                      disabled={Boolean(isAiAssisting) || !inlineContent.trim()}
+                      title="Polish & improve your post text with WELINK AI"
+                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-blue-50/80 hover:bg-blue-100 text-[#2563EB] border border-blue-200/80 text-xs font-bold flex items-center gap-1.5 transition active:scale-95 disabled:opacity-40"
+                    >
+                      {isAiAssisting === 'improve' ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <Wand2 size={14} />
+                      )}
+                      <span>Improve</span>
                     </button>
                   </div>
 
@@ -1605,13 +1852,26 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             <span className="font-mono tabular-numbers">{post.commentsCount || 0}</span>
                           </button>
                         </div>
-                        <button
-                          onClick={() => copyPostLink(post.id)}
-                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
-                        >
-                          <Share2 size={14} />
-                          <span>Share</span>
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadPost(post)}
+                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
+                            title={post.imageUrl && !post.videoUrl && !post.hasVideoChunks && post.mediaType !== 'video' ? 'Download post image' : 'Download post text (.txt)'}
+                          >
+                            <Download size={14} />
+                            <span>Download</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleSharePost(post)}
+                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
+                            title="Share post via Web Share or WhatsApp"
+                          >
+                            <Share2 size={14} />
+                            <span>Share</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -1913,17 +2173,31 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         </button>
                       </div>
 
-                      <button
-                        onClick={() => copyPostLink(post.id)}
-                        className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
-                      >
-                        {copiedId === post.id ? (
-                          <Check size={14} className="text-[#10B981]" />
-                        ) : (
-                          <Share2 size={14} />
-                        )}
-                        <span>{copiedId === post.id ? 'Copied' : 'Share'}</span>
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleDownloadPost(post)}
+                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
+                          title={post.imageUrl && !post.videoUrl && !post.hasVideoChunks && post.mediaType !== 'video' ? 'Download post image' : 'Download post text (.txt)'}
+                        >
+                          <Download size={14} />
+                          <span>Download</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleSharePost(post)}
+                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
+                          title="Share post via Web Share or WhatsApp"
+                        >
+                          {copiedId === post.id ? (
+                            <Check size={14} className="text-[#10B981]" />
+                          ) : (
+                            <Share2 size={14} />
+                          )}
+                          <span>{copiedId === post.id ? 'Shared' : 'Share'}</span>
+                        </button>
+                      </div>
                     </div>
 
                     {/* Collapsible Comments Section */}
@@ -2140,6 +2414,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 </div>
               )}
 
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-stone-100">
+                <button
+                  type="button"
+                  onClick={() => handleDownloadPost(focusedPost)}
+                  className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-stone-100 hover:bg-stone-200/80 text-stone-700 text-xs font-semibold transition"
+                >
+                  <Download size={14} />
+                  <span>Download</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSharePost(focusedPost)}
+                  className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-blue-50 hover:bg-blue-100 text-[#2563EB] text-xs font-semibold transition"
+                >
+                  <Share2 size={14} />
+                  <span>Share</span>
+                </button>
+              </div>
+
               <div className="pt-4 border-t border-stone-100 space-y-3">
                 <h4 className="text-xs font-extrabold uppercase tracking-wider text-stone-500">
                   Replies ({(commentsMap[focusedPost.id] || []).length})
@@ -2184,6 +2477,26 @@ export const FeedView: React.FC<FeedViewProps> = ({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Floating Toast Notification for Download / Share actions */}
+      {actionToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl shadow-lg border text-xs font-bold transition-all ${
+            actionToast.type === 'success'
+              ? 'bg-emerald-600 text-white border-emerald-500'
+              : 'bg-rose-600 text-white border-rose-500'
+          }`}
+        >
+          {actionToast.type === 'success' ? (
+            <Check size={14} className="shrink-0" />
+          ) : (
+            <X size={14} className="shrink-0" />
+          )}
+          <span>{actionToast.text}</span>
         </div>
       )}
     </div>

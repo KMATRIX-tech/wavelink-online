@@ -42,7 +42,7 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
   onClearExternalPosts,
   onStartChat
 }) => {
-  const { currentUser, userProfile } = useAuth();
+  const { currentUser, userProfile, isAdmin } = useAuth();
   const { isUploadingAny, overallProgress } = useSparkUploadQueue();
   const [activeSparks, setActiveSparks] = useState<Spark[]>([]);
   const [viewingGroup, setViewingGroup] = useState<UserSparkGroup | null>(null);
@@ -80,10 +80,12 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
 
         setActiveSparks(list);
 
-        // Delete expired Spark files from Firebase Storage and remove expired Spark documents
+        // Delete expired Spark files from Firebase Storage and remove expired Spark documents (only if owner or admin)
         if (expiredList.length > 0 && currentUser) {
           expiredList.forEach((expiredSpark) => {
-            deleteSparkAndStorageFile(expiredSpark, true);
+            if (expiredSpark.authorId === currentUser.uid || isAdmin) {
+              deleteSparkAndStorageFile(expiredSpark, true);
+            }
           });
         }
       },
@@ -104,7 +106,7 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
         prev.forEach((spark) => {
           if (new Date(spark.expiresAt).getTime() > now) {
             stillActive.push(spark);
-          } else {
+          } else if (currentUser && (spark.authorId === currentUser.uid || isAdmin)) {
             deleteSparkAndStorageFile(spark, true);
           }
         });
@@ -120,6 +122,31 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
     () => groupSparksByAuthor(activeSparks, currentUser?.uid),
     [activeSparks, currentUser?.uid]
   );
+
+  const mySparkGroup = useMemo(
+    () => userSparkGroups.find((g) => g.authorId === currentUser?.uid) || null,
+    [userSparkGroups, currentUser?.uid]
+  );
+
+  const mySparkTotalViews = useMemo(() => {
+    if (!mySparkGroup) return 0;
+    const uniqueViewerIds = new Set<string>();
+    mySparkGroup.sparks.forEach((s) => {
+      (s.viewers || []).forEach((id) => uniqueViewerIds.add(id));
+    });
+    return uniqueViewerIds.size;
+  }, [mySparkGroup]);
+
+  const mySparkTotalLikes = useMemo(() => {
+    if (!mySparkGroup) return 0;
+    return mySparkGroup.totalLikes || 0;
+  }, [mySparkGroup]);
+
+  const earnedDailySparkBonus = useMemo(() => {
+    if (!currentUser?.uid) return false;
+    const today = new Date().toISOString().slice(0, 10);
+    return localStorage.getItem(`wavelink_spark_reward_${currentUser.uid}_${today}`) === '1';
+  }, [currentUser?.uid, activeSparks.length]);
 
   // Keep viewingGroup in sync if live data updates
   const activeViewingSparks = useMemo(() => {
@@ -153,14 +180,30 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
               <span className="font-bold text-[#D97706]">Spark of the Day:</span> {todayTheme}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => setIsMultiPosterOpen(true)}
-            className="px-2.5 py-1 rounded-lg bg-[#2563EB]/10 hover:bg-[#2563EB]/15 text-[11px] font-extrabold text-[#2563EB] flex items-center gap-1 shrink-0 transition"
-          >
-            <Layers size={12} />
-            <span>Post Multi-Spark</span>
-          </button>
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
+            {mySparkGroup && (
+              <span
+                onClick={() => setViewingGroup(mySparkGroup)}
+                className="px-2.5 py-1 rounded-lg bg-amber-50 text-[#D97706] border border-amber-200/80 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer hover:bg-amber-100/70 transition"
+                title="View who watched and liked your Spark"
+              >
+                <span>👁️ {mySparkTotalViews}</span>
+                <span>•</span>
+                <span>🔥 {mySparkTotalLikes}</span>
+              </span>
+            )}
+            <span className="px-2 py-1 rounded-lg bg-emerald-50 text-[#0D9488] border border-emerald-200/70 text-[10px] font-extrabold">
+              {earnedDailySparkBonus ? '✓ +20 pts earned today' : '+20 pts Daily Spark Bonus'}
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsMultiPosterOpen(true)}
+              className="px-2.5 py-1 rounded-lg bg-[#2563EB]/10 hover:bg-[#2563EB]/15 text-[11px] font-extrabold text-[#2563EB] flex items-center gap-1 shrink-0 transition"
+            >
+              <Layers size={12} />
+              <span>Post Multi-Spark</span>
+            </button>
+          </div>
         </div>
 
         {/* Inline Background Spark Upload Queue Progress */}

@@ -54,20 +54,73 @@ html[data-theme="sunrise"] {
   --accent-highlight: #EAB308;
 }
 
+/* Dark Mode: sleek obsidian & slate with high contrast and mobile comfort */
+html.dark,
+html[data-theme="dark"] {
+  --bg-canvas: #0B0F19;
+  --bg-surface: #111827;
+  --bg-subtle: #1E293B;
+  --text-primary: #F8FAFC;
+  --text-secondary: #94A3B8;
+  --border-hairline: #1E293B;
+  --accent-primary: #3B82F6;
+  --accent-secondary: #14B8A6;
+  --accent-highlight: #F59E0B;
+}
+
 @layer base {
   html, body {
     font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     background-color: var(--bg-canvas) !important;
     color: var(--text-primary) !important;
-    color-scheme: light !important;
     transition: background-color 0.25s ease, color 0.25s ease;
     font-size: 16px;
     line-height: 1.5;
+    -webkit-tap-highlight-color: transparent;
   }
 
   code, pre, .font-mono {
     font-family: 'JetBrains Mono', monospace;
   }
+}
+
+/* Harmonized Dark Mode utility overrides for hardcoded light cards & text across views */
+html.dark .bg-white,
+html.dark .bg-\[\#FFFFFF\],
+html.dark .bg-\[\#ffffff\] {
+  background-color: var(--bg-surface) !important;
+}
+
+html.dark .bg-\[\#FAF7F2\],
+html.dark .bg-\[\#F8FAFC\],
+html.dark .bg-\[\#f8fafc\],
+html.dark .bg-stone-50,
+html.dark .bg-slate-50 {
+  background-color: var(--bg-subtle) !important;
+}
+
+html.dark .text-\[\#1C1917\],
+html.dark .text-\[\#1e293b\],
+html.dark .text-\[\#0F172A\],
+html.dark .text-slate-900,
+html.dark .text-stone-900 {
+  color: var(--text-primary) !important;
+}
+
+html.dark .text-\[\#78716C\],
+html.dark .text-\[\#57534E\],
+html.dark .text-slate-500,
+html.dark .text-stone-500 {
+  color: var(--text-secondary) !important;
+}
+
+html.dark .border-\[\#EFECE6\],
+html.dark .border-slate-100,
+html.dark .border-slate-200,
+html.dark .border-slate-200\/90,
+html.dark .border-stone-100,
+html.dark .border-stone-200 {
+  border-color: var(--border-hairline) !important;
 }
 
 /* Ensure app canvas and surfaces respond smoothly to the active light theme */

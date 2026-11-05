@@ -1,9 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { CrystalBadge } from './CrystalBadge';
 import { ActiveTab } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 import { AdsterraAdBanner } from './AdsterraAdBanner';
+import { inviteFriends } from '../utils/share';
 import {
   Waves,
   Rss,
@@ -20,7 +21,9 @@ import {
   Sparkles,
   Coins,
   CalendarDays,
-  Flame
+  Flame,
+  UserPlus,
+  Check
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -39,8 +42,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenWelink
 }) => {
   const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, signOut } = useAuth();
+  const [inviteToast, setInviteToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const isProUser = isProEffective;
+
+  const handleInviteFriends = () => {
+    try {
+      const res = inviteFriends();
+      setInviteToast({ type: 'success', text: res?.message || 'Invite opened in WhatsApp!' });
+      setTimeout(() => setInviteToast(null), 2800);
+    } catch {
+      setInviteToast({ type: 'error', text: "Couldn't open invite" });
+      setTimeout(() => setInviteToast(null), 2800);
+    }
+  };
 
   const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; badge?: string }[] = [
     { id: 'feed', label: 'Home Feed', icon: <Rss size={18} /> },
@@ -163,6 +178,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </button>
         )}
+
+        <button
+          type="button"
+          onClick={handleInviteFriends}
+          className="w-full flex items-center justify-between px-3.5 py-2.5 rounded-2xl text-xs sm:text-sm font-bold text-emerald-800 hover:bg-emerald-50 transition-all duration-150 mt-1 border border-emerald-200/80 bg-emerald-50/50"
+        >
+          <div className="flex items-center gap-3">
+            <span className="text-emerald-600">
+              <UserPlus size={18} />
+            </span>
+            <span>Invite Friends</span>
+          </div>
+          <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider bg-emerald-600 text-white">
+            WhatsApp
+          </span>
+        </button>
       </div>
 
       {/* WaveLink Pro Shortcut / Upgrade Button */}
@@ -282,6 +313,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="relative w-72 max-w-[85vw] h-full shadow-2xl z-10 animate-slide-right">
             {sidebarContent}
           </div>
+        </div>
+      )}
+
+      {inviteToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl shadow-lg border text-xs font-bold transition-all ${
+            inviteToast.type === 'success'
+              ? 'bg-emerald-600 text-white border-emerald-500'
+              : 'bg-rose-600 text-white border-rose-500'
+          }`}
+        >
+          {inviteToast.type === 'success' ? (
+            <Check size={14} className="shrink-0" />
+          ) : (
+            <X size={14} className="shrink-0" />
+          )}
+          <span>{inviteToast.text}</span>
         </div>
       )}
     </>

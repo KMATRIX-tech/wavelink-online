@@ -10,6 +10,9 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 export default defineConfig(() => {
   return {
     plugins: [react(), tailwindcss()],
+    // SECURITY: Only expose non-secret Firebase AppCheck public site key prefix;
+    // GEMINI_API_KEY, AZAMPAY_CLIENT_SECRET, and OWNER_PHONE remain strictly on the Express server.
+    envPrefix: ['VITE_FIREBASE_'],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

@@ -1,7 +1,44 @@
 rules_version = '2';
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users/{userId}
+//   - uid: string (immutable, matches userId)
+//   - email: string (optional, <= 160 chars)
+//   - displayName: string (required/optional, <= 80 chars)
+//   - username: string (optional, <= 50 chars)
+//   - bio: string (optional, <= 500 chars)
+//   - role: 'user' | 'sub_admin' | 'super_admin' (protected against self-escalation)
+//   - isSubAdmin: bool (protected against self-escalation)
+//   - isBanned: bool (protected against self-unbanning)
+//   - wavePoints / points: number (bounded increments per check-in/spark reward)
+//
+// Collection: posts/{postId}
+//   - id: string
+//   - authorId: string (immutable, matches request.auth.uid or wavelink_support_bot for admins)
+//   - content: string (<= 4000 chars)
+//   - likes: list, likesCount: number, reactions: map, reactionCounts: map, commentsCount: number
+//   - createdAt: string (immutable ISO timestamp)
+//
+// Subcollection: posts/{postId}/comments/{commentId}
+//   - postId: string, authorId: string (immutable, matches request.auth.uid)
+//   - content: string (1..2000 chars), createdAt: string (immutable)
+//
+// Collection: sparks/{sparkId}
+//   - id: string, authorId: string (immutable, matches request.auth.uid)
+//   - caption: string (<= 600 chars), mediaType: 'image' | 'video'
+//   - videoDurationSeconds: number (<= 60.5s Free, <= 90.5s Pro), videoFileSize: number (<= 80MB)
+//   - likes, likesCount, likedUsers, viewers, viewersCount, viewerUsers: engagement fields
+//   - createdAt: string (immutable), expiresAt: string (immutable 24h expiry)
+// ===============================================================
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ===============================================================
+    // Helper & Validator Functions
+    // ===============================================================
     function isSignedIn() {
       return request.auth != null;
     }
@@ -12,6 +49,14 @@ service cloud.firestore {
 
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 160 && id.matches('^[a-zA-Z0-9_\\-@.:]+$');
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidOptionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
     }
 
     // Server-designated Super Admin or server-recorded /admins/{uid} document
@@ -54,28 +99,60 @@ service cloud.firestore {
       );
     }
 
+    // Validate User Profile payload lengths & types (used on both create and update)
+    function isValidUserProfilePayload(data) {
+      return isValidOptionalString(data, 'displayName', 80) &&
+        isValidOptionalString(data, 'username', 50) &&
+        isValidOptionalString(data, 'bio', 500) &&
+        isValidOptionalString(data, 'email', 160) &&
+        isValidOptionalString(data, 'photoURL', 150000);
+    }
+
     // Protect RBAC, Pro status, badges, and points from unauthorized client self-escalation
     function isSafeUserProfileCreate(userId) {
       let data = request.resource.data;
       return isOwner(userId) &&
+        isValidUserProfilePayload(data) &&
+        (!('uid' in data) || data.uid == userId) &&
         (!('role' in data) || data.role == 'user' || isSuperAdmin()) &&
         (!('isSubAdmin' in data) || data.isSubAdmin == false || isSuperAdmin()) &&
         (!('isBot' in data) || data.isBot == false) &&
-        (!('points' in data) || (data.points is number && data.points <= 500));
+        (!('points' in data) || (data.points is number && data.points >= 0 && data.points <= 500)) &&
+        (!('wavePoints' in data) || (data.wavePoints is number && data.wavePoints >= 0 && data.wavePoints <= 500));
     }
 
     function isSafeUserProfileUpdate(userId) {
       let incoming = request.resource.data;
       let existing = resource.data;
       return isOwner(userId) &&
+        isValidUserProfilePayload(incoming) &&
+        (!('uid' in incoming) || incoming.uid == userId) &&
         // Block non-admins from editing their own role or sub-admin status
         (!('role' in incoming) || (existing != null && incoming.role == existing.role) || incoming.role == 'user') &&
         (!('isSubAdmin' in incoming) || (existing != null && incoming.isSubAdmin == existing.isSubAdmin) || incoming.isSubAdmin == false) &&
         (!('isBot' in incoming) || incoming.isBot == false) &&
         // Block non-admins from unbanning themselves
         (!('isBanned' in incoming) || (existing != null && incoming.isBanned == existing.isBanned) || incoming.isBanned == false) &&
-        // Prevent arbitrary point inflation (daily check-in increments bounded to <= 100 per update)
-        (!('points' in incoming) || (existing != null && 'points' in existing ? incoming.points <= existing.points + 100 : incoming.points <= 500));
+        // Prevent arbitrary point inflation (daily check-in & Spark rewards bounded to <= 100 per update)
+        (!('points' in incoming) || (existing != null && 'points' in existing ? incoming.points <= existing.points + 100 : incoming.points <= 500)) &&
+        (!('wavePoints' in incoming) || (existing != null && 'wavePoints' in existing ? incoming.wavePoints <= existing.wavePoints + 100 : incoming.wavePoints <= 500));
+    }
+
+    // Validate Feed Post payload on create & update
+    function isValidPostPayload(data) {
+      return ('authorId' in data) && data.authorId is string && data.authorId.size() >= 1 && data.authorId.size() <= 128 &&
+        isValidOptionalString(data, 'content', 4000) &&
+        isValidOptionalString(data, 'authorName', 100) &&
+        isValidOptionalString(data, 'authorUsername', 60) &&
+        (!('likesCount' in data) || (data.likesCount is number && data.likesCount >= 0)) &&
+        (!('commentsCount' in data) || (data.commentsCount is number && data.commentsCount >= 0));
+    }
+
+    // Validate Post Comment payload on create & update
+    function isValidCommentPayload(data) {
+      return ('authorId' in data) && data.authorId is string && data.authorId.size() >= 1 && data.authorId.size() <= 128 &&
+        ('content' in data) && data.content is string && data.content.size() >= 1 && data.content.size() <= 2000 &&
+        isValidOptionalString(data, 'authorName', 100);
     }
 
     // Default catch-all deny rule for zero-trust baseline
@@ -106,30 +183,51 @@ service cloud.firestore {
     // Social feed posts (includes approved scheduled bot posts when triggered by an admin)
     match /posts/{postId} {
       allow read: if true;
-      allow create: if isSignedIn() && (
+      allow create: if isSignedIn() && isValidPostPayload(request.resource.data) && (
         request.resource.data.authorId == request.auth.uid ||
         (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
       );
-      allow update: if isSignedIn() && (
-        resource.data.authorId == request.auth.uid ||
+      allow update: if isSignedIn() && isValidPostPayload(request.resource.data) && (
+        (resource.data.authorId == request.auth.uid && areImmutableFieldsUnchanged(['authorId', 'createdAt'])) ||
         isAdmin() ||
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes', 'likesCount', 'reactions', 'reactionCounts', 'commentsCount', 'savesCount', 'tipsTotalTZS', 'isBoosted', 'updatedAt'])
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'likes',
+          'likesCount',
+          'reactions',
+          'reactionCounts',
+          'commentsCount',
+          'savesCount',
+          'tipsTotalTZS',
+          'isBoosted',
+          'updatedAt'
+        ])
       );
       allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
 
       match /comments/{commentId} {
         allow read: if true;
-        allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
-        allow update, delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+          isValidCommentPayload(request.resource.data) &&
+          request.resource.data.authorId == request.auth.uid;
+        allow update: if isSignedIn() &&
+          isValidCommentPayload(request.resource.data) &&
+          areImmutableFieldsUnchanged(['authorId', 'postId', 'createdAt']) &&
+          (resource.data.authorId == request.auth.uid || isAdmin());
+        allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
       }
 
       match /chunks/{chunkId} {
         allow read: if true;
-        allow create, update, delete: if isSignedIn();
+        allow create: if isSignedIn();
+        allow update, delete: if isSignedIn() && (
+          isAdmin() ||
+          (exists(/databases/$(database)/documents/posts/$(postId)) &&
+           get(/databases/$(database)/documents/posts/$(postId)).data.authorId == request.auth.uid)
+        );
       }
     }
 
-    // Validate Spark payload: never allow base64 video in Firestore, and enforce 60s Free / 90s Pro duration limits
+    // Validate Spark payload: never allow base64 video in Firestore, enforce caption size, and enforce 60s Free / 90s Pro duration limits
     function isUserProOrAdmin() {
       return isAdmin() || (
         isSignedIn() &&
@@ -140,7 +238,10 @@ service cloud.firestore {
 
     function isValidSparkPayload() {
       let data = request.resource.data;
-      return (!('mediaUrl' in data) || !(data.mediaUrl is string) || !data.mediaUrl.matches('^data:video/.*')) &&
+      return ('authorId' in data) && data.authorId is string && data.authorId.size() <= 128 &&
+        isValidOptionalString(data, 'caption', 600) &&
+        isValidOptionalString(data, 'legendaryTag', 80) &&
+        (!('mediaUrl' in data) || !(data.mediaUrl is string) || !data.mediaUrl.matches('^data:video/.*')) &&
         (!('videoDurationSeconds' in data) || (
           data.videoDurationSeconds is number &&
           data.videoDurationSeconds >= 0 &&
@@ -156,20 +257,32 @@ service cloud.firestore {
         request.resource.data.authorId == request.auth.uid ||
         (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
       );
-      allow update: if isSignedIn() && (
-        resource.data.authorId == request.auth.uid ||
+      allow update: if isSignedIn() && isValidSparkPayload() && (
+        (resource.data.authorId == request.auth.uid && areImmutableFieldsUnchanged(['authorId', 'createdAt'])) ||
         isAdmin() ||
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes', 'likesCount'])
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'likes',
+          'likesCount',
+          'likedUsers',
+          'viewers',
+          'viewersCount',
+          'viewerUsers'
+        ])
       );
+      // Only the Spark owner or an Admin can delete a Spark
       allow delete: if isSignedIn() && (
         resource.data.authorId == request.auth.uid ||
-        isAdmin() ||
-        isSignedIn()
+        isAdmin()
       );
 
       match /chunks/{chunkId} {
         allow read: if true;
-        allow create, update, delete: if isSignedIn();
+        allow create: if isSignedIn();
+        allow update, delete: if isSignedIn() && (
+          isAdmin() ||
+          (exists(/databases/$(database)/documents/sparks/$(sparkId)) &&
+           get(/databases/$(database)/documents/sparks/$(sparkId)).data.authorId == request.auth.uid)
+        );
       }
     }
 
@@ -181,7 +294,7 @@ service cloud.firestore {
         (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
       );
       allow update: if isSignedIn() && (
-        resource.data.authorId == request.auth.uid ||
+        (resource.data.authorId == request.auth.uid && areImmutableFieldsUnchanged(['authorId', 'createdAt'])) ||
         isAdmin() ||
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rsvpUserIds', 'rsvpCount'])
       );
@@ -299,7 +412,7 @@ service cloud.firestore {
     // In-App Notifications (messages, calls, posts, follows)
     match /notifications/{notificationId} {
       allow read: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn();
+      allow create: if isSignedIn() && isValidOptionalString(request.resource.data, 'body', 600);
       allow update: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
       allow delete: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
     }
@@ -346,7 +459,7 @@ service cloud.firestore {
     // AI-Collected Platform Upgrades & Feature Feedback (from Welink AI, Live Talk, and Support Bot)
     match /upgrade_feedback/{feedbackId} {
       allow read: if isSignedIn() && (isAdmin() || resource.data.submittedByUserId == request.auth.uid);
-      allow create: if isSignedIn();
+      allow create: if isSignedIn() && isValidOptionalString(request.resource.data, 'rawSuggestion', 2000);
       allow update, delete: if isAdmin();
     }
   }

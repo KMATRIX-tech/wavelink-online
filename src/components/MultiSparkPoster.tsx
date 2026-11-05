@@ -23,6 +23,7 @@ import {
   PRO_SPARK_MAX_SECONDS
 } from '../utils/mediaStorage';
 import { enqueueSparkUploadJob } from '../services/sparkUploadQueue';
+import { moderatePostContent } from '../services/geminiService';
 import { SongSelectorModal } from './SongSelectorModal';
 import {
   Flame,
@@ -315,8 +316,9 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
   onSparkCreated,
   initialPostsToShare
 }) => {
-  const { currentUser, userProfile, isAdmin, isProEffective } = useAuth();
+  const { currentUser, userProfile, isAdmin, isProEffective, recordPointTransaction } = useAuth();
   const isProTier = Boolean(isProEffective || isAdmin);
+  const maxActiveSlidesAllowed = isProTier ? 25 : 10;
 
   const [activeTab, setActiveTab] = useState<'builder' | 'from_posts' | 'active_sparks'>('builder');
   const [slides, setSlides] = useState<MultiSparkSlideItem[]>([]);
@@ -630,9 +632,76 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
     e.preventDefault();
     if (!currentUser || slides.length === 0) return;
 
+    // 1. Anti-abuse active Spark cap check (10 active slides Free / 25 Pro)
+    if (myActiveSparks.length + slides.length > maxActiveSlidesAllowed) {
+      setFeedbackBanner({
+        type: 'error',
+        showTryProNote: !isProTier,
+        text: `You currently have ${myActiveSparks.length} active Spark slide(s). ${
+          isProTier ? 'Pro members can have up to 25' : 'Free members can have up to 10'
+        } active 24h Spark slides at once.`
+      });
+      return;
+    }
+
+    // 2. Anti-spam cooldown (15s between consecutive Spark batch submissions)
+    const lastSparkPostMs = Number(sessionStorage.getItem(`wavelink_last_spark_${currentUser.uid}`) || '0');
+    const elapsedMs = Date.now() - lastSparkPostMs;
+    if (elapsedMs < 15000) {
+      const waitSec = Math.ceil((15000 - elapsedMs) / 1000);
+      setFeedbackBanner({
+        type: 'error',
+        text: `Please wait ${waitSec}s before posting another Spark batch (anti-spam protection).`
+      });
+      return;
+    }
+
     setIsPublishing(true);
     setPublishProgress(15);
     setFeedbackBanner(null);
+
+    // 3. Pre-publish AI content moderation on slide captions
+    const combinedCaptions = slides
+      .map((s) => (s.caption || s.textCardBody || '').trim())
+      .filter(Boolean)
+      .join(' | ');
+    if (combinedCaptions) {
+      try {
+        const modCheck = await moderatePostContent(combinedCaptions);
+        if (modCheck.flagged) {
+          setFeedbackBanner({
+            type: 'error',
+            text: modCheck.reason || 'Spark caption flagged by WaveLink AI Safety Moderation.'
+          });
+          setIsPublishing(false);
+          setPublishProgress(0);
+          return;
+        }
+      } catch (err: any) {
+        if (err?.message?.includes('rate limit')) {
+          setFeedbackBanner({ type: 'error', text: err.message });
+          setIsPublishing(false);
+          setPublishProgress(0);
+          return;
+        }
+      }
+    }
+
+    sessionStorage.setItem(`wavelink_last_spark_${currentUser.uid}`, String(Date.now()));
+
+    // 4. Daily Spark Creator Reward (+20 WavePoints once per day)
+    const today = new Date().toISOString().slice(0, 10);
+    const rewardKey = `wavelink_spark_reward_${currentUser.uid}_${today}`;
+    if (!localStorage.getItem(rewardKey)) {
+      localStorage.setItem(rewardKey, '1');
+      recordPointTransaction({
+        type: 'earned',
+        category: 'daily_reward',
+        title: 'Daily Spark Creator Bonus ✨',
+        description: 'Earned +20 WavePoints for sharing a 24-hour Spark today',
+        amount: 20
+      }).catch(() => {});
+    }
 
     const slidesSnapshot = slides.map((slide) => ({
       id: slide.id,

@@ -53,6 +53,7 @@ export const APPEARANCE_THEMES: AppearanceThemeOption[] = [
 interface ThemeContextType {
   theme: ThemeMode;
   setTheme: (theme: ThemeMode) => void;
+  toggleDarkMode: () => void;
   isDark: boolean;
   appearanceTheme: AppearanceTheme;
   setAppearanceTheme: (next: AppearanceTheme) => void;
@@ -63,11 +64,20 @@ interface ThemeContextType {
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
 const APPEARANCE_STORAGE_KEY = 'wavelink_appearance_theme_v1';
+const THEME_MODE_STORAGE_KEY = 'wavelink_theme_mode_v1';
 export const BATTERY_SAVER_STORAGE_KEY = 'wavelink_battery_saver_v1';
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const theme: ThemeMode = 'light';
-  const isDark = false;
+  const [theme, setThemeState] = useState<ThemeMode>(() => {
+    try {
+      const saved = localStorage.getItem(THEME_MODE_STORAGE_KEY);
+      if (saved === 'dark' || saved === 'light') return saved;
+    } catch {
+      // default to light
+    }
+    return 'light';
+  });
+  const isDark = theme === 'dark';
 
   const [appearanceTheme, setAppearanceThemeState] = useState<AppearanceTheme>(() => {
     const saved = localStorage.getItem(APPEARANCE_STORAGE_KEY) as AppearanceTheme | null;
@@ -89,13 +99,25 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     const root = document.documentElement;
     const body = document.body;
 
-    root.classList.remove('dark');
-    body?.classList.remove('dark');
-    root.setAttribute('data-theme', appearanceTheme);
-    root.style.colorScheme = 'light';
+    if (isDark) {
+      root.classList.add('dark');
+      body?.classList.add('dark');
+      root.setAttribute('data-theme', 'dark');
+      root.style.colorScheme = 'dark';
+    } else {
+      root.classList.remove('dark');
+      body?.classList.remove('dark');
+      root.setAttribute('data-theme', appearanceTheme);
+      root.style.colorScheme = 'light';
+    }
 
-    localStorage.setItem(APPEARANCE_STORAGE_KEY, appearanceTheme);
-  }, [appearanceTheme]);
+    try {
+      localStorage.setItem(APPEARANCE_STORAGE_KEY, appearanceTheme);
+      localStorage.setItem(THEME_MODE_STORAGE_KEY, theme);
+    } catch {
+      // ignore storage errors
+    }
+  }, [appearanceTheme, isDark, theme]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -126,8 +148,14 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     setIsBatterySaverState(Boolean(enabled));
   };
 
-  const setTheme = () => {
-    // Always light mode
+  const setTheme = (nextTheme: ThemeMode) => {
+    if (nextTheme === 'dark' || nextTheme === 'light') {
+      setThemeState(nextTheme);
+    }
+  };
+
+  const toggleDarkMode = () => {
+    setThemeState((prev) => (prev === 'dark' ? 'light' : 'dark'));
   };
 
   return (
@@ -135,6 +163,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
       value={{
         theme,
         setTheme,
+        toggleDarkMode,
         isDark,
         appearanceTheme,
         setAppearanceTheme,

@@ -39,8 +39,10 @@ import {
   CheckCircle2,
   Send,
   AlertCircle,
-  RefreshCw
+  RefreshCw,
+  Download
 } from 'lucide-react';
+import { downloadPost, sharePost } from '../utils/share';
 
 interface VideosHubViewProps {
   onNavigateToFeed: () => void;
@@ -53,6 +55,7 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
   const [filter, setFilter] = useState<'all' | 'saved' | 'popular'>('all');
   const [isLoading, setIsLoading] = useState(true);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [actionToast, setActionToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Active playing video tracking
   const [muted, setMuted] = useState(true);
@@ -226,10 +229,30 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
     await toggleSavePost(postId);
   };
 
-  const handleShare = (postId: string) => {
-    navigator.clipboard.writeText(`${window.location.origin}/#video-${postId}`);
-    setCopiedId(postId);
-    setTimeout(() => setCopiedId(null), 2000);
+  const handleDownload = async (post: Post) => {
+    try {
+      const res = await downloadPost(post);
+      setActionToast({ type: 'success', text: res?.message || 'Downloaded!' });
+      setTimeout(() => setActionToast(null), 2800);
+    } catch {
+      setActionToast({ type: 'error', text: "Couldn't download" });
+      setTimeout(() => setActionToast(null), 2800);
+    }
+  };
+
+  const handleShare = async (post: Post) => {
+    try {
+      const res = await sharePost(post);
+      setCopiedId(post.id);
+      setActionToast({ type: 'success', text: res?.message || 'Shared!' });
+      setTimeout(() => {
+        setCopiedId(null);
+        setActionToast(null);
+      }, 2500);
+    } catch {
+      setActionToast({ type: 'error', text: "Couldn't share post" });
+      setTimeout(() => setActionToast(null), 2800);
+    }
   };
 
   const filteredPosts = videoPosts.filter((post) => {
@@ -596,20 +619,51 @@ export const VideosHubView: React.FC<VideosHubViewProps> = ({ onNavigateToFeed }
                       </button>
                     </div>
 
-                    {/* Share */}
-                    <button
-                      onClick={() => handleShare(post.id)}
-                      className="flex items-center gap-1 py-1 px-2.5 rounded-xl hover:bg-[#F8FAFC] transition"
-                      title="Share Video Link"
-                    >
-                      {copiedId === post.id ? <Check size={14} className="text-[#10B981]" /> : <Share2 size={14} />}
-                      <span>{copiedId === post.id ? 'Copied' : 'Share'}</span>
-                    </button>
+                    {/* Download & Share */}
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => handleDownload(post)}
+                        className="flex items-center gap-1 py-1 px-2.5 rounded-xl hover:bg-[#F8FAFC] transition"
+                        title="Download Post"
+                      >
+                        <Download size={14} />
+                        <span>Download</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleShare(post)}
+                        className="flex items-center gap-1 py-1 px-2.5 rounded-xl hover:bg-[#F8FAFC] transition"
+                        title="Share Video via Web Share or WhatsApp"
+                      >
+                        {copiedId === post.id ? <Check size={14} className="text-[#10B981]" /> : <Share2 size={14} />}
+                        <span>{copiedId === post.id ? 'Shared' : 'Share'}</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {actionToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl shadow-lg border text-xs font-bold transition-all ${
+            actionToast.type === 'success'
+              ? 'bg-emerald-600 text-white border-emerald-500'
+              : 'bg-rose-600 text-white border-rose-500'
+          }`}
+        >
+          {actionToast.type === 'success' ? (
+            <Check size={14} className="shrink-0" />
+          ) : (
+            <X size={14} className="shrink-0" />
+          )}
+          <span>{actionToast.text}</span>
         </div>
       )}
 
