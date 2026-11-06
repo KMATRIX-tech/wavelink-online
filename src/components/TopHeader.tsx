@@ -3,8 +3,8 @@ import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { ActiveTab } from '../types';
 import { triggerHaptic } from '../utils/haptics';
-import { inviteFriends } from '../utils/share';
-import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus, Check, X, Moon, Sun } from 'lucide-react';
+import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus } from 'lucide-react';
+import { inviteFriends } from '../utils/share.js';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { CompactPointsDisplay } from './CompactPointsDisplay';
 
@@ -40,7 +40,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   hasUnreadNotifications = false
 }) => {
   const { currentUser, userProfile, isProEffective, isExemptFromPayments } = useAuth();
-  const { isBatterySaver, isDark, toggleDarkMode } = useTheme();
+  const { isBatterySaver } = useTheme();
   const isProUser = isProEffective || isExemptFromPayments;
   const currentTabInfo = TAB_TITLES[activeTab] || { title: 'WaveLink', subtitle: 'Community' };
 
@@ -48,19 +48,6 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [justReconnected, setJustReconnected] = useState<boolean>(false);
-  const [inviteToast, setInviteToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-
-  const handleInviteFriends = () => {
-    try {
-      triggerHaptic('light');
-      const res = inviteFriends();
-      setInviteToast({ type: 'success', text: res?.message || 'Invite opened in WhatsApp!' });
-      setTimeout(() => setInviteToast(null), 2800);
-    } catch {
-      setInviteToast({ type: 'error', text: "Couldn't open invite" });
-      setTimeout(() => setInviteToast(null), 2800);
-    }
-  };
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -125,7 +112,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
   return (
     <header
-      className={`sticky top-0 z-20 w-full bg-[var(--bg-surface)]/95 backdrop-blur-md border-b border-[var(--border-hairline)] transition-all ${
+      className={`sticky top-0 z-20 w-full max-w-full bg-[var(--bg-surface)]/95 backdrop-blur-md border-b border-[var(--border-hairline)] safe-area-top transition-all ${
         activeTab === 'feed' && isOnline && !justReconnected ? 'hidden md:block' : 'block'
       }`}
     >
@@ -142,21 +129,21 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
       )}
 
       <div
-        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 ${
+        className={`w-full max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 ${
           activeTab === 'feed' ? 'hidden md:block' : 'block'
         }`}
       >
-        <div className="flex items-center justify-between h-14 sm:h-16 gap-3">
+        <div className="flex items-center justify-between min-h-[3.5rem] sm:min-h-[4rem] gap-2 sm:gap-3">
           {/* Left: View Title, Calm Brand & Subtle Connection Indicator */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
             <div
               onClick={() => {
                 triggerHaptic('tab');
                 if (onNavigateTab) onNavigateTab('feed');
               }}
-              className="flex items-center gap-2 cursor-pointer select-none"
+              className="flex items-center gap-2 cursor-pointer select-none shrink-0"
             >
-              <div className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shadow-xs">
+              <div className="w-9 h-9 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shadow-xs">
                 <Waves size={18} />
               </div>
               <span className="font-extrabold text-base tracking-tight text-[#1C1917] hidden sm:inline">
@@ -164,13 +151,13 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               </span>
             </div>
 
-            <div className="flex flex-col ml-1 sm:ml-2">
-              <div className="flex items-center gap-2">
-                <h1 className="font-bold text-base sm:text-lg text-[#1C1917] tracking-tight">
+            <div className="flex flex-col min-w-0 ml-0.5 sm:ml-2">
+              <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+                <h1 className="font-bold text-base sm:text-lg text-[#1C1917] tracking-tight truncate">
                   {currentTabInfo.title}
                 </h1>
                 {isProUser && (
-                  <span className="text-[11px] font-semibold text-[#0D9488] bg-[#CCFBF1] px-2 py-0.5 rounded-full">
+                  <span className="text-[11px] font-semibold text-[#0D9488] bg-[#CCFBF1] px-2 py-0.5 rounded-full shrink-0">
                     Pro
                   </span>
                 )}
@@ -186,7 +173,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                         : 'Connected to network'
                       : 'Offline — network connection lost'
                   }
-                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors select-none ${
+                  className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-md text-[11px] font-medium transition-colors select-none shrink-0 ${
                     !isOnline
                       ? 'bg-amber-50 text-amber-800 border border-amber-200/90'
                       : justReconnected
@@ -204,12 +191,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   {!isOnline ? (
                     <span className="inline-flex items-center gap-1 font-semibold">
                       <WifiOff size={11} className="shrink-0" />
-                      <span>Offline</span>
+                      <span className="hidden xs:inline">Offline</span>
                     </span>
                   ) : justReconnected ? (
                     <span className="inline-flex items-center gap-1 font-semibold">
                       <Wifi size={11} className="shrink-0" />
-                      <span>Back online</span>
+                      <span className="hidden xs:inline">Back online</span>
                     </span>
                   ) : (
                     <span className="hidden lg:inline text-[11px] text-[#78716C]">
@@ -223,7 +210,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     type="button"
                     onClick={() => onNavigateTab && onNavigateTab('settings')}
                     title="Battery Saver Mode Active — reduced animations & optimized network checks"
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[#0D9488] border border-emerald-200/80 text-[11px] font-semibold"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[#0D9488] border border-emerald-200/80 text-[11px] font-semibold shrink-0"
                   >
                     <BatteryCharging size={12} className="shrink-0" />
                     <span className="hidden sm:inline">Saver</span>
@@ -245,32 +232,8 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
             />
           </div>
 
-          {/* Right: Non-floating WELINK Guide & Live Voice Buttons, Invite Friends, Dark Mode, Points & Profile Shortcut */}
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => {
-                triggerHaptic('light');
-                toggleDarkMode();
-              }}
-              className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-blue-50/60 text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
-              title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-              aria-label={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-            >
-              {isDark ? <Sun size={14} className="text-amber-400" /> : <Moon size={14} className="text-[#2563EB]" />}
-              <span className="hidden xl:inline">{isDark ? 'Light' : 'Dark'}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleInviteFriends}
-              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95"
-              title="Invite Friends on WhatsApp"
-            >
-              <UserPlus size={14} className="text-emerald-600" />
-              <span className="hidden lg:inline">Invite Friends</span>
-            </button>
-
+          {/* Right: Non-floating WELINK Guide & Live Voice Buttons, Points & Profile Shortcut */}
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {onOpenWelink && (
               <>
                 <button
@@ -279,11 +242,11 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('medium');
                     onOpenWelink('voice');
                   }}
-                  className="min-h-[38px] px-3 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95"
+                  className="min-h-[42px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95"
                   title="Talk Live with WELINK"
                 >
-                  <Mic size={14} className="text-[#0D9488]" />
-                  <span>Live Talk</span>
+                  <Mic size={14} className="text-[#0D9488] shrink-0" />
+                  <span className="hidden md:inline">Live Talk</span>
                 </button>
                 <button
                   type="button"
@@ -291,25 +254,41 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('light');
                     onOpenWelink('chat');
                   }}
-                  className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                  className="min-h-[42px] px-2.5 sm:px-3.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                   title="Open WELINK AI Guide"
                 >
-                  <Sparkles size={14} className="text-[#0D9488]" />
-                  <span>WELINK AI</span>
+                  <Sparkles size={14} className="text-[#0D9488] shrink-0" />
+                  <span className="hidden sm:inline">WELINK AI</span>
                 </button>
               </>
             )}
 
+            {/* Invite Friends Button (WhatsApp / Web Share) */}
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                inviteFriends();
+              }}
+              className="min-h-[42px] min-w-[42px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 text-xs font-bold flex items-center justify-center gap-1.5 transition active:scale-95"
+              title="Invite Friends to WaveLink via WhatsApp"
+            >
+              <UserPlus size={15} className="text-emerald-600 shrink-0" />
+              <span className="hidden sm:inline">Invite Friends</span>
+            </button>
+
             {currentUser && (
-              <div className="flex items-center gap-2">
-                <CompactPointsDisplay
-                  userId={currentUser.uid}
-                  onClick={() => {
-                    triggerHaptic('tab');
-                    if (onNavigateTab) onNavigateTab('settings');
-                  }}
-                  className="bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[#78716C] hover:text-[#1C1917]"
-                />
+              <div className="flex items-center gap-1.5 sm:gap-2">
+                <div className="hidden xs:block">
+                  <CompactPointsDisplay
+                    userId={currentUser.uid}
+                    onClick={() => {
+                      triggerHaptic('tab');
+                      if (onNavigateTab) onNavigateTab('settings');
+                    }}
+                    className="bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[#78716C] hover:text-[#1C1917]"
+                  />
+                </div>
 
                 <button
                   type="button"
@@ -317,7 +296,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('tab');
                     if (onNavigateTab) onNavigateTab('settings');
                   }}
-                  className="relative w-8 h-8 rounded-full overflow-hidden border border-[var(--border-hairline)] focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition"
+                  className="relative w-9 h-9 rounded-full overflow-hidden border border-[var(--border-hairline)] focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0"
                   title="View Profile"
                 >
                   <img
@@ -338,25 +317,6 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
           </div>
         </div>
       </div>
-
-      {inviteToast && (
-        <div
-          role="status"
-          aria-live="polite"
-          className={`fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl shadow-lg border text-xs font-bold transition-all ${
-            inviteToast.type === 'success'
-              ? 'bg-emerald-600 text-white border-emerald-500'
-              : 'bg-rose-600 text-white border-rose-500'
-          }`}
-        >
-          {inviteToast.type === 'success' ? (
-            <Check size={14} className="shrink-0" />
-          ) : (
-            <X size={14} className="shrink-0" />
-          )}
-          <span>{inviteToast.text}</span>
-        </div>
-      )}
     </header>
   );
 };

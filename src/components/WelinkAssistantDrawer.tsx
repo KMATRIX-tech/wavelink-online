@@ -402,32 +402,34 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       });
     }
 
-    // 1. Check lightweight IndexedDB cache first for sub-5ms response
-    const cachedHit =
-      (await getCachedWelinkResponse(exactCacheKey)) ||
-      (await getCachedWelinkResponse(promptOnlyKey)) ||
-      (await findCachedResponseByPrompt(userScope, selectedModel, promptText));
+    // 1. Only use instant cache if there is no prior conversation history (so multi-turn context is always preserved)
+    if (previousUserTurns.length === 0) {
+      const cachedHit =
+        (await getCachedWelinkResponse(exactCacheKey)) ||
+        (await getCachedWelinkResponse(promptOnlyKey));
 
-    if (cachedHit && cachedHit.reply) {
-      if (!isDrawerOpenRef.current) return;
-      const cachedTurn: ChatTurn = {
-        id: `model_${Date.now()}`,
-        role: 'model',
-        text: cachedHit.reply,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        modelUsed: cachedHit.model || selectedModel,
-        fromCache: true,
-      };
-      setMessages((prev) => [...prev, cachedTurn]);
-      return;
+      if (cachedHit && cachedHit.reply) {
+        if (!isDrawerOpenRef.current) return;
+        const cachedTurn: ChatTurn = {
+          id: `model_${Date.now()}`,
+          role: 'model',
+          text: cachedHit.reply,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          modelUsed: cachedHit.model || selectedModel,
+          fromCache: true,
+        };
+        setMessages((prev) => [...prev, cachedTurn]);
+        return;
+      }
     }
 
     setIsChatLoading(true);
     setHasReceivedFirstChunk(false);
 
+    // Send full recent conversation history (up to 20 turns) so the AI remembers context
     const apiHistory = updatedMessages
       .filter((m) => m.id !== 'welcome')
-      .slice(-10)
+      .slice(-20)
       .map((m) => ({
         role: m.role,
         text: m.text,
@@ -473,16 +475,9 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       });
 
       const finalReply = (accumulatedText || streamRes.fullText || '').trim();
-      if (finalReply && isDrawerOpenRef.current && !controller.signal.aborted) {
+      if (finalReply && isDrawerOpenRef.current && !controller.signal.aborted && previousUserTurns.length === 0) {
         void setCachedWelinkResponse({
           key: exactCacheKey,
-          userScope,
-          prompt: promptText,
-          reply: finalReply,
-          model: streamRes.model || selectedModel,
-        });
-        void setCachedWelinkResponse({
-          key: promptOnlyKey,
           userScope,
           prompt: promptText,
           reply: finalReply,

@@ -151,10 +151,6 @@ export async function preloadPostAssets(
   await Promise.all(
     imageTargets.map((targetUrl) => preloadImageUrl(targetUrl, onDimensionsReady))
   );
-
-  if (post.videoUrl) {
-    preloadVideoMetadata(post.videoUrl);
-  }
 }
 
 /**

@@ -1,16 +1,16 @@
-import { getAuthHeaders } from '../firebase';
-
-export const WELINK_SYSTEM_INSTRUCTION = `You are WELINK, the warm, intelligent, and official AI Community Guide & Creative Assistant built directly into the WaveLink social platform.
-Your role:
-1. Guide users on how to use every WaveLink feature:
-   - Home Feed: Posting text, photos, and videos, reacting (Like 👍, Love ❤️, Fire 🔥), commenting, and sharing 24-hour Sparks.
-   - Video Reels Hub: Watching and uploading short-form vertical videos with chunked Firestore storage.
-   - Media Studio: Creating custom posts, attaching soundtracks, and publishing to the community.
-   - Notice Board & Events: Exploring pinned community announcements and RSVPing to events.
-   - Direct Messages & Groups: Real-time chat, read receipts, and WebRTC voice/video calling.
-   - WaveLink Pro: Upgrading to WaveLink Pro (18,000 TZS/month via AzamPay / Mobile Money paid to WaveLink), creator tipping, post boosting, custom themes, and Blue Star verification.
-2. Act as a creative co-pilot: brainstorm viral post captions, video reel scripts, event announcements, hashtag ideas, and community engagement strategies tailored to East African & global creators.
-3. Keep answers clear, friendly, concise, and helpful. Use clean Markdown formatting (bold text and bullet lists) when listing steps or ideas.`;
+export const WELINK_SYSTEM_INSTRUCTION = `You are WELINK, the warm, intelligent, and official AI Assistant & Community Guide built into the WaveLink social platform.
+HOW TO RESPOND:
+1. Language Matching: Always reply in the exact same language the user writes in (e.g., English, Kiswahili, French, Arabic, etc.).
+2. Context & Memory: Carefully read the conversation history sent with each request so you remember earlier messages and answer follow-up questions naturally and accurately.
+3. Helpful, Accurate, Friendly Answers:
+   - Answer any question the user asks—whether about general knowledge, coding, math, science, writing, translations, creative brainstorming, or WaveLink features—directly, accurately, and warmly.
+   - Use clean Markdown formatting (bold text, bullet lists, or code blocks) when listing steps or ideas.
+4. WaveLink Platform Guide:
+   - Home Feed & Sparks: Share text, photos, and videos on the Home Feed, or post 24-hour Sparks (and see who viewed and liked your Spark). React with 👍, ❤️, or 🔥, and use Download or Share buttons on any post.
+   - Video Reels Hub: Watch and upload short-form vertical videos (up to 50 MB on Free, up to 100 MB on WaveLink Pro).
+   - Media Studio: Create custom posts, attach soundtracks, and publish to the community.
+   - Direct Messages & Groups: Real-time chat, voice notes, read receipts, and WebRTC voice/video calling with real-time incoming call alerts.
+   - WaveLink Pro: Upgrade to WaveLink Pro (18,000 TZS/month via AzamPay / Mobile Money paid to WaveLink), creator tipping, post boosting, custom themes, and Blue Star verification.`;
 
 export interface WelinkChatTurn {
   role: 'user' | 'model';
@@ -20,7 +20,7 @@ export interface WelinkChatTurn {
 function normalizeTurnsForRequest(messages: WelinkChatTurn[]): WelinkChatTurn[] {
   const cleaned: WelinkChatTurn[] = [];
   for (const m of messages) {
-    const text = String(m?.text || '').trim();
+    const text = String(m?.text || '').trim().slice(0, 6000);
     if (!text) continue;
     const role: 'user' | 'model' = m.role === 'model' ? 'model' : 'user';
     if (cleaned.length === 0 && role === 'model') {
@@ -28,7 +28,7 @@ function normalizeTurnsForRequest(messages: WelinkChatTurn[]): WelinkChatTurn[] 
     }
     const prev = cleaned[cleaned.length - 1];
     if (prev && prev.role === role) {
-      prev.text = `${prev.text}\n\n${text}`;
+      prev.text = `${prev.text}\n\n${text}`.slice(0, 8000);
     } else {
       cleaned.push({ role, text });
     }
@@ -145,10 +145,9 @@ export async function sendWelinkChatMessage(params: {
 }): Promise<{ reply: string; model: string }> {
   const normalizedMessages = normalizeTurnsForRequest(params.messages);
   try {
-    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/chat', {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/json' },
       signal: params.signal,
       body: JSON.stringify({
         model: params.model || 'gemini-3.8-flash',
@@ -190,10 +189,9 @@ export async function sendWelinkChatMessageStream(params: {
 }): Promise<{ fullText: string; model: string }> {
   const normalizedMessages = normalizeTurnsForRequest(params.messages);
   try {
-    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/chat-stream', {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/json' },
       signal: params.signal,
       body: JSON.stringify({
         model: params.model || 'gemini-3.8-flash',
@@ -385,10 +383,9 @@ export async function generateWelinkImage(params: {
   imageSize?: '1K' | '2K';
 }): Promise<{ imageUrl: string; caption: string; model: string }> {
   try {
-    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/image', {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt: params.prompt,
         imageBase64: params.imageBase64 || null,
@@ -449,10 +446,9 @@ export async function sendWelinkVoiceTurn(params: {
   const cleanTranscript = String(params.transcript || '').trim();
   const history = Array.isArray(params.history) ? params.history : [];
   try {
-    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/voice-turn', {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         transcript: cleanTranscript,
         history,
@@ -475,100 +471,30 @@ export async function sendWelinkVoiceTurn(params: {
   };
 }
 
-/**
- * Request 3 AI caption suggestions from the server-side Gemini endpoint (/api/ai/post-assist)
- * Includes friendly rate-limit and error messages.
- */
-export async function suggestPostCaptions(params: {
-  text?: string;
-  mediaType?: 'text' | 'image' | 'video';
-  tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
-  isPro?: boolean;
-}): Promise<{ suggestions: string[] }> {
-  const headers = await getAuthHeaders();
-  const res = await fetch('/api/ai/post-assist', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      mode: 'captions',
-      text: params.text || '',
-      mediaType: params.mediaType || 'text',
-      tone: params.tone || 'engaging',
-      isPro: Boolean(params.isPro),
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 429) {
-    throw new Error(
-      data.error || 'AI Caption limit reached (max 10 requests/minute). Please wait a few seconds and try again.'
-    );
-  }
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Could not generate caption suggestions right now. Please try again.');
-  }
-  return {
-    suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
-  };
-}
-
-/**
- * Polish and improve a user's post draft via the server-side Gemini endpoint (/api/ai/post-assist)
- * Includes friendly rate-limit and error messages.
- */
-export async function improvePostDraft(params: {
-  text: string;
-  mediaType?: 'text' | 'image' | 'video';
-  tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
-  isPro?: boolean;
-}): Promise<{ improvedText: string }> {
-  const headers = await getAuthHeaders();
-  const res = await fetch('/api/ai/post-assist', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      mode: 'improve',
-      text: params.text || '',
-      mediaType: params.mediaType || 'text',
-      tone: params.tone || 'engaging',
-      isPro: Boolean(params.isPro),
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 429) {
-    throw new Error(
-      data.error || 'AI Post Improver limit reached (max 10 requests/minute). Please wait a few seconds and try again.'
-    );
-  }
-  if (!res.ok || !data.success || !data.improvedText) {
-    throw new Error(data.error || 'Could not improve post draft right now. Please try again.');
-  }
-  return {
-    improvedText: String(data.improvedText),
-  };
-}
-
-/**
- * Moderate post or comment text via the server-side safety endpoint (/api/ai/moderate)
- */
-export async function moderatePostContent(text: string): Promise<{
+export interface ModerationResult {
   flagged: boolean;
   category: string;
   reason: string;
-}> {
-  const clean = String(text || '').trim();
-  if (!clean) {
+}
+
+/**
+ * Moderate post, comment, or Spark text via the server-side /api/ai/moderate endpoint.
+ */
+export async function moderatePostContent(text: string): Promise<ModerationResult> {
+  const cleanText = String(text || '').trim().slice(0, 4000);
+  if (!cleanText) {
     return { flagged: false, category: 'safe', reason: '' };
   }
+
   try {
-    const headers = await getAuthHeaders();
     const res = await fetch('/api/ai/moderate', {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ text: clean }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: cleanText }),
     });
     const data = await res.json().catch(() => ({}));
     if (res.status === 429) {
-      throw new Error(data.error || 'Moderation rate limit reached. Please wait a moment before posting.');
+      throw new Error(data.error || 'AI moderation rate limit reached. Please wait a moment and try again.');
     }
     if (res.ok && data.success) {
       return {
@@ -582,6 +508,71 @@ export async function moderatePostContent(text: string): Promise<{
       throw err;
     }
   }
+
   return { flagged: false, category: 'safe', reason: '' };
+}
+
+/**
+ * Generate 3 engaging social captions via the server-side /api/ai/post-assist endpoint.
+ */
+export async function generatePostCaptions(params: {
+  text?: string;
+  mediaType?: 'text' | 'image' | 'video';
+  tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
+  isPro?: boolean;
+}): Promise<string[]> {
+  try {
+    const res = await fetch('/api/ai/post-assist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'captions',
+        text: params.text || '',
+        mediaType: params.mediaType || 'text',
+        tone: params.tone || 'engaging',
+        isPro: Boolean(params.isPro),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success && Array.isArray(data.suggestions)) {
+      return data.suggestions;
+    }
+  } catch {
+    // Fallback below
+  }
+  return [
+    `🌊 ${params.text || 'Sharing a quick thought with the WaveLink family today!'} ✨ #WaveLink #CommunityFirst`,
+    `💡 Big energy today on WaveLink! 🚀 #WaveLinkCreators #GrowthMindset`,
+    `🔥 What's your take? Drop a comment below 👇 #WaveLink`,
+  ];
+}
+
+/**
+ * Polish and improve a post draft via the server-side /api/ai/post-assist endpoint.
+ */
+export async function improvePostContent(params: {
+  text: string;
+  tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
+  isPro?: boolean;
+}): Promise<string> {
+  try {
+    const res = await fetch('/api/ai/post-assist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'improve',
+        text: params.text || '',
+        tone: params.tone || 'engaging',
+        isPro: Boolean(params.isPro),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success && typeof data.improvedText === 'string') {
+      return data.improvedText;
+    }
+  } catch {
+    // Fallback below
+  }
+  return params.text;
 }
 

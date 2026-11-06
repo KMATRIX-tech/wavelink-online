@@ -1,153 +1,197 @@
-// Change your website link in one place here:
-export const APP_URL = 'https://ais-dev-3q3vlonjbk6epnc53geyhc-713336902783.europe-west2.run.app';
+/**
+ * WaveLink Social Sharing & Download Utilities
+ * Change APP_URL here in one place to update your website link everywhere.
+ */
+export const APP_URL =
+  typeof window !== 'undefined' && window.location?.origin
+    ? window.location.origin
+    : 'https://ais-dev-3q3vlonjbk6epnc53geyhc-713336902783.europe-west2.run.app';
 
 /**
- * Builds a direct link to a specific post using APP_URL.
- * @param {string} [postId]
- * @returns {string}
+ * Downloads a file directly via browser anchor tag
+ * @param {string} url - Blob URL or direct URL
+ * @param {string} filename - Desired filename
  */
-export function getPostUrl(postId) {
-  const baseUrl = (APP_URL || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
-  return postId ? `${baseUrl}/#post-${postId}` : baseUrl;
+function triggerDownload(url, filename) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
 }
 
 /**
- * Downloads the post image if present, or saves the post text as a .txt file if there is no image.
- * @param {Object} post
+ * Downloads the post's image or saves the post content as a .txt file if there is no image.
+ * @param {object} post - The post object containing id, content, imageUrl, authorName, etc.
  * @returns {Promise<{ success: boolean, message: string }>}
  */
 export async function downloadPost(post) {
-  try {
-    if (!post) {
-      throw new Error('Invalid post');
+  if (!post) {
+    throw new Error('Post data is missing');
+  }
+
+  const postId = post.id || `post_${Date.now()}`;
+  const author = post.authorName || 'waver';
+
+  // 0. If post has a video URL, download the video file
+  if (post.videoUrl && typeof post.videoUrl === 'string' && !post.videoUrl.startsWith('idb://')) {
+    try {
+      if (post.videoUrl.startsWith('data:video/') || post.videoUrl.startsWith('blob:')) {
+        triggerDownload(post.videoUrl, post.videoFileName || `wavelink-${postId}.mp4`);
+        return { success: true, message: 'Video downloaded!' };
+      }
+      const res = await fetch(post.videoUrl, { mode: 'cors' });
+      if (res.ok) {
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        triggerDownload(blobUrl, post.videoFileName || `wavelink-${postId}.mp4`);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 4000);
+        return { success: true, message: 'Video downloaded!' };
+      }
+    } catch {
+      try {
+        triggerDownload(post.videoUrl, post.videoFileName || `wavelink-${postId}.mp4`);
+        return { success: true, message: 'Video download started!' };
+      } catch {
+        // Fall through to thumbnail/text download
+      }
     }
+  }
 
-    const postId = post.id || Date.now();
-    const hasImage = Boolean(post.imageUrl && post.mediaType !== 'video' && !post.videoUrl && !post.hasVideoChunks);
-
-    if (hasImage && post.imageUrl) {
-      const response = await fetch(post.imageUrl);
-      if (!response.ok) {
-        throw new Error(`Image fetch failed (${response.status})`);
+  // 1. If post has an image, download the image
+  if (post.imageUrl) {
+    try {
+      // If it's a data URL, download directly
+      if (post.imageUrl.startsWith('data:')) {
+        const extension = post.imageUrl.includes('image/png') ? 'png' : 'jpg';
+        triggerDownload(post.imageUrl, `wavelink-${postId}.${extension}`);
+        return { success: true, message: 'Downloaded!' };
       }
 
-      const blob = await response.blob();
-      const mimeType = blob.type || 'image/jpeg';
-      let ext = 'jpg';
-      if (mimeType.includes('png')) ext = 'png';
-      else if (mimeType.includes('webp')) ext = 'webp';
-      else if (mimeType.includes('gif')) ext = 'gif';
-
-      const blobUrl = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = `wavelink-post-${postId}.${ext}`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
-
-      return { success: true, message: 'Downloaded!' };
+      // Try fetching as Blob for cross-origin or storage URLs
+      const res = await fetch(post.imageUrl, { mode: 'cors' });
+      if (res.ok) {
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const mime = blob.type || '';
+        const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
+        triggerDownload(blobUrl, `wavelink-${postId}.${ext}`);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+        return { success: true, message: 'Downloaded!' };
+      }
+    } catch {
+      // If fetch fails (e.g. CORS), attempt direct href download fallback
+      try {
+        triggerDownload(post.imageUrl, `wavelink-${postId}.jpg`);
+        return { success: true, message: 'Downloaded!' };
+      } catch {
+        // Fall back to saving text below if image download was blocked
+      }
     }
+  }
 
-    // Fallback when there is no image: save the post text as a .txt file
-    const authorHeader = post.authorName
-      ? `${post.authorName}${post.authorUsername ? ` (${post.authorUsername})` : ''}\n`
-      : '';
-    const dateLine = post.createdAt ? `${new Date(post.createdAt).toLocaleString()}\n\n` : '\n';
-    const bodyText = (post.content || 'WaveLink Post').trim();
-    const footerLink = `\n\n---\nShared from WaveLink: ${getPostUrl(postId)}`;
+  // 2. If no image (or image fetch failed), save the post text as a .txt file
+  try {
+    const textContent = [
+      `WaveLink Post by ${author}`,
+      `Date: ${post.createdAt ? new Date(post.createdAt).toLocaleString() : new Date().toLocaleString()}`,
+      `Link: ${APP_URL}/?post=${postId}`,
+      '----------------------------------------',
+      post.content || '(No text content)',
+      '----------------------------------------',
+      `Shared from WaveLink: ${APP_URL}`
+    ].join('\n\n');
 
-    const fullText = `${authorHeader}${dateLine}${bodyText}${footerLink}`;
-    const textBlob = new Blob([fullText], { type: 'text/plain;charset=utf-8' });
-    const textUrl = URL.createObjectURL(textBlob);
-
-    const link = document.createElement('a');
-    link.href = textUrl;
-    link.download = `wavelink-post-${postId}.txt`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(textUrl), 2000);
-
+    const blob = new Blob([textContent], { type: 'text/plain;charset=utf-8' });
+    const textBlobUrl = URL.createObjectURL(blob);
+    triggerDownload(textBlobUrl, `wavelink-post-${postId}.txt`);
+    setTimeout(() => URL.revokeObjectURL(textBlobUrl), 2000);
     return { success: true, message: 'Downloaded!' };
-  } catch (error) {
-    console.error('Download post error:', error);
-    throw new Error("Couldn't download");
+  } catch (err) {
+    throw new Error(err?.message || "Couldn't download");
   }
 }
 
 /**
- * Shares a post using the Web Share API first, with WhatsApp (wa.me) as a fallback.
- * @param {Object} post
- * @returns {Promise<{ success: boolean, method?: string, message: string }>}
+ * Shares a post via Web Share API first, falling back to WhatsApp (wa.me)
+ * @param {object} post - The post to share
+ * @returns {Promise<{ success: boolean, method: string }>}
  */
 export async function sharePost(post) {
-  try {
-    if (!post) {
-      throw new Error('Invalid post');
-    }
+  if (!post) {
+    throw new Error('Post data is missing');
+  }
 
-    const postUrl = getPostUrl(post.id);
-    const cleanText = (post.content || '').trim();
-    const snippet = cleanText
-      ? cleanText.length > 100
-        ? `${cleanText.slice(0, 97)}...`
-        : cleanText
-      : 'Check out this post on WaveLink!';
-    const authorPart = post.authorName ? `by ${post.authorName} ` : '';
-    const shareMessage = `🌊 Check out this post ${authorPart}on WaveLink: "${snippet}"`;
-    const whatsappText = `${shareMessage}\n${postUrl}`;
+  const postId = post.id || '';
+  const postUrl = `${APP_URL}/?post=${encodeURIComponent(postId)}`;
+  const author = post.authorName || 'a creator';
+  const snippet = post.content ? post.content.trim().slice(0, 100) : 'Check out this wave on WaveLink';
+  const shareTitle = `WaveLink Post by ${author}`;
+  const shareText = `Check out this post by ${author} on WaveLink:\n"${snippet}"`;
 
-    // 1. Try Web Share API first
-    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
-      try {
-        await navigator.share({
-          title: `WaveLink Post ${authorPart}`.trim(),
-          text: shareMessage,
-          url: postUrl
-        });
-        return { success: true, method: 'web-share', message: 'Shared!' };
-      } catch (shareError) {
-        if (shareError && shareError.name === 'AbortError') {
-          return { success: false, method: 'cancelled', message: '' };
-        }
-        // If Web Share API fails (e.g. desktop or iframe restriction), fall back to WhatsApp
+  // 1. Try Web Share API first
+  if (typeof navigator !== 'undefined' && navigator.share) {
+    try {
+      await navigator.share({
+        title: shareTitle,
+        text: shareText,
+        url: postUrl
+      });
+      return { success: true, method: 'web_share' };
+    } catch (err) {
+      // If user deliberately cancelled the native share sheet, do not force-open WhatsApp
+      if (err && err.name === 'AbortError') {
+        return { success: true, method: 'cancelled' };
       }
+      // Otherwise fall through to WhatsApp fallback
     }
+  }
 
-    // 2. Fallback to WhatsApp (wa.me)
-    const waUrl = `https://wa.me/?text=${encodeURIComponent(whatsappText)}`;
-    const win = window.open(waUrl, '_blank', 'noopener,noreferrer');
-    if (!win) {
-      window.location.href = waUrl;
-    }
-
-    return { success: true, method: 'whatsapp', message: 'Shared to WhatsApp!' };
-  } catch (error) {
-    console.error('Share post error:', error);
-    throw new Error("Couldn't share");
+  // 2. WhatsApp fallback (wa.me)
+  try {
+    const whatsappMessage = `${shareText}\n\n👉 View post: ${postUrl}`;
+    const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(whatsappMessage)}`;
+    window.open(whatsappUrl, '_blank', 'noopener,noreferrer');
+    return { success: true, method: 'whatsapp' };
+  } catch (err) {
+    throw new Error(err?.message || "Couldn't share to WhatsApp");
   }
 }
 
 /**
- * Opens WhatsApp with a pre-written invite message and APP_URL.
- * @param {string} [customMessage]
- * @returns {{ success: boolean, message: string }}
+ * Invites friends to WaveLink via Web Share API first, falling back to WhatsApp (wa.me)
+ * @param {string} [customMessage] - Optional custom invitation message
+ * @returns {Promise<{ success: boolean, method: string }>}
  */
-export function inviteFriends(customMessage) {
-  try {
-    const inviteText =
-      customMessage ||
-      `Hey! 👋 Come join me on WaveLink to share photos, 24h Sparks, Video Reels, and chat live! Join here: ${APP_URL}`;
-    const waUrl = `https://wa.me/?text=${encodeURIComponent(inviteText)}`;
-    const win = window.open(waUrl, '_blank', 'noopener,noreferrer');
-    if (!win) {
-      window.location.href = waUrl;
+export async function inviteFriends(customMessage) {
+  const defaultMessage =
+    customMessage ||
+    `Hey! 🌊 Join me on WaveLink — the modern social platform with Video Reels, 24-hour Sparks, live AI voice talks, and creator tipping. Check it out here: ${APP_URL}`;
+
+  // 1. Try Web Share API first
+  if (typeof navigator !== 'undefined' && navigator.share) {
+    try {
+      await navigator.share({
+        title: 'Join me on WaveLink 🌊',
+        text: defaultMessage,
+        url: APP_URL
+      });
+      return { success: true, method: 'web_share' };
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        return { success: true, method: 'cancelled' };
+      }
+      // Fall through to WhatsApp fallback
     }
-    return { success: true, message: 'Invite link opened in WhatsApp!' };
-  } catch (error) {
-    console.error('Invite friends error:', error);
-    throw new Error("Couldn't open invite");
+  }
+
+  // 2. WhatsApp fallback
+  try {
+    const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(defaultMessage)}`;
+    window.open(whatsappUrl, '_blank', 'noopener,noreferrer');
+    return { success: true, method: 'whatsapp' };
+  } catch (err) {
+    throw new Error(err?.message || "Couldn't open WhatsApp");
   }
 }

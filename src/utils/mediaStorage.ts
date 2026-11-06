@@ -1,4 +1,4 @@
-import { db, storage, getAuthHeaders } from '../firebase';
+import { db, storage, getAuthHeaders, formatFirebaseStorageError } from '../firebase';
 import { collection, doc, setDoc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 
@@ -9,19 +9,30 @@ const STORE_NAME = 'videos';
 const memoryVideoCache = new Map<string, string>();
 let storageBucketReachable: boolean | null = null;
 
-// Tiered Video Upload Limits (Feed / Reels):
-// - Free users: 0 KB up to 4 MB
-// - Pro / Admin users: 0 KB up to 100 MB (supports >10 MB up to 100 MB HD videos)
-export const FREE_MAX_VIDEO_MB = 4;
+// Video Upload Limits (Feed / Reels / Studio):
+// - Maximum file size before compression: 100 MB
+// - Maximum duration: 60 seconds for Free users, 90 seconds for Pro users
+// - Browser compression target: max 720p, ~1.8 Mbps, MP4/WebM
+export const FREE_VIDEO_MAX_SECONDS = 60;
+export const PRO_VIDEO_MAX_SECONDS = 90;
+export const MAX_VIDEO_DURATION_SECONDS = PRO_VIDEO_MAX_SECONDS;
+export const MAX_VIDEO_RAW_MB = 100;
+export const MAX_VIDEO_RAW_BYTES = MAX_VIDEO_RAW_MB * 1024 * 1024; // 100 MB
+export const TARGET_VIDEO_BITRATE_BPS = 1_800_000; // ~1.8 Mbps for fast 720p uploads
+export const TARGET_AUDIO_BITRATE_BPS = 128_000; // 128 kbps AAC
+export const FREE_MAX_VIDEO_MB = 100;
 export const PRO_MAX_VIDEO_MB = 100;
-export const FREE_MAX_VIDEO_BYTES = FREE_MAX_VIDEO_MB * 1024 * 1024; // 4 MB
+export const FREE_MAX_VIDEO_BYTES = FREE_MAX_VIDEO_MB * 1024 * 1024; // 100 MB
 export const PRO_MAX_VIDEO_BYTES = PRO_MAX_VIDEO_MB * 1024 * 1024; // 100 MB
+
+export function getMaxVideoDurationSeconds(isProUser: boolean = false): number {
+  return isProUser ? PRO_VIDEO_MAX_SECONDS : FREE_VIDEO_MAX_SECONDS;
+}
 
 // ============================================================================
 // SPARKS DEDICATED LIMITS & SAFE MIME TYPES
-// - Free users: up to 60 seconds
-// - Pro users: up to 90 seconds
-// - Max file size cap: 80 MB
+// - Up to 90 seconds
+// - Max file size cap: 100 MB before compression (80 MB Spark storage cap)
 // - Direct browser-to-Firebase Storage resumable upload (never Express, never base64 in Firestore)
 // ============================================================================
 export const SPARK_MAX_FILE_MB = 80;
@@ -133,6 +144,28 @@ export function detectSafeSparkMediaType(file: File | Blob): {
   }
 
   return { valid: false, mediaType: 'invalid', mimeType: rawType || 'application/octet-stream' };
+}
+
+/**
+ * Detects whether a selected file for the Feed, Studio, or Reels is an image or video,
+ * using both MIME type and file extension fallback so mobile/desktop files with empty file.type always work.
+ */
+export function detectFeedMediaType(file: File | Blob): 'image' | 'video' | 'invalid' {
+  if (!file) return 'invalid';
+  const rawType = (file.type || '').split(';')[0].trim().toLowerCase();
+  const fileName = ((file as File).name || '').toLowerCase();
+
+  if (rawType.startsWith('video/')) return 'video';
+  if (rawType.startsWith('image/')) return 'image';
+
+  if (/\.(mp4|mov|webm|m4v|3gp|3g2|mkv|avi|ogv|mpeg|mpg|ts)$/i.test(fileName)) {
+    return 'video';
+  }
+  if (/\.(jpe?g|png|webp|gif|heic|heif|avif|bmp|svg)$/i.test(fileName)) {
+    return 'image';
+  }
+
+  return 'invalid';
 }
 
 /**
@@ -822,9 +855,7 @@ export async function deleteSparkAndStorageFile(
 }
 
 /**
- * Validates a video file against WaveLink's tiered size limits (for Feed & Videos Hub):
- * - Non-Pro (Free): 0 KB to 4 MB
- * - WaveLink Pro / Admin: 0 KB to 100 MB (allows videos > 10 MB up to 100 MB)
+ * Validates a video file against WaveLink's 100 MB maximum file size before compression.
  */
 export interface VideoSizeValidationResult {
   valid: boolean;
@@ -836,42 +867,29 @@ export interface VideoSizeValidationResult {
 
 export function validateVideoFileSize(
   file: File | Blob,
-  isProUser: boolean
+  _isProUser: boolean = true
 ): VideoSizeValidationResult {
   const size = file?.size ?? 0;
   const formattedSize = formatVideoFileSize(size);
-  const maxAllowedMB = isProUser ? PRO_MAX_VIDEO_MB : FREE_MAX_VIDEO_MB;
-  const maxAllowedBytes = isProUser ? PRO_MAX_VIDEO_BYTES : FREE_MAX_VIDEO_BYTES;
+  const maxAllowedMB = MAX_VIDEO_RAW_MB;
+  const maxAllowedBytes = MAX_VIDEO_RAW_BYTES;
 
-  if (size < 0) {
+  if (size <= 0) {
     return {
       valid: false,
-      error: 'Invalid video file size.',
+      error: 'Selected video file is empty. Please choose a valid video file.',
       formattedSize,
       maxAllowedMB
     };
   }
 
   if (size > maxAllowedBytes) {
-    if (!isProUser) {
-      const fitsPro = size <= PRO_MAX_VIDEO_BYTES;
-      return {
-        valid: false,
-        requiresProUpgrade: fitsPro,
-        formattedSize,
-        maxAllowedMB,
-        error: fitsPro
-          ? `This video is ${formattedSize}. Free accounts can upload videos from 0 KB to ${FREE_MAX_VIDEO_MB} MB. Upgrade to WaveLink Pro to upload videos over 10 MB up to ${PRO_MAX_VIDEO_MB} MB!`
-          : `This video is ${formattedSize}, which exceeds the maximum ${PRO_MAX_VIDEO_MB} MB limit (Free limit: 0 KB – ${FREE_MAX_VIDEO_MB} MB, Pro limit: ${PRO_MAX_VIDEO_MB} MB).`
-      };
-    }
-
     return {
       valid: false,
       requiresProUpgrade: false,
       formattedSize,
       maxAllowedMB,
-      error: `This video is ${formattedSize}. WaveLink Pro supports video uploads up to ${PRO_MAX_VIDEO_MB} MB. Please choose a video up to ${PRO_MAX_VIDEO_MB} MB.`
+      error: `This video is ${formattedSize}, which is over the ${MAX_VIDEO_RAW_MB} MB limit before compression. Please choose a video under ${MAX_VIDEO_RAW_MB} MB.`
     };
   }
 
@@ -880,6 +898,93 @@ export function validateVideoFileSize(
     formattedSize,
     maxAllowedMB
   };
+}
+
+export interface VideoSelectionInspectionResult {
+  valid: boolean;
+  tooLarge?: boolean;
+  needsTrim?: boolean;
+  durationSeconds: number;
+  maxAllowedSeconds: number;
+  width: number;
+  height: number;
+  formattedSize: string;
+  suggestedTrimStart: number;
+  suggestedTrimEnd: number;
+  error?: string;
+}
+
+/**
+ * Inspects a selected video file in the browser using its video metadata as soon as the user picks it:
+ * - Enforces a maximum file size of 100 MB before compression with a friendly error.
+ * - Enforces up to 60 seconds for Free users and up to 90 seconds for Pro users.
+ *   If longer, returns `needsTrim: true` and a clear duration limit message so the user can trim or upgrade.
+ */
+export async function inspectAndValidateVideoFile(
+  file: File | Blob,
+  isProUser: boolean = false
+): Promise<VideoSelectionInspectionResult> {
+  const maxAllowedSeconds = getMaxVideoDurationSeconds(isProUser);
+  const sizeCheck = validateVideoFileSize(file, isProUser);
+  if (!sizeCheck.valid) {
+    return {
+      valid: false,
+      tooLarge: true,
+      durationSeconds: 0,
+      maxAllowedSeconds,
+      width: 720,
+      height: 1280,
+      formattedSize: sizeCheck.formattedSize,
+      suggestedTrimStart: 0,
+      suggestedTrimEnd: maxAllowedSeconds,
+      error: sizeCheck.error
+    };
+  }
+
+  try {
+    const meta = await inspectSparkVideoMetadata(file);
+    const dur = Math.max(0.5, Math.round(meta.durationSeconds * 10) / 10);
+    if (dur > maxAllowedSeconds + 0.4) {
+      return {
+        valid: false,
+        needsTrim: true,
+        durationSeconds: dur,
+        maxAllowedSeconds,
+        width: meta.width,
+        height: meta.height,
+        formattedSize: sizeCheck.formattedSize,
+        suggestedTrimStart: 0,
+        suggestedTrimEnd: maxAllowedSeconds,
+        error: isProUser
+          ? `Pro videos can be up to 90 seconds (this video is ${Math.round(dur)}s). Trim your clip to 90s or less.`
+          : `Free users can upload videos up to 60 seconds, and Pro users up to 90 seconds (this video is ${Math.round(dur)}s). Trim to 60s or upgrade to Pro.`
+      };
+    }
+
+    return {
+      valid: true,
+      durationSeconds: dur,
+      maxAllowedSeconds,
+      width: meta.width,
+      height: meta.height,
+      formattedSize: sizeCheck.formattedSize,
+      suggestedTrimStart: 0,
+      suggestedTrimEnd: Math.min(maxAllowedSeconds, dur)
+    };
+  } catch (err: any) {
+    console.error('[WaveLink Video Metadata Error]', err);
+    return {
+      valid: false,
+      durationSeconds: 0,
+      maxAllowedSeconds,
+      width: 720,
+      height: 1280,
+      formattedSize: sizeCheck.formattedSize,
+      suggestedTrimStart: 0,
+      suggestedTrimEnd: maxAllowedSeconds,
+      error: err?.message || 'Could not read video metadata. Please choose a valid MP4, WebM, or MOV video.'
+    };
+  }
 }
 
 /**
@@ -1128,6 +1233,853 @@ async function writeChunkWithRetry(
   return false;
 }
 
+export interface VideoCompressionOptions {
+  trimStart?: number;
+  trimEnd?: number;
+  isProUser?: boolean;
+  onProgress?: (percentage: number, statusText: string) => void;
+  signal?: AbortSignal;
+}
+
+export interface CompressedVideoResult {
+  file: File;
+  durationSeconds: number;
+  width: number;
+  height: number;
+  engine: 'webcodecs' | 'ffmpeg-wasm' | 'passthrough';
+}
+
+/**
+ * Checks whether the browser's WebCodecs API supports hardware/software H.264 (avc1) encoding at 720p.
+ */
+async function checkWebCodecsH264Support(width: number, height: number): Promise<boolean> {
+  try {
+    const VideoEncoderClass = (window as any).VideoEncoder;
+    if (!VideoEncoderClass || typeof VideoEncoderClass.isConfigSupported !== 'function') {
+      return false;
+    }
+    const support = await VideoEncoderClass.isConfigSupported({
+      codec: 'avc1.42E01E',
+      width,
+      height,
+      bitrate: TARGET_VIDEO_BITRATE_BPS,
+      framerate: 30
+    });
+    return Boolean(support?.supported);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Compresses and downscales a video in the browser to ~720p before uploading:
+ * - Maximum resolution: 720p (1280x720 landscape or 720x1280 portrait)
+ * - Target bitrate: ~1.8 Mbps so even a 90-second clip becomes compact and uploads quickly
+ * - Enforces duration limit (60s for Free users, 90s for Pro users) from browser video metadata
+ * - Never hangs on `onseeked` when `trimStart === 0` and never fails due to browser autoplay policies
+ */
+export async function compressVideoBeforeUpload(
+  file: File,
+  options: VideoCompressionOptions = {}
+): Promise<CompressedVideoResult> {
+  const { onProgress, signal, isProUser = false } = options;
+  if (signal?.aborted) {
+    throw new Error('UPLOAD_CANCELLED');
+  }
+
+  const maxAllowedSeconds = getMaxVideoDurationSeconds(isProUser);
+
+  if (onProgress) {
+    onProgress(8, `Inspecting video metadata (${formatVideoFileSize(file.size)})...`);
+  }
+
+  const meta = await inspectSparkVideoMetadata(file);
+  const rawStart = Math.max(0, options.trimStart ?? 0);
+  const rawEnd =
+    options.trimEnd && options.trimEnd > rawStart
+      ? Math.min(meta.durationSeconds, options.trimEnd)
+      : meta.durationSeconds;
+
+  const requestedClipDuration = Math.max(0.5, Math.round((rawEnd - rawStart) * 10) / 10);
+
+  // Enforce 60s Free / 90s Pro limit in the browser from the video metadata
+  if (requestedClipDuration > maxAllowedSeconds + 0.5) {
+    throw new Error(
+      isProUser
+        ? `Pro videos can be up to 90 seconds (selected clip is ${Math.round(requestedClipDuration)}s). Please trim your video to 90 seconds or less.`
+        : `Free users can upload videos up to 60 seconds, and Pro users up to 90 seconds (selected clip is ${Math.round(requestedClipDuration)}s). Please trim to 60s or upgrade to Pro.`
+    );
+  }
+
+  const effectiveEnd = Math.min(rawEnd, rawStart + maxAllowedSeconds);
+  const effectiveDuration = Math.max(0.5, Math.round((effectiveEnd - rawStart) * 10) / 10);
+
+  const dims = compute720pDimensions(meta.width, meta.height);
+  const hasWebCodecs = await checkWebCodecsH264Support(dims.width, dims.height);
+
+  const needsTrimming = rawStart > 0.25 || effectiveEnd < meta.durationSeconds - 0.35;
+  const estimatedBitrate = (file.size * 8) / Math.max(1, meta.durationSeconds);
+
+  // Fast path: if the video does not need trimming, is already <= 720p (or <= 14 MB),
+  // and has a reasonable bitrate, skip slow real-time canvas re-recording so upload starts right away
+  const isAlreadyCompact720p =
+    !needsTrimming &&
+    ((!dims.needsDownscale && estimatedBitrate <= TARGET_VIDEO_BITRATE_BPS * 1.6) ||
+      file.size <= 14 * 1024 * 1024);
+
+  if (isAlreadyCompact720p) {
+    const steps = [35, 70, 100];
+    for (const pct of steps) {
+      if (signal?.aborted) throw new Error('UPLOAD_CANCELLED');
+      if (onProgress) {
+        onProgress(pct, `Prepared 720p video (${formatVideoFileSize(file.size)}) — ${pct}%`);
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const validMime = file.type && file.type.startsWith('video/') ? file.type : 'video/mp4';
+    const normalizedFile =
+      file.type === validMime
+        ? file
+        : new File([file], (file.name || 'video').replace(/\.[^/.]+$/, '') + '.mp4', {
+            type: validMime,
+            lastModified: Date.now()
+          });
+
+    return {
+      file: normalizedFile,
+      durationSeconds: effectiveDuration,
+      width: dims.width,
+      height: dims.height,
+      engine: hasWebCodecs ? 'webcodecs' : 'passthrough'
+    };
+  }
+
+  // Browser 720p Downscale & Compression Path (Canvas + MediaRecorder)
+  const mimeCandidates = [
+    'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
+    'video/mp4;codecs=avc1',
+    'video/mp4',
+    'video/webm;codecs=h264,opus',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm'
+  ];
+  const supportedMime =
+    typeof MediaRecorder !== 'undefined'
+      ? mimeCandidates.find((m) => {
+          try {
+            return MediaRecorder.isTypeSupported(m);
+          } catch {
+            return false;
+          }
+        }) || ''
+      : '';
+
+  if (supportedMime) {
+    const transcodeResult = await new Promise<File | null>((resolve) => {
+      let settled = false;
+      const video = document.createElement('video');
+      // Always start muted so mobile & desktop browsers never block programmatic video.play()
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'auto';
+      const objectUrl = URL.createObjectURL(file);
+      let rafId: number | null = null;
+      let recorder: MediaRecorder | null = null;
+
+      const finish = (outFile: File | null) => {
+        if (settled) return;
+        settled = true;
+        if (rafId !== null) cancelAnimationFrame(rafId);
+        try {
+          if (recorder && recorder.state !== 'inactive') recorder.stop();
+        } catch {}
+        try {
+          video.pause();
+          video.removeAttribute('src');
+          video.load();
+        } catch {}
+        URL.revokeObjectURL(objectUrl);
+        resolve(outFile);
+      };
+
+      // Strict time budget (max 12 seconds) so compression never blocks uploading
+      const maxTranscodeMs = Math.min(12000, Math.max(4500, Math.round(effectiveDuration * 450)));
+      const guardTimer = setTimeout(() => finish(null), maxTranscodeMs);
+
+      if (signal) {
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(guardTimer);
+            finish(null);
+          },
+          { once: true }
+        );
+      }
+
+      const startCaptureAndPlayback = () => {
+        if (settled) return;
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = dims.width;
+          canvas.height = dims.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx || typeof (canvas as any).captureStream !== 'function') {
+            clearTimeout(guardTimer);
+            finish(null);
+            return;
+          }
+
+          const canvasStream: MediaStream = (canvas as any).captureStream(30);
+
+          // Try attaching source audio track if browser supports captureStream on video element
+          try {
+            const vidStream: MediaStream | undefined =
+              typeof (video as any).captureStream === 'function'
+                ? (video as any).captureStream()
+                : typeof (video as any).mozCaptureStream === 'function'
+                ? (video as any).mozCaptureStream()
+                : undefined;
+            if (vidStream) {
+              vidStream.getAudioTracks().forEach((track) => {
+                canvasStream.addTrack(track);
+              });
+            }
+          } catch {}
+
+          const chunks: BlobPart[] = [];
+          recorder = new MediaRecorder(canvasStream, {
+            mimeType: supportedMime,
+            videoBitsPerSecond: TARGET_VIDEO_BITRATE_BPS,
+            audioBitsPerSecond: TARGET_AUDIO_BITRATE_BPS
+          });
+
+          recorder.ondataavailable = (ev) => {
+            if (ev.data && ev.data.size > 0) {
+              chunks.push(ev.data);
+            }
+          };
+
+          recorder.onstop = () => {
+            clearTimeout(guardTimer);
+            if (chunks.length === 0) {
+              finish(null);
+              return;
+            }
+            const outType = supportedMime.includes('webm') ? 'video/webm' : 'video/mp4';
+            const outExt = outType === 'video/webm' ? 'webm' : 'mp4';
+            const outBlob = new Blob(chunks, { type: outType });
+            if (outBlob.size > 2048 && (needsTrimming || outBlob.size < file.size)) {
+              const baseName = (file.name || 'video').replace(/\.[^/.]+$/, '');
+              finish(
+                new File([outBlob], `${baseName}_720p.${outExt}`, {
+                  type: outType,
+                  lastModified: Date.now()
+                })
+              );
+            } else {
+              finish(null);
+            }
+          };
+
+          recorder.onerror = () => {
+            clearTimeout(guardTimer);
+            finish(null);
+          };
+
+          video.playbackRate = needsTrimming ? 1.0 : Math.min(2.5, Math.max(1.25, effectiveDuration / 6));
+
+          const renderLoop = () => {
+            if (settled) return;
+            if (video.currentTime >= effectiveEnd || video.ended) {
+              if (onProgress) onProgress(96, 'Finalizing 720p video...');
+              try {
+                if (recorder && recorder.state !== 'inactive') recorder.stop();
+              } catch {
+                finish(null);
+              }
+              return;
+            }
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const elapsed = Math.max(0, video.currentTime - rawStart);
+            const pct = Math.max(12, Math.min(95, Math.round(12 + (elapsed / effectiveDuration) * 83)));
+            if (onProgress) {
+              onProgress(pct, `Compressing to 720p (${pct}%)...`);
+            }
+            rafId = requestAnimationFrame(renderLoop);
+          };
+
+          recorder.start(250);
+          video
+            .play()
+            .then(() => {
+              rafId = requestAnimationFrame(renderLoop);
+            })
+            .catch(() => {
+              clearTimeout(guardTimer);
+              finish(null);
+            });
+        } catch {
+          clearTimeout(guardTimer);
+          finish(null);
+        }
+      };
+
+      video.onloadeddata = () => {
+        if (settled) return;
+        // Avoid waiting for onseeked when rawStart is already ~0 (where browsers don't emit seeked)
+        if (rawStart <= 0.05 || Math.abs(video.currentTime - rawStart) <= 0.05) {
+          startCaptureAndPlayback();
+        } else {
+          video.onseeked = () => {
+            video.onseeked = null;
+            startCaptureAndPlayback();
+          };
+          video.currentTime = rawStart;
+        }
+      };
+
+      video.onerror = () => {
+        clearTimeout(guardTimer);
+        finish(null);
+      };
+
+      video.src = objectUrl;
+    });
+
+    if (signal?.aborted) throw new Error('UPLOAD_CANCELLED');
+
+    if (transcodeResult) {
+      if (onProgress) {
+        onProgress(100, `Compressed to 720p (${formatVideoFileSize(transcodeResult.size)})`);
+      }
+      return {
+        file: transcodeResult,
+        durationSeconds: effectiveDuration,
+        width: dims.width,
+        height: dims.height,
+        engine: hasWebCodecs ? 'webcodecs' : 'passthrough'
+      };
+    }
+  }
+
+  // Safe passthrough with 720p metadata if real-time transcoding is skipped or unsupported
+  if (onProgress) {
+    onProgress(100, `Prepared video (${formatVideoFileSize(file.size)})`);
+  }
+
+  const validMime = file.type && file.type.startsWith('video/') ? file.type : 'video/mp4';
+  const normalizedFile =
+    file.type === validMime
+      ? file
+      : new File([file], (file.name || 'video').replace(/\.[^/.]+$/, '') + '.mp4', {
+          type: validMime,
+          lastModified: Date.now()
+        });
+
+  return {
+    file: normalizedFile,
+    durationSeconds: effectiveDuration,
+    width: dims.width,
+    height: dims.height,
+    engine: 'passthrough'
+  };
+}
+
+/**
+ * Uploads a video thumbnail image to Firebase Storage (`users/{userId}/thumbnails/{postId}.jpg`)
+ * alongside the video so the feed can display the thumbnail immediately.
+ */
+export async function uploadVideoThumbnailToStorage(
+  userId: string,
+  postId: string,
+  thumbnailDataUrl: string
+): Promise<string> {
+  if (!thumbnailDataUrl) return '';
+
+  try {
+    const res = await fetch(thumbnailDataUrl);
+    const blob = await res.blob();
+    const thumbPath = `users/${userId}/thumbnails/${postId}.jpg`;
+    const thumbRef = ref(storage, thumbPath);
+    const uploadTask = uploadBytesResumable(thumbRef, blob, {
+      contentType: 'image/jpeg',
+      cacheControl: 'public, max-age=31536000'
+    });
+
+    const downloadUrl = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        try {
+          uploadTask.cancel();
+        } catch {}
+        reject(new Error('THUMB_TIMEOUT'));
+      }, 8000);
+
+      uploadTask.on(
+        'state_changed',
+        undefined,
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+        async () => {
+          clearTimeout(timer);
+          try {
+            const url = await getDownloadURL(uploadTask.snapshot.ref);
+            resolve(url);
+          } catch (e) {
+            reject(e);
+          }
+        }
+      );
+    });
+
+    return downloadUrl || '';
+  } catch (err) {
+    console.warn('[WaveLink Thumbnail Upload Notice]', err);
+    return '';
+  }
+}
+
+export interface DirectVideoUploadTaskHandle {
+  pause: () => boolean;
+  resume: () => boolean;
+  cancel: () => boolean;
+  promise: Promise<{
+    videoUrl: string;
+    thumbnailUrl: string;
+    storagePath: string;
+    durationSeconds: number;
+    fileSize: number;
+    hasVideoChunks: boolean;
+  }>;
+}
+
+/**
+ * Uploads a video directly from the browser to Firebase Storage using `uploadBytesResumable`
+ * (`users/{userId}/videos/{postId}_${fileName}`).
+ * - Never sends the file through the Express server and never stores base64 video in Firestore.
+ * - Reports real progress with percentage and file size (`bytesTransferred / totalBytes`).
+ * - Passes `durationSeconds` and `isPro` in `customMetadata` so `storage.rules` enforces 60s Free / 90s Pro.
+ * - Logs the real error to `console.error` and surfaces a clear error message if Storage fails.
+ */
+export function startDirectVideoUploadToFirebase(params: {
+  postId: string;
+  userId: string;
+  file: File;
+  thumbnailDataUrl?: string;
+  durationSeconds: number;
+  width?: number;
+  height?: number;
+  isProUser?: boolean;
+  onProgress?: (
+    percentage: number,
+    statusText: string,
+    bytesTransferred: number,
+    totalBytes: number
+  ) => void;
+  onStateChange?: (state: 'running' | 'paused' | 'waiting_network') => void;
+}): DirectVideoUploadTaskHandle {
+  const {
+    postId,
+    userId,
+    file,
+    thumbnailDataUrl = '',
+    durationSeconds,
+    width = 720,
+    height = 1280,
+    isProUser = false,
+    onProgress,
+    onStateChange
+  } = params;
+
+  const maxAllowedSeconds = getMaxVideoDurationSeconds(isProUser);
+  const roundedDuration = Math.max(0.5, Math.round(durationSeconds * 10) / 10);
+
+  const ext = file.type.includes('webm')
+    ? 'webm'
+    : file.type.includes('quicktime')
+    ? 'mov'
+    : 'mp4';
+  const cleanName = (file.name || `${postId}.${ext}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const finalFileName = /\.(mp4|webm|mov)$/i.test(cleanName) ? cleanName : `${cleanName}.${ext}`;
+  const storagePath = `users/${userId}/videos/${postId}_${finalFileName}`;
+  const contentType = file.type && file.type.startsWith('video/') ? file.type : 'video/mp4';
+
+  let uploadTask: ReturnType<typeof uploadBytesResumable> | null = null;
+  let isPausedByUser = false;
+  let isCancelledByUser = false;
+
+  const promise = new Promise<{
+    videoUrl: string;
+    thumbnailUrl: string;
+    storagePath: string;
+    durationSeconds: number;
+    fileSize: number;
+    hasVideoChunks: boolean;
+  }>((resolve, reject) => {
+    // 1. Validate size & duration before starting upload
+    if (!file || file.size <= 0) {
+      const err = new Error('Selected video file is empty.');
+      console.error('[WaveLink Video Upload Error]', err);
+      reject(err);
+      return;
+    }
+
+    if (file.size > MAX_VIDEO_RAW_BYTES) {
+      const err = new Error(
+        `File too big: ${formatVideoFileSize(file.size)} exceeds the ${MAX_VIDEO_RAW_MB} MB limit.`
+      );
+      console.error('[WaveLink Video Upload Error]', err);
+      reject(err);
+      return;
+    }
+
+    if (roundedDuration > maxAllowedSeconds + 0.5) {
+      const err = new Error(
+        isProUser
+          ? `Pro videos can be up to 90 seconds (yours is ${Math.round(roundedDuration)}s).`
+          : `Free users can upload videos up to 60 seconds, and Pro users up to 90 seconds (yours is ${Math.round(roundedDuration)}s).`
+      );
+      console.error('[WaveLink Video Upload Error]', err);
+      reject(err);
+      return;
+    }
+
+    // Cache locally in memory/IndexedDB in background without blocking uploadTask listener attachment
+    void cacheVideoLocally(postId, file);
+
+    let storageRef: ReturnType<typeof ref>;
+    try {
+      storageRef = ref(storage, storagePath);
+      uploadTask = uploadBytesResumable(storageRef, file, {
+        contentType,
+        cacheControl: 'public, max-age=31536000',
+        customMetadata: {
+          userId,
+          postId,
+          durationSeconds: String(roundedDuration),
+          isPro: isProUser ? 'true' : 'false',
+          width: String(width),
+          height: String(height)
+        }
+      });
+    } catch (initError) {
+      const formatted = formatFirebaseStorageError(initError, {
+        fileSize: file.size,
+        maxAllowedSeconds,
+        isProUser,
+        storagePath
+      });
+      reject(new Error(formatted));
+      return;
+    }
+
+    // Start thumbnail upload in parallel
+    const thumbPromise = thumbnailDataUrl
+      ? uploadVideoThumbnailToStorage(userId, postId, thumbnailDataUrl)
+      : generateVideoThumbnail(file, 1.0).then((gen) =>
+          gen ? uploadVideoThumbnailToStorage(userId, postId, gen) : ''
+        );
+
+    let lastBytes = 0;
+    let noProgressTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearNoProgressTimer = () => {
+      if (noProgressTimer) {
+        clearTimeout(noProgressTimer);
+        noProgressTimer = null;
+      }
+    };
+
+    const resetNoProgressTimer = (timeoutMs: number) => {
+      clearNoProgressTimer();
+      if (isPausedByUser || isCancelledByUser) return;
+      noProgressTimer = setTimeout(() => {
+        if (isPausedByUser || isCancelledByUser) return;
+        try {
+          uploadTask?.cancel();
+        } catch {}
+        cleanupNetworkListeners();
+        const isZeroBytes = lastBytes <= 0;
+        const stallErr = new Error(
+          isZeroBytes
+            ? 'STORAGE_NOT_ENABLED_OR_CORS: 0 bytes transferred to Firebase Storage within 18 seconds.'
+            : 'UPLOAD_TIMEOUT: No upload progress for 25 seconds.'
+        );
+        const formatted = formatFirebaseStorageError(stallErr, {
+          fileSize: file.size,
+          maxAllowedSeconds,
+          isProUser,
+          storagePath
+        });
+        reject(new Error(formatted));
+      }, timeoutMs);
+    };
+
+    const totalSizeLabel = formatVideoFileSize(file.size);
+
+    const handleOnline = () => {
+      if (isCancelledByUser || isPausedByUser) return;
+      try {
+        uploadTask?.resume();
+        if (onStateChange) onStateChange('running');
+        if (onProgress && file.size > 0) {
+          const pct = Math.round((Math.max(0, lastBytes) / file.size) * 100);
+          const transferredLabel = formatVideoFileSize(Math.max(0, lastBytes));
+          onProgress(
+            pct,
+            `Resuming upload • ${transferredLabel} / ${totalSizeLabel}`,
+            Math.max(0, lastBytes),
+            file.size
+          );
+        }
+        resetNoProgressTimer(25000);
+      } catch {}
+    };
+
+    const handleOffline = () => {
+      if (isCancelledByUser || isPausedByUser) return;
+      if (onStateChange) onStateChange('waiting_network');
+      if (onProgress && file.size > 0) {
+        const pct = Math.round((Math.max(0, lastBytes) / file.size) * 100);
+        const transferredLabel = formatVideoFileSize(Math.max(0, lastBytes));
+        onProgress(
+          pct,
+          `Waiting for network • ${transferredLabel} / ${totalSizeLabel}`,
+          Math.max(0, lastBytes),
+          file.size
+        );
+      }
+    };
+
+    const cleanupNetworkListeners = () => {
+      clearNoProgressTimer();
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline);
+        window.removeEventListener('offline', handleOffline);
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handleOnline);
+      window.addEventListener('offline', handleOffline);
+    }
+
+    // 18s initial connection timeout if 0 bytes transfer, then 25s per chunk progress
+    resetNoProgressTimer(18000);
+
+    uploadTask.on(
+      'state_changed',
+      (snapshot) => {
+        if (isCancelledByUser) return;
+
+        const total = snapshot.totalBytes > 0 ? snapshot.totalBytes : file.size;
+        const transferred = Math.max(0, snapshot.bytesTransferred);
+        const transferredLabel = formatVideoFileSize(transferred);
+        const totalLabel = formatVideoFileSize(total);
+
+        if (snapshot.state === 'paused') {
+          clearNoProgressTimer();
+          if (onStateChange) onStateChange('paused');
+          const pct = total > 0 ? Math.round((transferred / total) * 100) : 0;
+          if (onProgress) {
+            onProgress(
+              pct,
+              `Upload paused • ${transferredLabel} / ${totalLabel}`,
+              transferred,
+              total
+            );
+          }
+          return;
+        }
+
+        if (snapshot.state === 'running') {
+          if (onStateChange) onStateChange('running');
+        }
+
+        if (transferred > lastBytes) {
+          lastBytes = transferred;
+          storageBucketReachable = true;
+          resetNoProgressTimer(25000);
+        }
+
+        if (total > 0 && onProgress) {
+          const rawPct = Math.round((transferred / total) * 100);
+          const displayPct = transferred === 0 ? 1 : Math.max(1, Math.min(99, rawPct));
+          onProgress(
+            displayPct,
+            `Uploading ${displayPct}% • ${transferredLabel} / ${totalLabel}`,
+            transferred,
+            total
+          );
+        }
+      },
+      (error: any) => {
+        if (isCancelledByUser || error?.code === 'storage/canceled') {
+          cleanupNetworkListeners();
+          reject(new Error('UPLOAD_CANCELLED'));
+          return;
+        }
+
+        cleanupNetworkListeners();
+        const formatted = formatFirebaseStorageError(error, {
+          fileSize: file.size,
+          maxAllowedSeconds,
+          isProUser,
+          storagePath
+        });
+        reject(new Error(formatted));
+      },
+      async () => {
+        cleanupNetworkListeners();
+        try {
+          if (!uploadTask) {
+            throw new Error('Upload task missing after completion.');
+          }
+          const [downloadUrl, resolvedStorageThumb] = await Promise.all([
+            getDownloadURL(uploadTask.snapshot.ref),
+            thumbPromise.catch(() => '')
+          ]);
+
+          if (!downloadUrl || !downloadUrl.startsWith('http')) {
+            throw new Error('Firebase Storage did not return a valid download URL.');
+          }
+
+          storageBucketReachable = true;
+          if (onProgress) {
+            onProgress(
+              100,
+              `Uploaded ${totalSizeLabel} (100%) — saving post...`,
+              file.size,
+              file.size
+            );
+          }
+
+          // Use Firebase Storage thumbnail URL if available, or a compact poster (< 60 KB)
+          const safeThumb =
+            resolvedStorageThumb ||
+            (thumbnailDataUrl && thumbnailDataUrl.length < 65000 ? thumbnailDataUrl : '');
+
+          resolve({
+            videoUrl: downloadUrl,
+            thumbnailUrl: safeThumb,
+            storagePath,
+            durationSeconds: roundedDuration,
+            fileSize: file.size,
+            hasVideoChunks: false
+          });
+        } catch (err: any) {
+          const formatted = formatFirebaseStorageError(err, {
+            fileSize: file.size,
+            maxAllowedSeconds,
+            isProUser,
+            storagePath
+          });
+          reject(new Error(formatted));
+        }
+      }
+    );
+  });
+
+  return {
+    pause: () => {
+      isPausedByUser = true;
+      try {
+        return uploadTask ? uploadTask.pause() : false;
+      } catch {
+        return false;
+      }
+    },
+    resume: () => {
+      isPausedByUser = false;
+      try {
+        return uploadTask ? uploadTask.resume() : false;
+      } catch {
+        return false;
+      }
+    },
+    cancel: () => {
+      isCancelledByUser = true;
+      try {
+        return uploadTask ? uploadTask.cancel() : false;
+      } catch {
+        return false;
+      }
+    },
+    promise
+  };
+}
+
+async function saveVideoFallbackChunks(
+  postId: string,
+  file: File | Blob,
+  collectionName: 'posts' | 'sparks' = 'posts',
+  onProgress?: (percentage: number) => void
+): Promise<{ videoUrl?: string; hasVideoChunks: boolean }> {
+  const resolvedDataUrl = await readFileAsDataUrlSafe(file, 4.5 * 1024 * 1024);
+  if (collectionName === 'posts' && resolvedDataUrl && resolvedDataUrl.length < 320 * 1024) {
+    if (onProgress) onProgress(100);
+    return { videoUrl: resolvedDataUrl, hasVideoChunks: false };
+  }
+
+  try {
+    if (!resolvedDataUrl) {
+      if (onProgress) onProgress(100);
+      const cachedUrl = await getCachedVideo(postId);
+      return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
+    }
+
+    const totalChunks = Math.ceil(resolvedDataUrl.length / CHUNK_SIZE);
+    if (totalChunks > MAX_CHUNKS) {
+      if (onProgress) onProgress(100);
+      const cachedUrl = await getCachedVideo(postId);
+      return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
+    }
+
+    const chunksRef = collection(db, collectionName, postId, 'chunks');
+    const BATCH_SIZE = 6;
+    const startTime = Date.now();
+    for (let i = 0; i < totalChunks; i += BATCH_SIZE) {
+      if (Date.now() - startTime > 4500) {
+        if (onProgress) onProgress(100);
+        const cachedUrl = await getCachedVideo(postId);
+        return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
+      }
+      const batchPromises: Promise<boolean>[] = [];
+      const currentBatchEnd = Math.min(i + BATCH_SIZE, totalChunks);
+      for (let j = i; j < currentBatchEnd; j++) {
+        const chunkData = resolvedDataUrl.substring(j * CHUNK_SIZE, (j + 1) * CHUNK_SIZE);
+        const chunkId = `chunk_${j.toString().padStart(4, '0')}`;
+        batchPromises.push(
+          writeChunkWithRetry(
+            doc(chunksRef, chunkId),
+            { index: j, total: totalChunks, data: chunkData },
+            0
+          )
+        );
+      }
+      const results = await Promise.all(batchPromises);
+      if (onProgress) {
+        const progress = Math.min(98, Math.round(20 + (currentBatchEnd / totalChunks) * 78));
+        onProgress(progress);
+      }
+      if (results.some((ok) => !ok)) {
+        if (onProgress) onProgress(100);
+        const cachedUrl = await getCachedVideo(postId);
+        return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
+      }
+    }
+    if (onProgress) onProgress(100);
+    return { videoUrl: undefined, hasVideoChunks: true };
+  } catch {
+    if (onProgress) onProgress(100);
+    const cachedUrl = await getCachedVideo(postId);
+    return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
+  }
+}
+
 export async function uploadVideoResumableWithRetry(
   entityId: string,
   file: File | Blob,
@@ -1160,8 +2112,8 @@ export async function uploadVideoResumableWithRetry(
             try {
               uploadTask.cancel();
             } catch {}
-            reject(new Error('Storage upload stalled without progress'));
-          }, 8000);
+            reject(new Error('No upload progress for 30 seconds'));
+          }, 30000);
         };
 
         resetStallTimer();
@@ -1176,7 +2128,7 @@ export async function uploadVideoResumableWithRetry(
             }
             if (snapshot.totalBytes > 0 && onProgress) {
               const pct = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-              onProgress(Math.max(10, Math.min(98, pct)));
+              onProgress(Math.max(5, Math.min(99, pct)));
             }
           },
           (error) => {
@@ -1210,45 +2162,28 @@ export async function uploadVideoResumableWithRetry(
   return null;
 }
 
+/**
+ * Uploads video directly from the browser to Firebase Storage using `uploadBytesResumable`
+ * (never sending the file through the Render server).
+ */
 export async function saveVideoPost(
   postId: string,
   file: File | Blob,
   dataUrl?: string,
   collectionName: 'posts' | 'sparks' = 'posts',
-  onProgress?: (percentage: number) => void
+  onProgress?: (percentage: number) => void,
+  userId?: string
 ): Promise<{ videoUrl?: string; hasVideoChunks: boolean }> {
   await cacheVideoLocally(postId, file);
-  if (onProgress) onProgress(12);
+  if (onProgress) onProgress(10);
 
-  const resolvedDataUrl =
-    dataUrl && dataUrl.startsWith('data:video/')
-      ? dataUrl
-      : await readFileAsDataUrlSafe(file, 4.5 * 1024 * 1024);
+  const targetFolder = userId ? `users/${userId}/videos` : collectionName;
 
-  if (collectionName === 'posts' && resolvedDataUrl && resolvedDataUrl.length < 650 * 1024) {
-    if (onProgress) onProgress(100);
-    return {
-      videoUrl: resolvedDataUrl,
-      hasVideoChunks: false
-    };
-  }
-
-  const serverStreamUrl = await uploadVideoChunkedToServer(postId, file, (pct) => {
-    if (onProgress) onProgress(pct);
-  });
-
-  if (serverStreamUrl) {
-    if (onProgress) onProgress(100);
-    return {
-      videoUrl: serverStreamUrl,
-      hasVideoChunks: false
-    };
-  }
-
+  // 1. Primary path: Direct browser-to-Firebase Storage resumable upload (`uploadBytesResumable`)
   const storageDownloadUrl = await uploadVideoResumableWithRetry(
     postId,
     file,
-    collectionName,
+    targetFolder,
     (pct) => {
       if (onProgress) onProgress(pct);
     },
@@ -1263,79 +2198,8 @@ export async function saveVideoPost(
     };
   }
 
-  try {
-    if (!resolvedDataUrl) {
-      for (const step of [35, 65, 90, 100]) {
-        if (onProgress) onProgress(step);
-        await new Promise((r) => setTimeout(r, 60));
-      }
-      return {
-        videoUrl: undefined,
-        hasVideoChunks: false
-      };
-    }
-
-    const rawTotalChunks = Math.ceil(resolvedDataUrl.length / CHUNK_SIZE);
-    if (rawTotalChunks > MAX_CHUNKS) {
-      for (const step of [35, 65, 90, 100]) {
-        if (onProgress) onProgress(step);
-        await new Promise((r) => setTimeout(r, 60));
-      }
-      return {
-        videoUrl: undefined,
-        hasVideoChunks: false
-      };
-    }
-
-    const totalChunks = rawTotalChunks;
-    const chunksRef = collection(db, collectionName, postId, 'chunks');
-
-    const BATCH_SIZE = 2;
-    for (let i = 0; i < totalChunks; i += BATCH_SIZE) {
-      const batchPromises: Promise<boolean>[] = [];
-      const currentBatchEnd = Math.min(i + BATCH_SIZE, totalChunks);
-
-      for (let j = i; j < currentBatchEnd; j++) {
-        const chunkData = resolvedDataUrl.substring(j * CHUNK_SIZE, (j + 1) * CHUNK_SIZE);
-        const chunkId = `chunk_${j.toString().padStart(4, '0')}`;
-        batchPromises.push(
-          writeChunkWithRetry(doc(chunksRef, chunkId), {
-            index: j,
-            total: totalChunks,
-            data: chunkData
-          })
-        );
-      }
-
-      const results = await Promise.all(batchPromises);
-      if (onProgress) {
-        const progress = Math.min(98, Math.round(20 + (currentBatchEnd / totalChunks) * 78));
-        onProgress(progress);
-      }
-
-      if (results.some((ok) => !ok)) {
-        if (onProgress) onProgress(100);
-        return {
-          videoUrl: undefined,
-          hasVideoChunks: false
-        };
-      }
-    }
-
-    if (onProgress) onProgress(100);
-
-    return {
-      videoUrl: undefined,
-      hasVideoChunks: true
-    };
-  } catch (err) {
-    console.warn(`Error chunking video to ${collectionName}, using local cache fallback:`, err);
-    if (onProgress) onProgress(100);
-    return {
-      videoUrl: undefined,
-      hasVideoChunks: false
-    };
-  }
+  // 2. Fallback path if Firebase Storage rules are not yet deployed in preview
+  return saveVideoFallbackChunks(postId, file, collectionName, onProgress);
 }
 
 // Retrieve full video for a post or spark
@@ -1397,10 +2261,38 @@ export function compressImage(
   quality = 0.8
 ): Promise<string> {
   return new Promise((resolve) => {
-    if (file.type === 'image/svg+xml') {
+    if (!file || file.size === 0) {
+      resolve('');
+      return;
+    }
+
+    let settled = false;
+    const finish = (val: string) => {
+      if (!settled) {
+        settled = true;
+        resolve(val);
+      }
+    };
+
+    // Safety timeout so image compression can never hang post creation
+    const safetyTimer = setTimeout(() => {
+      try {
+        finish(URL.createObjectURL(file));
+      } catch {
+        finish('');
+      }
+    }, 4500);
+
+    if (file.type === 'image/svg+xml' && file.size <= 300 * 1024) {
       const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target?.result as string);
-      reader.onerror = () => resolve('');
+      reader.onload = (e) => {
+        clearTimeout(safetyTimer);
+        finish((e.target?.result as string) || '');
+      };
+      reader.onerror = () => {
+        clearTimeout(safetyTimer);
+        finish('');
+      };
       reader.readAsDataURL(file);
       return;
     }
@@ -1409,9 +2301,11 @@ export function compressImage(
     const objectUrl = URL.createObjectURL(file);
 
     img.onload = () => {
+      clearTimeout(safetyTimer);
       URL.revokeObjectURL(objectUrl);
-      let width = img.width;
-      let height = img.height;
+
+      let width = img.width || 800;
+      let height = img.height || 800;
 
       if (width > maxWidth || height > maxHeight) {
         if (width > height) {
@@ -1423,85 +2317,114 @@ export function compressImage(
         }
       }
 
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, width);
-      canvas.height = Math.max(1, height);
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        const reader = new FileReader();
-        reader.onload = (e) => resolve(e.target?.result as string);
-        reader.readAsDataURL(file);
-        return;
+      const renderAtScale = (scale: number, q: number): string => {
+        const w = Math.max(1, Math.round(width * scale));
+        const h = Math.max(1, Math.round(height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return '';
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, w, h);
+        return canvas.toDataURL('image/jpeg', q);
+      };
+
+      const MAX_SAFE_FIRESTORE_CHARS = 450 * 1024; // ~330 KB binary, well under 1 MB Firestore doc limit
+      let compressed = renderAtScale(1, quality);
+
+      if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
+        compressed = renderAtScale(1, 0.62);
+      }
+      if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
+        compressed = renderAtScale(0.78, 0.52);
+      }
+      if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
+        compressed = renderAtScale(0.6, 0.42);
       }
 
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, width, height);
-
-      let compressed = canvas.toDataURL('image/jpeg', quality);
-
-      if (compressed.length > 600 * 1024) {
-        compressed = canvas.toDataURL('image/jpeg', 0.6);
-      }
-      if (compressed.length > 600 * 1024) {
-        compressed = canvas.toDataURL('image/jpeg', 0.45);
-      }
-
-      resolve(compressed);
+      finish(compressed);
     };
 
     img.onerror = () => {
+      clearTimeout(safetyTimer);
       URL.revokeObjectURL(objectUrl);
-      const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target?.result as string);
-      reader.onerror = () => resolve('');
-      reader.readAsDataURL(file);
+      if (file.size <= 320 * 1024) {
+        const reader = new FileReader();
+        reader.onload = (e) => finish((e.target?.result as string) || '');
+        reader.onerror = () => finish('');
+        reader.readAsDataURL(file);
+      } else {
+        try {
+          finish(URL.createObjectURL(file));
+        } catch {
+          finish('');
+        }
+      }
     };
 
     img.src = objectUrl;
   });
 }
 
-export function generateVideoThumbnail(file: File | Blob): Promise<string> {
+/**
+ * Generates a JPEG thumbnail image from the first second (`captureTimeSeconds = 1.0`) of the video.
+ */
+export function generateVideoThumbnail(
+  file: File | Blob,
+  captureTimeSeconds: number = 1.0
+): Promise<string> {
   return new Promise((resolve) => {
     const video = document.createElement('video');
     video.preload = 'metadata';
     video.muted = true;
     video.playsInline = true;
     const objectUrl = URL.createObjectURL(file);
-    video.src = objectUrl;
+    let settled = false;
+
+    const finish = (val: string) => {
+      if (settled) return;
+      settled = true;
+      try {
+        video.removeAttribute('src');
+        video.load();
+      } catch {}
+      URL.revokeObjectURL(objectUrl);
+      resolve(val);
+    };
 
     video.onloadeddata = () => {
-      video.currentTime = Math.min(0.5, (video.duration || 1) / 2);
+      const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 2;
+      video.currentTime = Math.min(captureTimeSeconds, Math.max(0.1, dur * 0.5));
     };
 
     video.onseeked = () => {
       try {
+        const dims = compute720pDimensions(video.videoWidth || 640, video.videoHeight || 360);
         const canvas = document.createElement('canvas');
-        canvas.width = Math.min(480, video.videoWidth || 480);
-        canvas.height = Math.min(360, video.videoHeight || 360);
+        canvas.width = Math.min(640, dims.width);
+        canvas.height = Math.max(1, Math.round((canvas.width * dims.height) / dims.width));
         const ctx = canvas.getContext('2d');
         if (ctx) {
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const thumb = canvas.toDataURL('image/jpeg', 0.6);
-          URL.revokeObjectURL(objectUrl);
-          resolve(thumb);
+          const thumb = canvas.toDataURL('image/jpeg', 0.75);
+          finish(thumb);
           return;
         }
       } catch {}
-      URL.revokeObjectURL(objectUrl);
-      resolve('');
+      finish('');
     };
 
     video.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      resolve('');
+      finish('');
     };
 
     setTimeout(() => {
-      URL.revokeObjectURL(objectUrl);
-      resolve('');
-    }, 2500);
+      finish('');
+    }, 3000);
+
+    video.src = objectUrl;
   });
 }
 

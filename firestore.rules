@@ -138,14 +138,25 @@ service cloud.firestore {
         (!('wavePoints' in incoming) || (existing != null && 'wavePoints' in existing ? incoming.wavePoints <= existing.wavePoints + 100 : incoming.wavePoints <= 500));
     }
 
-    // Validate Feed Post payload on create & update
+    // Validate Feed Post payload on create & update (never allow base64 video in Firestore; enforce 60s Free / 90s Pro duration)
     function isValidPostPayload(data) {
       return ('authorId' in data) && data.authorId is string && data.authorId.size() >= 1 && data.authorId.size() <= 128 &&
         isValidOptionalString(data, 'content', 4000) &&
         isValidOptionalString(data, 'authorName', 100) &&
         isValidOptionalString(data, 'authorUsername', 60) &&
+        (!('videoUrl' in data) || !(data.videoUrl is string) || !data.videoUrl.matches('^data:video/.*')) &&
         (!('likesCount' in data) || (data.likesCount is number && data.likesCount >= 0)) &&
-        (!('commentsCount' in data) || (data.commentsCount is number && data.commentsCount >= 0));
+        (!('commentsCount' in data) || (data.commentsCount is number && data.commentsCount >= 0)) &&
+        (!('duration' in data) || (
+          data.duration is number &&
+          data.duration >= 0 &&
+          (isUserProOrAdmin() ? data.duration <= 90.5 : data.duration <= 60.5)
+        )) &&
+        (!('videoDurationSeconds' in data) || (
+          data.videoDurationSeconds is number &&
+          data.videoDurationSeconds >= 0 &&
+          (isUserProOrAdmin() ? data.videoDurationSeconds <= 90.5 : data.videoDurationSeconds <= 60.5)
+        ));
     }
 
     // Validate Post Comment payload on create & update
@@ -461,6 +472,38 @@ service cloud.firestore {
       allow read: if isSignedIn() && (isAdmin() || resource.data.submittedByUserId == request.auth.uid);
       allow create: if isSignedIn() && isValidOptionalString(request.resource.data, 'rawSuggestion', 2000);
       allow update, delete: if isAdmin();
+    }
+
+    // Live Video & Voice Calls (Strictly only the caller and the receiver can read and update the call and its ICE candidate subcollections)
+    function isCallParticipant(callId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/calls/$(callId)) && (
+          get(/databases/$(database)/documents/calls/$(callId)).data.callerId == request.auth.uid ||
+          get(/databases/$(database)/documents/calls/$(callId)).data.receiverId == request.auth.uid ||
+          get(/databases/$(database)/documents/calls/$(callId)).data.caller == request.auth.uid ||
+          get(/databases/$(database)/documents/calls/$(callId)).data.receiver == request.auth.uid
+        );
+    }
+
+    match /calls/{callId} {
+      allow create: if isSignedIn() && (
+        request.resource.data.callerId == request.auth.uid ||
+        request.resource.data.caller == request.auth.uid
+      );
+      allow read, update, delete: if isSignedIn() && (
+        resource.data.callerId == request.auth.uid ||
+        resource.data.receiverId == request.auth.uid ||
+        resource.data.caller == request.auth.uid ||
+        resource.data.receiver == request.auth.uid
+      );
+
+      match /callerCandidates/{candidateId} {
+        allow read, create, update, delete: if isCallParticipant(callId);
+      }
+
+      match /calleeCandidates/{candidateId} {
+        allow read, create, update, delete: if isCallParticipant(callId);
+      }
     }
   }
 }

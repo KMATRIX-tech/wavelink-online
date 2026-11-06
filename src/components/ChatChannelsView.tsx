@@ -222,6 +222,94 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const editLogoInputRef = useRef<HTMLInputElement | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const chatShellRef = useRef<HTMLDivElement | null>(null);
+  const messagesListRef = useRef<HTMLDivElement | null>(null);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
+  const isInputFocusedRef = useRef<boolean>(false);
+  const wasKeyboardOpenRef = useRef<boolean>(false);
+
+  // Detect virtual keyboard open/close on mobile via window.visualViewport and adjust chat bounds without clipping
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const updateVisualViewportBounds = () => {
+      const isMobileViewport = window.innerWidth < 768;
+      const vv = window.visualViewport;
+      const vvHeight = vv ? vv.height : window.innerHeight;
+      const vvOffsetTop = vv ? vv.offsetTop : 0;
+      const layoutHeight = document.documentElement.clientHeight || window.innerHeight;
+      const keyboardHeight = Math.max(0, Math.round(layoutHeight - vvHeight - vvOffsetTop));
+
+      const isKeyboardOpen =
+        isMobileViewport &&
+        (keyboardHeight > 85 || (isInputFocusedRef.current && keyboardHeight > 25));
+
+      document.documentElement.setAttribute(
+        'data-keyboard-open',
+        isKeyboardOpen ? 'true' : 'false'
+      );
+      document.documentElement.style.setProperty('--vv-height', `${Math.round(vvHeight)}px`);
+      document.documentElement.style.setProperty(
+        '--vv-offset-top',
+        `${Math.round(vvOffsetTop)}px`
+      );
+      document.documentElement.style.setProperty('--kb-offset', `${keyboardHeight}px`);
+
+      if (!isMobileViewport) {
+        if (chatShellRef.current) {
+          chatShellRef.current.style.removeProperty('--chat-visual-height');
+        }
+        wasKeyboardOpenRef.current = false;
+        return;
+      }
+
+      // Prevent iOS Safari from scrolling the top header out of the visual viewport when the keyboard opens
+      if (isKeyboardOpen && vvOffsetTop > 0) {
+        window.scrollTo(0, 0);
+      }
+
+      if (chatShellRef.current) {
+        const rect = chatShellRef.current.getBoundingClientRect();
+        const topWithinVisual = Math.max(0, Math.round(rect.top));
+        const bottomNavReserve = isKeyboardOpen ? 0 : 64;
+        const availableHeight = Math.max(
+          150,
+          Math.floor(vvHeight - topWithinVisual - bottomNavReserve)
+        );
+        chatShellRef.current.style.setProperty('--chat-visual-height', `${availableHeight}px`);
+      }
+
+      // Keep active message area scrolled to the bottom when the virtual keyboard opens or resizes
+      if (isKeyboardOpen && (!wasKeyboardOpenRef.current || isInputFocusedRef.current)) {
+        window.requestAnimationFrame(() => {
+          if (messagesListRef.current) {
+            messagesListRef.current.scrollTop = messagesListRef.current.scrollHeight;
+          } else {
+            messagesEndRef.current?.scrollIntoView({ block: 'end' });
+          }
+        });
+      }
+
+      wasKeyboardOpenRef.current = isKeyboardOpen;
+    };
+
+    updateVisualViewportBounds();
+
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', updateVisualViewportBounds);
+    vv?.addEventListener('scroll', updateVisualViewportBounds);
+    window.addEventListener('resize', updateVisualViewportBounds);
+
+    return () => {
+      vv?.removeEventListener('resize', updateVisualViewportBounds);
+      vv?.removeEventListener('scroll', updateVisualViewportBounds);
+      window.removeEventListener('resize', updateVisualViewportBounds);
+      document.documentElement.removeAttribute('data-keyboard-open');
+      document.documentElement.style.removeProperty('--vv-height');
+      document.documentElement.style.removeProperty('--vv-offset-top');
+      document.documentElement.style.removeProperty('--kb-offset');
+    };
+  }, [activeChannel, showMobileChannels]);
 
   // 1. Real-time listener for registered users / online members (with dedicated WaveLink Support Bot pinned first)
   useEffect(() => {
@@ -1734,23 +1822,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   );
 
   return (
-    <div className="max-w-7xl mx-auto pt-2 sm:pt-4 pb-2 px-2 sm:px-6">
-      <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl shadow-xs overflow-hidden flex flex-col md:flex-row h-[calc(100dvh-9.25rem)] sm:h-[calc(100dvh-9.5rem)] min-h-[440px]">
-        {/* Left Sidebar: Groups & Direct Chats */}
+    <div className="wavelink-chat-wrapper">
+      <div
+        ref={chatShellRef}
+        className="wavelink-chat-shell bg-[var(--bg-surface)] border-y md:border border-[var(--border-subtle)] shadow-xs"
+      >
+        {/* Left Sidebar: Groups & Direct Chats (Full-screen when toggled on mobile; side-by-side on tablet/desktop) */}
         <div
-          className={`w-full md:w-80 h-full border-r border-[#EFECE6] flex-col bg-[#FAF7F2] shrink-0 ${
+          className={`w-full md:w-72 lg:w-80 xl:w-96 h-full border-r border-[#EFECE6] flex-col bg-[#FAF7F2] shrink-0 ${
             showMobileChannels ? 'flex' : 'hidden md:flex'
           }`}
         >
           {/* Top Bar with Create Group Button */}
-          <div className="p-3.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <MessageSquare size={18} className="text-[#2563EB]" />
-              <h3 className="font-extrabold text-xs uppercase tracking-wider text-[#1C1917]">
+          <div className="p-3.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <MessageSquare size={18} className="text-[#2563EB] shrink-0" />
+              <h3 className="font-extrabold text-xs uppercase tracking-wider text-[#1C1917] truncate">
                 Conversations
               </h3>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={() => {
@@ -1760,7 +1851,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   setNewGroupLogo(PRESET_LOGOS[0].url);
                   setIsCreateGroupOpen(true);
                 }}
-                className="min-h-[38px] flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold text-xs shadow-2xs transition"
+                className="min-h-[44px] flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold text-xs shadow-2xs transition"
                 title="Create a new group"
               >
                 <Plus size={14} />
@@ -1770,7 +1861,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 <button
                   type="button"
                   onClick={() => setShowMobileChannels(false)}
-                  className="min-w-[38px] min-h-[38px] rounded-xl flex items-center justify-center text-[#57534E] hover:text-[#1C1917] hover:bg-[#FAF7F2] md:hidden font-semibold"
+                  className="min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center text-[#57534E] hover:text-[#1C1917] hover:bg-[#FAF7F2] md:hidden font-semibold"
                   title="Back to chat"
                 >
                   <X size={18} />
@@ -2022,12 +2113,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           }`}
         >
           {/* Header Bar */}
-          <div className="p-3 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2 shrink-0">
-            <div className="flex items-center gap-2.5 min-w-0">
+          <div className="p-2.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-2 min-w-0">
               <button
                 type="button"
                 onClick={() => setShowMobileChannels(true)}
-                className="md:hidden min-w-[42px] min-h-[42px] px-2.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] hover:bg-[#EFECE6] flex items-center justify-center gap-1 text-xs font-bold shrink-0"
+                className="md:hidden min-w-[44px] min-h-[44px] px-2.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] hover:bg-[#EFECE6] flex items-center justify-center gap-1 text-xs font-bold shrink-0"
                 title="View Conversations List"
               >
                 <Users size={16} className="text-[#2563EB]" />
@@ -2175,7 +2266,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           photoURL: directRecipient.photoURL
                         })
                       }
-                      className="min-h-[40px] px-3 py-2 rounded-xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] text-xs font-bold flex items-center gap-1.5 transition"
+                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] text-xs font-bold flex items-center justify-center gap-1.5 transition shrink-0"
                       title="Start Voice Call"
                     >
                       <PhoneCall size={16} className="text-[#0D9488]" />
@@ -2190,7 +2281,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           photoURL: directRecipient.photoURL
                         })
                       }
-                      className="min-h-[40px] px-3 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-xs font-bold flex items-center gap-1.5 shadow-2xs transition"
+                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-2xs transition shrink-0"
                       title="Start Video Call"
                     >
                       <Video size={16} />
@@ -2201,7 +2292,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         <button
                           type="button"
                           onClick={() => toggleBlockUser(directRecipient.id)}
-                          className={`min-h-[40px] px-2.5 py-2 rounded-xl border text-xs font-bold flex items-center gap-1 transition ${
+                          className={`hidden sm:flex min-h-[40px] px-2.5 py-2 rounded-xl border text-xs font-bold items-center gap-1 transition shrink-0 ${
                             isRecipientBlocked
                               ? 'bg-rose-600 text-white border-rose-600'
                               : 'bg-[#FAF7F2] hover:bg-rose-50 border-[#EFECE6] text-[#57534E] hover:text-rose-600'
@@ -2224,7 +2315,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                               reason: 'Reported user from Direct Messages'
                             })
                           }
-                          className="min-h-[40px] px-2.5 py-2 rounded-xl bg-[#FAF7F2] hover:bg-amber-50 border border-[#EFECE6] text-[#57534E] hover:text-amber-700 text-xs font-bold flex items-center gap-1 transition"
+                          className="hidden sm:flex min-h-[40px] px-2.5 py-2 rounded-xl bg-[#FAF7F2] hover:bg-amber-50 border border-[#EFECE6] text-[#57534E] hover:text-amber-700 text-xs font-bold items-center gap-1 transition shrink-0"
                           title="Report User"
                         >
                           <Flag size={14} />
@@ -2264,7 +2355,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           </div>
 
           {/* Messages Feed — Soft Cream Background & Extra Bottom Padding so last message is never hidden */}
-          <div className="flex-1 overflow-y-auto p-4 sm:p-5 pb-8 space-y-4 bg-[#FAF7F2]">
+          <div
+            ref={messagesListRef}
+            className="wavelink-chat-messages-list flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 bg-[#FAF7F2]"
+          >
             {messages.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-center p-6 text-[#57534E]">
                 <div className="p-4 rounded-3xl bg-blue-50 text-[#2563EB] border border-blue-200/60 mb-3">
@@ -2322,9 +2416,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         className="w-8 h-8 rounded-full object-cover ring-1 ring-[#2563EB]/25 shrink-0 mt-1 bg-white"
                       />
 
-                      {/* Message Bubble Wrapper */}
+                      {/* Message Bubble Wrapper (strictly up to 80% width on mobile, 70% on desktop) */}
                       <div
-                        className={`max-w-[82%] sm:max-w-[70%] flex flex-col ${
+                        className={`wavelink-chat-bubble-wrap max-w-[80%] lg:max-w-[70%] min-w-0 flex flex-col ${
                           isOwn ? 'items-end' : 'items-start'
                         }`}
                       >
@@ -2361,7 +2455,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
                         {/* Message Bubble Card */}
                         <div
-                          className={`rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed relative ${
+                          className={`w-full max-w-full rounded-2xl px-3.5 py-2.5 text-base sm:text-[15px] leading-relaxed relative break-words [overflow-wrap:anywhere] ${
                             msg.isDeleted
                               ? 'italic bg-white/80 border border-[#EFECE6] text-[#57534E]'
                               : isOwn
@@ -2370,12 +2464,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           }`}
                         >
                           {isEditing ? (
-                            <div className="space-y-2 min-w-[200px]">
+                            <div className="space-y-2 w-full min-w-[160px] max-w-full">
                               <input
                                 type="text"
                                 value={editText}
                                 onChange={(e) => setEditText(e.target.value)}
-                                className="w-full p-2 rounded-xl bg-white text-[#1C1917] text-xs sm:text-sm border border-white/40 focus:outline-none"
+                                className="w-full p-2 rounded-xl bg-white text-[#1C1917] text-base sm:text-sm border border-white/40 focus:outline-none"
                               />
                               <div className="flex justify-end gap-2 text-xs">
                                 <button
@@ -2398,10 +2492,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                             <>
                               {/* Media Attachment (Audio Voice Note / Video / Image) */}
                               {(msg.mediaUrl || msg.audioUrl) && !msg.isDeleted && (
-                                <div className="mb-2 rounded-xl overflow-hidden max-w-sm">
+                                <div className="mb-2 rounded-xl overflow-hidden w-full max-w-sm">
                                   {msg.mediaType === 'audio' || msg.audioUrl ? (
                                     <div
-                                      className={`p-2.5 rounded-xl flex flex-col gap-2 min-w-[230px] sm:min-w-[260px] ${
+                                      className={`p-2.5 rounded-xl flex flex-col gap-2 w-full max-w-full ${
                                         isOwn
                                           ? 'bg-white/15 border border-white/25 text-white'
                                           : 'bg-[#FAF7F2] border border-[#E7E2DA] text-[#1C1917]'
@@ -2785,11 +2879,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           )}
 
-          {/* Input & Action Footer Bar — Always sits above the bottom tab bar and is never covered */}
-          <div className="p-2.5 sm:p-3.5 border-t border-[#EFECE6] bg-white relative shrink-0 z-10">
+          {/* Input & Action Footer Bar — Fixed/pinned at the bottom above the keyboard */}
+          <div className="wavelink-chat-input-bar p-2 sm:p-3.5 border-t border-[#EFECE6] bg-white shrink-0">
             {/* Popover Emoji Picker */}
             {showEmojiPicker && (
-              <div className="absolute bottom-20 left-3 p-3 bg-white border border-[#EFECE6] rounded-2xl shadow-xl z-30 grid grid-cols-8 gap-2">
+              <div className="absolute bottom-20 left-2 right-2 sm:right-auto sm:w-80 p-3 bg-white border border-[#EFECE6] rounded-2xl shadow-xl z-30 grid grid-cols-6 sm:grid-cols-8 gap-2">
                 {EMOJI_LIST.map((em) => (
                   <button
                     key={em}
@@ -2798,7 +2892,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       handleInputTextChange(inputText + em);
                       setShowEmojiPicker(false);
                     }}
-                    className="text-lg p-1.5 hover:scale-125 transition-transform rounded-lg hover:bg-[#FAF7F2]"
+                    className="min-h-[40px] text-lg p-1.5 hover:scale-125 transition-transform rounded-lg hover:bg-[#FAF7F2]"
                   >
                     {em}
                   </button>
@@ -2808,7 +2902,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
             {/* Popover GIF Picker */}
             {showGifPicker && (
-              <div className="absolute bottom-20 left-12 p-3 bg-white border border-[#EFECE6] rounded-2xl shadow-xl z-30 w-72 max-h-60 overflow-y-auto">
+              <div className="absolute bottom-20 left-2 right-2 sm:left-12 sm:right-auto sm:w-72 p-3 bg-white border border-[#EFECE6] rounded-2xl shadow-xl z-30 max-h-60 overflow-y-auto">
                 <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#EFECE6]">
                   <span className="text-xs font-bold text-[#1C1917]">
                     Pick a GIF
@@ -2913,7 +3007,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 </div>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5 sm:gap-2">
+              <div className="flex items-center gap-1.5 sm:gap-2 w-full min-w-0">
                 {/* Media Picker Button (From Phone/Folders) */}
                 <input
                   type="file"
@@ -2954,28 +3048,42 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   <Smile size={18} className="text-[#0D9488]" />
                 </button>
 
-                {/* GIF button */}
+                {/* GIF button (visible on >= 640px so 360px mobile input box has generous width) */}
                 <button
                   type="button"
                   onClick={() => {
                     setShowGifPicker((p) => !p);
                     setShowEmojiPicker(false);
                   }}
-                  className="min-w-[44px] min-h-[44px] px-2.5 rounded-2xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-xs font-extrabold text-[#1C1917] flex items-center justify-center transition shrink-0"
+                  className="hidden sm:flex min-w-[44px] min-h-[44px] px-2.5 rounded-2xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-xs font-extrabold text-[#1C1917] items-center justify-center transition shrink-0"
                   title="Add GIF"
                 >
                   GIF
                 </button>
 
-                {/* Large, Easy-to-Tap Text Input Field */}
+                {/* Large, Easy-to-Tap Text Input Field (16px minimum to prevent mobile zoom) */}
                 <input
+                  ref={chatInputRef}
                   type="text"
                   value={inputText}
                   onChange={(e) => handleInputTextChange(e.target.value)}
+                  onFocus={() => {
+                    isInputFocusedRef.current = true;
+                    window.setTimeout(() => {
+                      window.visualViewport?.dispatchEvent(new Event('resize'));
+                      if (messagesListRef.current) {
+                        messagesListRef.current.scrollTop = messagesListRef.current.scrollHeight;
+                      }
+                    }, 120);
+                  }}
                   onBlur={() => {
+                    isInputFocusedRef.current = false;
                     if (isCurrentlyTypingRef.current) {
                       broadcastTypingStatus(false);
                     }
+                    window.setTimeout(() => {
+                      window.visualViewport?.dispatchEvent(new Event('resize'));
+                    }, 120);
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') handleSendMessage();
@@ -2987,7 +3095,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       ? `Message ${directRecipient.displayName}...`
                       : 'Write a message...'
                   }
-                  className="flex-1 min-w-0 min-h-[48px] py-3 px-4 rounded-2xl bg-[#FAF7F2] border border-[#D6D3CD] text-sm sm:text-base text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/20 transition"
+                  className="flex-1 min-w-0 min-h-[44px] py-2.5 px-3 rounded-2xl bg-[#FAF7F2] border border-[#D6D3CD] text-base text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/20 transition"
                 />
 
                 {/* Send Button — Primary action in chat thread */}
@@ -2995,7 +3103,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   type="button"
                   onClick={() => handleSendMessage()}
                   disabled={!inputText.trim() && !chatMediaUrl}
-                  className="min-w-[48px] min-h-[48px] rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-bold disabled:opacity-40 hover:opacity-95 shadow-xs active:scale-95 transition flex items-center justify-center shrink-0"
+                  className="min-w-[44px] min-h-[44px] rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-bold disabled:opacity-40 hover:opacity-95 shadow-xs active:scale-95 transition flex items-center justify-center shrink-0"
                   title="Send message"
                 >
                   <Send size={18} />
@@ -3036,7 +3144,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               </button>
             </div>
 
-            <div className="space-y-4 max-h-[65vh] overflow-y-auto pr-1">
+            <div className="space-y-4 max-h-[65dvh] overflow-y-auto pr-1">
               {/* Group Name */}
               <div>
                 <label className="block text-xs font-bold text-[#1C1917] mb-1.5">
@@ -3257,7 +3365,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               </button>
             </div>
 
-            <div className="space-y-4 max-h-[65vh] overflow-y-auto pr-1">
+            <div className="space-y-4 max-h-[65dvh] overflow-y-auto pr-1">
               {/* Group Banner & Identity */}
               {!isEditingGroup ? (
                 <div className="flex items-start gap-4 p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6]">

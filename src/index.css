@@ -54,29 +54,32 @@ html[data-theme="sunrise"] {
   --accent-highlight: #EAB308;
 }
 
-/* Dark Mode: sleek obsidian & slate with high contrast and mobile comfort */
-html.dark,
-html[data-theme="dark"] {
-  --bg-canvas: #0B0F19;
-  --bg-surface: #111827;
-  --bg-subtle: #1E293B;
-  --text-primary: #F8FAFC;
-  --text-secondary: #94A3B8;
-  --border-hairline: #1E293B;
-  --accent-primary: #3B82F6;
-  --accent-secondary: #14B8A6;
-  --accent-highlight: #F59E0B;
-}
-
 @layer base {
-  html, body {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
     font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     background-color: var(--bg-canvas) !important;
     color: var(--text-primary) !important;
+    color-scheme: light !important;
     transition: background-color 0.25s ease, color 0.25s ease;
     font-size: 16px;
     line-height: 1.5;
-    -webkit-tap-highlight-color: transparent;
+    width: 100%;
+    max-width: 100%;
+    min-height: 100dvh;
+    overflow-x: hidden;
+  }
+
+  img,
+  video {
+    max-width: 100%;
   }
 
   code, pre, .font-mono {
@@ -84,43 +87,612 @@ html[data-theme="dark"] {
   }
 }
 
-/* Harmonized Dark Mode utility overrides for hardcoded light cards & text across views */
-html.dark .bg-white,
-html.dark .bg-\[\#FFFFFF\],
-html.dark .bg-\[\#ffffff\] {
-  background-color: var(--bg-surface) !important;
+/* ============================================================================
+   MOBILE-FIRST RESPONSIVE LAYOUT ARCHITECTURE (TWO SEPARATE LAYOUTS + TABLET)
+   1. Base (< 768px): Mobile Layout — Single column, full width, bottom nav
+   2. Tablet (768px - 1023px): Simple in-between layout
+   3. Desktop (>= 1024px): Left sidebar + centered feed (600-700px) + right panel
+   ============================================================================ */
+
+/* 1. MOBILE LAYOUT (Base: screens under 768px wide) */
+.wavelink-app-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 100%;
+  min-height: 100dvh;
+  overflow-x: hidden;
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
 }
 
-html.dark .bg-\[\#FAF7F2\],
-html.dark .bg-\[\#F8FAFC\],
-html.dark .bg-\[\#f8fafc\],
-html.dark .bg-stone-50,
-html.dark .bg-slate-50 {
-  background-color: var(--bg-subtle) !important;
+.wavelink-body-workspace {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
-html.dark .text-\[\#1C1917\],
-html.dark .text-\[\#1e293b\],
-html.dark .text-\[\#0F172A\],
-html.dark .text-slate-900,
-html.dark .text-stone-900 {
-  color: var(--text-primary) !important;
+/* Desktop left sidebar never renders on phones or tablets (< 1024px) */
+.wavelink-desktop-sidebar {
+  display: none;
 }
 
-html.dark .text-\[\#78716C\],
-html.dark .text-\[\#57534E\],
-html.dark .text-slate-500,
-html.dark .text-stone-500 {
-  color: var(--text-secondary) !important;
+/* Bottom navigation bar with safe-area padding on mobile & tablet (< 1024px) */
+.wavelink-mobile-bottom-nav {
+  display: block;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-html.dark .border-\[\#EFECE6\],
-html.dark .border-slate-100,
-html.dark .border-slate-200,
-html.dark .border-slate-200\/90,
-html.dark .border-stone-100,
-html.dark .border-stone-200 {
-  border-color: var(--border-hairline) !important;
+/* Main viewport column on mobile (< 768px) */
+.wavelink-main-content {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+  padding-bottom: calc(5rem + env(safe-area-inset-bottom, 0px));
+}
+
+.wavelink-main-content--chat {
+  padding-bottom: calc(4rem + env(safe-area-inset-bottom, 0px));
+}
+
+/* When virtual keyboard is open on mobile (< 768px), hide bottom nav, adjust shell height to visualViewport, and prevent input clipping */
+@media (max-width: 767px) {
+  input,
+  textarea,
+  select,
+  [contenteditable="true"] {
+    scroll-margin-bottom: calc(var(--kb-offset, 0px) + 4.5rem);
+    scroll-margin-top: 4.5rem;
+  }
+
+  html[data-keyboard-open="true"] .wavelink-app-shell {
+    min-height: var(--vv-height, 100dvh);
+  }
+
+  html[data-keyboard-open="true"] .wavelink-mobile-bottom-nav {
+    display: none !important;
+  }
+
+  html[data-keyboard-open="true"] .wavelink-main-content {
+    padding-bottom: max(1rem, var(--kb-offset, 0px)) !important;
+  }
+
+  html[data-keyboard-open="true"] .wavelink-main-content--chat {
+    padding-bottom: 0 !important;
+  }
+}
+
+/* Feed container & vertical stacking on mobile (< 768px) */
+.wavelink-feed-container {
+  width: 100%;
+  max-width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  padding: 0.75rem 0.75rem 1.5rem;
+}
+
+.wavelink-feed-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+  max-width: 100%;
+}
+
+.wavelink-feed-column {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* Right trending/suggestions panel hidden below 1024px */
+.wavelink-right-panel {
+  display: none;
+}
+
+/* Fluid typography with clamp() and >= 16px body text */
+.wavelink-fluid-h1 {
+  font-size: clamp(1.375rem, 1.15rem + 1.1vw, 1.875rem);
+  line-height: 1.25;
+}
+
+.wavelink-fluid-h2 {
+  font-size: clamp(1.125rem, 1.02rem + 0.6vw, 1.5rem);
+  line-height: 1.3;
+}
+
+.wavelink-post-body {
+  font-size: clamp(1rem, 0.98rem + 0.15vw, 1.0625rem);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Chat Mobile Layout (< 768px): Full-width message list, bubbles <= 80%, input bar kept inside visualViewport above keyboard */
+.wavelink-chat-wrapper {
+  width: 100%;
+  max-width: 100%;
+  padding: 0;
+  margin: 0 auto;
+  overflow: hidden;
+}
+
+.wavelink-chat-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 100%;
+  height: var(
+    --chat-visual-height,
+    calc(var(--vv-height, 100dvh) - 3.5rem - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))
+  );
+  max-height: var(
+    --chat-visual-height,
+    calc(var(--vv-height, 100dvh) - 3.5rem - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))
+  );
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 0;
+  transition: height 0.08s ease-out, max-height 0.08s ease-out;
+}
+
+html[data-keyboard-open="true"] .wavelink-chat-shell {
+  height: var(
+    --chat-visual-height,
+    calc(var(--vv-height, 100dvh) - 3.5rem - env(safe-area-inset-top, 0px))
+  );
+  max-height: var(
+    --chat-visual-height,
+    calc(var(--vv-height, 100dvh) - 3.5rem - env(safe-area-inset-top, 0px))
+  );
+}
+
+.wavelink-chat-messages-list {
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 1rem;
+}
+
+.wavelink-chat-bubble-wrap {
+  max-width: 80%;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.wavelink-chat-input-bar {
+  position: sticky;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  max-width: 100%;
+  flex-shrink: 0;
+  z-index: 35;
+  padding-left: max(0.5rem, env(safe-area-inset-left, 0px));
+  padding-right: max(0.5rem, env(safe-area-inset-right, 0px));
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+}
+
+html[data-keyboard-open="true"] .wavelink-chat-input-bar {
+  padding-bottom: 0.375rem;
+}
+
+/* Call Screen Mobile Layout (< 768px): Full-screen 100dvh, remote video fills screen, 100x140px top-right PIP, single-row bottom controls */
+.wavelink-call-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  width: 100%;
+  height: 100dvh;
+  background-color: #0C0A09;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: 0;
+  overflow: hidden;
+}
+
+.wavelink-call-shell {
+  position: relative;
+  width: 100%;
+  height: 100dvh;
+  max-height: 100dvh;
+  background-color: #0C0A09;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  overflow: hidden;
+  border-radius: 0;
+  border: none;
+}
+
+.wavelink-call-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  padding: max(0.75rem, env(safe-area-inset-top, 0px)) 1rem 0.75rem;
+  background: linear-gradient(to bottom, rgba(12, 10, 9, 0.82), rgba(12, 10, 9, 0));
+  color: #FFFFFF;
+}
+
+.wavelink-call-stage {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #0C0A09;
+}
+
+.wavelink-call-remote-pane {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wavelink-call-remote-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.wavelink-call-local-pip {
+  position: absolute;
+  top: calc(max(0.75rem, env(safe-area-inset-top, 0px)) + 3.25rem);
+  right: 0.875rem;
+  width: 100px;
+  height: 140px;
+  border-radius: 1rem;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  background-color: #1C1917;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  z-index: 25;
+}
+
+.wavelink-call-local-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.wavelink-call-controls-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  padding: 0.875rem 1rem calc(max(1rem, env(safe-area-inset-bottom, 0px)));
+  background: linear-gradient(to top, rgba(12, 10, 9, 0.88), rgba(12, 10, 9, 0));
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 1.125rem;
+}
+
+.wavelink-call-control-btn {
+  width: 3.25rem;
+  height: 3.25rem;
+  min-width: 52px;
+  min-height: 52px;
+  border-radius: 9999px;
+  border-width: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.safe-area-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* 2. TABLET LAYOUT (768px to 1023px): Simple in-between layout */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .wavelink-feed-container {
+    max-width: 46rem;
+    padding: 1.25rem 1.5rem 2rem;
+  }
+
+  .wavelink-feed-column {
+    max-width: 42rem;
+    margin-left: auto;
+    margin-right: auto;
+    gap: 1.25rem;
+  }
+
+  .wavelink-chat-wrapper {
+    max-width: 64rem;
+    padding: 0.75rem 1rem;
+  }
+
+  .wavelink-chat-shell {
+    flex-direction: row;
+    height: calc(100dvh - 9.25rem - env(safe-area-inset-bottom, 0px));
+    max-height: calc(100dvh - 9.25rem - env(safe-area-inset-bottom, 0px));
+    border-radius: 1.5rem;
+  }
+
+  .wavelink-chat-messages-list {
+    padding-bottom: 1.5rem;
+  }
+
+  .wavelink-chat-bubble-wrap {
+    max-width: 75%;
+  }
+
+  .wavelink-chat-input-bar {
+    position: sticky;
+    bottom: 0;
+    padding-bottom: 0.75rem;
+  }
+
+  .wavelink-call-overlay {
+    padding: 1.25rem;
+    background-color: rgba(28, 25, 23, 0.75);
+    backdrop-filter: blur(12px);
+    align-items: center;
+  }
+
+  .wavelink-call-shell {
+    max-width: 48rem;
+    height: auto;
+    max-height: 90dvh;
+    background-color: #FFFFFF;
+    border-radius: 1.5rem;
+    border: 1px solid #EFECE6;
+  }
+
+  .wavelink-call-header {
+    position: relative;
+    padding: 1rem 1.5rem;
+    background: #FAF7F2;
+    color: #1C1917;
+    border-bottom: 1px solid #EFECE6;
+  }
+
+  .wavelink-call-stage {
+    padding: 1rem;
+    min-height: 24rem;
+    background-color: #F5F1EA;
+  }
+
+  .wavelink-call-remote-pane {
+    height: 22rem;
+    border-radius: 1.25rem;
+    background-color: #0C0A09;
+  }
+
+  .wavelink-call-local-pip {
+    top: auto;
+    bottom: 1rem;
+    right: 1rem;
+    width: 160px;
+    height: 110px;
+  }
+
+  .wavelink-call-controls-bar {
+    position: relative;
+    padding: 1rem 1.5rem;
+    background: #FAF7F2;
+    border-top: 1px solid #EFECE6;
+    justify-content: center;
+    gap: 1.25rem;
+  }
+}
+
+/* 3. DESKTOP LAYOUT (1024px and up): Strictly scoped inside min-width: 1024px */
+@media (min-width: 1024px) {
+  .wavelink-body-workspace {
+    flex-direction: row;
+    align-items: flex-start;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .wavelink-desktop-sidebar {
+    display: block;
+    width: 16rem; /* ~256px full expanded width */
+    flex-shrink: 0;
+    position: sticky;
+    top: 3.5rem;
+    height: calc(100dvh - 3.5rem);
+    z-index: 30;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-desktop-sidebar--expanded {
+    width: 16rem; /* 256px */
+  }
+
+  .wavelink-desktop-sidebar--collapsed {
+    width: 4.5rem; /* 72px icon-only rail (within 64px–80px) */
+  }
+
+  .wavelink-mobile-bottom-nav {
+    display: none !important;
+  }
+
+  .wavelink-main-content,
+  .wavelink-main-content--chat {
+    flex: 1 1 0%;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    padding-bottom: 2rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-feed-container {
+    width: 100%;
+    max-width: 100%;
+    padding: 1.5rem 2rem 2.5rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-feed-row {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: center;
+    width: 100%;
+    gap: 1.5rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-feed-column {
+    flex: 1 1 0%;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    margin-left: auto;
+    margin-right: auto;
+    gap: 1.5rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-right-panel {
+    display: block;
+    width: 20rem; /* 320px expanded */
+    flex-shrink: 0;
+    position: sticky;
+    top: 4.5rem;
+    height: calc(100dvh - 5rem);
+    overflow: visible;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-right-panel--expanded {
+    width: 20rem; /* 320px */
+  }
+
+  .wavelink-right-panel--collapsed {
+    width: 3.75rem; /* 60px slim vertical strip */
+  }
+
+  .wavelink-chat-wrapper {
+    width: 100%;
+    max-width: 100%;
+    padding: 1rem 1.5rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-chat-shell {
+    flex-direction: row;
+    height: calc(100dvh - 6.5rem);
+    max-height: calc(100dvh - 6.5rem);
+    border-radius: 1.5rem;
+  }
+
+  .wavelink-chat-messages-list {
+    padding-bottom: 1.5rem;
+  }
+
+  .wavelink-chat-bubble-wrap {
+    max-width: 70%;
+  }
+
+  .wavelink-chat-input-bar {
+    position: sticky;
+    bottom: 0;
+    padding-bottom: 0.75rem;
+  }
+
+  /* Desktop Call Layout: Centered modal with side-by-side Remote & Local video panes */
+  .wavelink-call-overlay {
+    padding: 1.5rem;
+    background-color: rgba(28, 25, 23, 0.75);
+    backdrop-filter: blur(12px);
+    align-items: center;
+  }
+
+  .wavelink-call-shell {
+    max-width: 60rem;
+    height: auto;
+    max-height: 90dvh;
+    background-color: #FFFFFF;
+    border-radius: 1.75rem;
+    border: 1px solid #EFECE6;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
+  }
+
+  .wavelink-call-header {
+    position: relative;
+    padding: 1rem 1.5rem;
+    background: #FAF7F2;
+    color: #1C1917;
+    border-bottom: 1px solid #EFECE6;
+  }
+
+  .wavelink-call-stage {
+    padding: 1.25rem 1.5rem;
+    background-color: #F5F1EA;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 1.25rem;
+    align-items: stretch;
+    min-height: 25rem;
+  }
+
+  .wavelink-call-remote-pane {
+    height: 24rem;
+    border-radius: 1.5rem;
+    background-color: #0C0A09;
+    border: 2px solid rgba(37, 99, 235, 0.2);
+  }
+
+  .wavelink-call-local-pip {
+    position: relative;
+    top: auto;
+    right: auto;
+    width: 100%;
+    height: 24rem;
+    border-radius: 1.5rem;
+    border: 2px solid rgba(13, 148, 136, 0.25);
+    box-shadow: none;
+  }
+
+  .wavelink-call-controls-bar {
+    position: relative;
+    padding: 1rem 1.5rem;
+    background: #FAF7F2;
+    border-top: 1px solid #EFECE6;
+    justify-content: center;
+    gap: 1.25rem;
+  }
 }
 
 /* Ensure app canvas and surfaces respond smoothly to the active light theme */
@@ -294,4 +866,65 @@ html[data-battery-saver="true"] [class*="backdrop-blur"] {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
+
+/* ============================================================================
+   CREATE STUDIO: MOBILE-FIRST (<768px) & DESKTOP (>=1024px) ISOLATED LAYOUTS
+   ============================================================================ */
+.wavelink-studio-shell {
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto;
+  padding: 0.75rem 0.75rem calc(5.5rem + env(safe-area-inset-bottom, 0px));
+  overflow-x: hidden;
+}
+
+.wavelink-studio-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  width: 100%;
+}
+
+.wavelink-studio-preview-column,
+.wavelink-studio-controls-column {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+}
+
+.wavelink-studio-tool-strip {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.375rem;
+  width: 100%;
+}
+
+.wavelink-inpost-player {
+  width: 100%;
+  max-width: 100%;
+}
+
+@media (min-width: 768px) and (max-width: 1023px) {
+  .wavelink-studio-shell {
+    max-width: 44rem;
+    padding: 1.25rem 1.25rem calc(5.5rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+@media (min-width: 1024px) {
+  .wavelink-studio-shell {
+    max-width: 72rem;
+    padding: 1.5rem 2rem 3rem;
+  }
+
+  .wavelink-studio-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: 1.75rem;
+    align-items: start;
+  }
+}
+
 

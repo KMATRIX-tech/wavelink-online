@@ -4,6 +4,7 @@ import { db, handleFirestoreError, OperationType } from '../firebase';
 import { collection, query, orderBy, onSnapshot, where } from 'firebase/firestore';
 import { UserProfile } from '../types';
 import { CrystalBadge } from './CrystalBadge';
+import { UserDirectorySkeleton } from './PostSkeleton';
 import { Users, Search, MessageSquare, Shield, AlertTriangle, ShieldAlert, Lock, Star, Sparkles, X, UserPlus, Check } from 'lucide-react';
 import { isSuperAdminEmail, ADMIN_EMAIL } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
@@ -72,6 +73,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
   }, [currentUser]);
 
   useEffect(() => {
+    setIsLoading(true);
     const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
     const unsub = onSnapshot(
       q,
@@ -117,8 +119,13 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
             <Users size={13} />
             <span>Community Directory</span>
           </div>
-          <h2 className="text-2xl font-extrabold text-[#1C1917]">
-            WaveLink Members ({users.length})
+          <h2 className="text-2xl font-extrabold text-[#1C1917] flex items-center gap-2">
+            <span>WaveLink Members</span>
+            {isLoading ? (
+              <span className="inline-block h-6 w-12 rounded-lg bg-stone-200 animate-pulse" />
+            ) : (
+              <span>({users.length})</span>
+            )}
           </h2>
           <p className="text-xs sm:text-sm text-[#57534E] mt-1">
             Real registered members across the network. Zero bot profiles or artificial activity.
@@ -139,7 +146,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
       </div>
 
       {isLoading ? (
-        <div className="py-16 text-center text-xs font-medium text-[#57534E]">Loading member directory...</div>
+        <UserDirectorySkeleton count={6} />
       ) : filteredUsers.length === 0 ? (
         <div className="text-center py-16 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6">
           <Users size={32} className="mx-auto text-[#57534E] mb-2" />

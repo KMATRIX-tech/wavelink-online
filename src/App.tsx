@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { db, testConnection } from './firebase';
@@ -13,6 +13,7 @@ import { triggerHaptic } from './utils/haptics';
 import { ActiveTab, CallRecipient } from './types';
 import { AuthPage } from './components/AuthPage';
 import { TopHeader } from './components/TopHeader';
+import { Sidebar } from './components/Sidebar';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { WarningBanner } from './components/WarningBanner';
 import { BannedView } from './components/BannedView';
@@ -29,6 +30,7 @@ import { MonetizationHub } from './components/MonetizationHub';
 import { CallingModal } from './components/CallingModal';
 import { WelinkAssistantDrawer } from './components/WelinkAssistantDrawer';
 import { SparkUploadQueueBanner } from './components/SparkUploadQueueBanner';
+import { VideoUploadProgressChip } from './components/VideoUploadProgressChip';
 import { Waves, PhoneCall, PhoneOff, Video } from 'lucide-react';
 
 interface IncomingCallData {
@@ -38,6 +40,7 @@ interface IncomingCallData {
   callerPhotoURL?: string;
   callType: 'video' | 'voice';
   offer?: any;
+  createdAt?: string;
 }
 
 function MainApp() {
@@ -78,6 +81,16 @@ function MainApp() {
   const [isWelinkOpen, setIsWelinkOpen] = useState(false);
   const [welinkInitialMode, setWelinkInitialMode] = useState<'chat' | 'image' | 'voice'>('chat');
   const [unreadNotificationIds, setUnreadNotificationIds] = useState<string[]>([]);
+
+  const ringtoneStopRef = useRef<(() => void) | null>(null);
+  const handledCallIdsRef = useRef<Set<string>>(new Set());
+
+  const stopIncomingRingtone = useCallback(() => {
+    if (ringtoneStopRef.current) {
+      ringtoneStopRef.current();
+      ringtoneStopRef.current = null;
+    }
+  }, []);
 
   // Global delegated haptic feedback for button and interactive tab interactions
   useEffect(() => {
@@ -157,15 +170,44 @@ function MainApp() {
     recordSystemDomain();
   }, []);
 
+  // Ringtone ONLY for the person receiving the call; stops immediately on accept, decline, or call end
+  const isReceivingRingingCall = Boolean(
+    incomingCall && !activeCall && incomingCall.callerId !== currentUser?.uid
+  );
 
-
-  // Soft pleasant Web Audio Ringtone loop for incoming calls
   useEffect(() => {
-    if (!incomingCall) return;
+    if (!isReceivingRingingCall) {
+      stopIncomingRingtone();
+      return;
+    }
 
     let isPlaying = true;
-    let timer: any = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     let audioCtx: AudioContext | null = null;
+    let activeOscillators: OscillatorNode[] = [];
+
+    const cleanupAudio = () => {
+      isPlaying = false;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      activeOscillators.forEach((osc) => {
+        try {
+          osc.stop();
+          osc.disconnect();
+        } catch {
+          // ignore already stopped
+        }
+      });
+      activeOscillators = [];
+      if (audioCtx && audioCtx.state !== 'closed') {
+        audioCtx.close().catch(() => {});
+      }
+      audioCtx = null;
+    };
+
+    ringtoneStopRef.current = cleanupAudio;
 
     try {
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -175,6 +217,9 @@ function MainApp() {
         const playChime = () => {
           if (!isPlaying || !audioCtx || audioCtx.state === 'closed') return;
           try {
+            if (audioCtx.state === 'suspended') {
+              audioCtx.resume().catch(() => {});
+            }
             const now = audioCtx.currentTime;
             const osc1 = audioCtx.createOscillator();
             const osc2 = audioCtx.createOscillator();
@@ -193,17 +238,20 @@ function MainApp() {
             osc2.connect(gain);
             gain.connect(audioCtx.destination);
 
+            activeOscillators = [osc1, osc2];
             osc1.start(now);
             osc2.start(now + 0.2);
             osc1.stop(now + 1.2);
             osc2.stop(now + 1.2);
 
             triggerHaptic('medium');
-          } catch (e) {
+          } catch {
             // Audio policy exception handling
           }
 
-          timer = setTimeout(playChime, 2600);
+          if (isPlaying) {
+            timer = setTimeout(playChime, 2400);
+          }
         };
 
         playChime();
@@ -213,15 +261,140 @@ function MainApp() {
     }
 
     return () => {
-      isPlaying = false;
-      if (timer) clearTimeout(timer);
-      if (audioCtx && audioCtx.state !== 'closed') {
-        audioCtx.close().catch(() => {});
+      cleanupAudio();
+    };
+  }, [isReceivingRingingCall, stopIncomingRingtone]);
+
+  // 30-second receiver-side auto-timeout in case caller disconnected abruptly while ringing
+  useEffect(() => {
+    if (!incomingCall) return;
+    const targetCallId = incomingCall.callId;
+    const timeout = setTimeout(() => {
+      stopIncomingRingtone();
+      setIncomingCall((prev) => (prev?.callId === targetCallId ? null : prev));
+      updateDoc(doc(db, 'calls', targetCallId), {
+        status: 'no_answer',
+        updatedAt: new Date().toISOString()
+      }).catch(() => {});
+    }, 30000);
+
+    return () => clearTimeout(timeout);
+  }, [incomingCall?.callId, stopIncomingRingtone]);
+
+  // Real-time Firestore listener for calls addressed to the logged-in user (works across all pages/tabs)
+  useEffect(() => {
+    if (!currentUser?.uid) {
+      setIncomingCall(null);
+      return;
+    }
+
+    const processCallSnapshots = (docs: Array<{ id: string; data: () => any }>) => {
+      const now = Date.now();
+      let newestRinging: IncomingCallData | null = null;
+      let newestTime = -Infinity;
+
+      docs.forEach((docSnap) => {
+        const data = docSnap.data();
+        if (!data) return;
+        const callId = docSnap.id;
+        const status = data.status;
+        const parsedTime = data.createdAt ? new Date(data.createdAt).getTime() : now;
+        const createdAtMs = isNaN(parsedTime) ? now : parsedTime;
+        // Tolerate up to 2 minutes of clock skew between caller and receiver devices
+        const ageMs = now - createdAtMs;
+
+        if (
+          status === 'ringing' &&
+          ageMs < 120000 &&
+          !handledCallIdsRef.current.has(callId) &&
+          (data.callerId || data.caller) !== currentUser.uid
+        ) {
+          if (createdAtMs >= newestTime) {
+            newestTime = createdAtMs;
+            newestRinging = {
+              callId,
+              callerId: data.callerId || data.caller,
+              callerName: data.callerName || 'WaveLink Member',
+              callerPhotoURL: data.callerPhotoURL || undefined,
+              callType: (data.type || data.callType) === 'voice' ? 'voice' : 'video',
+              offer: data.offer || undefined,
+              createdAt: data.createdAt
+            };
+          }
+        }
+      });
+
+      if (newestRinging) {
+        setIncomingCall((prev) => {
+          if (prev && prev.callId === newestRinging!.callId) {
+            return { ...prev, offer: newestRinging!.offer || prev.offer };
+          }
+          return newestRinging;
+        });
+      } else {
+        setIncomingCall((prev) => {
+          if (!prev) return null;
+          const matchingDoc = docs.find((d) => d.id === prev.callId);
+          if (matchingDoc) {
+            const st = matchingDoc.data()?.status;
+            if (st && st !== 'ringing') {
+              stopIncomingRingtone();
+              return null;
+            }
+          }
+          return prev;
+        });
       }
     };
-  }, [Boolean(incomingCall)]);
 
-  // Real-time listener for incoming call signals via WebSocket
+    const qByReceiverId = query(
+      collection(db, 'calls'),
+      where('receiverId', '==', currentUser.uid)
+    );
+    const qByReceiver = query(
+      collection(db, 'calls'),
+      where('receiver', '==', currentUser.uid)
+    );
+
+    let docsById: Array<{ id: string; data: () => any }> = [];
+    let docsByReceiver: Array<{ id: string; data: () => any }> = [];
+
+    const mergeAndProcess = () => {
+      const mergedMap = new Map<string, { id: string; data: () => any }>();
+      docsById.forEach((d) => mergedMap.set(d.id, d));
+      docsByReceiver.forEach((d) => mergedMap.set(d.id, d));
+      processCallSnapshots(Array.from(mergedMap.values()));
+    };
+
+    const unsub1 = onSnapshot(
+      qByReceiverId,
+      (snapshot) => {
+        docsById = snapshot.docs;
+        mergeAndProcess();
+      },
+      (err) => {
+        console.warn('Incoming calls (receiverId) listener notice:', err);
+      }
+    );
+
+    const unsub2 = onSnapshot(
+      qByReceiver,
+      (snapshot) => {
+        docsByReceiver = snapshot.docs;
+        mergeAndProcess();
+      },
+      (err) => {
+        console.warn('Incoming calls (receiver) listener notice:', err);
+      }
+    );
+
+    return () => {
+      unsub1();
+      unsub2();
+    };
+  }, [currentUser?.uid, stopIncomingRingtone]);
+
+  // Real-time listener for incoming call signals via WebSocket (instant low-latency supplement)
   useEffect(() => {
     if (!currentUser?.uid) return;
     let isCleanedUp = false;
@@ -247,16 +420,17 @@ function MainApp() {
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
-          if (data.signalType === 'offer') {
-            setIncomingCall({
+          if (data.signalType === 'offer' && !handledCallIdsRef.current.has(data.callId)) {
+            setIncomingCall((prev) => ({
               callId: data.callId,
               callerId: data.senderId,
-              callerName: data.senderName,
-              callerPhotoURL: data.senderPhotoURL,
-              callType: data.callType || 'video',
-              offer: data.sdp
-            });
+              callerName: data.senderName || prev?.callerName || 'WaveLink Member',
+              callerPhotoURL: data.senderPhotoURL || prev?.callerPhotoURL,
+              callType: data.callType || prev?.callType || 'video',
+              offer: data.sdp || prev?.offer
+            }));
           } else if (data.signalType === 'end' || data.signalType === 'declined') {
+            stopIncomingRingtone();
             setIncomingCall((prev) => (prev?.callId === data.callId ? null : prev));
           }
         }
@@ -271,13 +445,16 @@ function MainApp() {
         ws.close();
       }
     };
-  }, [currentUser?.uid]);
+  }, [currentUser?.uid, stopIncomingRingtone]);
 
   const handleOpenCall = (type: 'video' | 'voice', recipient?: CallRecipient) => {
     triggerHaptic('medium');
+    stopIncomingRingtone();
     // Single popup rule: close any open drawer before opening call modal
     setIsWelinkOpen(false);
     const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    // CallingModal (Step 1) acquires local tracks, creates the WebRTC SDP offer, and saves the call document with the offer
     setActiveCall({
       type,
       recipient,
@@ -288,9 +465,13 @@ function MainApp() {
 
   const handleAcceptIncomingCall = () => {
     if (!incomingCall) return;
+    stopIncomingRingtone();
     const { callId, callerId, callerName, callerPhotoURL, callType, offer } = incomingCall;
+    handledCallIdsRef.current.add(callId);
     setIncomingCall(null);
     setIsWelinkOpen(false);
+
+    // CallingModal (Step 2) reads the offer, calls setRemoteDescription, creates the answer, and updates the call document
     setActiveCall({
       type: callType,
       recipient: {
@@ -306,6 +487,18 @@ function MainApp() {
 
   const handleDeclineIncomingCall = () => {
     if (!incomingCall) return;
+    stopIncomingRingtone();
+    const { callId, callerId } = incomingCall;
+    handledCallIdsRef.current.add(callId);
+    setIncomingCall(null);
+
+    // Update Firestore call status to 'declined' so the caller immediately sees "No answer"
+    updateDoc(doc(db, 'calls', callId), {
+      status: 'declined',
+      endedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }).catch(() => {});
+
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
@@ -313,10 +506,10 @@ function MainApp() {
         ws.send(
           JSON.stringify({
             type: 'call:signal',
-            callId: incomingCall.callId,
+            callId,
             senderId: currentUser?.uid,
             senderName: userProfile?.displayName || currentUser?.displayName || 'Waver',
-            targetUserId: incomingCall.callerId,
+            targetUserId: callerId,
             signalType: 'declined'
           })
         );
@@ -325,7 +518,6 @@ function MainApp() {
     } catch {
       // ws send error
     }
-    setIncomingCall(null);
   };
 
   const handleOpenWelink = (mode: 'chat' | 'image' | 'voice' = 'chat') => {
@@ -338,14 +530,14 @@ function MainApp() {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center bg-[var(--bg-canvas)] text-[var(--text-primary)] px-4">
         <div className="p-4 rounded-3xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white shadow-lg mb-4 animate-bounce">
           <Waves size={36} />
         </div>
         <h2 className="text-xl font-extrabold tracking-tight text-[#1C1917]">
           WaveLink
         </h2>
-        <p className="text-xs text-[#78716C] mt-1 font-medium">
+        <p className="text-sm text-[#78716C] mt-1 font-medium text-center">
           Opening your welcoming community space...
         </p>
       </div>
@@ -361,7 +553,7 @@ function MainApp() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)] antialiased transition-colors duration-300">
+    <div className="wavelink-app-shell bg-[var(--bg-canvas)] text-[var(--text-primary)] antialiased transition-colors duration-300">
       {/* Top in-app warning notice if issued by admin */}
       <WarningBanner />
 
@@ -379,55 +571,70 @@ function MainApp() {
         }}
       />
 
-      {/* Main Body View */}
-      <main
-        className={`flex-1 w-full max-w-full overflow-x-hidden ${
-          activeTab === 'chat' ? 'pb-18' : 'pb-24'
-        }`}
-      >
-        {activeTab === 'feed' && (
-          <FeedView
-            onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
-            initialFilterTag={selectedHashtag}
-            onClearFilterTag={() => setSelectedHashtag(null)}
-            onOpenWelink={handleOpenWelink}
-            onStartChat={handleStartChatWithUser}
-          />
-        )}
-        {activeTab === 'studio' && (
-          <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
-        )}
-        {activeTab === 'videos' && (
-          <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
-        )}
-        {activeTab === 'announcements' && <AnnouncementsView />}
-        {activeTab === 'chat' && (
-          <ChatChannelsView
-            onOpenCall={handleOpenCall}
-            initialTargetUserId={targetChatUserId}
-          />
-        )}
-        {activeTab === 'directory' && (
-          <UserDirectoryView onStartChat={handleStartChatWithUser} />
-        )}
-        {activeTab === 'analytics' && (
-          <CreatorAnalyticsView onOpenUpgradeModal={() => setActiveTab('settings')} />
-        )}
-        {activeTab === 'monetization' && (
-          <MonetizationHub onNavigateToFeed={() => setActiveTab('feed')} />
-        )}
-        {activeTab === 'admin' && (
-          <AdminDashboard onReturnToFeed={() => setActiveTab('settings')} />
-        )}
-        {activeTab === 'settings' && (
-          <SettingsView onOpenAdminPanel={() => setActiveTab('admin')} />
-        )}
-      </main>
+      {/* Responsive Workspace: Single-Column on Mobile (< 768px) / Left Sidebar + Main View on Desktop (>= 1024px) */}
+      <div className="wavelink-body-workspace">
+        {/* Desktop Left Sidebar Navigation (strictly >= 1024px) */}
+        <Sidebar
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          isOpenMobile={false}
+          onCloseMobile={() => {}}
+          onOpenWelink={() => handleOpenWelink('chat')}
+        />
 
-      {/* Non-blocking Background Spark Upload Queue Progress Tracker */}
+        {/* Main Body View */}
+        <main
+          className={`wavelink-main-content ${
+            activeTab === 'chat' ? 'wavelink-main-content--chat' : ''
+          }`}
+        >
+          {activeTab === 'feed' && (
+            <FeedView
+              onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
+              initialFilterTag={selectedHashtag}
+              onClearFilterTag={() => setSelectedHashtag(null)}
+              onOpenWelink={handleOpenWelink}
+              onStartChat={handleStartChatWithUser}
+            />
+          )}
+          {activeTab === 'studio' && (
+            <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
+          )}
+          {activeTab === 'videos' && (
+            <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
+          )}
+          {activeTab === 'announcements' && <AnnouncementsView />}
+          {activeTab === 'chat' && (
+            <ChatChannelsView
+              onOpenCall={handleOpenCall}
+              initialTargetUserId={targetChatUserId}
+            />
+          )}
+          {activeTab === 'directory' && (
+            <UserDirectoryView onStartChat={handleStartChatWithUser} />
+          )}
+          {activeTab === 'analytics' && (
+            <CreatorAnalyticsView onOpenUpgradeModal={() => setActiveTab('settings')} />
+          )}
+          {activeTab === 'monetization' && (
+            <MonetizationHub onNavigateToFeed={() => setActiveTab('feed')} />
+          )}
+          {activeTab === 'admin' && (
+            <AdminDashboard onReturnToFeed={() => setActiveTab('settings')} />
+          )}
+          {activeTab === 'settings' && (
+            <SettingsView onOpenAdminPanel={() => setActiveTab('admin')} />
+          )}
+        </main>
+      </div>
+
+      {/* Non-blocking Background Spark & Video Upload Queue Progress Trackers */}
       <SparkUploadQueueBanner variant="floating" />
+      {activeTab !== 'feed' && activeTab !== 'studio' && activeTab !== 'videos' && (
+        <VideoUploadProgressChip variant="floating" />
+      )}
 
-      {/* Bottom Tab Bar as the only main navigation */}
+      {/* Bottom Tab Bar on Mobile & Tablet (< 1024px) with safe-area padding */}
       <MobileBottomNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -442,12 +649,12 @@ function MainApp() {
         initialMode={welinkInitialMode}
       />
 
-      {/* Incoming Call Notification Ringing Alert Dialog */}
+      {/* Full-Screen Incoming Call Notification Popup */}
       {incomingCall && !activeCall && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in">
-          <div className="w-full max-w-sm bg-white rounded-3xl p-6 shadow-2xl border border-stone-200 text-center space-y-4">
-            <div className="relative mx-auto w-24 h-24">
-              <div className="absolute inset-0 rounded-full bg-emerald-500/20 animate-ping" />
+        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center p-6 bg-stone-950/90 backdrop-blur-xl animate-fade-in">
+          <div className="w-full max-w-md bg-white rounded-3xl p-8 shadow-2xl border border-stone-200 text-center space-y-6">
+            <div className="relative mx-auto w-28 h-28">
+              <div className="absolute inset-0 rounded-full bg-emerald-500/25 animate-ping" />
               <img
                 src={
                   incomingCall.callerPhotoURL ||
@@ -456,39 +663,39 @@ function MainApp() {
                 alt={incomingCall.callerName}
                 className="w-full h-full rounded-full object-cover ring-4 ring-emerald-500 shadow-lg relative bg-white"
               />
-              <div className="absolute -bottom-1 -right-1 p-2 rounded-full bg-emerald-500 text-white shadow-md">
-                {incomingCall.callType === 'video' ? <Video size={16} /> : <PhoneCall size={16} />}
+              <div className="absolute -bottom-1 -right-1 p-2.5 rounded-full bg-emerald-500 text-white shadow-md">
+                {incomingCall.callType === 'video' ? <Video size={18} /> : <PhoneCall size={18} />}
               </div>
             </div>
 
             <div>
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-extrabold uppercase tracking-wider mb-2">
+              <span className="inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-extrabold uppercase tracking-wider mb-2">
                 <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                 <span>Incoming {incomingCall.callType === 'video' ? 'Video' : 'Voice'} Call</span>
               </span>
-              <h3 className="text-xl font-black text-stone-900 tracking-tight">
+              <h3 className="text-2xl font-black text-stone-900 tracking-tight">
                 {incomingCall.callerName}
               </h3>
-              <p className="text-xs text-stone-500 mt-1">
-                Wants to connect with you via live {incomingCall.callType} call!
+              <p className="text-xs sm:text-sm text-stone-500 mt-1">
+                Calling you on WaveLink • Tap Accept to connect
               </p>
             </div>
 
-            <div className="grid grid-cols-2 gap-3 pt-2">
+            <div className="grid grid-cols-2 gap-4 pt-2">
               <button
                 type="button"
                 onClick={handleDeclineIncomingCall}
-                className="min-h-[44px] py-3 px-4 rounded-2xl bg-stone-100 hover:bg-stone-200 text-rose-600 font-extrabold text-xs flex items-center justify-center gap-1.5 transition active:scale-95"
+                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95"
               >
-                <PhoneOff size={16} />
+                <PhoneOff size={18} />
                 <span>Decline</span>
               </button>
               <button
                 type="button"
                 onClick={handleAcceptIncomingCall}
-                className="min-h-[44px] py-3 px-4 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-600/30 transition active:scale-95 animate-pulse"
+                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition active:scale-95 animate-pulse"
               >
-                <PhoneCall size={16} />
+                <PhoneCall size={18} />
                 <span>Accept</span>
               </button>
             </div>

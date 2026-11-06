@@ -2,15 +2,13 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Play,
   Pause,
-  Music,
   Volume2,
   VolumeX,
   Disc,
-  Radio,
-  Sparkles
+  RotateCcw,
 } from 'lucide-react';
 
-interface SongPlayerCardProps {
+export interface SongPlayerCardProps {
   title: string;
   artist: string;
   albumArt?: string;
@@ -18,9 +16,12 @@ interface SongPlayerCardProps {
   albumName?: string;
   compact?: boolean;
   autoPlayOnVisible?: boolean;
+  defaultMuted?: boolean;
+  startTime?: number;
+  volume?: number;
 }
 
-// Global active audio coordinator so only one soundtrack plays at a time across the entire app
+// Global coordinator ensuring only ONE post plays audio at a time across the entire app
 let activeGlobalAudio: HTMLAudioElement | null = null;
 let stopActiveGlobalAudio: (() => void) | null = null;
 
@@ -29,83 +30,127 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
   artist,
   albumArt,
   previewUrl,
-  albumName,
   compact = false,
-  autoPlayOnVisible = true
+  autoPlayOnVisible = true,
+  defaultMuted = false,
+  startTime = 0,
+  volume = 85,
 }) => {
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [hasEnded, setHasEnded] = useState(false);
+  const [currentTime, setCurrentTime] = useState(startTime || 0);
   const [duration, setDuration] = useState(30);
-  const [isMuted, setIsMuted] = useState(false);
-  const [isAutoplayTriggered, setIsAutoplayTriggered] = useState(false);
+  const [isMuted, setIsMuted] = useState(defaultMuted);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const manuallyPausedRef = useRef<boolean>(false);
+  const startOffset = Math.max(0, Number(startTime) || 0);
+  const normalizedVolume = Math.max(0, Math.min(1, (Number(volume) || 85) / 100));
 
-  // Initialize or get the audio element
   const getOrCreateAudio = useCallback((): HTMLAudioElement => {
-    if (!audioRef.current) {
+    if (!audioRef.current || audioRef.current.src !== previewUrl) {
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
       const audio = new Audio(previewUrl);
-      audio.preload = 'auto';
+      audio.preload = 'metadata';
+      audio.volume = normalizedVolume;
+      audio.muted = isMuted;
       audioRef.current = audio;
+
+      audio.onloadedmetadata = () => {
+        if (audio.duration && !isNaN(audio.duration) && isFinite(audio.duration)) {
+          setDuration(audio.duration);
+          if (startOffset > 0 && startOffset < audio.duration) {
+            audio.currentTime = startOffset;
+            setCurrentTime(startOffset);
+          }
+        }
+      };
 
       audio.ontimeupdate = () => {
         setCurrentTime(audio.currentTime);
-        if (audio.duration && !isNaN(audio.duration)) {
+        if (audio.duration && !isNaN(audio.duration) && isFinite(audio.duration)) {
           setDuration(audio.duration);
         }
       };
 
       audio.onended = () => {
         setIsPlaying(false);
-        setCurrentTime(0);
+        setHasEnded(true);
       };
 
-      audio.onerror = (e) => {
-        console.warn('Audio stream error:', e);
+      audio.onerror = () => {
         setIsPlaying(false);
       };
+    } else {
+      audioRef.current.volume = normalizedVolume;
     }
     return audioRef.current;
-  }, [previewUrl]);
+  }, [previewUrl, normalizedVolume, isMuted, startOffset]);
 
-  // Play audio helper with global coordinator
-  const playAudio = useCallback(() => {
-    const audio = getOrCreateAudio();
-
-    if (activeGlobalAudio && activeGlobalAudio !== audio) {
-      activeGlobalAudio.pause();
-      if (stopActiveGlobalAudio) stopActiveGlobalAudio();
+  // Sync volume & mute changes live
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = normalizedVolume;
+      audioRef.current.muted = isMuted;
     }
+  }, [normalizedVolume, isMuted]);
 
-    activeGlobalAudio = audio;
-    stopActiveGlobalAudio = () => setIsPlaying(false);
+  const playAudio = useCallback(
+    (fromReplay = false) => {
+      const audio = getOrCreateAudio();
 
-    const playPromise = audio.play();
-    if (playPromise !== undefined) {
-      playPromise
-        .then(() => {
-          setIsPlaying(true);
-        })
-        .catch((err) => {
-          console.log('Autoplay waiting for user gesture or policy:', err);
-          // If browser blocked unmuted autoplay before any gesture on the page,
-          // listen for the first touch/click anywhere on document and resume immediately!
-          const unlockHandler = () => {
-            if (!manuallyPausedRef.current && audioRef.current) {
-              audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
+      // Stop any other post's audio so only one post plays at a time
+      if (activeGlobalAudio && activeGlobalAudio !== audio) {
+        activeGlobalAudio.pause();
+        if (stopActiveGlobalAudio) stopActiveGlobalAudio();
+      }
+
+      if (fromReplay || hasEnded || (audio.duration && audio.currentTime >= audio.duration - 0.2)) {
+        const targetStart =
+          audio.duration && startOffset < audio.duration ? startOffset : 0;
+        try {
+          audio.currentTime = targetStart;
+          setCurrentTime(targetStart);
+        } catch {
+          // ignore
+        }
+        setHasEnded(false);
+      }
+
+      activeGlobalAudio = audio;
+      stopActiveGlobalAudio = () => setIsPlaying(false);
+
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            setIsPlaying(true);
+            setHasEnded(false);
+          })
+          .catch(() => {
+            // If browser blocks unmuted autoplay before user interaction, fall back to muted autoplay with tap-to-unmute
+            if (!audio.muted) {
+              audio.muted = true;
+              setIsMuted(true);
+              audio
+                .play()
+                .then(() => {
+                  setIsPlaying(true);
+                  setHasEnded(false);
+                })
+                .catch(() => {
+                  setIsPlaying(false);
+                });
             }
-            window.removeEventListener('click', unlockHandler);
-            window.removeEventListener('touchstart', unlockHandler);
-          };
-          window.addEventListener('click', unlockHandler, { once: true });
-          window.addEventListener('touchstart', unlockHandler, { once: true });
-        });
-    }
-  }, [getOrCreateAudio]);
+          });
+      }
+    },
+    [getOrCreateAudio, hasEnded, startOffset]
+  );
 
-  // Pause audio helper
   const pauseAudio = useCallback(() => {
     if (audioRef.current) {
       audioRef.current.pause();
@@ -117,18 +162,18 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
   useEffect(() => {
     return () => {
       if (audioRef.current) {
+        if (activeGlobalAudio === audioRef.current) {
+          activeGlobalAudio = null;
+          stopActiveGlobalAudio = null;
+        }
         audioRef.current.pause();
         audioRef.current.src = '';
         audioRef.current = null;
       }
-      if (activeGlobalAudio === audioRef.current) {
-        activeGlobalAudio = null;
-        stopActiveGlobalAudio = null;
-      }
     };
   }, []);
 
-  // IntersectionObserver: when user scrolls and reaches this post, automatically play the song!
+  // Auto-play when post scrolls into view; pause when it scrolls away
   useEffect(() => {
     if (!autoPlayOnVisible || !cardRef.current) return;
 
@@ -136,197 +181,187 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
       (entries) => {
         const [entry] = entries;
         if (entry.isIntersecting) {
-          // User reached the post
-          setIsAutoplayTriggered(true);
-          if (!manuallyPausedRef.current) {
-            playAudio();
+          if (!manuallyPausedRef.current && !hasEnded) {
+            playAudio(false);
           }
         } else {
-          // User scrolled away from post -> pause automatically so songs don't collide
           pauseAudio();
-          // Reset manual pause flag when scrolling out so when they come back later it plays again
           manuallyPausedRef.current = false;
         }
       },
       {
-        threshold: 0.5, // Triggers when at least 50% of the post/song card is visible in viewport
-        rootMargin: '0px 0px -50px 0px'
+        threshold: 0.55,
+        rootMargin: '0px 0px -40px 0px',
       }
     );
 
     observer.observe(cardRef.current);
+    return () => observer.disconnect();
+  }, [autoPlayOnVisible, hasEnded, playAudio, pauseAudio]);
 
-    return () => {
-      observer.disconnect();
-    };
-  }, [autoPlayOnVisible, playAudio, pauseAudio]);
-
-  const handleTogglePlay = (e: React.MouseEvent) => {
+  const handleTogglePlayOrReplay = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (hasEnded) {
+      manuallyPausedRef.current = false;
+      playAudio(true);
+      return;
+    }
     if (isPlaying) {
       manuallyPausedRef.current = true;
       pauseAudio();
     } else {
       manuallyPausedRef.current = false;
-      playAudio();
+      playAudio(false);
     }
   };
 
   const handleToggleMute = (e: React.MouseEvent) => {
     e.stopPropagation();
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
     if (audioRef.current) {
-      audioRef.current.muted = !isMuted;
-      setIsMuted(!isMuted);
+      audioRef.current.muted = nextMuted;
     }
   };
 
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
     e.stopPropagation();
-    if (!audioRef.current) return;
+    const audio = getOrCreateAudio();
     const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const ratio = Math.max(0, Math.min(1, clickX / rect.width));
-    const newTime = ratio * (duration || 30);
-    audioRef.current.currentTime = newTime;
-    setCurrentTime(newTime);
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const total = duration > 0 ? duration : 30;
+    const newTime = ratio * total;
+    try {
+      audio.currentTime = newTime;
+      setCurrentTime(newTime);
+      if (hasEnded && newTime < total - 0.5) {
+        setHasEnded(false);
+      }
+    } catch {
+      // ignore
+    }
   };
 
-  const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const progressPercent =
+    duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
 
-  if (compact) {
-    return (
-      <div
-        ref={cardRef}
-        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-50 border border-blue-200 shadow-2xs"
-      >
-        <button
-          type="button"
-          onClick={handleTogglePlay}
-          className="w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shrink-0 hover:bg-[#1D4ED8] transition active:scale-95"
-        >
-          {isPlaying ? <Pause size={10} /> : <Play size={10} className="ml-0.5 fill-white" />}
-        </button>
-        <span className="text-xs font-bold text-[#1C1917] truncate max-w-[140px]">
-          {title}
-        </span>
-        <span className="text-[11px] font-medium text-[#2563EB] truncate max-w-[90px]">
-          • {artist}
-        </span>
-      </div>
-    );
-  }
+  const formatTime = (sec: number) => {
+    const s = Math.max(0, Math.floor(sec));
+    const mins = Math.floor(s / 60);
+    const rem = s % 60;
+    return `${mins}:${rem.toString().padStart(2, '0')}`;
+  };
 
   return (
     <div
       ref={cardRef}
-      className={`relative overflow-hidden rounded-2xl p-3.5 sm:p-4 bg-[#FAF7F2] border transition duration-300 ${
+      className={`wavelink-inpost-player ${
+        compact ? 'py-2 px-3' : 'py-2.5 px-3.5'
+      } rounded-2xl bg-[#FAF7F2] border transition-all ${
         isPlaying
-          ? 'border-[#2563EB] shadow-sm'
-          : 'border-[#EFECE6] shadow-2xs hover:border-[#2563EB]/40'
+          ? 'border-[#2563EB]/60 shadow-2xs'
+          : 'border-[#EFECE6] hover:border-[#2563EB]/30'
       }`}
     >
-      <div className="flex items-center justify-between gap-3">
-        {/* Left: Album Art & Spinning Disc */}
-        <div className="flex items-center gap-3 min-w-0 flex-1">
-          <div className="relative w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-blue-50 border border-[#EFECE6] shadow-2xs">
-            {albumArt ? (
-              <img
-                src={albumArt}
-                alt={title}
-                className={`w-full h-full object-cover transition-transform duration-500 ${
-                  isPlaying ? 'scale-105' : ''
-                }`}
-              />
-            ) : (
-              <div className="w-full h-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] flex items-center justify-center text-white">
-                <Music size={20} />
+      <div className="flex items-center gap-2.5 min-w-0">
+        {/* Play / Pause / Replay Button (>=44px touch target) */}
+        <button
+          type="button"
+          onClick={handleTogglePlayOrReplay}
+          aria-label={hasEnded ? 'Replay track' : isPlaying ? 'Pause track' : 'Play track'}
+          className={`min-h-[44px] ${
+            hasEnded ? 'px-3.5 gap-1.5' : 'min-w-[44px] w-11'
+          } rounded-xl flex items-center justify-center shrink-0 font-bold text-xs transition active:scale-95 cursor-pointer ${
+            hasEnded
+              ? 'bg-[#0D9488] hover:bg-teal-700 text-white shadow-2xs'
+              : isPlaying
+              ? 'bg-[#2563EB] text-white shadow-2xs'
+              : 'bg-white border border-[#EFECE6] text-[#1C1917] hover:border-[#2563EB]'
+          }`}
+        >
+          {hasEnded ? (
+            <>
+              <RotateCcw size={15} />
+              <span>Replay</span>
+            </>
+          ) : isPlaying ? (
+            <Pause size={16} />
+          ) : (
+            <Play size={16} className="ml-0.5 fill-current" />
+          )}
+        </button>
+
+        {/* Spinning Disc + Track Info + Progress Bar */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-2 mb-1.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="relative w-6 h-6 rounded-full overflow-hidden shrink-0 bg-slate-900 flex items-center justify-center border border-[#EFECE6]">
+                {albumArt ? (
+                  <img
+                    src={albumArt}
+                    alt={title}
+                    className={`w-full h-full object-cover ${
+                      isPlaying ? 'animate-spin' : ''
+                    }`}
+                    style={{ animationDuration: '4s' }}
+                  />
+                ) : (
+                  <Disc
+                    size={14}
+                    className={`text-[#2563EB] ${isPlaying ? 'animate-spin' : ''}`}
+                    style={{ animationDuration: '3s' }}
+                  />
+                )}
               </div>
-            )}
+              <Disc
+                size={14}
+                className={`shrink-0 text-[#2563EB] ${isPlaying ? 'animate-spin' : 'opacity-60'}`}
+                style={{ animationDuration: '3s' }}
+              />
+              <p className="text-xs font-bold text-[#1C1917] truncate">
+                {title}
+                {artist ? (
+                  <span className="font-medium text-[#57534E]"> · {artist}</span>
+                ) : null}
+              </p>
+            </div>
 
-            {/* Spinning Disc Indicator */}
+            <span className="text-[11px] font-mono text-[#78716C] tabular-nums shrink-0">
+              {formatTime(currentTime)}
+            </span>
+          </div>
+
+          {/* Scrubbable Progress Bar */}
+          <div
+            onClick={handleSeek}
+            role="slider"
+            aria-label="Audio progress"
+            aria-valuemin={0}
+            aria-valuemax={Math.round(duration)}
+            aria-valuenow={Math.round(currentTime)}
+            className="h-1.5 w-full bg-[#EFECE6] rounded-full overflow-hidden cursor-pointer"
+          >
             <div
-              className={`absolute inset-0 bg-black/35 flex items-center justify-center pointer-events-none transition-opacity ${
-                isPlaying ? 'opacity-100' : 'opacity-0'
-              }`}
-            >
-              <Disc size={20} className="text-white/90 animate-spin" style={{ animationDuration: '3s' }} />
-            </div>
-          </div>
-
-          {/* Song Details & Animated Equalizer */}
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-[#2563EB] flex items-center gap-1">
-                <Music size={11} />
-                <span>Track Soundtrack</span>
-              </span>
-
-              {isPlaying && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200 text-[9px] font-extrabold animate-pulse">
-                  <Radio size={9} />
-                  <span>Now Playing</span>
-                </span>
-              )}
-            </div>
-
-            <h4 className="text-xs sm:text-sm font-extrabold text-[#1C1917] truncate mt-0.5">
-              {title}
-            </h4>
-            <p className="text-xs font-semibold text-[#57534E] truncate">
-              {artist}
-              {albumName && <span className="text-[#57534E] font-normal"> • {albumName}</span>}
-            </p>
+              className="h-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] rounded-full transition-all duration-150"
+              style={{ width: `${hasEnded ? 100 : progressPercent}%` }}
+            />
           </div>
         </div>
 
-        {/* Right: Audio Controls */}
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={handleToggleMute}
-            className="p-2 rounded-xl text-[#57534E] hover:text-[#2563EB] hover:bg-white transition"
-            title={isMuted ? 'Unmute' : 'Mute'}
-          >
-            {isMuted ? <VolumeX size={15} className="text-rose-600" /> : <Volume2 size={15} />}
-          </button>
-
-          <button
-            type="button"
-            onClick={handleTogglePlay}
-            className={`w-10 h-10 rounded-2xl flex items-center justify-center transition shadow-xs active:scale-95 ${
-              isPlaying
-                ? 'bg-[#0D9488] hover:bg-teal-700 text-white'
-                : 'bg-[#2563EB] hover:bg-[#1D4ED8] text-white'
-            }`}
-            title={isPlaying ? 'Pause song' : 'Play online soundtrack'}
-          >
-            {isPlaying ? (
-              <Pause size={17} />
-            ) : (
-              <Play size={17} className="fill-white ml-0.5" />
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* Interactive Progress Timeline */}
-      <div
-        onClick={handleSeek}
-        className="mt-2.5 h-1.5 w-full bg-[#EFECE6] rounded-full overflow-hidden cursor-pointer relative group"
-        title="Seek soundtrack"
-      >
-        <div
-          className="h-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] rounded-full transition-all duration-150"
-          style={{ width: `${progressPercent}%` }}
-        />
-      </div>
-
-      <div className="flex items-center justify-between text-[10px] font-mono text-[#57534E] mt-1 tabular-nums">
-        <span>0:{Math.floor(currentTime).toString().padStart(2, '0')}</span>
-        <span className="flex items-center gap-1">
-          <Sparkles size={9} className="text-[#2563EB]" />
-          <span>Auto-plays as you reach post</span>
-        </span>
+        {/* Mute / Unmute Button (>=44px touch target) */}
+        <button
+          type="button"
+          onClick={handleToggleMute}
+          aria-label={isMuted ? 'Unmute music' : 'Mute music'}
+          title={isMuted ? 'Tap to unmute' : 'Mute'}
+          className={`min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center shrink-0 transition active:scale-95 cursor-pointer ${
+            isMuted
+              ? 'bg-amber-50 text-amber-700 border border-amber-200'
+              : 'text-[#57534E] hover:text-[#1C1917] hover:bg-white'
+          }`}
+        >
+          {isMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+        </button>
       </div>
     </div>
   );

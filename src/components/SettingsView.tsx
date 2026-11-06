@@ -47,12 +47,10 @@ import {
   BatteryCharging,
   Zap,
   Lightbulb,
-  UserPlus,
-  Moon,
-  Sun
+  UserPlus
 } from 'lucide-react';
-import { inviteFriends } from '../utils/share';
 
+import { inviteFriends } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
 import { compressImage } from '../utils/mediaStorage';
 import { validateStrongPassword } from '../utils/security';
@@ -191,7 +189,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     deleteMyAccount,
     signOut
   } = useAuth();
-  const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver, isDark, toggleDarkMode, setTheme } = useTheme();
+  const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
 
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>('profile');
   const [selectedLegalDoc, setSelectedLegalDoc] = useState<LegalDocType | null>(null);
@@ -241,6 +239,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
+  const [inviteToast, setInviteToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+  const handleInviteFriends = async () => {
+    try {
+      const res = await inviteFriends();
+      if (res?.method !== 'cancelled') {
+        setInviteToast({ message: 'WhatsApp Invite opened!', type: 'success' });
+        setTimeout(() => setInviteToast(null), 3000);
+      }
+    } catch (err: any) {
+      setInviteToast({ message: err?.message || "Couldn't open WhatsApp", type: 'error' });
+      setTimeout(() => setInviteToast(null), 3000);
+    }
+  };
 
   // Privacy Settings state
   const [privacySettings, setPrivacySettings] = useState<UserPrivacySettings>(() => {
@@ -574,19 +586,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     }
   };
 
-  const [inviteToast, setInviteToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-
-  const handleInviteFriends = () => {
-    try {
-      const res = inviteFriends();
-      setInviteToast({ type: 'success', text: res?.message || 'Invite opened in WhatsApp!' });
-      setTimeout(() => setInviteToast(null), 2800);
-    } catch {
-      setInviteToast({ type: 'error', text: "Couldn't open invite" });
-      setTimeout(() => setInviteToast(null), 2800);
-    }
-  };
-
   const borderOptions: { id: ProBorderEffect; name: string; ringClass: string }[] = [
     { id: 'aura-gold', name: 'Golden Aura ✨', ringClass: 'pro-aura-gold ring-4 ring-amber-400' },
     { id: 'neon-pulse', name: 'Teal Breeze 🌊', ringClass: 'pro-aura-neon ring-4 ring-teal-400' },
@@ -599,12 +598,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     AGREEMENT_SECTIONS.find((s) => s.id === termsAgreement.selectedSection) || AGREEMENT_SECTIONS[0];
 
   return (
-    <div className="max-w-3xl mx-auto py-6 px-4 sm:px-6 space-y-6">
+    <div className="w-full max-w-3xl mx-auto py-4 sm:py-6 px-3 sm:px-6 space-y-5 sm:space-y-6 overflow-x-hidden">
       {/* User Profile Card */}
-      <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-5">
+      <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-5">
         <div className="flex items-start justify-between flex-wrap gap-4">
-          <div className="flex items-center gap-4">
-            <div className="relative">
+          <div className="flex items-center gap-3.5 sm:gap-4 min-w-0">
+            <div className="relative shrink-0">
               <img
                 src={
                   photoURL ||
@@ -620,7 +619,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               />
             </div>
 
-            <div>
+            <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <CrystalBadge
                   email={currentUser?.email}
@@ -635,21 +634,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                   {userProfile?.username || username}
                 </span>
               </div>
-              <p className="text-xs sm:text-sm text-[#78716C] mt-1 max-w-xl">
+              <p className="text-base sm:text-sm text-[#78716C] mt-1 max-w-xl break-words">
                 {userProfile?.bio || bio || 'Connecting on WaveLink 🌊'}
               </p>
               {currentUser?.email && (
-                <p className="text-[11px] text-[#78716C] mt-0.5 font-medium">{currentUser.email}</p>
+                <p className="text-[11px] text-[#78716C] mt-0.5 font-medium truncate">{currentUser.email}</p>
               )}
             </div>
           </div>
 
           {/* WavePoints, Streak & Quick Log Out Button */}
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto">
             <button
               type="button"
               onClick={() => setIsDailyRewardModalOpen(true)}
-              className="px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-2 text-xs font-bold text-[#1C1917] hover:border-amber-300 transition"
+              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-2 text-xs font-bold text-[#1C1917] hover:border-amber-300 transition"
             >
               <Coins size={15} className="text-[#D97706]" />
               <span>{totalWavePoints.toLocaleString()} pts</span>
@@ -659,7 +658,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             <button
               type="button"
               onClick={() => setIsDailyRewardModalOpen(true)}
-              className="px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-1.5 text-xs font-bold text-[#1C1917] hover:border-blue-300 transition"
+              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-1.5 text-xs font-bold text-[#1C1917] hover:border-blue-300 transition"
             >
               <Flame size={15} className="text-[#D97706]" />
               <span>{currentStreak}d streak</span>
@@ -668,8 +667,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             <button
               type="button"
               onClick={handleInviteFriends}
-              className="px-3.5 py-2 rounded-2xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 flex items-center gap-1.5 text-xs font-extrabold transition active:scale-95"
-              title="Invite Friends on WhatsApp"
+              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1.5 text-xs font-bold transition active:scale-95"
+              title="Invite Friends to WaveLink via WhatsApp"
             >
               <UserPlus size={14} className="text-emerald-600" />
               <span>Invite Friends</span>
@@ -679,7 +678,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               type="button"
               onClick={handleLogOut}
               disabled={isLoggingOut}
-              className="px-3.5 py-2 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1.5 text-xs font-extrabold transition active:scale-95 disabled:opacity-50"
+              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1.5 text-xs font-extrabold transition active:scale-95 disabled:opacity-50"
               title="Log Out of WaveLink"
             >
               <LogOut size={14} />
@@ -688,27 +687,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
           </div>
         </div>
 
-        {inviteToast && (
-          <div
-            role="status"
-            aria-live="polite"
-            className={`px-3.5 py-2 rounded-2xl text-xs font-bold flex items-center gap-2 border ${
-              inviteToast.type === 'success'
-                ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                : 'bg-rose-50 text-rose-800 border-rose-200'
-            }`}
-          >
-            {inviteToast.type === 'success' ? (
-              <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
-            ) : (
-              <AlertCircle size={14} className="text-rose-600 shrink-0" />
-            )}
-            <span>{inviteToast.text}</span>
-          </div>
-        )}
-
         {/* Quiet Navigation Rows: WaveLink Pro & Admin Panel (only for admins) */}
         <div className="space-y-2.5 pt-2 border-t border-[var(--border-hairline)]">
+          {/* Invite Friends on WhatsApp Row */}
+          <button
+            type="button"
+            onClick={handleInviteFriends}
+            className="w-full min-h-[54px] px-4 py-3 rounded-2xl bg-emerald-50/70 hover:bg-emerald-100/70 border border-emerald-200/80 flex items-center justify-between gap-3 transition text-left"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
+                <UserPlus size={17} />
+              </div>
+              <div>
+                <span className="text-sm font-bold text-[#1C1917] block">Invite Friends to WaveLink</span>
+                <span className="text-xs text-emerald-800 block">
+                  Share your link directly on WhatsApp or social apps to grow your circle
+                </span>
+              </div>
+            </div>
+            <ChevronRight size={18} className="text-emerald-700 shrink-0" />
+          </button>
           {/* Quiet WaveLink Pro Row */}
           <button
             type="button"
@@ -1899,7 +1898,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             </div>
           </div>
 
-          {/* Appearance Section: Dark Mode + 4 Light Themes saved to Firestore */}
+          {/* Appearance Section: 4 Light Themes saved to Firestore */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <div className="flex items-center gap-2.5">
@@ -1908,43 +1907,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                 </div>
                 <div>
                   <h3 className="font-extrabold text-[#1C1917] text-base">
-                    Appearance &amp; Dark Mode
+                    Appearance
                   </h3>
                   <p className="text-xs text-[#78716C]">
-                    Switch between Dark Mode and Light Themes. Saved across all your devices.
+                    Choose a warm, light theme. Saved to your profile across all your devices.
                   </p>
                 </div>
               </div>
-
-              <button
-                type="button"
-                role="switch"
-                aria-checked={isDark}
-                onClick={toggleDarkMode}
-                className={`min-h-[42px] px-4 py-2 rounded-2xl font-extrabold text-xs flex items-center gap-2 transition cursor-pointer shrink-0 ${
-                  isDark
-                    ? 'bg-[#2563EB] text-white shadow-2xs'
-                    : 'bg-[var(--bg-subtle)] hover:bg-stone-200/70 text-[#1C1917] border border-[var(--border-hairline)]'
-                }`}
-              >
-                {isDark ? <Sun size={14} className="text-amber-300" /> : <Moon size={14} className="text-[#2563EB]" />}
-                <span>{isDark ? 'Dark Mode On (Tap for Light)' : 'Enable Dark Mode'}</span>
-              </button>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {APPEARANCE_THEMES.map((item) => {
-                const isSelected = !isDark && appearanceTheme === item.id;
+                const isSelected = appearanceTheme === item.id;
                 const isLocked = item.proOnly && !isProUser && !isAdmin;
 
                 return (
                   <button
                     key={item.id}
                     type="button"
-                    onClick={() => {
-                      setTheme('light');
-                      handleSelectAppearanceTheme(item.id, item.proOnly);
-                    }}
+                    onClick={() => handleSelectAppearanceTheme(item.id, item.proOnly)}
                     className={`min-h-[68px] p-4 rounded-2xl border text-left transition flex items-center justify-between gap-3 ${
                       isSelected
                         ? 'border-[#2563EB] bg-[var(--bg-subtle)] ring-2 ring-[#2563EB]/15'
@@ -2214,6 +2195,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
           onClose={() => setIsPaymentModalOpen(false)}
           onSuccess={() => setIsPaymentModalOpen(false)}
         />
+      )}
+
+      {/* Small Toast for Invite Friends action */}
+      {inviteToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-2.5 rounded-2xl shadow-xl text-xs font-bold transition-all transform animate-in fade-in slide-in-from-bottom-2 ${
+            inviteToast.type === 'error'
+              ? 'bg-rose-600 text-white shadow-rose-900/20'
+              : 'bg-emerald-800 text-white shadow-emerald-950/30'
+          }`}
+        >
+          {inviteToast.type === 'error' ? (
+            <X size={15} className="shrink-0 text-rose-200" />
+          ) : (
+            <Check size={15} className="shrink-0 text-emerald-300" />
+          )}
+          <span>{inviteToast.message}</span>
+        </div>
       )}
     </div>
   );

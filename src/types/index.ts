@@ -120,16 +120,31 @@ export interface Post {
   authorPhotoURL?: string;
   content: string;
   imageUrl?: string;
+  imageUrls?: string[];
+  aspectRatio?: '1:1' | '4:5' | '9:16';
   videoUrl?: string;
   thumbnailUrl?: string;
+  storagePath?: string;
+  duration?: number;
+  videoDurationSeconds?: number;
+  videoWidth?: number;
+  videoHeight?: number;
   hasVideoChunks?: boolean;
   videoFileName?: string;
+  videoTrimStart?: number;
+  videoTrimEnd?: number;
   mediaType?: 'image' | 'video' | 'none';
   songTitle?: string;
   songArtist?: string;
   songAlbumArt?: string;
   songPreviewUrl?: string;
   songAlbumName?: string;
+  songStartTime?: number;
+  songVolume?: number;
+  audience?: 'public' | 'followers' | 'close_friends';
+  locationTag?: string;
+  allowComments?: boolean;
+  hashtags?: string[];
   likes: string[]; // user IDs
   likesCount: number;
   reactions?: PostReactions;
@@ -165,6 +180,9 @@ export interface OnlineSong {
   previewUrl: string;
   collectionName?: string;
   primaryGenreName?: string;
+  startTime?: number;
+  volume?: number;
+  isCustomUpload?: boolean;
 }
 
 export interface SparkViewerEntry {

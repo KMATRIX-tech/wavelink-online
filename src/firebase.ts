@@ -16,12 +16,123 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export const auth = getAuth(app);
 
-export const storage = getStorage(app);
+export const storage = getStorage(
+  app,
+  firebaseConfig.storageBucket ? `gs://${firebaseConfig.storageBucket}` : undefined
+);
 try {
-  storage.maxUploadRetryTime = 4000;
-  storage.maxOperationRetryTime = 4000;
+  storage.maxUploadRetryTime = 25000;
+  storage.maxOperationRetryTime = 15000;
 } catch {
   // ignore if read-only in environment
+}
+
+/**
+ * Logs the real Firebase Storage / upload error to the console and returns a clear,
+ * human-readable message explaining the exact cause (Storage not enabled, permission denied,
+ * file too big, duration limit exceeded, or network lost).
+ */
+export function formatFirebaseStorageError(
+  error: unknown,
+  context?: {
+    fileSize?: number;
+    maxAllowedSeconds?: number;
+    isProUser?: boolean;
+    storagePath?: string;
+  }
+): string {
+  const errObj = error as {
+    code?: string;
+    message?: string;
+    serverResponse?: string;
+    status_?: number;
+    customData?: { serverResponse?: string };
+  };
+  const code = String(errObj?.code || '');
+  const rawMessage = error instanceof Error ? error.message : String(error || '');
+  const serverResponse = String(
+    errObj?.serverResponse || errObj?.customData?.serverResponse || ''
+  );
+
+  console.error('[WaveLink Video Upload Error]', {
+    code: code || 'unknown',
+    message: rawMessage,
+    serverResponse: serverResponse || undefined,
+    bucket: firebaseConfig.storageBucket,
+    storagePath: context?.storagePath,
+    fileSize: context?.fileSize,
+    isProUser: context?.isProUser,
+    rawError: error
+  });
+
+  if (
+    rawMessage.startsWith('Free users can upload videos up to') ||
+    rawMessage.startsWith('Pro videos can be up to') ||
+    rawMessage.startsWith('Videos can be up to') ||
+    rawMessage.startsWith('File too big:') ||
+    rawMessage.startsWith('This video is ')
+  ) {
+    return rawMessage;
+  }
+
+  if (
+    code === 'storage/unauthorized' ||
+    rawMessage.includes('storage/unauthorized') ||
+    serverResponse.includes('Permission denied') ||
+    serverResponse.includes('403')
+  ) {
+    const limitSec = context?.maxAllowedSeconds || (context?.isProUser ? 90 : 60);
+    return `Permission denied by Firebase Storage rules (storage/unauthorized). Check that you are signed in, uploading to users/{userId}/videos/, and your video is under 100 MB and within the ${limitSec}s ${context?.isProUser ? 'Pro' : 'Free'} duration limit.`;
+  }
+
+  if (
+    code === 'storage/bucket-not-found' ||
+    code === 'storage/project-not-found' ||
+    code === 'storage/no-default-bucket' ||
+    rawMessage.includes('STORAGE_NOT_ENABLED_OR_CORS') ||
+    rawMessage.includes('bucket-not-found') ||
+    serverResponse.includes('404') ||
+    serverResponse.includes('Not Found')
+  ) {
+    return `Firebase Storage is not enabled or bucket "${firebaseConfig.storageBucket}" is not initialized/CORS-configured (${code || 'storage/bucket-unreachable'}). Enable Storage in Firebase Console → Build → Storage and publish storage.rules.`;
+  }
+
+  if (code === 'storage/quota-exceeded' || rawMessage.includes('quota-exceeded')) {
+    return 'Firebase Storage quota exceeded (storage/quota-exceeded). Free up storage space or upgrade your Firebase plan.';
+  }
+
+  if (
+    code === 'storage/EntityTooLarge' ||
+    rawMessage.toLowerCase().includes('too large') ||
+    rawMessage.toLowerCase().includes('entity too large')
+  ) {
+    return 'File too big: this video exceeds the 100 MB maximum upload size allowed by Firebase Storage.';
+  }
+
+  if (
+    code === 'storage/retry-limit-exceeded' ||
+    rawMessage.includes('UPLOAD_TIMEOUT') ||
+    rawMessage.includes('No upload progress') ||
+    rawMessage.toLowerCase().includes('network')
+  ) {
+    return `Network lost or upload timed out reaching Firebase Storage (${code || 'network-timeout'}). Check your internet connection and that Firebase Storage is enabled for "${firebaseConfig.storageBucket}", then tap Retry.`;
+  }
+
+  if (
+    rawMessage.includes('Missing or insufficient permissions') ||
+    code === 'permission-denied'
+  ) {
+    const limitSec = context?.maxAllowedSeconds || (context?.isProUser ? 90 : 60);
+    return `Permission denied by Firestore rules when saving post (permission-denied). Ensure you are signed in and the video duration is within ${limitSec}s.`;
+  }
+
+  if (code === 'storage/unknown' && serverResponse) {
+    return `Firebase Storage error (storage/unknown): ${serverResponse.slice(0, 180)}`;
+  }
+
+  return rawMessage
+    ? `Video upload failed: ${rawMessage}`
+    : 'Video upload failed due to an unexpected Firebase Storage error. Tap Retry to try again.';
 }
 
 // Initialize Firebase App Check when VITE_FIREBASE_APPCHECK_KEY is configured

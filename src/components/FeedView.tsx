@@ -66,24 +66,18 @@ import {
   Mic,
   Flag,
   Ban,
-  Download,
-  Moon,
-  Sun,
-  Loader2,
-  AlertTriangle
+  Download
 } from 'lucide-react';
-import { downloadPost, sharePost } from '../utils/share';
-import { useTheme } from '../context/ThemeContext';
-import {
-  suggestPostCaptions,
-  improvePostDraft,
-  moderatePostContent
-} from '../services/geminiService';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { CreatorTipModal } from './CreatorTipModal';
 import { PostBoostModal } from './PostBoostModal';
 import { RightSidebar } from './RightSidebar';
-import { PostSkeleton } from './PostSkeleton';
+import {
+  PostSkeleton,
+  AnnouncementSkeleton,
+  SuggestedMembersSkeleton,
+  CommentSkeleton
+} from './PostSkeleton';
 import { LegalFooter } from './LegalModals';
 import { sendNotification } from '../services/notificationService';
 import {
@@ -95,13 +89,16 @@ import { sanitizeUserText, SUPPORT_BOT_ID } from '../utils/security';
 import {
   compressImage,
   generateVideoThumbnail,
-  saveVideoPost,
   cloneVideoFileToMemory,
-  validateVideoFileSize,
-  formatVideoFileSize,
-  FREE_MAX_VIDEO_MB,
-  PRO_MAX_VIDEO_MB
+  inspectAndValidateVideoFile,
+  detectFeedMediaType,
+  getMaxVideoDurationSeconds,
+  MAX_VIDEO_DURATION_SECONDS,
+  MAX_VIDEO_RAW_MB,
 } from '../utils/mediaStorage';
+import { enqueueVideoUploadJob, useVideoUploadQueue } from '../services/videoUploadQueue';
+import { VideoUploadProgressChip, VideoUploadingFeedPostList } from './VideoUploadProgressChip';
+import { downloadPost, sharePost } from '../utils/share.js';
 
 const SPONSORED_ADS: Post[] = [
   {
@@ -209,11 +206,20 @@ export const FeedView: React.FC<FeedViewProps> = ({
   // Ads Rule: HIDE if user.isPro === true, user has Blue Star, or user is admin. SHOW only to regular free users.
   const showAds = shouldShowAds(userProfile, isAdmin, isProEffective);
   const isProUser = !showAds;
+  const isProTier = Boolean(isProEffective || isAdmin);
+  const maxVideoSeconds = getMaxVideoDurationSeconds(isProTier);
+  const { jobs: videoUploadJobs } = useVideoUploadQueue();
+  const activeOrFailedVideoJobs = videoUploadJobs.filter(
+    (j) => j.status !== 'completed' && j.status !== 'cancelled'
+  );
 
   const [posts, setPosts] = useState<Post[]>([]);
   const [latestAnnouncement, setLatestAnnouncement] = useState<Announcement | null>(null);
   const [pinnedAnnouncement, setPinnedAnnouncement] = useState<Announcement | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingAnnouncements, setIsLoadingAnnouncements] = useState(true);
+  const [isLoadingSuggested, setIsLoadingSuggested] = useState(true);
+  const [loadingCommentsMap, setLoadingCommentsMap] = useState<Record<string, boolean>>({});
 
   // Post editing state (WaveLink Pro / Admin privilege)
   const [editingPostId, setEditingPostId] = useState<string | null>(null);
@@ -222,18 +228,19 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
 
   // Post creation state for center feed creation box
-  const { isDark, toggleDarkMode } = useTheme();
   const [inlineContent, setInlineContent] = useState('');
   const [inlineMediaFile, setInlineMediaFile] = useState<File | null>(null);
   const [inlineMediaPreview, setInlineMediaPreview] = useState<string | null>(null);
   const [inlineMediaType, setInlineMediaType] = useState<'image' | 'video'>('image');
-  const [compressionBadge, setCompressionBadge] = useState<string | null>(null);
-  const [aiCaptionSuggestions, setAiCaptionSuggestions] = useState<string[]>([]);
-  const [isAiAssisting, setIsAiAssisting] = useState<'captions' | 'improve' | null>(null);
+  const [inlineVideoDuration, setInlineVideoDuration] = useState<number>(0);
+  const [inlineVideoTrimStart, setInlineVideoTrimStart] = useState<number>(0);
+  const [inlineVideoTrimEnd, setInlineVideoTrimEnd] = useState<number>(90);
+  const [inlineVideoNeedsTrim, setInlineVideoNeedsTrim] = useState<boolean>(false);
   const [isSubmittingPost, setIsSubmittingPost] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [postNotice, setPostNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
 
   // Monetization modals, Post Detail reader & Multi-Spark post sharing
   const [tippingPost, setTippingPost] = useState<Post | null>(null);
@@ -251,8 +258,38 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [expandedComments, setExpandedComments] = useState<Record<string, boolean>>({});
   const [commentsMap, setCommentsMap] = useState<Record<string, PostComment[]>>({});
   const [commentInput, setCommentInput] = useState<Record<string, string>>({});
+  const [carouselIndices, setCarouselIndices] = useState<Record<string, number>>({});
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [actionToast, setActionToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [toastNotice, setToastNotice] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const toastTimeoutRef = useRef<any>(null);
+
+  const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    setToastNotice({ message, type });
+    toastTimeoutRef.current = setTimeout(() => {
+      setToastNotice(null);
+    }, 2800);
+  };
+
+  const handleDownloadPost = async (post: Post) => {
+    try {
+      const res = await downloadPost(post);
+      showToast(res?.message || 'Downloaded!', 'success');
+    } catch (err: any) {
+      showToast(err?.message || "Couldn't download", 'error');
+    }
+  };
+
+  const handleSharePost = async (post: Post) => {
+    try {
+      const res = await sharePost(post);
+      if (res?.method !== 'cancelled') {
+        showToast('Shared!', 'success');
+      }
+    } catch (err: any) {
+      showToast(err?.message || "Couldn't share", 'error');
+    }
+  };
 
   // Reaction animation & optimistic state
   const [animatingReactions, setAnimatingReactions] = useState<Record<string, boolean>>({});
@@ -278,7 +315,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
   }, [userProfile?.followingIds]);
 
   useEffect(() => {
-    if (!currentUser?.uid || !showWelcomeFlow) return;
+    if (!currentUser?.uid || !showWelcomeFlow) {
+      setIsLoadingSuggested(false);
+      return;
+    }
+    setIsLoadingSuggested(true);
     const q = query(collection(db, 'users'), limit(6));
     const unsub = onSnapshot(
       q,
@@ -291,8 +332,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
           }
         });
         setSuggestedMembers(list);
+        setIsLoadingSuggested(false);
       },
-      () => {}
+      () => {
+        setIsLoadingSuggested(false);
+      }
     );
     return () => unsub();
   }, [currentUser?.uid, showWelcomeFlow]);
@@ -343,8 +387,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Real-time listener for posts
+  // Real-time listener for posts + immediate event when a video upload completes
   useEffect(() => {
+    setIsLoading(true);
     const postsQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'));
     const unsub = onSnapshot(
       postsQuery,
@@ -362,11 +407,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
       }
     );
 
-    return () => unsub();
+    const handleVideoPostCreated = (ev: Event) => {
+      const created = (ev as CustomEvent<Post>)?.detail;
+      if (created && created.id) {
+        setPosts((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
+      }
+    };
+    window.addEventListener('wavelink:video-post-created', handleVideoPostCreated);
+
+    return () => {
+      unsub();
+      window.removeEventListener('wavelink:video-post-created', handleVideoPostCreated);
+    };
   }, [currentUser?.uid]);
 
   // Fetch announcements for pinned banner and right sidebar
   useEffect(() => {
+    setIsLoadingAnnouncements(true);
     const q = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'));
     const unsub = onSnapshot(
       q,
@@ -380,9 +437,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
         });
         setLatestAnnouncement(latest);
         setPinnedAnnouncement(pinned);
+        setIsLoadingAnnouncements(false);
       },
       (err) => {
         console.warn('Announcements listener notice:', err);
+        setIsLoadingAnnouncements(false);
       }
     );
     return () => unsub();
@@ -405,7 +464,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   // Toggle comments expander
   const toggleComments = (postId: string) => {
-    setExpandedComments((prev) => ({ ...prev, [postId]: !prev[postId] }));
+    setExpandedComments((prev) => {
+      const next = !prev[postId];
+      if (next && commentsMap[postId] === undefined) {
+        setLoadingCommentsMap((lm) => ({ ...lm, [postId]: true }));
+      }
+      return { ...prev, [postId]: next };
+    });
   };
 
   useEffect(() => {
@@ -421,9 +486,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
             const list: PostComment[] = [];
             snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PostComment));
             setCommentsMap((prev) => ({ ...prev, [postId]: list }));
+            setLoadingCommentsMap((prev) => ({ ...prev, [postId]: false }));
           },
           (err) => {
             console.error('Comments error:', err);
+            setLoadingCommentsMap((prev) => ({ ...prev, [postId]: false }));
           }
         );
         unsubscribers.push(unsub);
@@ -555,21 +622,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
       fire: nextFires.length
     };
 
-    // Optimistic local state update so likes/reactions respond in 0ms
-    setPosts((prev) =>
-      prev.map((p) =>
-        p.id === rawPost.id
-          ? {
-              ...p,
-              reactions: updatedReactions,
-              reactionCounts: updatedReactionCounts,
-              likes: nextHearts,
-              likesCount: nextHearts.length
-            }
-          : p
-      )
-    );
-
     try {
       await updateDoc(doc(db, 'posts', rawPost.id), {
         reactions: updatedReactions,
@@ -653,196 +705,154 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Handle media selection for inline post creator (compresses images & prepares videos for Firestore)
+  // Handle media selection for inline post creator (checks 90s duration & 100MB limit immediately)
   const handleMediaSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const isVideo = file.type.startsWith('video/');
-    const isImage = file.type.startsWith('image/');
-    if (!isVideo && !isImage) {
+    const detectedType = detectFeedMediaType(file);
+    if (detectedType === 'invalid') {
+      e.target.value = '';
       setPostNotice({ type: 'error', text: 'Please select a valid photo or video file.' });
       return;
     }
 
-    if (isVideo) {
-      const canUploadLarge = Boolean(isProEffective || isAdmin);
-      const validation = validateVideoFileSize(file, canUploadLarge);
-      if (!validation.valid) {
+    if (detectedType === 'video') {
+      const inspection = await inspectAndValidateVideoFile(file, isProTier);
+      if (inspection.tooLarge || (!inspection.valid && !inspection.needsTrim)) {
         e.target.value = '';
         setPostNotice({
           type: 'error',
-          text: validation.error || 'Video exceeds your plan upload limit.'
+          text:
+            inspection.error ||
+            `This video is larger than the ${MAX_VIDEO_RAW_MB} MB maximum size limit. Please choose a smaller video.`,
         });
         return;
       }
 
-      setPostNotice(null);
-      setInlineMediaType('video');
       // Clone video file into memory before clearing input so browser never invalidates the file handle
       const safeVideoFile = await cloneVideoFileToMemory(file);
       e.target.value = '';
+      const rawDur = Math.max(1, Math.round(inspection.durationSeconds || 30));
+      setInlineMediaType('video');
       setInlineMediaFile(safeVideoFile);
+      setInlineVideoDuration(rawDur);
+      setInlineVideoTrimStart(0);
+      setInlineVideoTrimEnd(Math.min(maxVideoSeconds, rawDur));
+      setInlineVideoNeedsTrim(Boolean(inspection.needsTrim || rawDur > maxVideoSeconds));
+
+      if (inspection.needsTrim || rawDur > maxVideoSeconds) {
+        setPostNotice({
+          type: 'error',
+          text:
+            inspection.error ||
+            (isProTier
+              ? `Pro videos can be up to 90 seconds (this video is ${rawDur}s). Trim to 90s below.`
+              : `Free users can upload videos up to 60 seconds, and Pro users up to 90 seconds (this video is ${rawDur}s). Trim to 60s below.`),
+        });
+      } else {
+        setPostNotice(null);
+      }
+
       const videoObjectUrl = URL.createObjectURL(safeVideoFile);
       setInlineMediaPreview(videoObjectUrl);
       return;
     }
 
     setPostNotice(null);
-    setCompressionBadge(null);
-    setInlineMediaFile(file);
     setInlineMediaType('image');
+    setInlineVideoNeedsTrim(false);
+    // Clone image file into memory BEFORE clearing e.target.value so the browser never invalidates the file handle
+    const safeImageFile = await cloneVideoFileToMemory(file);
+    e.target.value = '';
+    setInlineMediaFile(safeImageFile);
+    // Show instant objectURL preview immediately so the Share Wave button is enabled without delay
+    const instantPreviewUrl = URL.createObjectURL(safeImageFile);
+    setInlineMediaPreview(instantPreviewUrl);
 
     try {
-      const originalKB = Math.max(1, Math.round(file.size / 1024));
-      const compressedDataUrl = await compressImage(file, 1280, 1280, 0.82);
-      setInlineMediaPreview(compressedDataUrl);
-      const compressedBytes = Math.round((compressedDataUrl.length * 3) / 4);
-      const compressedKB = Math.max(1, Math.round(compressedBytes / 1024));
-      if (compressedKB < originalKB) {
-        const savedPct = Math.min(98, Math.max(5, Math.round((1 - compressedKB / originalKB) * 100)));
-        setCompressionBadge(
-          `Optimized: ${formatVideoFileSize(file.size)} → ${compressedKB} KB (${savedPct}% smaller)`
-        );
-      } else {
-        setCompressionBadge(`Ready: ${compressedKB} KB`);
+      const compressedDataUrl = await compressImage(safeImageFile, 1280, 1280, 0.82);
+      if (compressedDataUrl && compressedDataUrl.startsWith('data:image/')) {
+        setInlineMediaPreview(compressedDataUrl);
       }
     } catch (err) {
-      console.error('Error compressing image:', err);
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setInlineMediaPreview(event.target?.result as string);
-      };
-      reader.readAsDataURL(file);
-    }
-
-    e.target.value = '';
-  };
-
-  // AI Caption Suggestions handler (Server-side Gemini with rate-limit handling)
-  const handleSuggestCaptions = async () => {
-    if (isAiAssisting) return;
-    setIsAiAssisting('captions');
-    setPostNotice(null);
-    try {
-      const mediaKind = inlineMediaPreview ? inlineMediaType : 'text';
-      const { suggestions } = await suggestPostCaptions({
-        text: inlineContent,
-        mediaType: mediaKind,
-        tone: 'engaging',
-        isPro: Boolean(isProEffective || isAdmin)
-      });
-      setAiCaptionSuggestions(suggestions);
-      if (suggestions.length === 0) {
-        setPostNotice({ type: 'error', text: 'No caption suggestions returned. Try adding a few words first.' });
-      }
-    } catch (err: any) {
-      setPostNotice({
-        type: 'error',
-        text: err?.message || 'Could not generate captions right now. Please try again in a moment.'
-      });
-    } finally {
-      setIsAiAssisting(null);
+      console.warn('Image background compression notice:', err);
     }
   };
 
-  // AI Post Improvement handler (Server-side Gemini with rate-limit handling)
-  const handleImprovePostDraft = async () => {
-    if (isAiAssisting) return;
-    if (!inlineContent.trim()) {
-      setPostNotice({
-        type: 'error',
-        text: 'Write a rough draft or a few words first, then tap Improve Post!'
-      });
-      return;
-    }
-    setIsAiAssisting('improve');
-    setPostNotice(null);
-    try {
-      const mediaKind = inlineMediaPreview ? inlineMediaType : 'text';
-      const { improvedText } = await improvePostDraft({
-        text: inlineContent,
-        mediaType: mediaKind,
-        tone: 'engaging',
-        isPro: Boolean(isProEffective || isAdmin)
-      });
-      setInlineContent(improvedText);
-      setPostNotice({ type: 'success', text: '✨ Post polished with WELINK AI!' });
-      setTimeout(() => setPostNotice(null), 3200);
-    } catch (err: any) {
-      setPostNotice({
-        type: 'error',
-        text: err?.message || 'Could not improve post right now. Please wait a moment and try again.'
-      });
-    } finally {
-      setIsAiAssisting(null);
-    }
-  };
-
-  // Submit inline post with AI Moderation check, Firestore picture & chunked video storage
+  // Submit inline post with background video compression + resumable Firebase Storage upload
   const handleCreatePost = async () => {
     if (!currentUser || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)) return;
+
+    const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
+
+    // Video posts: run compression + resumable upload in the background queue so user can keep browsing
+    if (inlineMediaType === 'video' && inlineMediaFile) {
+      const clipDuration = Math.max(1, inlineVideoTrimEnd - inlineVideoTrimStart);
+      if (clipDuration > maxVideoSeconds + 0.5) {
+        setPostNotice({
+          type: 'error',
+          text: isProTier
+            ? 'Pro videos can be up to 90 seconds. Please trim your clip to 90s or less.'
+            : 'Free users can upload videos up to 60 seconds (Pro up to 90 seconds). Please trim to 60s.',
+        });
+        setInlineVideoTrimEnd(Math.min(inlineVideoDuration, inlineVideoTrimStart + maxVideoSeconds));
+        return;
+      }
+
+      enqueueVideoUploadJob({
+        file: inlineMediaFile,
+        isProUser: isProTier,
+        authorId: currentUser.uid,
+        authorEmail: currentUser.email || '',
+        authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
+        authorUsername: userProfile?.username || `@${emailPrefix}`,
+        authorPhotoURL:
+          userProfile?.photoURL ||
+          currentUser.photoURL ||
+          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+        content: sanitizeUserText(inlineContent, 2000),
+        trimStart: inlineVideoTrimStart,
+        trimEnd: inlineVideoTrimEnd,
+      });
+
+      setInlineContent('');
+      setInlineMediaFile(null);
+      setInlineMediaPreview(null);
+      setInlineVideoNeedsTrim(false);
+      setPostNotice(null);
+      return;
+    }
+
     setIsSubmittingPost(true);
-    setUploadProgress(5);
+    setUploadProgress(10);
     setPostNotice(null);
 
     try {
-      // Pre-publish server-side AI content moderation check
-      if (inlineContent.trim()) {
-        const modCheck = await moderatePostContent(inlineContent.trim());
-        if (modCheck.flagged) {
-          setPostNotice({
-            type: 'error',
-            text: modCheck.reason || 'Post blocked by WaveLink AI Safety Moderation. Please revise your text.'
-          });
-          setIsSubmittingPost(false);
-          setUploadProgress(0);
-          return;
-        }
-      }
-
       const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-      const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
 
       let finalImageUrl: string | undefined = undefined;
-      let finalVideoUrl: string | undefined = undefined;
-      let finalHasVideoChunks: boolean | undefined = undefined;
-      let finalThumbnailUrl: string | undefined = undefined;
-      let finalVideoFileName: string | undefined = undefined;
       let finalMediaType: 'image' | 'video' | undefined = undefined;
 
       if (inlineMediaType === 'image' && (inlineMediaPreview || inlineMediaFile)) {
         setUploadProgress(40);
-        if (inlineMediaFile && (!inlineMediaPreview || inlineMediaPreview.length > 600 * 1024)) {
-          finalImageUrl = await compressImage(inlineMediaFile, 1280, 1280, 0.8);
+        if (
+          inlineMediaPreview &&
+          inlineMediaPreview.startsWith('data:image/') &&
+          inlineMediaPreview.length <= 460 * 1024
+        ) {
+          finalImageUrl = inlineMediaPreview;
+        } else if (inlineMediaFile) {
+          const compressed = await compressImage(inlineMediaFile, 1280, 1280, 0.8);
+          finalImageUrl = compressed || inlineMediaPreview || undefined;
         } else {
           finalImageUrl = inlineMediaPreview || undefined;
         }
         finalMediaType = 'image';
-        setUploadProgress(90);
-      } else if (inlineMediaType === 'video' && inlineMediaFile) {
-        setUploadProgress(10);
-        // 1. Generate lightweight video poster thumbnail (<30KB) for Firestore document
-        const thumb = await generateVideoThumbnail(inlineMediaFile);
-        finalThumbnailUrl = thumb || undefined;
-        finalImageUrl = thumb || undefined;
-
-        // 2. Store in Firestore / local cache via resilient saveVideoPost
-        const savedVideo = await saveVideoPost(
-          postId,
-          inlineMediaFile,
-          undefined,
-          'posts',
-          (pct) => setUploadProgress(pct)
-        );
-
-        finalVideoUrl = savedVideo.videoUrl;
-        finalHasVideoChunks = savedVideo.hasVideoChunks;
-        finalVideoFileName = inlineMediaFile.name;
-        finalMediaType = 'video';
+        setUploadProgress(88);
       }
 
-      const newPost: Partial<Post> = {
+      const newPost: Post = {
         id: postId,
         authorId: currentUser.uid,
         authorEmail: currentUser.email || '',
@@ -854,10 +864,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
           `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
         content: sanitizeUserText(inlineContent, 2000),
         imageUrl: finalImageUrl,
-        thumbnailUrl: finalThumbnailUrl,
-        videoUrl: finalVideoUrl,
-        hasVideoChunks: finalHasVideoChunks,
-        videoFileName: finalVideoFileName,
         mediaType: finalMediaType,
         likes: [],
         likesCount: 0,
@@ -867,22 +873,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
         createdAt: new Date().toISOString()
       };
 
-      await setDoc(doc(db, 'posts', postId), cleanFirestoreData(newPost));
+      // Optimistically add the new post to the top of the feed immediately
+      setPosts((prev) => [newPost, ...prev.filter((p) => p.id !== postId)]);
+
+      const writePromise = setDoc(doc(db, 'posts', postId), cleanFirestoreData(newPost));
+      const writeTimeout = new Promise<'timeout'>((resolve) =>
+        setTimeout(() => resolve('timeout'), 4500)
+      );
+      await Promise.race([writePromise, writeTimeout]);
       setUploadProgress(100);
 
       // Reset form
       setInlineContent('');
       setInlineMediaFile(null);
       setInlineMediaPreview(null);
-      setCompressionBadge(null);
-      setAiCaptionSuggestions([]);
       setPostNotice({
         type: 'success',
         text:
-          finalMediaType === 'video'
-            ? 'Video reel uploaded and saved to Firestore!'
-            : finalMediaType === 'image'
-            ? 'Photo wave published to Firestore!'
+          finalMediaType === 'image'
+            ? 'Photo wave published to the feed!'
             : 'Wave published to the community feed!'
       });
       setTimeout(() => setPostNotice(null), 4000);
@@ -890,7 +899,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       console.error('Post creation error:', err);
       setPostNotice({
         type: 'error',
-        text: 'Could not publish wave. Please try a smaller clip or check your connection.'
+        text: 'Could not publish wave. Please try a smaller file or check your connection.'
       });
     } finally {
       setIsSubmittingPost(false);
@@ -1002,22 +1011,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
   };
 
 
-  // Add Comment (with AI Moderation & instant real-time counter update)
+  // Add Comment
   const handleAddComment = async (postId: string) => {
     const text = sanitizeUserText(commentInput[postId] || '', 800);
     if (!text || !currentUser) return;
 
     try {
-      const modCheck = await moderatePostContent(text);
-      if (modCheck.flagged) {
-        setActionToast({
-          type: 'error',
-          text: modCheck.reason || 'Reply blocked by WaveLink AI Moderation.'
-        });
-        setTimeout(() => setActionToast(null), 4000);
-        return;
-      }
-
       const commentData = {
         postId,
         authorId: currentUser.uid,
@@ -1060,43 +1059,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  const copyPostLink = async (postId: string) => {
-    const targetPost = combinedFeed.find((p) => p.id === postId) || posts.find((p) => p.id === postId);
-    if (targetPost) {
-      await handleSharePost(targetPost);
-      return;
-    }
+  const copyPostLink = (postId: string) => {
     navigator.clipboard.writeText(`${window.location.origin}/#post-${postId}`);
     setCopiedId(postId);
     setTimeout(() => setCopiedId(null), 2000);
-  };
-
-  const handleDownloadPost = async (post: Post) => {
-    try {
-      const res = await downloadPost(post);
-      setActionToast({ type: 'success', text: res.message || 'Downloaded!' });
-      setTimeout(() => setActionToast(null), 3000);
-    } catch {
-      setActionToast({ type: 'error', text: "Couldn't download" });
-      setTimeout(() => setActionToast(null), 3000);
-    }
-  };
-
-  const handleSharePost = async (post: Post) => {
-    try {
-      const res = await sharePost(post);
-      if (res.success) {
-        setCopiedId(post.id);
-        setTimeout(() => setCopiedId(null), 2000);
-        if (res.message) {
-          setActionToast({ type: 'success', text: res.message });
-          setTimeout(() => setActionToast(null), 3000);
-        }
-      }
-    } catch {
-      setActionToast({ type: 'error', text: "Couldn't share" });
-      setTimeout(() => setActionToast(null), 3000);
-    }
   };
 
   const blockedIds = userProfile?.blockedUserIds || [];
@@ -1199,7 +1165,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
   };
 
   return (
-    <div className="w-full max-w-7xl mx-auto px-3 sm:px-5 md:px-8 py-5 sm:py-7 relative">
+    <div className="wavelink-feed-container relative">
       {/* Top Viewport Visual Reading Progress Bar */}
       <div
         role="progressbar"
@@ -1215,9 +1181,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
         />
       </div>
 
-      <div className="flex flex-row gap-7 items-start justify-center">
-        {/* Center Main Feed (Width < 768px: Full Width, Width >= 768px: max-w-2xl) */}
-        <div className="flex-1 min-w-0 max-w-full md:max-w-2xl w-full space-y-6 overflow-hidden">
+      <div className="wavelink-feed-row">
+        {/* Center Main Feed (Mobile < 768px: Full Width Single Column; Desktop >= 1024px: Centered max 660px) */}
+        <div className="wavelink-feed-column overflow-hidden">
+          {/* Background Video Upload Progress Chip at the Top of the Feed */}
+          <VideoUploadProgressChip variant="feed-inline" />
+
           {/* Active Hashtag Filter Banner from Global Search */}
           {initialFilterTag && (
             <div className="p-4 rounded-3xl bg-gradient-to-r from-[#3B82F6] to-[#10B981] text-white flex items-center justify-between gap-3 shadow-md animate-in fade-in">
@@ -1227,7 +1196,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 </div>
                 <div className="min-w-0">
                   <span className="text-[10px] text-blue-100 font-bold uppercase tracking-wider block">Hashtag Filter</span>
-                  <h4 className="text-xs sm:text-sm font-extrabold truncate">
+                  <h4 className="text-sm font-extrabold truncate">
                     Filtered by <span className="text-emerald-200">{initialFilterTag}</span> ({filteredSortedPosts.length} waves)
                   </h4>
                 </div>
@@ -1235,7 +1204,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
               {onClearFilterTag && (
                 <button
                   onClick={onClearFilterTag}
-                  className="px-3.5 py-1.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shrink-0"
+                  className="min-h-[44px] px-3.5 py-1.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shrink-0"
                 >
                   <span>Clear</span>
                   <X size={13} />
@@ -1245,9 +1214,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
           )}
 
           {/* Minimal Calm Friendly Greeting + Non-overlapping WELINK AI button */}
-          <div className="pt-1 pb-1 px-1 flex items-center justify-between gap-3 flex-wrap">
-            <div>
-              <h1 className="text-2xl sm:text-3xl font-extrabold text-[#1C1917] tracking-tight">
+          <div className="pt-1 pb-1 px-1 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h1 className="wavelink-fluid-h1 font-extrabold text-[#1C1917] tracking-tight break-words">
                 {(() => {
                   const hour = new Date().getHours();
                   const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Friend';
@@ -1255,45 +1224,33 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   return `${timeGreeting}, ${name} 👋`;
                 })()}
               </h1>
-              <p className="text-xs sm:text-sm text-[#78716C] mt-0.5 font-medium">
+              <p className="text-base sm:text-sm text-[#78716C] mt-0.5 font-medium">
                 Welcome back to your community.
               </p>
             </div>
 
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
-                onClick={toggleDarkMode}
-                className="min-h-[42px] px-3 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
-                title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-              >
-                {isDark ? <Sun size={15} className="text-amber-400" /> : <Moon size={15} className="text-[#2563EB]" />}
-                <span>{isDark ? 'Light' : 'Dark'}</span>
-              </button>
-
-              {onOpenWelink && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => onOpenWelink('voice')}
-                    className="min-h-[42px] px-3.5 py-2 rounded-2xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
-                    title="Talk Live by Voice with WELINK"
-                  >
-                    <Mic size={15} className="text-[#0D9488]" />
-                    <span>Live Talk</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onOpenWelink('chat')}
-                    className="min-h-[42px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-2 shadow-2xs transition active:scale-95"
-                    title="Open WELINK AI Guide"
-                  >
-                    <Sparkles size={15} className="text-[#0D9488]" />
-                    <span>WELINK Guide</span>
-                  </button>
-                </>
-              )}
-            </div>
+            {onOpenWelink && (
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => onOpenWelink('voice')}
+                  className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
+                  title="Talk Live by Voice with WELINK"
+                >
+                  <Mic size={15} className="text-[#0D9488]" />
+                  <span>Live Talk</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenWelink('chat')}
+                  className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-2 shadow-2xs transition active:scale-95"
+                  title="Open WELINK AI Guide"
+                >
+                  <Sparkles size={15} className="text-[#0D9488]" />
+                  <span>WELINK Guide</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Skippable First-Time Welcome Flow */}
@@ -1320,48 +1277,52 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 </button>
               </div>
 
-              {suggestedMembers.length > 0 && (
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  {suggestedMembers.map((member) => {
-                    const isFollowing = followedIds.includes(member.id);
-                    return (
-                      <div
-                        key={member.id}
-                        className="p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-2"
-                      >
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <img
-                            src={
-                              member.photoURL ||
-                              `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
-                            }
-                            alt={member.displayName}
-                            className="w-9 h-9 rounded-full object-cover shrink-0"
-                          />
-                          <div className="min-w-0">
-                            <span className="text-xs font-bold text-[#1C1917] block truncate">
-                              {member.displayName || 'Community Member'}
-                            </span>
-                            <span className="text-[10px] text-[#78716C] block truncate">
-                              {member.username || '@member'}
-                            </span>
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => handleFollowMember(member)}
-                          className={`px-3 py-1.5 rounded-xl text-xs font-bold transition shrink-0 ${
-                            isFollowing
-                              ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
-                              : 'bg-[#2563EB] text-white hover:bg-[#1D4ED8]'
-                          }`}
+              {isLoadingSuggested ? (
+                <SuggestedMembersSkeleton count={3} />
+              ) : (
+                suggestedMembers.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    {suggestedMembers.map((member) => {
+                      const isFollowing = followedIds.includes(member.id);
+                      return (
+                        <div
+                          key={member.id}
+                          className="p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-2"
                         >
-                          {isFollowing ? 'Following' : 'Follow'}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <img
+                              src={
+                                member.photoURL ||
+                                `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
+                              }
+                              alt={member.displayName}
+                              className="w-9 h-9 rounded-full object-cover shrink-0"
+                            />
+                            <div className="min-w-0">
+                              <span className="text-xs font-bold text-[#1C1917] block truncate">
+                                {member.displayName || 'Community Member'}
+                              </span>
+                              <span className="text-[10px] text-[#78716C] block truncate">
+                                {member.username || '@member'}
+                              </span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleFollowMember(member)}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition shrink-0 ${
+                              isFollowing
+                                ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
+                                : 'bg-[#2563EB] text-white hover:bg-[#1D4ED8]'
+                            }`}
+                          >
+                            {isFollowing ? 'Following' : 'Follow'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
               )}
 
               <div className="flex items-center justify-between pt-1 flex-wrap gap-2">
@@ -1386,22 +1347,22 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Friendly Daily Check-In Card */}
-          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-4 shadow-2xs flex items-center justify-between gap-3 flex-wrap">
-            <div className="flex items-center gap-3">
+          {/* Friendly Daily Check-In Card (stacks vertically on narrow screens) */}
+          <div className="w-full max-w-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-4 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start sm:items-center gap-3 min-w-0">
               <div className="w-10 h-10 rounded-2xl bg-amber-50 text-[#D97706] border border-amber-200/70 flex items-center justify-center shrink-0">
                 <Flame size={18} />
               </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs sm:text-sm font-bold text-[#1C1917]">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-base sm:text-sm font-bold text-[#1C1917]">
                     Daily Check-In
                   </span>
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-[#D97706] border border-amber-200/80">
+                  <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-50 text-[#D97706] border border-amber-200/80">
                     {Math.max(1, userProfile?.loginStreak ?? 1)}-day streak
                   </span>
                 </div>
-                <p className="text-xs text-[#78716C]">
+                <p className="text-sm sm:text-xs text-[#78716C] break-words">
                   {checkInDoneToday
                     ? `Checked in for today • ${(userProfile?.wavePoints ?? 10).toLocaleString()} WavePoints`
                     : `Tap to check in and earn +15 WavePoints • ${(userProfile?.wavePoints ?? 10).toLocaleString()} pts`}
@@ -1413,7 +1374,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
               type="button"
               onClick={handleDailyCheckIn}
               disabled={checkInDoneToday}
-              className={`min-h-[38px] px-4 py-1.5 rounded-xl text-xs font-bold transition ${
+              className={`min-h-[44px] w-full sm:w-auto px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${
                 checkInDoneToday
                   ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
                   : 'bg-[#0D9488] hover:bg-teal-700 text-white active:scale-95'
@@ -1433,19 +1394,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
           </div>
 
           {/* One Compact Pinned Notice Card with a single small badge */}
-          {(pinnedAnnouncement || latestAnnouncement) && (
-            <div className="w-full max-w-full">
-              <RichEventCard
-                announcement={(pinnedAnnouncement || latestAnnouncement)!}
-                isFeedBanner={true}
-                onRsvp={handleToggleAnnouncementRsvp}
-              />
-            </div>
+          {isLoadingAnnouncements ? (
+            <AnnouncementSkeleton />
+          ) : (
+            (pinnedAnnouncement || latestAnnouncement) && (
+              <div className="w-full max-w-full">
+                <RichEventCard
+                  announcement={(pinnedAnnouncement || latestAnnouncement)!}
+                  isFeedBanner={true}
+                  onRsvp={handleToggleAnnouncementRsvp}
+                />
+              </div>
+            )
           )}
 
           {/* Center Main Feed: Calm Post Creation Card with ONE main button */}
-          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border border-[#EFECE6] rounded-3xl p-5 shadow-xs transition">
-            <div className="flex items-start gap-3.5">
+          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border border-[#EFECE6] rounded-3xl p-4 sm:p-5 shadow-xs transition">
+            <div className="flex items-start gap-3">
               <img
                 src={
                   userProfile?.photoURL ||
@@ -1453,7 +1418,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                 }
                 alt="User"
-                className="w-11 h-11 rounded-full object-cover ring-2 ring-[#2563EB]/15 shrink-0 mt-0.5"
+                className="w-10 h-10 sm:w-11 sm:h-11 rounded-full object-cover ring-2 ring-[#2563EB]/15 shrink-0 mt-0.5"
               />
               <div className="flex-1 min-w-0">
                 <textarea
@@ -1461,67 +1426,101 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   onChange={(e) => setInlineContent(e.target.value)}
                   placeholder={`What's on your mind today, ${userProfile?.displayName?.split(' ')[0] || 'Friend'}?`}
                   rows={inlineContent || inlineMediaPreview ? 3 : 2}
-                  className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-3.5 border border-[#EFECE6] resize-none text-sm text-[#1C1917] placeholder-[#A8A29E] focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition"
+                  className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-3.5 border border-[#EFECE6] resize-none text-base text-[#1C1917] placeholder-[#A8A29E] focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition"
                 />
 
                 {inlineMediaPreview && (
-                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] max-h-72 bg-[#1C1917]">
+                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] bg-[#1C1917]">
                     {inlineMediaType === 'video' ? (
                       <video src={inlineMediaPreview} controls className="w-full h-auto max-h-72 object-contain" />
                     ) : (
                       <img src={inlineMediaPreview} alt="Preview" className="w-full h-auto max-h-72 object-cover" />
-                    )}
-                    {compressionBadge && inlineMediaType === 'image' && (
-                      <span className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded-xl bg-stone-900/80 text-emerald-300 text-[10px] font-mono font-bold backdrop-blur-xs">
-                        ⚡ {compressionBadge}
-                      </span>
                     )}
                     <button
                       type="button"
                       onClick={() => {
                         setInlineMediaFile(null);
                         setInlineMediaPreview(null);
-                        setCompressionBadge(null);
+                        setInlineVideoNeedsTrim(false);
                       }}
                       className="absolute top-2.5 right-2.5 min-w-[36px] min-h-[36px] p-2 rounded-full bg-stone-900/80 text-white hover:bg-stone-900 flex items-center justify-center transition"
                       title="Remove attachment"
                     >
                       <X size={16} />
                     </button>
-                  </div>
-                )}
 
-                {/* AI Caption Suggestions Chips */}
-                {aiCaptionSuggestions.length > 0 && (
-                  <div className="my-2.5 p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-extrabold text-[#0D9488] flex items-center gap-1.5">
-                        <Sparkles size={13} />
-                        <span>AI Caption Ideas (Tap to use)</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setAiCaptionSuggestions([])}
-                        className="text-[11px] text-[#78716C] hover:text-[#1C1917]"
-                      >
-                        Dismiss
-                      </button>
-                    </div>
-                    <div className="space-y-1.5">
-                      {aiCaptionSuggestions.map((suggestion, idx) => (
-                        <button
-                          key={idx}
-                          type="button"
-                          onClick={() => {
-                            setInlineContent(suggestion);
-                            setAiCaptionSuggestions([]);
-                          }}
-                          className="w-full text-left p-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-[#2563EB] border border-[var(--border-hairline)] text-xs text-[var(--text-primary)] leading-relaxed transition"
-                        >
-                          {suggestion}
-                        </button>
-                      ))}
-                    </div>
+                    {inlineMediaType === 'video' && inlineVideoDuration > 0 && (
+                      <div className="p-3 bg-stone-900/95 border-t border-white/10 text-white space-y-2">
+                        <div className="flex items-center justify-between gap-2 flex-wrap text-xs">
+                          <span className="font-bold">
+                            {inlineVideoDuration > maxVideoSeconds
+                              ? `Videos can be up to ${maxVideoSeconds}s for ${isProTier ? 'Pro' : 'Free'} users (yours is ${inlineVideoDuration}s)`
+                              : `Clip length: ${Math.max(1, Math.round(inlineVideoTrimEnd - inlineVideoTrimStart))}s (up to ${maxVideoSeconds}s ${isProTier ? 'Pro' : 'Free'})`}
+                          </span>
+                          {inlineVideoDuration > maxVideoSeconds && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInlineVideoTrimStart(0);
+                                setInlineVideoTrimEnd(maxVideoSeconds);
+                                setInlineVideoNeedsTrim(false);
+                                setPostNotice({
+                                  type: 'success',
+                                  text: `Trimmed to first ${maxVideoSeconds} seconds — ready to upload!`,
+                                });
+                              }}
+                              className="px-3 py-1 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white font-bold text-xs transition"
+                            >
+                              Trim to {maxVideoSeconds}s
+                            </button>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 gap-3 text-[11px]">
+                          <div>
+                            <div className="flex justify-between text-stone-300 mb-0.5">
+                              <span>Start</span>
+                              <span className="font-mono">{inlineVideoTrimStart}s</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={Math.max(0, inlineVideoDuration - 1)}
+                              step={1}
+                              value={inlineVideoTrimStart}
+                              onChange={(e) => {
+                                const nextStart = Number(e.target.value);
+                                setInlineVideoTrimStart(nextStart);
+                                if (inlineVideoTrimEnd <= nextStart) {
+                                  setInlineVideoTrimEnd(Math.min(inlineVideoDuration, nextStart + 1));
+                                } else if (inlineVideoTrimEnd - nextStart > maxVideoSeconds) {
+                                  setInlineVideoTrimEnd(Math.min(inlineVideoDuration, nextStart + maxVideoSeconds));
+                                }
+                                setInlineVideoNeedsTrim(false);
+                              }}
+                              className="w-full accent-[#2563EB]"
+                            />
+                          </div>
+                          <div>
+                            <div className="flex justify-between text-stone-300 mb-0.5">
+                              <span>End</span>
+                              <span className="font-mono">{inlineVideoTrimEnd}s</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={Math.min(inlineVideoDuration, inlineVideoTrimStart + 1)}
+                              max={Math.min(inlineVideoDuration, inlineVideoTrimStart + maxVideoSeconds)}
+                              step={1}
+                              value={inlineVideoTrimEnd}
+                              onChange={(e) => {
+                                setInlineVideoTrimEnd(Number(e.target.value));
+                                setInlineVideoNeedsTrim(false);
+                              }}
+                              className="w-full accent-[#10B981]"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1568,79 +1567,42 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 )}
 
                 <div className="flex items-center justify-between pt-3 mt-2 border-t border-[#EFECE6] flex-wrap gap-2">
-                  <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                  <div className="flex items-center gap-2">
                     <input
                       type="file"
                       ref={fileInputRef}
                       className="hidden"
-                      accept="image/*,video/*"
+                      accept="image/*,.jpg,.jpeg,.png,.webp,.gif,.heic"
+                      onChange={handleMediaSelect}
+                    />
+                    <input
+                      type="file"
+                      ref={videoInputRef}
+                      className="hidden"
+                      accept="video/*,.mp4,.mov,.webm,.m4v,.3gp,.mkv"
                       onChange={handleMediaSelect}
                     />
                     <button
                       type="button"
                       onClick={() => {
-                        if (fileInputRef.current) {
-                          fileInputRef.current.accept = 'image/*';
-                          fileInputRef.current.click();
-                        }
+                        fileInputRef.current?.click();
                       }}
-                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
-                      <ImageIcon size={15} />
+                      <ImageIcon size={16} />
                       <span>Photo</span>
                     </button>
 
                     <button
                       type="button"
                       onClick={() => {
-                        if (fileInputRef.current) {
-                          fileInputRef.current.accept = 'video/*';
-                          fileInputRef.current.click();
-                        }
+                        videoInputRef.current?.click();
                       }}
-                      title={
-                        isProEffective || isAdmin
-                          ? `Upload video up to ${PRO_MAX_VIDEO_MB} MB (WaveLink Pro)`
-                          : `Upload video from 0 KB to ${FREE_MAX_VIDEO_MB} MB (Pro unlocks ${PRO_MAX_VIDEO_MB} MB)`
-                      }
-                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                      title={`Upload video up to ${maxVideoSeconds}s (${MAX_VIDEO_RAW_MB} MB max)`}
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
-                      <VideoIcon size={15} />
-                      <span>
-                        Video ({isProEffective || isAdmin ? `Up to ${PRO_MAX_VIDEO_MB}MB` : `0–${FREE_MAX_VIDEO_MB}MB`})
-                      </span>
-                    </button>
-
-                    {/* AI Caption Suggestions Button */}
-                    <button
-                      type="button"
-                      onClick={handleSuggestCaptions}
-                      disabled={Boolean(isAiAssisting)}
-                      title="Generate 3 AI caption ideas with hashtags"
-                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-teal-50/80 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-xs font-bold flex items-center gap-1.5 transition active:scale-95 disabled:opacity-50"
-                    >
-                      {isAiAssisting === 'captions' ? (
-                        <Loader2 size={14} className="animate-spin" />
-                      ) : (
-                        <Sparkles size={14} />
-                      )}
-                      <span>AI Captions</span>
-                    </button>
-
-                    {/* AI Post Improvement Button */}
-                    <button
-                      type="button"
-                      onClick={handleImprovePostDraft}
-                      disabled={Boolean(isAiAssisting) || !inlineContent.trim()}
-                      title="Polish & improve your post text with WELINK AI"
-                      className="min-h-[42px] px-3 py-2 rounded-2xl bg-blue-50/80 hover:bg-blue-100 text-[#2563EB] border border-blue-200/80 text-xs font-bold flex items-center gap-1.5 transition active:scale-95 disabled:opacity-40"
-                    >
-                      {isAiAssisting === 'improve' ? (
-                        <Loader2 size={14} className="animate-spin" />
-                      ) : (
-                        <Wand2 size={14} />
-                      )}
-                      <span>Improve</span>
+                      <VideoIcon size={16} />
+                      <span>Video (Up to {maxVideoSeconds}s)</span>
                     </button>
                   </div>
 
@@ -1708,11 +1670,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Posts Stream */}
+          {/* Posts Stream: Show active/failed uploading video post cards at the top of the feed */}
           <div className="space-y-5">
+            <VideoUploadingFeedPostList />
             {isLoading ? (
-              <PostSkeleton count={3} />
-            ) : combinedFeed.length === 0 ? (
+              <PostSkeleton count={4} />
+            ) : combinedFeed.length === 0 && activeOrFailedVideoJobs.length === 0 ? (
               <div className="text-center py-16 px-6 bg-white border border-slate-200/90 rounded-3xl shadow-xs">
                 <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] text-white mx-auto flex items-center justify-center mb-4 shadow-md shadow-blue-500/20">
                   <Waves size={32} />
@@ -1780,7 +1743,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       </div>
 
                       {/* Content */}
-                      <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed mb-3.5">
+                      <p className="wavelink-post-body text-base text-slate-700 whitespace-pre-wrap leading-relaxed mb-3.5">
                         {post.content}
                       </p>
 
@@ -1852,12 +1815,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             <span className="font-mono tabular-numbers">{post.commentsCount || 0}</span>
                           </button>
                         </div>
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1">
                           <button
                             type="button"
                             onClick={() => handleDownloadPost(post)}
-                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
-                            title={post.imageUrl && !post.videoUrl && !post.hasVideoChunks && post.mediaType !== 'video' ? 'Download post image' : 'Download post text (.txt)'}
+                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
+                            title="Download post"
                           >
                             <Download size={14} />
                             <span>Download</span>
@@ -1865,8 +1828,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           <button
                             type="button"
                             onClick={() => handleSharePost(post)}
-                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
-                            title="Share post via Web Share or WhatsApp"
+                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
+                            title="Share on WhatsApp or via Web Share"
                           >
                             <Share2 size={14} />
                             <span>Share</span>
@@ -1927,7 +1890,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                               </span>
                             )}
                           </div>
-                          <div className="flex items-center gap-1.5 text-xs text-slate-400 mt-0.5">
+                          <div className="flex items-center gap-1.5 text-xs text-slate-400 mt-0.5 flex-wrap">
                             <span className="font-mono tabular-numbers">
                               {new Date(post.createdAt).toLocaleDateString(undefined, {
                                 month: 'short',
@@ -1936,6 +1899,22 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 minute: '2-digit'
                               })}
                             </span>
+                            {post.locationTag && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="text-slate-500 font-medium truncate max-w-[140px]">
+                                  {post.locationTag}
+                                </span>
+                              </>
+                            )}
+                            {post.audience && post.audience !== 'public' && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="text-[#0D9488] font-semibold">
+                                  {post.audience === 'close_friends' ? 'Close friends' : 'Followers'}
+                                </span>
+                              </>
+                            )}
                             <span aria-hidden="true">·</span>
                             <button
                               type="button"
@@ -2056,7 +2035,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       </div>
                     ) : (
                       post.content && (
-                        <p className="text-sm sm:text-[15px] text-[#0F172A] whitespace-pre-wrap leading-relaxed mb-4">
+                        <p className="wavelink-post-body text-base text-[#0F172A] whitespace-pre-wrap leading-relaxed mb-4">
                           {post.content}
                           {post.isEdited && (
                             <span className="text-[10px] text-slate-400 italic ml-2">
@@ -2067,7 +2046,139 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       )
                     )}
 
-                    {/* Attached Online Song Soundtrack */}
+                    {/* Attached Video from Firestore (Chunked or Direct) */}
+                    {(post.videoUrl || post.hasVideoChunks || post.mediaType === 'video') && (
+                      <div className="mb-3 -mx-1 sm:mx-0">
+                        <VideoPlayer
+                          postId={post.id}
+                          videoUrl={post.videoUrl}
+                          hasVideoChunks={post.hasVideoChunks}
+                          thumbnailUrl={post.thumbnailUrl || post.imageUrl}
+                          duration={post.duration ?? post.videoDurationSeconds}
+                          videoWidth={post.videoWidth}
+                          videoHeight={post.videoHeight}
+                          aspectRatio={post.aspectRatio}
+                        />
+                      </div>
+                    )}
+
+                    {/* Attached Image or Multi-Photo Carousel from Firestore */}
+                    {(post.imageUrl || (post.imageUrls && post.imageUrls.length > 0)) &&
+                      !post.videoUrl &&
+                      !post.hasVideoChunks &&
+                      post.mediaType !== 'video' && (() => {
+                        const slides =
+                          post.imageUrls && post.imageUrls.length > 0
+                            ? post.imageUrls
+                            : post.imageUrl
+                            ? [post.imageUrl]
+                            : [];
+                        const activeSlideIdx = Math.min(
+                          slides.length - 1,
+                          Math.max(0, carouselIndices[post.id] || 0)
+                        );
+                        const currentImgUrl = slides[activeSlideIdx] || post.imageUrl!;
+
+                        return (
+                          <div
+                            className="relative rounded-2xl overflow-hidden mb-3 border border-slate-200/80 max-h-[480px] min-h-[200px] bg-[#F8FAFC] flex items-center justify-center group"
+                            style={
+                              post.aspectRatio === '1:1'
+                                ? { aspectRatio: '1 / 1' }
+                                : post.aspectRatio === '4:5'
+                                ? { aspectRatio: '4 / 5' }
+                                : post.aspectRatio === '9:16'
+                                ? { aspectRatio: '9 / 16' }
+                                : (preloadedDimensions[currentImgUrl] ||
+                                    getPreloadedMediaInfo(currentImgUrl))
+                                ? {
+                                    aspectRatio: String(
+                                      (preloadedDimensions[currentImgUrl] ||
+                                        getPreloadedMediaInfo(currentImgUrl))!.aspectRatio
+                                    ),
+                                  }
+                                : undefined
+                            }
+                          >
+                            <img
+                              src={currentImgUrl}
+                              alt="Wave attachment"
+                              decoding="async"
+                              className="w-full h-full max-h-[480px] object-cover"
+                              onError={(e) => {
+                                (e.target as HTMLElement).style.display = 'none';
+                              }}
+                            />
+
+                            {slides.length > 1 && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setCarouselIndices((prev) => ({
+                                      ...prev,
+                                      [post.id]:
+                                        activeSlideIdx > 0
+                                          ? activeSlideIdx - 1
+                                          : slides.length - 1,
+                                    }));
+                                  }}
+                                  aria-label="Previous photo"
+                                  className="absolute left-2.5 top-1/2 -translate-y-1/2 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
+                                >
+                                  ‹
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setCarouselIndices((prev) => ({
+                                      ...prev,
+                                      [post.id]:
+                                        activeSlideIdx < slides.length - 1
+                                          ? activeSlideIdx + 1
+                                          : 0,
+                                    }));
+                                  }}
+                                  aria-label="Next photo"
+                                  className="absolute right-2.5 top-1/2 -translate-y-1/2 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
+                                >
+                                  ›
+                                </button>
+
+                                <div className="absolute top-3 right-3 px-2.5 py-1 rounded-full bg-black/60 text-white text-[11px] font-mono font-bold tabular-nums">
+                                  {activeSlideIdx + 1}/{slides.length}
+                                </div>
+
+                                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/45">
+                                  {slides.map((_, idx) => (
+                                    <button
+                                      key={idx}
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setCarouselIndices((prev) => ({
+                                          ...prev,
+                                          [post.id]: idx,
+                                        }));
+                                      }}
+                                      aria-label={`Slide ${idx + 1}`}
+                                      className={`h-1.5 rounded-full transition-all cursor-pointer ${
+                                        idx === activeSlideIdx
+                                          ? 'w-4 bg-white'
+                                          : 'w-1.5 bg-white/50'
+                                      }`}
+                                    />
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
+
+                    {/* In-Post Music Player INSIDE each post card, directly UNDER the media */}
                     {post.songPreviewUrl && post.songTitle && (
                       <div className="mb-3.5">
                         <SongPlayerCard
@@ -2076,44 +2187,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           albumArt={post.songAlbumArt}
                           previewUrl={post.songPreviewUrl}
                           albumName={post.songAlbumName}
-                        />
-                      </div>
-                    )}
-
-                    {/* Attached Video from Firestore (Chunked or Direct) */}
-                    {(post.videoUrl || post.hasVideoChunks || post.mediaType === 'video') && (
-                      <div className="mb-3.5">
-                        <VideoPlayer
-                          postId={post.id}
-                          videoUrl={post.videoUrl}
-                          hasVideoChunks={post.hasVideoChunks}
-                          thumbnailUrl={post.thumbnailUrl || post.imageUrl}
-                        />
-                      </div>
-                    )}
-
-                    {/* Attached Image from Firestore (with preloaded aspect-ratio stabilization) */}
-                    {post.imageUrl && !post.videoUrl && !post.hasVideoChunks && post.mediaType !== 'video' && (
-                      <div
-                        className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-[460px] min-h-[200px] bg-[#F8FAFC] flex items-center justify-center"
-                        style={
-                          (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))
-                            ? {
-                                aspectRatio: String(
-                                  (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))!.aspectRatio
-                                ),
-                              }
-                            : undefined
-                        }
-                      >
-                        <img
-                          src={post.imageUrl}
-                          alt="Wave attachment"
-                          decoding="async"
-                          className="w-full h-auto max-h-[460px] object-cover"
-                          onError={(e) => {
-                            (e.target as HTMLElement).style.display = 'none';
-                          }}
+                          defaultMuted={Boolean(
+                            post.videoUrl || post.hasVideoChunks || post.mediaType === 'video'
+                          )}
+                          startTime={post.songStartTime}
+                          volume={post.songVolume}
                         />
                       </div>
                     )}
@@ -2173,29 +2251,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         </button>
                       </div>
 
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1">
                         <button
                           type="button"
                           onClick={() => handleDownloadPost(post)}
-                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
-                          title={post.imageUrl && !post.videoUrl && !post.hasVideoChunks && post.mediaType !== 'video' ? 'Download post image' : 'Download post text (.txt)'}
+                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
+                          title="Download post image or text"
                         >
                           <Download size={14} />
                           <span>Download</span>
                         </button>
-
                         <button
                           type="button"
                           onClick={() => handleSharePost(post)}
-                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl hover:bg-slate-100 transition"
-                          title="Share post via Web Share or WhatsApp"
+                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
+                          title="Share on WhatsApp or Web Share"
                         >
-                          {copiedId === post.id ? (
-                            <Check size={14} className="text-[#10B981]" />
-                          ) : (
-                            <Share2 size={14} />
-                          )}
-                          <span>{copiedId === post.id ? 'Shared' : 'Share'}</span>
+                          <Share2 size={14} />
+                          <span>Share</span>
                         </button>
                       </div>
                     </div>
@@ -2203,29 +2276,37 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     {/* Collapsible Comments Section */}
                     {isExpanded && (
                       <div className="mt-4 pt-3.5 border-t border-[#EFECE6] space-y-3">
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="text"
-                            value={commentInput[post.id] || ''}
-                            onChange={(e) =>
-                              setCommentInput((prev) => ({ ...prev, [post.id]: e.target.value }))
-                            }
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') handleAddComment(post.id);
-                            }}
-                            placeholder="Write a reply..."
-                            className="flex-1 py-2 px-3.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-xs text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
-                          />
-                          <button
-                            onClick={() => handleAddComment(post.id)}
-                            disabled={!commentInput[post.id]?.trim()}
-                            className="p-2 rounded-xl bg-[#2563EB] text-white disabled:opacity-40 hover:bg-[#1D4ED8] transition shadow-xs"
-                          >
-                            <Send size={14} />
-                          </button>
-                        </div>
+                        {post.allowComments === false ? (
+                          <p className="text-xs text-[#78716C] italic py-1">
+                            Comments are turned off for this post.
+                          </p>
+                        ) : (
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="text"
+                              value={commentInput[post.id] || ''}
+                              onChange={(e) =>
+                                setCommentInput((prev) => ({ ...prev, [post.id]: e.target.value }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleAddComment(post.id);
+                              }}
+                              placeholder="Write a reply..."
+                              className="flex-1 min-h-[44px] py-2 px-3.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-base sm:text-xs text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                            />
+                            <button
+                              onClick={() => handleAddComment(post.id)}
+                              disabled={!commentInput[post.id]?.trim()}
+                              className="min-w-[44px] min-h-[44px] p-2 rounded-xl bg-[#2563EB] text-white disabled:opacity-40 hover:bg-[#1D4ED8] flex items-center justify-center transition shadow-xs"
+                            >
+                              <Send size={15} />
+                            </button>
+                          </div>
+                        )}
 
-                        {comments.length === 0 ? (
+                        {loadingCommentsMap[post.id] || commentsMap[post.id] === undefined ? (
+                          <CommentSkeleton count={2} />
+                        ) : comments.length === 0 ? (
                           <p className="text-[11px] text-[#78716C] italic py-1">
                             No replies yet. Be the first to chime in!
                           </p>
@@ -2321,7 +2402,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
           onClick={() => setFocusedPost(null)}
         >
           <div
-            className="w-full max-w-2xl max-h-[88vh] bg-white rounded-3xl border border-stone-200 shadow-2xl overflow-hidden flex flex-col"
+            className="w-full max-w-2xl max-h-[88dvh] bg-white rounded-3xl border border-stone-200 shadow-2xl overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Top Visual Reading Progress Bar for Post Detail View */}
@@ -2401,6 +2482,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   videoUrl={focusedPost.videoUrl}
                   hasVideoChunks={focusedPost.hasVideoChunks}
                   thumbnailUrl={focusedPost.thumbnailUrl || focusedPost.imageUrl}
+                  duration={focusedPost.duration ?? focusedPost.videoDurationSeconds}
+                  videoWidth={focusedPost.videoWidth}
+                  videoHeight={focusedPost.videoHeight}
+                  aspectRatio={focusedPost.aspectRatio}
                 />
               )}
 
@@ -2414,23 +2499,48 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 </div>
               )}
 
-              <div className="flex items-center justify-end gap-2 pt-2 border-t border-stone-100">
-                <button
-                  type="button"
-                  onClick={() => handleDownloadPost(focusedPost)}
-                  className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-stone-100 hover:bg-stone-200/80 text-stone-700 text-xs font-semibold transition"
-                >
-                  <Download size={14} />
-                  <span>Download</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleSharePost(focusedPost)}
-                  className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-blue-50 hover:bg-blue-100 text-[#2563EB] text-xs font-semibold transition"
-                >
-                  <Share2 size={14} />
-                  <span>Share</span>
-                </button>
+              {focusedPost.songPreviewUrl && focusedPost.songTitle && (
+                <SongPlayerCard
+                  title={focusedPost.songTitle}
+                  artist={focusedPost.songArtist || ''}
+                  albumArt={focusedPost.songAlbumArt}
+                  previewUrl={focusedPost.songPreviewUrl}
+                  albumName={focusedPost.songAlbumName}
+                  defaultMuted={Boolean(
+                    focusedPost.videoUrl ||
+                      focusedPost.hasVideoChunks ||
+                      focusedPost.mediaType === 'video'
+                  )}
+                  startTime={focusedPost.songStartTime}
+                  volume={focusedPost.songVolume}
+                />
+              )}
+
+              {/* Action bar inside detail modal */}
+              <div className="flex items-center justify-between py-2 border-y border-stone-100 text-xs font-semibold text-slate-500">
+                <span className="text-xs text-stone-400 font-mono">
+                  {focusedPost.createdAt ? new Date(focusedPost.createdAt).toLocaleDateString() : ''}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPost(focusedPost)}
+                    className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 text-slate-700 transition active:scale-95"
+                    title="Download post image or text"
+                  >
+                    <Download size={14} />
+                    <span>Download</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSharePost(focusedPost)}
+                    className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 text-[#2563EB] font-bold transition active:scale-95"
+                    title="Share on WhatsApp or via Web Share"
+                  >
+                    <Share2 size={14} />
+                    <span>Share on WhatsApp</span>
+                  </button>
+                </div>
               </div>
 
               <div className="pt-4 border-t border-stone-100 space-y-3">
@@ -2480,23 +2590,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
         </div>
       )}
 
-      {/* Floating Toast Notification for Download / Share actions */}
-      {actionToast && (
+      {/* Toast Notice for Download & Share actions */}
+      {toastNotice && (
         <div
           role="status"
           aria-live="polite"
-          className={`fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl shadow-lg border text-xs font-bold transition-all ${
-            actionToast.type === 'success'
-              ? 'bg-emerald-600 text-white border-emerald-500'
-              : 'bg-rose-600 text-white border-rose-500'
+          className={`fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-2.5 rounded-2xl shadow-xl text-xs font-bold transition-all transform animate-in fade-in slide-in-from-bottom-2 ${
+            toastNotice.type === 'error'
+              ? 'bg-rose-600 text-white shadow-rose-900/20'
+              : 'bg-slate-900 text-white shadow-slate-900/30'
           }`}
         >
-          {actionToast.type === 'success' ? (
-            <Check size={14} className="shrink-0" />
+          {toastNotice.type === 'error' ? (
+            <X size={15} className="shrink-0 text-rose-200" />
           ) : (
-            <X size={14} className="shrink-0" />
+            <Check size={15} className="shrink-0 text-emerald-400" />
           )}
-          <span>{actionToast.text}</span>
+          <span>{toastNotice.message}</span>
         </div>
       )}
     </div>

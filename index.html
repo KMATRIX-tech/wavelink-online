@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>WaveLink - Connect, Share, and Discover</title>
     <meta name="description" content="WaveLink is a modern social network featuring real-time feed, Airtel Money & AzamPay mobile payments, creator tipping, post boosting, and native monetization." />
     <meta name="keywords" content="WaveLink, Social Network, Tanzania, East Africa, Airtel Money, AzamPay, Creator Economy, Reels, Media Studio" />
@@ -76,6 +76,103 @@
   </head>
   <body class="bg-[#F8FAFC] text-[#0F172A] antialiased selection:bg-blue-500 selection:text-white min-h-screen">
     <div id="root"></div>
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var baselineHeight = window.innerHeight;
+        var rafId = null;
+
+        function isEditableElement(el) {
+          if (!el || el === document.body || el === root) return false;
+          var tag = el.tagName;
+          if (tag === 'INPUT') {
+            var type = (el.getAttribute('type') || 'text').toLowerCase();
+            return !['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(type);
+          }
+          return tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;
+        }
+
+        function ensureActiveInputVisible(vv) {
+          var activeEl = document.activeElement;
+          if (!isEditableElement(activeEl) || typeof activeEl.getBoundingClientRect !== 'function') {
+            return;
+          }
+          var rect = activeEl.getBoundingClientRect();
+          var visibleTop = vv ? vv.offsetTop : 0;
+          var visibleBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+          var safetyMargin = 16;
+
+          if (rect.bottom + safetyMargin > visibleBottom || rect.top - safetyMargin < visibleTop) {
+            if (typeof activeEl.scrollIntoView === 'function') {
+              activeEl.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+            }
+          }
+        }
+
+        function updateVisualViewportMetrics() {
+          var vv = window.visualViewport;
+          var width = vv ? vv.width : window.innerWidth;
+          var height = vv ? vv.height : window.innerHeight;
+          var offsetTop = vv ? vv.offsetTop : 0;
+          var isMobile = width < 768;
+
+          if (!isEditableElement(document.activeElement) && window.innerHeight >= baselineHeight) {
+            baselineHeight = window.innerHeight;
+          }
+
+          var referenceHeight = Math.max(window.innerHeight, baselineHeight);
+          var rawKeyboardOffset = Math.max(0, referenceHeight - (height + offsetTop));
+          var activeEditable = isEditableElement(document.activeElement);
+          var isKeyboardOpen = isMobile && (rawKeyboardOffset > 85 || (activeEditable && rawKeyboardOffset > 25));
+
+          root.style.setProperty('--vv-height', height + 'px');
+          root.style.setProperty('--vv-offset-top', offsetTop + 'px');
+          root.style.setProperty('--kb-offset', (isKeyboardOpen ? rawKeyboardOffset : 0) + 'px');
+
+          if (isKeyboardOpen) {
+            root.setAttribute('data-keyboard-open', 'true');
+            ensureActiveInputVisible(vv);
+          } else {
+            root.removeAttribute('data-keyboard-open');
+          }
+        }
+
+        function scheduleViewportUpdate() {
+          if (rafId !== null) {
+            cancelAnimationFrame(rafId);
+          }
+          rafId = requestAnimationFrame(function () {
+            rafId = null;
+            updateVisualViewportMetrics();
+          });
+        }
+
+        updateVisualViewportMetrics();
+
+        if (window.visualViewport) {
+          window.visualViewport.addEventListener('resize', scheduleViewportUpdate, { passive: true });
+          window.visualViewport.addEventListener('scroll', scheduleViewportUpdate, { passive: true });
+        }
+
+        window.addEventListener('resize', scheduleViewportUpdate, { passive: true });
+        window.addEventListener('orientationchange', function () {
+          baselineHeight = window.innerHeight;
+          setTimeout(scheduleViewportUpdate, 120);
+        }, { passive: true });
+
+        document.addEventListener('focusin', function (e) {
+          if (isEditableElement(e.target)) {
+            scheduleViewportUpdate();
+            setTimeout(scheduleViewportUpdate, 150);
+            setTimeout(scheduleViewportUpdate, 320);
+          }
+        }, { passive: true });
+
+        document.addEventListener('focusout', function () {
+          setTimeout(scheduleViewportUpdate, 100);
+        }, { passive: true });
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

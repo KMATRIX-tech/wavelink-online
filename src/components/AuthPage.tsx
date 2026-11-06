@@ -220,19 +220,19 @@ export const AuthPage: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen relative flex items-center justify-center p-4 sm:p-8 overflow-hidden animate-aurora-bg text-[#0F172A]">
+    <div className="min-h-[100dvh] w-full max-w-full relative flex items-center justify-center p-3.5 sm:p-8 overflow-x-hidden overflow-y-auto animate-aurora-bg text-[#0F172A] safe-area-top safe-area-bottom">
       {/* Moving Colorful Floating Orbs */}
       <div
-        className="absolute top-[-10%] left-[-8%] w-[520px] h-[520px] rounded-full bg-gradient-to-br from-blue-500/45 via-cyan-400/40 to-teal-300/35 blur-[95px] pointer-events-none animate-orb-1"
+        className="absolute top-[-10%] left-[-8%] w-[520px] max-w-[90vw] h-[520px] max-h-[90vw] rounded-full bg-gradient-to-br from-blue-500/45 via-cyan-400/40 to-teal-300/35 blur-[95px] pointer-events-none animate-orb-1"
       />
       <div
-        className="absolute bottom-[-12%] right-[-8%] w-[580px] h-[580px] rounded-full bg-gradient-to-tr from-emerald-400/45 via-teal-400/35 to-cyan-500/40 blur-[105px] pointer-events-none animate-orb-2"
+        className="absolute bottom-[-12%] right-[-8%] w-[580px] max-w-[90vw] h-[580px] max-h-[90vw] rounded-full bg-gradient-to-tr from-emerald-400/45 via-teal-400/35 to-cyan-500/40 blur-[105px] pointer-events-none animate-orb-2"
       />
       <div
-        className="absolute top-[15%] right-[8%] w-[460px] h-[460px] rounded-full bg-gradient-to-bl from-pink-500/40 via-rose-400/35 to-amber-300/40 blur-[95px] pointer-events-none animate-orb-3"
+        className="absolute top-[15%] right-[8%] w-[460px] max-w-[85vw] h-[460px] max-h-[85vw] rounded-full bg-gradient-to-bl from-pink-500/40 via-rose-400/35 to-amber-300/40 blur-[95px] pointer-events-none animate-orb-3"
       />
       <div
-        className="absolute bottom-[12%] left-[10%] w-[440px] h-[440px] rounded-full bg-gradient-to-tr from-violet-500/40 via-fuchsia-400/35 to-amber-400/35 blur-[95px] pointer-events-none animate-orb-4"
+        className="absolute bottom-[12%] left-[10%] w-[440px] max-w-[85vw] h-[440px] max-h-[85vw] rounded-full bg-gradient-to-tr from-violet-500/40 via-fuchsia-400/35 to-amber-400/35 blur-[95px] pointer-events-none animate-orb-4"
       />
 
       {/* Animated Moving Colour Waves at the Bottom */}
@@ -307,9 +307,9 @@ export const AuthPage: React.FC = () => {
 
         {/* Moving Rainbow Border Wrapper around the Crisp White Card */}
         <div className="p-[3px] rounded-[28px] animate-vibrant-ribbon shadow-[0_20px_60px_-12px_rgba(37,99,235,0.28)]">
-          <div className="bg-white/95 backdrop-blur-xl rounded-[25px] p-6 sm:p-8">
+          <div className="bg-white/95 backdrop-blur-xl rounded-[25px] p-5 sm:p-8">
             {/* Mode Switcher Tabs: Sign In vs Sign Up */}
-            <div className="grid grid-cols-2 p-1.5 bg-slate-100/90 rounded-2xl border border-slate-200/80 mb-6">
+            <div className="grid grid-cols-2 p-1.5 bg-slate-100/90 rounded-2xl border border-slate-200/80 mb-6 gap-1">
               <button
                 type="button"
                 onClick={() => {
@@ -317,7 +317,7 @@ export const AuthPage: React.FC = () => {
                   setError(null);
                   setStatusMessage(null);
                 }}
-                className={`py-2.5 px-4 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all duration-300 ${
+                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all duration-300 ${
                   authMode === 'signin'
                     ? 'animate-moving-btn text-white shadow-md shadow-blue-500/25 scale-[1.01]'
                     : 'text-slate-600 hover:text-[#0F172A]'
@@ -333,7 +333,7 @@ export const AuthPage: React.FC = () => {
                   setError(null);
                   setStatusMessage(null);
                 }}
-                className={`py-2.5 px-4 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all duration-300 ${
+                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all duration-300 ${
                   authMode === 'signup'
                     ? 'animate-moving-btn text-white shadow-md shadow-emerald-500/25 scale-[1.01]'
                     : 'text-slate-600 hover:text-[#0F172A]'
@@ -382,7 +382,7 @@ export const AuthPage: React.FC = () => {
               type="button"
               onClick={handleGoogleSignIn}
               disabled={isGoogleLoading || isLoading}
-              className="w-full py-3 px-4 rounded-2xl bg-gradient-to-r from-blue-50/70 via-purple-50/70 to-pink-50/70 hover:from-blue-100/80 hover:via-purple-100/80 hover:to-pink-100/80 border border-blue-200/80 text-[#0F172A] font-extrabold text-xs sm:text-sm flex items-center justify-center gap-3 transition shadow-xs active:scale-[0.99] disabled:opacity-50"
+              className="w-full min-h-[48px] py-3 px-4 rounded-2xl bg-gradient-to-r from-blue-50/70 via-purple-50/70 to-pink-50/70 hover:from-blue-100/80 hover:via-purple-100/80 hover:to-pink-100/80 border border-blue-200/80 text-[#0F172A] font-extrabold text-xs sm:text-sm flex items-center justify-center gap-3 transition shadow-xs active:scale-[0.99] disabled:opacity-50"
             >
               {isGoogleLoading ? (
                 <div className="w-4 h-4 border-2 border-[#3B82F6] border-t-transparent rounded-full animate-spin" />
@@ -431,14 +431,14 @@ export const AuthPage: React.FC = () => {
                       Full Name / Display Name
                     </label>
                     <div className="relative">
-                      <User className="absolute left-3.5 top-3 text-emerald-500" size={16} />
+                      <User className="absolute left-3.5 top-3.5 text-emerald-500" size={16} />
                       <input
                         type="text"
                         required
                         value={displayName}
                         onChange={(e) => setDisplayName(e.target.value)}
                         placeholder="e.g. Keylan Mbilinyi"
-                        className="w-full pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/25 text-xs sm:text-sm transition"
+                        className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/25 text-base sm:text-sm transition"
                       />
                     </div>
                   </div>
@@ -448,13 +448,13 @@ export const AuthPage: React.FC = () => {
                       Username (optional)
                     </label>
                     <div className="relative">
-                      <AtSign className="absolute left-3.5 top-3 text-purple-500" size={16} />
+                      <AtSign className="absolute left-3.5 top-3.5 text-purple-500" size={16} />
                       <input
                         type="text"
                         value={username}
                         onChange={(e) => setUsername(e.target.value)}
                         placeholder="e.g. keylan"
-                        className="w-full pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-500/25 text-xs sm:text-sm transition"
+                        className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-500/25 text-base sm:text-sm transition"
                       />
                     </div>
                   </div>
@@ -466,14 +466,14 @@ export const AuthPage: React.FC = () => {
                   Email Address
                 </label>
                 <div className="relative">
-                  <Mail className="absolute left-3.5 top-3 text-blue-500" size={16} />
+                  <Mail className="absolute left-3.5 top-3.5 text-blue-500" size={16} />
                   <input
                     type="email"
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     placeholder="name@domain.com"
-                    className="w-full pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#3B82F6] focus:ring-2 focus:ring-[#3B82F6]/25 text-xs sm:text-sm transition"
+                    className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#3B82F6] focus:ring-2 focus:ring-[#3B82F6]/25 text-base sm:text-sm transition"
                   />
                 </div>
               </div>
@@ -486,7 +486,7 @@ export const AuthPage: React.FC = () => {
                   <span className="text-[10px] text-pink-600 font-semibold">Min. 6 characters</span>
                 </div>
                 <div className="relative">
-                  <Lock className="absolute left-3.5 top-3 text-pink-500" size={16} />
+                  <Lock className="absolute left-3.5 top-3.5 text-pink-500" size={16} />
                   <input
                     type={showPassword ? 'text' : 'password'}
                     required
@@ -494,12 +494,12 @@ export const AuthPage: React.FC = () => {
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="••••••••"
                     minLength={6}
-                    className="w-full pl-10 pr-10 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-pink-500 focus:ring-2 focus:ring-pink-500/25 text-xs sm:text-sm transition"
+                    className="w-full min-h-[44px] pl-10 pr-10 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-pink-500 focus:ring-2 focus:ring-pink-500/25 text-base sm:text-sm transition"
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3.5 top-3 text-slate-400 hover:text-pink-600 transition"
+                    className="min-w-[44px] min-h-[44px] absolute right-0 top-0 flex items-center justify-center text-slate-400 hover:text-pink-600 transition"
                     title={showPassword ? 'Hide password' : 'Show password'}
                   >
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
@@ -510,7 +510,7 @@ export const AuthPage: React.FC = () => {
               <button
                 type="submit"
                 disabled={isLoading || isGoogleLoading}
-                className="w-full mt-2 py-3.5 px-5 rounded-2xl font-extrabold text-xs sm:text-sm text-white flex items-center justify-center gap-2 shadow-lg shadow-blue-500/30 hover:shadow-pink-500/35 hover:scale-[1.01] active:scale-[0.99] transition-all duration-200 disabled:opacity-50 animate-moving-btn"
+                className="w-full min-h-[48px] mt-2 py-3.5 px-5 rounded-2xl font-extrabold text-xs sm:text-sm text-white flex items-center justify-center gap-2 shadow-lg shadow-blue-500/30 hover:shadow-pink-500/35 hover:scale-[1.01] active:scale-[0.99] transition-all duration-200 disabled:opacity-50 animate-moving-btn"
               >
                 {isLoading ? (
                   <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />

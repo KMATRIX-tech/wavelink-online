@@ -108,10 +108,10 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
 
   return (
     <nav
-      className="fixed bottom-0 left-0 right-0 z-30 bg-[var(--bg-surface)]/95 backdrop-blur-md border-t border-[var(--border-hairline)] pb-safe shadow-[0_-2px_12px_rgba(28,25,23,0.04)]"
+      className="wavelink-mobile-bottom-nav lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-[var(--bg-surface)]/95 backdrop-blur-md border-t border-[var(--border-hairline)] pb-[env(safe-area-inset-bottom,0px)] shadow-[0_-2px_12px_rgba(28,25,23,0.04)]"
       aria-label="Main Navigation"
     >
-      <div className="flex items-center justify-between h-16 max-w-xl mx-auto px-3">
+      <div className="flex items-center justify-between min-h-[4rem] w-full max-w-xl mx-auto px-2 sm:px-3">
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
 
@@ -121,14 +121,14 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
                 key={item.id}
                 type="button"
                 onClick={() => handleNavClick(item.id, true)}
-                className="flex flex-col items-center justify-center -mt-4 group active:scale-95 transition-transform"
+                className="flex flex-col items-center justify-center min-w-[52px] min-h-[48px] -mt-3.5 group active:scale-95 transition-transform"
                 title="Create Wave or Reel"
                 aria-label="Create new Wave or Reel"
               >
-                <div className="w-12 h-12 rounded-2xl bg-[#0D9488] hover:bg-[#0f766e] flex items-center justify-center shadow-md shadow-[#0D9488]/25 transition">
+                <div className="w-11 h-11 rounded-2xl bg-[#0D9488] hover:bg-[#0f766e] flex items-center justify-center shadow-md shadow-[#0D9488]/25 transition">
                   {item.icon(isActive)}
                 </div>
-                <span className="text-[11px] font-bold mt-1 text-[#0D9488]">
+                <span className="text-[11px] font-bold mt-0.5 text-[#0D9488]">
                   {item.label}
                 </span>
               </button>
@@ -140,7 +140,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               key={item.id}
               type="button"
               onClick={() => handleNavClick(item.id, false)}
-              className={`flex-1 flex flex-col items-center justify-center py-1.5 transition-colors relative min-h-[48px] ${
+              className={`flex-1 flex flex-col items-center justify-center py-1.5 transition-colors relative min-w-[44px] min-h-[48px] ${
                 isActive ? item.activeColor : 'text-[#78716C] hover:text-[#1C1917]'
               }`}
               aria-label={item.label}
