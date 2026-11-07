@@ -100,10 +100,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const { currentUser, isSuperAdmin, isSubAdmin, isAdmin, toggleSubAdmin, toggleVerifyUser, recordAdminAuditLog } = useAuth();
 
   const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades'>('overview');
-  const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(true);
+  const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(false);
+  const [isCheckingServerAdmin, setIsCheckingServerAdmin] = useState<boolean>(true);
 
   useEffect(() => {
-    if (!currentUser?.email) return;
+    if (!currentUser) {
+      setServerAdminVerified(false);
+      setIsCheckingServerAdmin(false);
+      return;
+    }
+    setIsCheckingServerAdmin(true);
     getAuthHeaders()
       .then((headers) =>
         fetch('/api/admin/verify', {
@@ -116,10 +122,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       .then((d) => {
         if (d && typeof d.authorized === 'boolean') {
           setServerAdminVerified(d.authorized);
+        } else {
+          setServerAdminVerified(false);
         }
       })
-      .catch(() => {});
-  }, [currentUser?.email, isSubAdmin]);
+      .catch(() => {
+        setServerAdminVerified(Boolean(isAdmin));
+      })
+      .finally(() => {
+        setIsCheckingServerAdmin(false);
+      });
+  }, [currentUser, isSubAdmin, isAdmin]);
 
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [posts, setPosts] = useState<Post[]>([]);
@@ -470,7 +483,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Ban user (no window.prompt required)
   const handleBanUser = async (user: UserProfile) => {
-    if (user.email === ADMIN_EMAIL) {
+    if (user.role === 'super_admin') {
       console.warn('The primary platform administrator cannot be banned.');
       return;
     }
@@ -898,6 +911,41 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const openReportsCount = contentReports.filter((r) => r.status === 'open').length;
   const newUpgradesCount = upgradeFeedbacks.filter((u) => u.status === 'new').length;
 
+  if (isCheckingServerAdmin) {
+    return (
+      <div className="max-w-xl mx-auto py-16 px-4 text-center">
+        <div className="bg-white border border-[#EFECE6] rounded-3xl p-8 shadow-sm space-y-3">
+          <Loader2 size={28} className="mx-auto text-[#2563EB] animate-spin" />
+          <h3 className="text-base font-extrabold text-[#1C1917]">Verifying Admin Clearance...</h3>
+          <p className="text-xs text-[#57534E]">Checking server-side administrator credentials.</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAdmin || !serverAdminVerified) {
+    return (
+      <div className="max-w-xl mx-auto py-16 px-4 text-center">
+        <div className="bg-white border border-rose-200 rounded-3xl p-8 shadow-sm space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 mx-auto flex items-center justify-center">
+            <ShieldAlert size={24} />
+          </div>
+          <h3 className="text-lg font-extrabold text-[#1C1917]">Administrator Access Required</h3>
+          <p className="text-xs sm:text-sm text-[#57534E]">
+            This page requires server-verified administrator privileges.
+          </p>
+          <button
+            type="button"
+            onClick={onReturnToFeed}
+            className="px-5 py-2.5 rounded-2xl bg-[#2563EB] text-white font-bold text-xs hover:bg-[#1D4ED8] transition"
+          >
+            Return to Feed
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-7xl mx-auto py-6 px-3 sm:px-6 space-y-6">
       {/* Admin Title Card */}
@@ -933,10 +981,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Custom .crystal-sparkle badge exclusively for keylanmbilinyi5@gmail.com */}
           <CrystalBadge
             email={currentUser?.email}
-            name={isSuperAdmin ? 'Keylan (Platform Owner)' : (currentUser?.displayName || 'Moderator')}
+            name={isSuperAdmin ? 'Platform Owner' : (currentUser?.displayName || 'Moderator')}
+            role={isSuperAdmin ? 'super_admin' : isSubAdmin ? 'sub_admin' : 'user'}
             size="lg"
             showAdminTag={true}
             isSubAdmin={isSubAdmin}
@@ -2433,7 +2481,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               </thead>
               <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
                 {users.map((user) => {
-                  const isTargetSuperAdmin = user.email === ADMIN_EMAIL;
+                  const isTargetSuperAdmin = user.role === 'super_admin';
                   const isTargetSubAdmin = !isTargetSuperAdmin && (user.isSubAdmin || user.role === 'sub_admin');
 
                   return (

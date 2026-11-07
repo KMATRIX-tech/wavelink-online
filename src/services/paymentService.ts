@@ -7,6 +7,7 @@ import {
   UserProfile,
   PaymentGatewayConfig
 } from '../types';
+import { sendNotification } from './notificationService';
 
 export const PRO_TIERS: SubscriptionTier[] = [
   {
@@ -328,6 +329,16 @@ export async function completeSubscription(
       proAccentColor: 'purple',
       updatedAt: completedAt
     });
+
+    sendNotification({
+      recipientId: userId,
+      actorId: 'wavelink_billing',
+      actorName: 'WaveLink Billing',
+      type: 'payment_verified',
+      title: 'Payment Confirmed! 🎉',
+      body: `Your WaveLink Pro (${planId}) subscription is now active.`,
+      entityId: transactionId
+    }).catch(() => {});
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `users/${userId}`);
   }

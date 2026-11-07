@@ -120,9 +120,9 @@ export async function recordUpgradeFeedback(item: {
 
   const docRef = await addDoc(collection(db, 'upgrade_feedback'), cleanFirestoreData(feedbackData));
 
-  // Find Platform Owner / Super Admin user ID to dispatch in-app notification to Keylan
+  // Find Platform Owner / Super Admin user ID to dispatch in-app notification
   try {
-    const adminUserQuery = query(collection(db, 'users'), where('email', '==', ADMIN_EMAIL));
+    const adminUserQuery = query(collection(db, 'users'), where('role', '==', 'super_admin'));
     const adminSnap = await getDocs(adminUserQuery);
     if (!adminSnap.empty) {
       const ownerId = adminSnap.docs[0].id;

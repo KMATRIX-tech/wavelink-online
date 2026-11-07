@@ -25,6 +25,34 @@ export interface UserTermsAgreement {
   acceptedAt?: string;
 }
 
+export interface UserNotificationSettings {
+  masterEnabled: boolean;
+  messages: boolean;
+  calls: boolean;
+  followers: boolean;
+  reactions: boolean;
+  announcements: boolean;
+  payments?: boolean;
+  showMessagePreviews: boolean;
+  quietHoursEnabled: boolean;
+  quietHoursStart: string; // HH:mm in 24h format, e.g. "22:00"
+  quietHoursEnd: string;   // HH:mm in 24h format, e.g. "07:00"
+  timezoneOffsetMinutes?: number;
+  updatedAt?: string;
+}
+
+export interface FcmDeviceTokenDoc {
+  id: string;
+  token: string;
+  userId: string;
+  platform: string;
+  userAgent: string;
+  isIOS?: boolean;
+  isStandalone?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface UserProfile {
   id: string; // Auth UID
   email: string;
@@ -40,6 +68,7 @@ export interface UserProfile {
   blockedUserIds?: string[];
   appearanceTheme?: AppearanceTheme;
   privacySettings?: UserPrivacySettings;
+  notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;
   // Administrative and Security Roles
   role?: 'super_admin' | 'sub_admin' | 'user' | 'bot';
@@ -491,10 +520,15 @@ export type ActiveTab =
 export type NotificationType =
   | 'message'
   | 'call'
+  | 'incoming_call'
   | 'post_like'
+  | 'post_reaction'
   | 'post_comment'
   | 'post_tip'
   | 'post_boost'
+  | 'payment_verified'
+  | 'spark_like'
+  | 'announcement'
   | 'follow'
   | 'system';
 

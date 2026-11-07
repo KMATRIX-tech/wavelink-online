@@ -443,7 +443,7 @@ export const SupportDeskView: React.FC = () => {
                     <span className="text-[11px] font-bold uppercase tracking-wider text-[#2563EB]">
                       Official Admin Response:
                     </span>
-                    <CrystalBadge email="keylanmbilinyi5@gmail.com" name="Platform Administration" size="sm" />
+                    <CrystalBadge role="super_admin" name="Platform Administration" size="sm" />
                   </div>
                   <p className="text-sm text-[#1C1917] whitespace-pre-wrap leading-relaxed">
                     {selectedTicket.adminReply}

@@ -19,10 +19,7 @@ import { doc, getDoc, setDoc, deleteDoc, collection, query, where, getDocs, onSn
 import {
   auth,
   db,
-  ADMIN_EMAIL,
-  isOwnerEmail,
-  isAdminEmail,
-  isSuperAdminEmail,
+  OWNER_SESSION_STORAGE_KEY,
   handleFirestoreError,
   OperationType,
   cleanFirestoreData,
@@ -37,9 +34,15 @@ import {
   PointTransactionType,
   AppearanceTheme,
   UserPrivacySettings,
+  UserNotificationSettings,
   UserTermsAgreement,
   AuditActionType
 } from '../types';
+import {
+  removeCurrentDeviceFcmToken,
+  syncExistingDeviceTokenState,
+  syncNotificationSettingsToServer
+} from '../services/fcmService';
 import {
   sanitizeUserText,
   validateStrongPassword,
@@ -301,6 +304,7 @@ interface AuthContextType {
     appearanceTheme?: AppearanceTheme;
     followingIds?: string[];
     privacySettings?: UserPrivacySettings;
+    notificationSettings?: UserNotificationSettings;
     termsAgreement?: UserTermsAgreement;
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
@@ -326,6 +330,7 @@ interface AuthContextType {
   activateHarvestPass: () => Promise<void>;
   verifyAndRedeemCoupon: (rawCode: string) => Promise<boolean>;
   showGlobalToast: (message: string) => void;
+  refreshAdminVerification: () => Promise<boolean>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -344,6 +349,7 @@ function hasLocalProPass(uid?: string | null): boolean {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [serverVerifiedRole, setServerVerifiedRole] = useState<'super_admin' | 'sub_admin' | 'user'>('user');
   const [isLoading, setIsLoading] = useState(true);
   const [globalToast, setGlobalToast] = useState<string | null>(null);
   const [dailyRewardJustClaimed, setDailyRewardJustClaimed] = useState<{
@@ -363,6 +369,42 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setDailyRewardJustClaimed(null);
   };
 
+  // Verify admin role strictly against the server (/api/admin/verify)
+  const refreshAdminVerification = async (): Promise<boolean> => {
+    const activeUser = auth.currentUser;
+    if (!activeUser) {
+      setServerVerifiedRole('user');
+      return false;
+    }
+
+    // Ensure currentUser state is synced after Owner sign-in completes
+    setCurrentUser(activeUser);
+
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch('/api/admin/verify', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          email: activeUser.email,
+          isSubAdmin: Boolean(userProfile?.isSubAdmin || userProfile?.role === 'sub_admin')
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.authorized && (data.role === 'super_admin' || data.role === 'sub_admin')) {
+          setServerVerifiedRole(data.role);
+          await syncUserProfileDoc(activeUser);
+          return true;
+        }
+      }
+    } catch {
+      // ignore network error
+    }
+    setServerVerifiedRole('user');
+    return false;
+  };
+
   // Sync profile document in Firestore & evaluate Daily Login Reward
   const syncUserProfileDoc = async (user: FirebaseUser, customName?: string, customUsername?: string) => {
     const userDocRef = doc(db, 'users', user.uid);
@@ -371,29 +413,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const snap = await getDoc(userDocRef);
-      const isOwner = isOwnerEmail(user.email);
       const emailPrefix = user.email ? user.email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '') : 'waver';
 
       if (!snap.exists()) {
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, null);
+        // Never assign admin role on the client; roles default to 'user' and are elevated only by the server
         const initialProfile: UserProfile = {
           id: user.uid,
           email: user.email || '',
-          username: isOwner ? '@keylan' : (customUsername || `@${emailPrefix}`),
-          displayName: isOwner ? 'Keylan Mbilinyi (Platform Owner)' : (customName || user.displayName || user.email?.split('@')[0] || 'Waver'),
+          username: customUsername || `@${emailPrefix}`,
+          displayName: customName || user.displayName || user.email?.split('@')[0] || 'Waver',
           photoURL: user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.uid}`,
-          bio: isOwner ? 'Founder & Platform Owner of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
+          bio: 'Connecting on WaveLink 🌊',
           status: 'active',
           isBanned: false,
           savedPostIds: [],
-          role: isOwner ? 'super_admin' : 'user',
+          role: 'user',
           isSubAdmin: false,
-          hasBlueStar: isOwner || localPro,
-          isVerifiedByAdmin: isOwner || localPro,
-          isPro: isOwner || localPro,
-          proBadge: isOwner ? 'founder' : (localPro ? 'verified' : undefined),
-          proBorderEffect: isOwner ? 'aura-gold' : (localPro ? 'neon-pulse' : undefined),
-          proAccentColor: isOwner ? 'gold' : (localPro ? 'emerald' : undefined),
+          hasBlueStar: localPro,
+          isVerifiedByAdmin: localPro,
+          isPro: localPro,
+          proBadge: localPro ? 'verified' : undefined,
+          proBorderEffect: localPro ? 'neon-pulse' : undefined,
+          proAccentColor: localPro ? 'emerald' : undefined,
           isOnline: true,
           lastSeenAt: nowIso,
           ...rewardFields,
@@ -417,48 +459,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const data = snap.data() as UserProfile;
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, data);
 
-        if (isOwner && (!data.isPro || data.role !== 'super_admin' || !data.hasBlueStar)) {
-          const ownerProfile: UserProfile = {
-            ...data,
-            role: 'super_admin',
-            hasBlueStar: true,
-            isVerifiedByAdmin: true,
-            isPro: true,
-            proBadge: 'founder',
-            proBorderEffect: 'aura-gold',
-            proAccentColor: 'gold',
-            displayName: data.displayName || 'Keylan Mbilinyi (Platform Owner)',
-            username: data.username || '@keylan',
-            savedPostIds: data.savedPostIds || [],
+        const mergedProfile: UserProfile = {
+          ...data,
+          isPro: Boolean(data.isPro || localPro),
+          hasBlueStar: Boolean(data.hasBlueStar || data.isPro || localPro),
+          proBadge: data.proBadge || (localPro ? 'verified' : undefined),
+          isOnline: true,
+          lastSeenAt: nowIso,
+          ...rewardFields
+        };
+        setUserProfile(mergedProfile);
+        // Non-blocking presence + pro + daily reward sync (ensures 'points' field is always written in Firestore)
+        setDoc(
+          userDocRef,
+          cleanFirestoreData({
             isOnline: true,
             lastSeenAt: nowIso,
-            ...rewardFields
-          };
-          await setDoc(userDocRef, cleanFirestoreData(ownerProfile), { merge: true });
-          setUserProfile(ownerProfile);
-        } else {
-          const mergedProfile: UserProfile = {
-            ...data,
-            isPro: Boolean(data.isPro || localPro),
-            hasBlueStar: Boolean(data.hasBlueStar || data.isPro || localPro),
-            proBadge: data.proBadge || (localPro ? 'verified' : undefined),
-            isOnline: true,
-            lastSeenAt: nowIso,
-            ...rewardFields
-          };
-          setUserProfile(mergedProfile);
-          // Non-blocking presence + pro + daily reward sync (ensures 'points' field is always written in Firestore)
-          setDoc(
-            userDocRef,
-            cleanFirestoreData({
-              isOnline: true,
-              lastSeenAt: nowIso,
-              ...rewardFields,
-              ...(localPro ? { isPro: true, hasBlueStar: true, proBadge: 'verified' } : {})
-            }),
-            { merge: true }
-          ).catch(() => {});
-        }
+            ...rewardFields,
+            ...(localPro ? { isPro: true, hasBlueStar: true, proBadge: 'verified' } : {})
+          }),
+          { merge: true }
+        ).catch(() => {});
 
         if (newlyAwarded) {
           setDailyRewardJustClaimed({
@@ -468,6 +489,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           });
           showGlobalToast(`🎁 Daily Login Bonus: +${pointsAwarded} WavePoints! (${rewardFields.loginStreak}-Day Streak 🔥)`);
         }
+
+        // Passively sync existing notification settings & token state (never prompts on load)
+        syncExistingDeviceTokenState(user.uid, data.notificationSettings).catch(() => {});
       }
     } catch (err) {
       console.warn('Profile sync notice:', err);
@@ -621,10 +645,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     let presenceInterval: ReturnType<typeof setInterval> | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      // If a Hidden Owner Sign-In popup is currently awaiting server verification, do not transition yet
+      try {
+        if (user && typeof window !== 'undefined' && sessionStorage.getItem('wavelink_owner_flow_pending') === 'true') {
+          return;
+        }
+      } catch {
+        // ignore
+      }
+
       setCurrentUser(user);
 
       if (user) {
-        const isOwner = isOwnerEmail(user.email);
         const localPro = hasLocalProPass(user.uid);
         const emailPrefix = user.email ? user.email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '') : 'waver';
         const nowIso = new Date().toISOString();
@@ -641,8 +673,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         setUserProfile((prev) => prev ? {
           ...prev,
-          isPro: Boolean(prev.isPro || isOwner || localPro),
-          hasBlueStar: Boolean(prev.hasBlueStar || prev.isPro || isOwner || localPro),
+          isPro: Boolean(prev.isPro || localPro),
+          hasBlueStar: Boolean(prev.hasBlueStar || prev.isPro || localPro),
           isOnline: true,
           lastSeenAt: nowIso,
           points: prev.points ?? prev.wavePoints ?? rewardFields.points,
@@ -655,21 +687,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         } : ({
           id: user.uid,
           email: user.email || '',
-          username: isOwner ? '@keylan' : `@${emailPrefix}`,
-          displayName: isOwner ? 'Keylan Mbilinyi (Platform Owner)' : (user.displayName || user.email?.split('@')[0] || 'Waver'),
+          username: `@${emailPrefix}`,
+          displayName: user.displayName || user.email?.split('@')[0] || 'Waver',
           photoURL: user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.uid}`,
-          bio: isOwner ? 'Founder & Platform Owner of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
+          bio: 'Connecting on WaveLink 🌊',
           status: 'active',
           isBanned: false,
           savedPostIds: [],
-          role: isOwner ? 'super_admin' : 'user',
+          role: 'user',
           isSubAdmin: false,
-          hasBlueStar: isOwner || localPro,
-          isVerifiedByAdmin: isOwner || localPro,
-          isPro: isOwner || localPro,
-          proBadge: isOwner ? 'founder' : (localPro ? 'verified' : undefined),
-          proBorderEffect: isOwner ? 'aura-gold' : (localPro ? 'neon-pulse' : undefined),
-          proAccentColor: isOwner ? 'gold' : (localPro ? 'emerald' : undefined),
+          hasBlueStar: localPro,
+          isVerifiedByAdmin: localPro,
+          isPro: localPro,
+          proBadge: localPro ? 'verified' : undefined,
+          proBorderEffect: localPro ? 'neon-pulse' : undefined,
+          proAccentColor: localPro ? 'emerald' : undefined,
           isOnline: true,
           lastSeenAt: nowIso,
           ...rewardFields,
@@ -677,7 +709,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }));
         setIsLoading(false);
 
-        // Synchronize full profile in the background
+        // Verify server-side admin role & synchronize full profile in the background
+        refreshAdminVerification().catch(() => {});
         syncUserProfileDoc(user).catch((err) => {
           console.warn('Profile sync notice:', err);
         });
@@ -735,6 +768,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (unsubscribeDoc) unsubscribeDoc();
         if (presenceInterval) clearInterval(presenceInterval);
         setUserProfile(null);
+        setServerVerifiedRole('user');
         setDailyRewardJustClaimed(null);
         setIsLoading(false);
       }
@@ -903,15 +937,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signOut = async () => {
     try {
-      if (currentUser?.uid) {
+      try {
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+          localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+          sessionStorage.removeItem('wavelink_owner_flow_pending');
+        }
+      } catch {
+        // ignore
+      }
+      const uid = currentUser?.uid;
+      if (uid) {
+        // Delete this device's FCM token from Firestore & server on logout
+        await removeCurrentDeviceFcmToken(uid).catch(() => {});
         await setDoc(
-          doc(db, 'users', currentUser.uid),
+          doc(db, 'users', uid),
           { isOnline: false, lastSeenAt: new Date().toISOString() },
           { merge: true }
         ).catch(() => {});
       }
       await fbSignOut(auth);
       setUserProfile(null);
+      setServerVerifiedRole('user');
     } catch (err) {
       console.error('Sign Out Error:', err);
     }
@@ -981,6 +1028,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     appearanceTheme?: AppearanceTheme;
     followingIds?: string[];
     privacySettings?: UserPrivacySettings;
+    notificationSettings?: UserNotificationSettings;
     termsAgreement?: UserTermsAgreement;
   }) => {
     if (!currentUser) return;
@@ -1008,6 +1056,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (data.privacySettings !== undefined) {
         updatePayload.privacySettings = data.privacySettings;
         updatePayload.isOnline = data.privacySettings.showOnlineStatus;
+      }
+      if (data.notificationSettings !== undefined) {
+        updatePayload.notificationSettings = data.notificationSettings;
+        syncNotificationSettingsToServer(currentUser.uid, data.notificationSettings).catch(() => {});
       }
       if (data.termsAgreement !== undefined) {
         updatePayload.termsAgreement = data.termsAgreement;
@@ -1158,7 +1210,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // continue cleanup
     }
 
-    // 3. Delete user profile document
+    // 3. Delete device FCM token and user profile document
+    await removeCurrentDeviceFcmToken(uid).catch(() => {});
     await deleteDoc(doc(db, 'users', uid)).catch(() => {});
 
     // 4. Clear local storage caches
@@ -1231,8 +1284,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const isSuperAdmin = isSuperAdminEmail(currentUser?.email);
-  const isSubAdmin = !isSuperAdmin && Boolean(userProfile?.isSubAdmin || userProfile?.role === 'sub_admin');
+  const isSuperAdmin =
+    serverVerifiedRole === 'super_admin' ||
+    userProfile?.role === 'super_admin';
+  const isSubAdmin =
+    !isSuperAdmin &&
+    Boolean(
+      serverVerifiedRole === 'sub_admin' ||
+      userProfile?.isSubAdmin ||
+      userProfile?.role === 'sub_admin'
+    );
   const isAdmin = isSuperAdmin || isSubAdmin;
 
   // Verification status: verified by admin, has blue star, or verified badge
@@ -1248,7 +1309,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // Admin capability to appoint/demote sub-admins (enforced on server + Firestore + audit log)
   const toggleSubAdmin = async (targetUserId: string, makeSubAdmin: boolean) => {
     if (!isSuperAdmin) {
-      console.warn('Permission denied: Only Platform Owner (keylanmbilinyi5@gmail.com) can manage administrators.');
+      console.warn('Permission denied: Only the Platform Owner can manage administrators.');
       return;
     }
     if (targetUserId === SUPPORT_BOT_ID) {
@@ -1453,7 +1514,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         toggleVerifyUser,
         activateHarvestPass,
         verifyAndRedeemCoupon,
-        showGlobalToast
+        showGlobalToast,
+        refreshAdminVerification
       }}
     >
       {globalToast && (

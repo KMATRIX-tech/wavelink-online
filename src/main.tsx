@@ -20,8 +20,8 @@ if (typeof window !== 'undefined') {
   });
 }
 
-// Register PWA service worker for offline shell and installability
-if ('serviceWorker' in navigator && import.meta.env.PROD) {
+// Register PWA & FCM service worker for offline shell, installability, and push notifications
+if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch((err) => {
       console.warn('ServiceWorker registration note:', err);

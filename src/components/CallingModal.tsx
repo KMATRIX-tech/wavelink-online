@@ -36,6 +36,7 @@ import {
   addDoc,
 } from 'firebase/firestore';
 import { sendWelinkChatMessage } from '../services/geminiService';
+import { sendNotification } from '../services/notificationService';
 
 interface LegacyChatContact {
   id: string;
@@ -883,6 +884,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           { merge: true }
         );
         console.log('[WaveLink WebRTC] Call document created with offer:', activeCallId);
+
+        // Trigger server-side push notification for incoming call
+        if (meta.recipientId && meta.recipientId !== meta.userId) {
+          sendNotification({
+            recipientId: meta.recipientId,
+            actorId: meta.userId,
+            actorName: meta.userName,
+            actorPhotoURL: meta.userAvatar,
+            type: 'incoming_call',
+            title: normalizedMode === 'video' ? 'Incoming Video Call 📞' : 'Incoming Voice Call 📞',
+            body: `${meta.userName} is calling you on WaveLink. Tap to answer.`,
+            entityId: activeCallId,
+          }).catch(() => {});
+        }
 
         // Now that the call document exists in Firestore, flush buffered local candidates and attach remote candidates listener
         isCallDocReadyRef.current = true;

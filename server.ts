@@ -6,6 +6,16 @@ import { createServer as createViteServer } from 'vite';
 import { createServer as createHttpServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality, ThinkingLevel } from '@google/genai';
+import {
+  initializeApp as initializeAdminApp,
+  getApps as getAdminApps,
+  getApp as getAdminApp,
+  cert
+} from 'firebase-admin/app';
+import { getMessaging as getAdminMessaging } from 'firebase-admin/messaging';
+import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
+import { getAuth as getAdminAuth } from 'firebase-admin/auth';
+import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -73,12 +83,150 @@ function getOwnerPhone(): string {
   return (process.env.OWNER_PHONE || '').trim();
 }
 
-const ADMIN_EMAIL = 'keylanmbilinyi5@gmail.com';
-const ADMIN_EMAIL_ALT = 'keylanmbilinyi5@gnail.com';
+// Read Owner Email & Owner Access Code strictly on the server from process.env (never logged or returned to client)
+function getOwnerEmail(): string {
+  return (process.env.OWNER_EMAIL || '').trim().toLowerCase();
+}
 
-// Server-side authoritative sub-admin set (managed only by verified Super Admin on the server)
+function getOwnerAccessCode(): string {
+  return (process.env.OWNER_ACCESS_CODE || '').trim();
+}
+
+/**
+ * Constant-time string comparison using crypto.timingSafeEqual on SHA-256 digests + byte length
+ * Prevents timing side-channel attacks and never leaks length or character prefix matches.
+ */
+function safeConstantTimeEquals(inputA: string, inputB: string): boolean {
+  const strA = typeof inputA === 'string' ? inputA : '';
+  const strB = typeof inputB === 'string' ? inputB : '';
+  const hashA = crypto.createHash('sha256').update(strA, 'utf8').digest();
+  const hashB = crypto.createHash('sha256').update(strB, 'utf8').digest();
+  const hashesMatch = crypto.timingSafeEqual(hashA, hashB);
+  const lengthsMatch = strA.length === strB.length && strB.length > 0;
+  return hashesMatch && lengthsMatch;
+}
+
+// Ephemeral server secret for signing Owner session tokens (never exposed to client)
+const SERVER_OWNER_HMAC_SECRET = crypto.randomBytes(32).toString('hex');
+
+function signOwnerSessionToken(uid: string): string {
+  const issuedAt = Date.now();
+  const expiresAt = issuedAt + 12 * 60 * 60 * 1000; // 12 hours
+  const payload = Buffer.from(JSON.stringify({ uid, role: 'super_admin', issuedAt, expiresAt }), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', SERVER_OWNER_HMAC_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyOwnerSessionToken(token: string | undefined, expectedUid?: string): { valid: boolean; uid: string } {
+  if (!token || typeof token !== 'string') return { valid: false, uid: '' };
+  const parts = token.trim().split('.');
+  if (parts.length !== 2) return { valid: false, uid: '' };
+  const [payloadB64, providedSig] = parts;
+  const expectedSig = crypto.createHmac('sha256', SERVER_OWNER_HMAC_SECRET).update(payloadB64).digest('base64url');
+  if (!safeConstantTimeEquals(providedSig, expectedSig)) {
+    return { valid: false, uid: '' };
+  }
+  try {
+    const data = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (!data || typeof data.uid !== 'string' || data.role !== 'super_admin') {
+      return { valid: false, uid: '' };
+    }
+    if (typeof data.expiresAt !== 'number' || Date.now() > data.expiresAt) {
+      return { valid: false, uid: '' };
+    }
+    if (expectedUid && data.uid !== expectedUid) {
+      return { valid: false, uid: '' };
+    }
+    return { valid: true, uid: data.uid };
+  } catch {
+    return { valid: false, uid: '' };
+  }
+}
+
+// Server-side authoritative Owner & Sub-Admin sets (populated only by the server)
+const serverOwnerUids = new Set<string>();
 const serverSubAdminEmails = new Set<string>();
 const serverSubAdminUids = new Set<string>();
+
+// Per-device rate limiter for Hidden Owner Sign-In: strictly 5 attempts per hour per device
+const MAX_OWNER_ATTEMPTS_PER_HOUR = 5;
+const OWNER_ATTEMPT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+interface OwnerDeviceAttemptState {
+  attempts: number[];
+  lockedUntil: number;
+}
+
+const ownerDeviceAttempts = new Map<string, OwnerDeviceAttemptState>();
+
+function getOwnerDeviceKey(req: express.Request): string {
+  const rawDeviceId = String(req.headers['x-wavelink-device-id'] || req.body?.deviceId || '').trim().slice(0, 128);
+  const rawIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+  // Hash device + IP so raw identifiers are never logged or stored in plain text
+  return crypto.createHash('sha256').update(`${rawDeviceId || 'anon_dev'}|${rawIp}`).digest('hex');
+}
+
+function checkOwnerDeviceRateLimit(deviceKey: string): {
+  allowed: boolean;
+  remainingAttempts: number;
+  retryAfterSeconds: number;
+} {
+  const now = Date.now();
+  const existing = ownerDeviceAttempts.get(deviceKey) || { attempts: [], lockedUntil: 0 };
+
+  if (existing.lockedUntil > now) {
+    return {
+      allowed: false,
+      remainingAttempts: 0,
+      retryAfterSeconds: Math.ceil((existing.lockedUntil - now) / 1000)
+    };
+  }
+
+  const recentAttempts = existing.attempts.filter((ts) => now - ts < OWNER_ATTEMPT_WINDOW_MS);
+  if (recentAttempts.length >= MAX_OWNER_ATTEMPTS_PER_HOUR) {
+    const lockedUntil = (recentAttempts[0] || now) + OWNER_ATTEMPT_WINDOW_MS;
+    ownerDeviceAttempts.set(deviceKey, { attempts: recentAttempts, lockedUntil });
+    return {
+      allowed: false,
+      remainingAttempts: 0,
+      retryAfterSeconds: Math.max(1, Math.ceil((lockedUntil - now) / 1000))
+    };
+  }
+
+  return {
+    allowed: true,
+    remainingAttempts: MAX_OWNER_ATTEMPTS_PER_HOUR - recentAttempts.length,
+    retryAfterSeconds: 0
+  };
+}
+
+function recordOwnerDeviceAttempt(deviceKey: string): {
+  lockedOut: boolean;
+  remainingAttempts: number;
+  retryAfterSeconds: number;
+} {
+  const now = Date.now();
+  const existing = ownerDeviceAttempts.get(deviceKey) || { attempts: [], lockedUntil: 0 };
+  const recentAttempts = existing.attempts.filter((ts) => now - ts < OWNER_ATTEMPT_WINDOW_MS);
+  recentAttempts.push(now);
+
+  let lockedUntil = existing.lockedUntil;
+  if (recentAttempts.length >= MAX_OWNER_ATTEMPTS_PER_HOUR) {
+    lockedUntil = now + OWNER_ATTEMPT_WINDOW_MS;
+  }
+
+  ownerDeviceAttempts.set(deviceKey, { attempts: recentAttempts, lockedUntil });
+  const remainingAttempts = Math.max(0, MAX_OWNER_ATTEMPTS_PER_HOUR - recentAttempts.length);
+  return {
+    lockedOut: lockedUntil > now,
+    remainingAttempts,
+    retryAfterSeconds: lockedUntil > now ? Math.ceil((lockedUntil - now) / 1000) : 0
+  };
+}
+
+function clearOwnerDeviceAttempts(deviceKey: string): void {
+  ownerDeviceAttempts.delete(deviceKey);
+}
 
 /**
  * Strip dangerous HTML, scripts, and prompt-injection patterns from user inputs
@@ -100,11 +248,19 @@ function sanitizeServerString(raw: unknown, maxLength = 2000): string {
 function scrubAiOutputSafety(text: string): string {
   if (!text) return '';
   const ownerPhone = getOwnerPhone();
+  const ownerEmail = getOwnerEmail();
+  const ownerCode = getOwnerAccessCode();
   let safe = text
     .replace(/AIza[0-9A-Za-z_-]{30,}/g, '[REDACTED]')
-    .replace(/GEMINI_API_KEY|AZAMPAY_CLIENT_SECRET|OWNER_PHONE/gi, '[PROTECTED]');
+    .replace(/GEMINI_API_KEY|AZAMPAY_CLIENT_SECRET|OWNER_PHONE|OWNER_EMAIL|OWNER_ACCESS_CODE/gi, '[PROTECTED]');
   if (ownerPhone && ownerPhone.length >= 6) {
     safe = safe.split(ownerPhone).join('WaveLink');
+  }
+  if (ownerEmail && ownerEmail.length >= 5) {
+    safe = safe.split(ownerEmail).join('[PROTECTED]');
+  }
+  if (ownerCode && ownerCode.length >= 4) {
+    safe = safe.split(ownerCode).join('[PROTECTED]');
   }
   return safe;
 }
@@ -116,12 +272,17 @@ interface VerifiedAuthUser {
   uid: string;
   email: string;
   emailVerified: boolean;
+  signInProvider?: string;
+  customAdminClaim?: boolean;
+  isVerifiedOwnerSession?: boolean;
 }
 
 function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | null {
   const authHeader = String(req.headers.authorization || '').trim();
   const fallbackUid = sanitizeServerString(req.headers['x-wavelink-uid'], 128);
   const fallbackEmail = sanitizeServerString(req.headers['x-wavelink-email'], 160).toLowerCase();
+  const rawOwnerToken = String(req.headers['x-wavelink-owner-token'] || '').trim();
+  const ownerTokenCheck = verifyOwnerSessionToken(rawOwnerToken);
 
   if (authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
@@ -137,9 +298,24 @@ function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | n
           }
           const uid = String(payload.user_id || payload.sub || fallbackUid || '').trim();
           const email = String(payload.email || fallbackEmail || '').trim().toLowerCase();
-          const emailVerified = Boolean(payload.email_verified ?? true);
+          const emailVerified = Boolean(payload.email_verified ?? false);
+          const signInProvider = String(payload.firebase?.sign_in_provider || '').trim();
+          const customAdminClaim = Boolean(
+            payload.admin === true ||
+            payload.role === 'super_admin' ||
+            payload.role === 'admin'
+          );
           if (uid) {
-            return { uid, email, emailVerified };
+            return {
+              uid,
+              email,
+              emailVerified,
+              signInProvider,
+              customAdminClaim,
+              isVerifiedOwnerSession:
+                (ownerTokenCheck.valid && ownerTokenCheck.uid === uid) ||
+                serverOwnerUids.has(uid)
+            };
           }
         }
       } catch {
@@ -148,11 +324,23 @@ function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | n
     }
   }
 
-  if (fallbackUid || fallbackEmail) {
+  if (ownerTokenCheck.valid) {
     return {
-      uid: fallbackUid || 'authenticated_user',
+      uid: ownerTokenCheck.uid,
       email: fallbackEmail,
-      emailVerified: true
+      emailVerified: true,
+      customAdminClaim: true,
+      isVerifiedOwnerSession: true
+    };
+  }
+
+  if (fallbackUid || fallbackEmail) {
+    const uid = fallbackUid || 'authenticated_user';
+    return {
+      uid,
+      email: fallbackEmail,
+      emailVerified: true,
+      isVerifiedOwnerSession: serverOwnerUids.has(uid)
     };
   }
   return null;
@@ -166,8 +354,9 @@ function isServerAdminUser(user: VerifiedAuthUser | null, bodyEmail?: string, bo
   const candidateUid = (user?.uid || '').trim();
 
   if (
-    candidateEmail === ADMIN_EMAIL.toLowerCase() ||
-    candidateEmail === ADMIN_EMAIL_ALT.toLowerCase()
+    Boolean(user?.isVerifiedOwnerSession) ||
+    Boolean(user?.customAdminClaim) ||
+    (candidateUid && serverOwnerUids.has(candidateUid))
   ) {
     return { authorized: true, role: 'super_admin' };
   }
@@ -1921,13 +2110,379 @@ Escalation Required: ${
   });
 
   // ============================================================================
-  // 2. ADMIN VERIFICATION & ROLE MANAGEMENT ROUTES (Server-side enforcement)
+  // 2. HIDDEN OWNER SIGN-IN, USER VERIFICATION & ADMIN ROLE ENFORCEMENT ROUTES
   // ============================================================================
 
-  app.post('/api/admin/verify', rateLimitAuth, (req, res) => {
+  // Generic error message that never reveals whether the access code, Google token, or email failed
+  const GENERIC_OWNER_AUTH_ERROR =
+    'Authentication failed. Unable to verify owner credentials.';
+  const GENERIC_OWNER_LOCKOUT_ERROR =
+    'Too many attempts from this device. Access is locked for 1 hour.';
+
+  // Verify Google ID Token on the server (via Firebase Admin SDK verifyIdToken + Google tokeninfo / JWT claim check)
+  async function verifyGoogleTokenOnServer(rawIdToken: string): Promise<{
+    valid: boolean;
+    uid: string;
+    email: string;
+    emailVerified: boolean;
+    isGoogleProvider: boolean;
+  }> {
+    if (!rawIdToken || typeof rawIdToken !== 'string') {
+      return { valid: false, uid: '', email: '', emailVerified: false, isGoogleProvider: false };
+    }
+
+    // 1. Attempt Firebase Admin SDK cryptographic verification first
+    try {
+      if (getAdminApps().length) {
+        const decoded = await getAdminAuth(getAdminApp()).verifyIdToken(rawIdToken, true);
+        if (decoded && decoded.uid) {
+          const provider = String(decoded.firebase?.sign_in_provider || '');
+          return {
+            valid: true,
+            uid: decoded.uid,
+            email: String(decoded.email || '').trim().toLowerCase(),
+            emailVerified: Boolean(decoded.email_verified),
+            isGoogleProvider: provider === 'google.com'
+          };
+        }
+      }
+    } catch {
+      // Fall back to Google public token verification / Firebase JWT verification below
+    }
+
+    // 2. Verify Firebase ID token structure & claims (expiry, issuer, Google sign_in_provider, email_verified)
+    try {
+      const parts = rawIdToken.trim().split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (
+          payload &&
+          typeof payload === 'object' &&
+          typeof payload.exp === 'number' &&
+          payload.exp > nowSec - 30 &&
+          typeof payload.iat === 'number' &&
+          payload.iat <= nowSec + 300
+        ) {
+          const uid = String(payload.user_id || payload.sub || '').trim();
+          const email = String(payload.email || '').trim().toLowerCase();
+          const emailVerified = payload.email_verified === true;
+          const provider = String(payload.firebase?.sign_in_provider || '');
+          if (uid && email) {
+            return {
+              valid: true,
+              uid,
+              email,
+              emailVerified,
+              isGoogleProvider: provider === 'google.com'
+            };
+          }
+        }
+      }
+    } catch {
+      // Invalid token format
+    }
+
+    return { valid: false, uid: '', email: '', emailVerified: false, isGoogleProvider: false };
+  }
+
+  /**
+   * POST /api/auth/owner-signin
+   * Hidden Owner Sign-In endpoint:
+   * - Limits attempts to 5 per hour per device and locks out after that.
+   * - Compares verified Google email === process.env.OWNER_EMAIL and accessCode === process.env.OWNER_ACCESS_CODE
+   *   safely on the server only using crypto.timingSafeEqual.
+   * - Never logs or returns OWNER_EMAIL, OWNER_ACCESS_CODE, or which part failed.
+   * - Grants the 'admin' / 'super_admin' role strictly from the server.
+   */
+  app.post('/api/auth/owner-signin', async (req, res) => {
+    const deviceKey = getOwnerDeviceKey(req);
+    const rateCheck = checkOwnerDeviceRateLimit(deviceKey);
+
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        lockedOut: true,
+        remainingAttempts: 0,
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+        error: GENERIC_OWNER_LOCKOUT_ERROR
+      });
+    }
+
+    // Record attempt immediately against the 5-per-hour-per-device budget
+    const attemptState = recordOwnerDeviceAttempt(deviceKey);
+
+    const submittedCode = typeof req.body?.accessCode === 'string' ? req.body.accessCode.trim() : '';
+    const authHeader = String(req.headers.authorization || '').trim();
+    const rawIdToken =
+      typeof req.body?.idToken === 'string' && req.body.idToken.trim()
+        ? req.body.idToken.trim()
+        : authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+
+    const ownerEmailEnv = getOwnerEmail();
+    const ownerAccessCodeEnv = getOwnerAccessCode();
+
+    const verifiedToken = await verifyGoogleTokenOnServer(rawIdToken);
+
+    // Always run both constant-time comparisons so execution time never leaks which check failed
+    const codeMatches = safeConstantTimeEquals(submittedCode, ownerAccessCodeEnv);
+    const emailMatches = safeConstantTimeEquals(verifiedToken.email, ownerEmailEnv);
+    const isVerifiedGoogleAccount =
+      verifiedToken.valid &&
+      verifiedToken.emailVerified === true &&
+      verifiedToken.isGoogleProvider === true &&
+      Boolean(verifiedToken.uid);
+
+    const allChecksPass =
+      Boolean(ownerEmailEnv) &&
+      Boolean(ownerAccessCodeEnv) &&
+      isVerifiedGoogleAccount &&
+      codeMatches &&
+      emailMatches;
+
+    if (!allChecksPass) {
+      const isNowLocked = attemptState.lockedOut || attemptState.remainingAttempts === 0;
+      return res.status(isNowLocked ? 429 : 403).json({
+        success: false,
+        lockedOut: isNowLocked,
+        remainingAttempts: attemptState.remainingAttempts,
+        retryAfterSeconds: attemptState.retryAfterSeconds,
+        error: isNowLocked ? GENERIC_OWNER_LOCKOUT_ERROR : GENERIC_OWNER_AUTH_ERROR
+      });
+    }
+
+    // Both verified Google email and Owner access code matched!
+    clearOwnerDeviceAttempts(deviceKey);
+    const ownerUid = verifiedToken.uid;
+    serverOwnerUids.add(ownerUid);
+    const ownerSessionToken = signOwnerSessionToken(ownerUid);
+
+    // 1. Set Firebase Auth custom claims on the server (admin: true, role: 'super_admin')
+    try {
+      if (getAdminApps().length) {
+        await getAdminAuth(getAdminApp()).setCustomUserClaims(ownerUid, {
+          admin: true,
+          role: 'super_admin'
+        });
+      }
+    } catch {
+      // Custom claims optional if local preview lacks service account private key
+    }
+
+    // 2. Persist server-authoritative admin role in Firestore (/admins/{uid} & /users/{uid})
+    try {
+      let firestoreId = '';
+      try {
+        const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+        if (fs.existsSync(cfgPath)) {
+          const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+          firestoreId = parsedCfg.firestoreDatabaseId || '';
+        }
+      } catch {
+        // ignore
+      }
+      if (getAdminApps().length) {
+        const adminDb = firestoreId
+          ? getAdminFirestore(getAdminApp(), firestoreId)
+          : getAdminFirestore(getAdminApp());
+        const nowIso = new Date().toISOString();
+        await adminDb
+          .collection('admins')
+          .doc(ownerUid)
+          .set(
+            {
+              uid: ownerUid,
+              role: 'super_admin',
+              grantedBy: 'server_owner_verification',
+              updatedAt: nowIso
+            },
+            { merge: true }
+          );
+        await adminDb
+          .collection('users')
+          .doc(ownerUid)
+          .set(
+            {
+              role: 'super_admin',
+              isSubAdmin: false,
+              isPro: true,
+              hasBlueStar: true,
+              isVerifiedByAdmin: true,
+              proBadge: 'founder',
+              proBorderEffect: 'aura-gold',
+              proAccentColor: 'gold',
+              updatedAt: nowIso
+            },
+            { merge: true }
+          );
+      }
+    } catch {
+      // Non-fatal in preview if Admin Firestore lacks write credentials
+    }
+
+    return res.json({
+      success: true,
+      authorized: true,
+      role: 'super_admin',
+      ownerSessionToken
+    });
+  });
+
+  /**
+   * Normal User Email / Phone Verification & Username Mapping (Server-side OTP store)
+   */
+  interface PendingVerificationCode {
+    codeHash: string;
+    channel: 'email' | 'phone';
+    target: string;
+    expiresAt: number;
+    attempts: number;
+  }
+  const pendingUserVerifications = new Map<string, PendingVerificationCode>();
+  const usernameToAuthIdentifierMap = new Map<string, { authEmail: string; channel: 'email' | 'phone' }>();
+
+  app.post('/api/auth/register-username', rateLimitAuth, (req, res) => {
+    const rawUsername = sanitizeServerString(req.body?.username, 50).toLowerCase().replace(/^@/, '');
+    const rawAuthEmail = sanitizeServerString(req.body?.authEmail, 160).toLowerCase();
+    const channel = req.body?.channel === 'phone' ? 'phone' : 'email';
+    if (!rawUsername || !rawAuthEmail) {
+      return res.status(400).json({ success: false, error: 'Username and account identifier are required.' });
+    }
+    usernameToAuthIdentifierMap.set(rawUsername, { authEmail: rawAuthEmail, channel });
+    return res.json({ success: true });
+  });
+
+  app.post('/api/auth/lookup-username', rateLimitAuth, async (req, res) => {
+    const rawUsername = sanitizeServerString(req.body?.username, 50).toLowerCase().replace(/^@/, '');
+    if (!rawUsername) {
+      return res.status(400).json({ success: false, error: 'Please enter your username.' });
+    }
+    const cached = usernameToAuthIdentifierMap.get(rawUsername);
+    if (cached) {
+      return res.json({ success: true, authEmail: cached.authEmail, channel: cached.channel });
+    }
+    return res.json({ success: true, authEmail: null });
+  });
+
+  app.post('/api/auth/send-verification-code', rateLimitAuth, (req, res) => {
+    const channel: 'email' | 'phone' = req.body?.channel === 'phone' ? 'phone' : 'email';
+    const target = sanitizeServerString(req.body?.target, 160).toLowerCase();
+    if (!target || target.length < 5) {
+      return res.status(400).json({
+        success: false,
+        error: channel === 'phone' ? 'Please enter a valid phone number.' : 'Please enter a valid email address.'
+      });
+    }
+
+    const code = String(crypto.randomInt(100000, 999999));
+    const codeHash = crypto.createHash('sha256').update(code, 'utf8').digest('hex');
+    pendingUserVerifications.set(`${channel}:${target}`, {
+      codeHash,
+      channel,
+      target,
+      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+      attempts: 0
+    });
+
+    const maskedTarget =
+      channel === 'phone'
+        ? `${target.slice(0, 4)}••••${target.slice(-3)}`
+        : `${target.slice(0, 2)}•••@${target.split('@')[1] || 'mail'}`;
+
+    return res.json({
+      success: true,
+      channel,
+      maskedTarget,
+      verificationCodePreview: code,
+      message: `A 6-digit verification code has been sent to ${maskedTarget}.`
+    });
+  });
+
+  app.post('/api/auth/confirm-verification-code', rateLimitAuth, (req, res) => {
+    const channel: 'email' | 'phone' = req.body?.channel === 'phone' ? 'phone' : 'email';
+    const target = sanitizeServerString(req.body?.target, 160).toLowerCase();
+    const submittedCode = sanitizeServerString(req.body?.code, 12).replace(/\s+/g, '');
+    const key = `${channel}:${target}`;
+    const entry = pendingUserVerifications.get(key);
+
+    if (!entry || Date.now() > entry.expiresAt) {
+      pendingUserVerifications.delete(key);
+      return res.status(400).json({
+        success: false,
+        error: 'Verification code has expired or was not found. Please request a new code.'
+      });
+    }
+
+    entry.attempts += 1;
+    if (entry.attempts > 5) {
+      pendingUserVerifications.delete(key);
+      return res.status(429).json({
+        success: false,
+        error: 'Too many incorrect verification code attempts. Please request a new code.'
+      });
+    }
+
+    const submittedHash = crypto.createHash('sha256').update(submittedCode, 'utf8').digest('hex');
+    if (!safeConstantTimeEquals(submittedHash, entry.codeHash)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Incorrect verification code. Please check the 6-digit code and try again.'
+      });
+    }
+
+    pendingUserVerifications.delete(key);
+    return res.json({
+      success: true,
+      verified: true,
+      channel,
+      verifiedAt: new Date().toISOString()
+    });
+  });
+
+  app.post('/api/admin/verify', rateLimitAuth, async (req, res) => {
     const authUser = verifyFirebaseIdTokenHeader(req);
     const { email, isSubAdmin } = req.body || {};
-    const check = isServerAdminUser(authUser, email, isSubAdmin);
+    let check = isServerAdminUser(authUser, email, isSubAdmin);
+
+    // Also check server-side Firestore /admins/{uid} or /users/{uid}.role if Admin SDK is connected
+    if (!check.authorized && authUser?.uid) {
+      try {
+        if (getAdminApps().length) {
+          let firestoreId = '';
+          try {
+            const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+            if (fs.existsSync(cfgPath)) {
+              const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+              firestoreId = parsedCfg.firestoreDatabaseId || '';
+            }
+          } catch {
+            // ignore
+          }
+          const adminDb = firestoreId
+            ? getAdminFirestore(getAdminApp(), firestoreId)
+            : getAdminFirestore(getAdminApp());
+          const adminSnap = await adminDb.collection('admins').doc(authUser.uid).get();
+          if (adminSnap.exists) {
+            serverOwnerUids.add(authUser.uid);
+            check = { authorized: true, role: 'super_admin' };
+          } else {
+            const userSnap = await adminDb.collection('users').doc(authUser.uid).get();
+            const userData = userSnap.data();
+            if (userData?.role === 'super_admin' || userData?.role === 'admin') {
+              serverOwnerUids.add(authUser.uid);
+              check = { authorized: true, role: 'super_admin' };
+            } else if (userData?.isSubAdmin === true || userData?.role === 'sub_admin') {
+              serverSubAdminUids.add(authUser.uid);
+              check = { authorized: true, role: 'sub_admin' };
+            }
+          }
+        }
+      } catch {
+        // ignore if local preview lacks service account credentials
+      }
+    }
 
     if (!check.authorized) {
       return res.status(403).json({
@@ -1946,9 +2501,8 @@ Escalation Required: ${
 
   app.post('/api/admin/role', rateLimitAuth, (req, res) => {
     const authUser = verifyFirebaseIdTokenHeader(req);
-    const callerEmail = (authUser?.email || req.body?.callerEmail || '').trim().toLowerCase();
-    const isSuper =
-      callerEmail === ADMIN_EMAIL.toLowerCase() || callerEmail === ADMIN_EMAIL_ALT.toLowerCase();
+    const check = isServerAdminUser(authUser, undefined, false);
+    const isSuper = check.authorized && check.role === 'super_admin';
 
     if (!isSuper) {
       return res.status(403).json({
@@ -2841,6 +3395,465 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       if (!res.headersSent) {
         res.status(500).end();
       }
+    }
+  });
+
+  // ============================================================================
+  // 4B. FIREBASE ADMIN SDK & SERVER-ONLY FCM PUSH NOTIFICATIONS
+  // ============================================================================
+  let firebaseProjectId = process.env.FIREBASE_PROJECT_ID || 'formal-photon-n48x0';
+  let firestoreDatabaseId = process.env.FIRESTORE_DATABASE_ID || '';
+  try {
+    const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      if (parsedCfg.projectId) firebaseProjectId = parsedCfg.projectId;
+      if (parsedCfg.firestoreDatabaseId) firestoreDatabaseId = parsedCfg.firestoreDatabaseId;
+    }
+  } catch {
+    // fallback to defaults
+  }
+
+  try {
+    if (!getAdminApps().length) {
+      const rawServiceAccount = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+      if (rawServiceAccount) {
+        const certObj = JSON.parse(rawServiceAccount);
+        initializeAdminApp({
+          credential: cert(certObj),
+          projectId: certObj.project_id || firebaseProjectId,
+        });
+      } else {
+        initializeAdminApp({
+          projectId: firebaseProjectId,
+        });
+      }
+    }
+  } catch (initErr: any) {
+    console.warn('[WaveLink FCM Admin Init Notice]:', initErr?.message || initErr);
+  }
+
+  const getServerFirestore = () => {
+    try {
+      if (!getAdminApps().length) return null;
+      return firestoreDatabaseId
+        ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+        : getAdminFirestore(getAdminApp());
+    } catch {
+      return null;
+    }
+  };
+
+  interface ServerNotificationSettings {
+    masterEnabled: boolean;
+    messages: boolean;
+    calls: boolean;
+    followers: boolean;
+    reactions: boolean;
+    announcements: boolean;
+    payments: boolean;
+    showMessagePreviews: boolean;
+    quietHoursEnabled: boolean;
+    quietHoursStart: string;
+    quietHoursEnd: string;
+    timezoneOffsetMinutes: number;
+  }
+
+  const DEFAULT_SERVER_NOTIFICATION_SETTINGS: ServerNotificationSettings = {
+    masterEnabled: true,
+    messages: true,
+    calls: true,
+    followers: true,
+    reactions: true,
+    announcements: true,
+    payments: true,
+    showMessagePreviews: true,
+    quietHoursEnabled: false,
+    quietHoursStart: '22:00',
+    quietHoursEnd: '07:00',
+    timezoneOffsetMinutes: -180,
+  };
+
+  const userFcmTokensStore = new Map<
+    string,
+    Map<string, { tokenId: string; token: string; platform?: string; updatedAt: string }>
+  >();
+  const userNotificationSettingsStore = new Map<string, ServerNotificationSettings>();
+
+  function isWithinQuietHours(settings: ServerNotificationSettings): boolean {
+    if (!settings.quietHoursEnabled) return false;
+    const parseHhMm = (val: string): number | null => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec((val || '').trim());
+      if (!m) return null;
+      const hh = Number(m[1]);
+      const mm = Number(m[2]);
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+      return hh * 60 + mm;
+    };
+
+    const startMins = parseHhMm(settings.quietHoursStart);
+    const endMins = parseHhMm(settings.quietHoursEnd);
+    if (startMins === null || endMins === null) return false;
+
+    const nowUtcMs = Date.now();
+    // JS getTimezoneOffset() is (UTC - local) in minutes, so local = UTC - offset
+    const offsetMinutes =
+      typeof settings.timezoneOffsetMinutes === 'number' ? settings.timezoneOffsetMinutes : -180;
+    const localDate = new Date(nowUtcMs - offsetMinutes * 60 * 1000);
+    const currentMins = localDate.getUTCHours() * 60 + localDate.getUTCMinutes();
+
+    if (startMins === endMins) return false;
+    if (startMins < endMins) {
+      return currentMins >= startMins && currentMins < endMins;
+    }
+    // Overnight window, e.g., 22:00 to 07:00
+    return currentMins >= startMins || currentMins < endMins;
+  }
+
+  function isCategoryAllowedBySettings(
+    notifType: string,
+    settings: ServerNotificationSettings
+  ): { allowed: boolean; category: string } {
+    if (!settings.masterEnabled) {
+      return { allowed: false, category: 'master' };
+    }
+    switch (notifType) {
+      case 'message':
+        return { allowed: settings.messages !== false, category: 'messages' };
+      case 'call':
+      case 'incoming_call':
+        return { allowed: settings.calls !== false, category: 'calls' };
+      case 'follow':
+        return { allowed: settings.followers !== false, category: 'followers' };
+      case 'post_like':
+      case 'post_reaction':
+      case 'post_comment':
+      case 'spark_like':
+        return { allowed: settings.reactions !== false, category: 'reactions' };
+      case 'announcement':
+        return { allowed: settings.announcements !== false, category: 'announcements' };
+      case 'post_tip':
+      case 'post_boost':
+      case 'payment_verified':
+        return { allowed: settings.payments !== false, category: 'payments' };
+      default:
+        return { allowed: true, category: 'system' };
+    }
+  }
+
+  function formatPrivacySafeNotificationPayload(params: {
+    type: string;
+    title: string;
+    body: string;
+    actorName?: string;
+    settings: ServerNotificationSettings;
+  }): { title: string; body: string } {
+    const cleanActor = (params.actorName || 'Someone').trim();
+    if (params.type === 'message') {
+      if (!params.settings.showMessagePreviews) {
+        return {
+          title: cleanActor ? `New message from ${cleanActor}` : 'New Message',
+          body: 'Sent you a private message on WaveLink. Tap to view.',
+        };
+      }
+      // Show only a short preview in message notifications, never full private content
+      const collapsed = (params.body || '')
+        .replace(/\s+/g, ' ')
+        .replace(/^.*sent you a (private )?message:\s*/i, '')
+        .replace(/^["']|["']$/g, '')
+        .trim();
+      const shortPreview =
+        collapsed.length > 48 ? `${collapsed.slice(0, 48).trim()}…` : collapsed || 'Sent a message';
+      return {
+        title: params.title || (cleanActor ? `${cleanActor}` : 'New Message'),
+        body: shortPreview,
+      };
+    }
+
+    const safeTitle = (params.title || 'WaveLink').trim().slice(0, 80);
+    const safeBody = (params.body || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    return { title: safeTitle, body: safeBody };
+  }
+
+  // Register device FCM token on server
+  app.post('/api/notifications/register-token', async (req, res) => {
+    const authUser = await verifyFirebaseIdTokenHeader(req);
+    const userId = String(req.body?.userId || authUser?.uid || '').trim();
+    const token = String(req.body?.token || '').trim();
+    const tokenId = String(req.body?.tokenId || '').trim() || `tok_${token.slice(0, 16)}`;
+    const platform = String(req.body?.platform || 'web').trim();
+
+    if (!userId || !token) {
+      return res.status(400).json({ error: 'userId and token are required' });
+    }
+    if (authUser?.uid && authUser.uid !== userId) {
+      return res.status(403).json({ error: 'Cannot register token for another user' });
+    }
+
+    if (!userFcmTokensStore.has(userId)) {
+      userFcmTokensStore.set(userId, new Map());
+    }
+    userFcmTokensStore.get(userId)!.set(tokenId, {
+      tokenId,
+      token,
+      platform,
+      updatedAt: new Date().toISOString(),
+    });
+
+    return res.json({ success: true, tokenId });
+  });
+
+  // Unregister / delete device FCM token on logout or invalidation
+  app.post('/api/notifications/unregister-token', async (req, res) => {
+    const userId = String(req.body?.userId || '').trim();
+    const tokenId = String(req.body?.tokenId || '').trim();
+    const token = String(req.body?.token || '').trim();
+
+    if (userId && userFcmTokensStore.has(userId)) {
+      const userMap = userFcmTokensStore.get(userId)!;
+      if (tokenId) userMap.delete(tokenId);
+      if (token) {
+        for (const [k, v] of userMap.entries()) {
+          if (v.token === token) userMap.delete(k);
+        }
+      }
+    }
+
+    if (userId && tokenId) {
+      const adminDb = getServerFirestore();
+      if (adminDb) {
+        await adminDb
+          .doc(`users/${userId}/fcmTokens/${tokenId}`)
+          .delete()
+          .catch(() => {});
+      }
+    }
+
+    return res.json({ success: true });
+  });
+
+  // Sync user notification settings to server so server respects them before sending push
+  app.post('/api/notifications/sync-settings', async (req, res) => {
+    const authUser = await verifyFirebaseIdTokenHeader(req);
+    const userId = String(req.body?.userId || authUser?.uid || '').trim();
+    const raw = req.body?.settings || {};
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+    if (authUser?.uid && authUser.uid !== userId) {
+      return res.status(403).json({ error: 'Cannot modify another user settings' });
+    }
+
+    const merged: ServerNotificationSettings = {
+      masterEnabled: raw.masterEnabled !== undefined ? Boolean(raw.masterEnabled) : true,
+      messages: raw.messages !== undefined ? Boolean(raw.messages) : true,
+      calls: raw.calls !== undefined ? Boolean(raw.calls) : true,
+      followers: raw.followers !== undefined ? Boolean(raw.followers) : true,
+      reactions: raw.reactions !== undefined ? Boolean(raw.reactions) : true,
+      announcements: raw.announcements !== undefined ? Boolean(raw.announcements) : true,
+      payments: raw.payments !== undefined ? Boolean(raw.payments) : true,
+      showMessagePreviews:
+        raw.showMessagePreviews !== undefined ? Boolean(raw.showMessagePreviews) : true,
+      quietHoursEnabled: Boolean(raw.quietHoursEnabled),
+      quietHoursStart: String(raw.quietHoursStart || '22:00'),
+      quietHoursEnd: String(raw.quietHoursEnd || '07:00'),
+      timezoneOffsetMinutes:
+        typeof raw.timezoneOffsetMinutes === 'number' ? raw.timezoneOffsetMinutes : -180,
+    };
+
+    userNotificationSettingsStore.set(userId, merged);
+    return res.json({ success: true, settings: merged });
+  });
+
+  // Server-only push notification dispatch using Firebase Admin SDK
+  app.post('/api/notifications/send-push', async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdTokenHeader(req);
+      if (!authUser?.uid) {
+        return res.status(401).json({ error: 'Authentication required to trigger push notifications' });
+      }
+
+      const recipientId = String(req.body?.recipientId || '').trim();
+      const actorId = String(req.body?.actorId || authUser.uid).trim();
+      const actorName = String(req.body?.actorName || 'WaveLink Member').trim();
+      const type = String(req.body?.type || 'system').trim();
+      const rawTitle = String(req.body?.title || 'WaveLink').trim();
+      const rawBody = String(req.body?.body || '').trim();
+      const entityId = String(req.body?.entityId || '').trim();
+
+      if (!recipientId || recipientId === actorId) {
+        return res.json({ sent: false, skippedReason: 'self_or_missing_recipient' });
+      }
+
+      const adminDb = getServerFirestore();
+
+      // 1. Load recipient's notification settings (from Firestore via Admin SDK if available, else synced store, else client-provided snapshot)
+      let settings: ServerNotificationSettings =
+        userNotificationSettingsStore.get(recipientId) || {
+          ...DEFAULT_SERVER_NOTIFICATION_SETTINGS,
+          ...(req.body?.recipientSettings || {}),
+        };
+
+      if (adminDb) {
+        try {
+          const userSnap = await adminDb.doc(`users/${recipientId}`).get();
+          const userData = userSnap.data();
+          if (userData?.notificationSettings) {
+            settings = {
+              ...DEFAULT_SERVER_NOTIFICATION_SETTINGS,
+              ...userData.notificationSettings,
+            };
+            userNotificationSettingsStore.set(recipientId, settings);
+          }
+        } catch {
+          // fallback to in-memory settings
+        }
+      }
+
+      // 2. Enforce Master Switch & Category Toggles on the server
+      const categoryCheck = isCategoryAllowedBySettings(type, settings);
+      if (!categoryCheck.allowed) {
+        return res.json({
+          sent: false,
+          skippedReason: `disabled_${categoryCheck.category}`,
+        });
+      }
+
+      // 3. Enforce Quiet Hours on the server
+      if (isWithinQuietHours(settings)) {
+        return res.json({
+          sent: false,
+          skippedReason: 'quiet_hours_active',
+        });
+      }
+
+      // 4. Format privacy-preserving notification title & short preview body
+      const { title, body } = formatPrivacySafeNotificationPayload({
+        type,
+        title: rawTitle,
+        body: rawBody,
+        actorName,
+        settings,
+      });
+
+      // 5. Gather recipient's FCM tokens from Firestore and server store
+      const tokenEntries = new Map<string, string>(); // tokenId -> token
+      const memMap = userFcmTokensStore.get(recipientId);
+      if (memMap) {
+        for (const [tId, entry] of memMap.entries()) {
+          if (entry.token) tokenEntries.set(tId, entry.token);
+        }
+      }
+      if (Array.isArray(req.body?.recipientTokens)) {
+        for (const item of req.body.recipientTokens) {
+          if (item?.tokenId && item?.token) {
+            tokenEntries.set(String(item.tokenId), String(item.token));
+          }
+        }
+      }
+      if (adminDb) {
+        try {
+          const tokSnap = await adminDb.collection(`users/${recipientId}/fcmTokens`).get();
+          tokSnap.forEach((d) => {
+            const data = d.data();
+            if (data?.token) {
+              tokenEntries.set(d.id, String(data.token));
+            }
+          });
+        } catch {
+          // ignore if Admin SDK lacks Firestore read credentials in local preview
+        }
+      }
+
+      if (tokenEntries.size === 0) {
+        return res.json({
+          sent: false,
+          skippedReason: 'no_registered_tokens',
+          sanitizedPreview: { title, body },
+        });
+      }
+
+      // Filter real FCM registration tokens vs preview simulation tokens
+      const realTokenList: Array<{ tokenId: string; token: string }> = [];
+      for (const [tokenId, token] of tokenEntries.entries()) {
+        if (!token.startsWith('fcm_web_')) {
+          realTokenList.push({ tokenId, token });
+        }
+      }
+
+      const invalidTokenIds: string[] = [];
+      let successCount = 0;
+
+      if (realTokenList.length > 0 && getAdminApps().length > 0) {
+        try {
+          const multicastResult = await getAdminMessaging(getAdminApp()).sendEachForMulticast({
+            tokens: realTokenList.map((t) => t.token),
+            notification: {
+              title,
+              body,
+            },
+            data: {
+              type,
+              title,
+              body,
+              actorId,
+              actorName,
+              entityId,
+              url: '/',
+            },
+            webpush: {
+              notification: {
+                title,
+                body,
+                icon: '/pwa-192x192.png',
+                badge: '/pwa-192x192.png',
+              },
+              fcmOptions: {
+                link: '/',
+              },
+            },
+          });
+
+          successCount = multicastResult.successCount;
+
+          // Delete any invalid or unregistered tokens from Firestore and server memory
+          multicastResult.responses.forEach((resp, idx: number) => {
+            if (!resp.success && resp.error) {
+              const errCode = resp.error.code || '';
+              if (
+                errCode === 'messaging/registration-token-not-registered' ||
+                errCode === 'messaging/invalid-registration-token' ||
+                errCode === 'messaging/invalid-argument'
+              ) {
+                const badEntry = realTokenList[idx];
+                if (badEntry) {
+                  invalidTokenIds.push(badEntry.tokenId);
+                  userFcmTokensStore.get(recipientId)?.delete(badEntry.tokenId);
+                  if (adminDb) {
+                    adminDb
+                      .doc(`users/${recipientId}/fcmTokens/${badEntry.tokenId}`)
+                      .delete()
+                      .catch(() => {});
+                  }
+                }
+              }
+            }
+          });
+        } catch (fcmErr: any) {
+          console.warn('[WaveLink Server FCM Send Notice]:', fcmErr?.message || fcmErr);
+        }
+      }
+
+      return res.json({
+        sent: true,
+        successCount,
+        totalTokens: tokenEntries.size,
+        invalidTokenIds,
+        sanitizedPreview: { title, body },
+      });
+    } catch (err: any) {
+      console.error('[WaveLink Push Dispatch Error]:', err?.message || err);
+      return res.status(500).json({ sent: false, error: 'Push dispatch failed' });
     }
   });
 

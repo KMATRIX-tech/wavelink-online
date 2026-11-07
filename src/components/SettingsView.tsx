@@ -47,8 +47,10 @@ import {
   BatteryCharging,
   Zap,
   Lightbulb,
-  UserPlus
+  UserPlus,
+  Bell
 } from 'lucide-react';
+import { NotificationSettingsPanel } from './NotificationSettingsPanel';
 
 import { inviteFriends } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
@@ -63,7 +65,15 @@ interface SettingsViewProps {
   onOpenAdminPanel?: () => void;
 }
 
-type SettingsSection = 'profile' | 'privacy' | 'security' | 'terms' | 'pro' | 'support' | 'upgrades';
+type SettingsSection =
+  | 'profile'
+  | 'notifications'
+  | 'privacy'
+  | 'security'
+  | 'terms'
+  | 'pro'
+  | 'support'
+  | 'upgrades';
 
 const DEFAULT_PRIVACY_SETTINGS: UserPrivacySettings = {
   profileVisibility: 'public',
@@ -191,7 +201,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   } = useAuth();
   const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
 
-  const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>('profile');
+  const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>(() => {
+    if (typeof window !== 'undefined') {
+      const requested = localStorage.getItem('wavelink_settings_initial_section');
+      if (requested === 'notifications') {
+        localStorage.removeItem('wavelink_settings_initial_section');
+        return 'notifications';
+      }
+    }
+    return 'profile';
+  });
   const [selectedLegalDoc, setSelectedLegalDoc] = useState<LegalDocType | null>(null);
   const [isDailyRewardModalOpen, setIsDailyRewardModalOpen] = useState(false);
   const [gentleProNote, setGentleProNote] = useState<string | null>(null);
@@ -761,7 +780,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
         </div>
 
         {/* Section Switcher Navigation */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] p-1.5 text-xs font-semibold">
+        <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-8 gap-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] p-1.5 text-xs font-semibold">
           <button
             type="button"
             onClick={() => setActiveSettingsSection('profile')}
@@ -773,6 +792,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
           >
             <User size={14} />
             <span>Profile</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveSettingsSection('notifications')}
+            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
+              activeSettingsSection === 'notifications'
+                ? 'bg-[#2563EB] text-white shadow-2xs font-bold'
+                : 'text-[#78716C] hover:text-[#1C1917]'
+            }`}
+          >
+            <Bell size={14} />
+            <span>Notifications</span>
           </button>
 
           <button
@@ -859,6 +891,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
         isOpen={isDailyRewardModalOpen}
         onClose={() => setIsDailyRewardModalOpen(false)}
       />
+
+      {/* =====================================================================
+          SECTION: PUSH NOTIFICATIONS & ALERT SETTINGS
+      ===================================================================== */}
+      {activeSettingsSection === 'notifications' && <NotificationSettingsPanel />}
 
       {/* =====================================================================
           SECTION: AI UPGRADES & FEEDBACK INBOX

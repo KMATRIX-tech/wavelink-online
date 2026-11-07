@@ -30,7 +30,7 @@ export const CrystalBadge: React.FC<CrystalBadgeProps> = ({
   size = 'md'
 }) => {
   const isAutomatedBot = Boolean(isBot || role === 'bot' || isSupportBotUser(email));
-  const isSuperAdmin = !isAutomatedBot && isAdminEmail(email);
+  const isSuperAdmin = !isAutomatedBot && (role === 'super_admin' || isAdminEmail(email, role));
   const isModerator = !isAutomatedBot && !isSuperAdmin && (isSubAdmin || role === 'sub_admin');
   const hasProBadge = !isAutomatedBot && (isPro || hasBlueStar);
 

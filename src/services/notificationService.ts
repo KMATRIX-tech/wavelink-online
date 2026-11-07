@@ -1,7 +1,8 @@
-import { db, auth, cleanFirestoreData } from '../firebase';
+import { db, auth, cleanFirestoreData, getAuthHeaders } from '../firebase';
 import {
   collection,
   doc,
+  getDoc,
   setDoc,
   deleteDoc,
   updateDoc,
@@ -10,7 +11,13 @@ import {
   where,
   limit
 } from 'firebase/firestore';
-import { AppNotification, NotificationType, UserFollow } from '../types';
+import {
+  AppNotification,
+  NotificationType,
+  UserFollow,
+  UserNotificationSettings
+} from '../types';
+import { DEFAULT_NOTIFICATION_SETTINGS } from './fcmService';
 
 export interface SendNotificationParams {
   recipientId: string;
@@ -27,29 +34,83 @@ export interface SendNotificationParams {
 }
 
 /**
- * Dispatch an in-app notification to a user (messages, calls, posts, follows)
+ * Formats a short, privacy-safe preview for message notifications so full private message
+ * content is never exposed in notifications, and hides the preview completely if the
+ * recipient disabled `showMessagePreviews`.
+ */
+export function buildShortMessagePreview(
+  rawBody: string,
+  showMessagePreviews: boolean = true
+): string {
+  if (!showMessagePreviews) {
+    return 'Sent you a new message';
+  }
+  const cleaned = (rawBody || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^.*sent you a (private )?message:\s*/i, '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  if (!cleaned) return 'Sent you a new message';
+  return cleaned.length > 48 ? `${cleaned.slice(0, 48).trim()}…` : cleaned;
+}
+
+/**
+ * Dispatches an in-app notification to Firestore AND triggers a server-only FCM push
+ * notification via `/api/notifications/send-push` (which uses the Firebase Admin SDK
+ * and enforces the recipient's master switch, per-category toggles, quiet hours, and
+ * message preview privacy settings).
  */
 export async function sendNotification(params: SendNotificationParams): Promise<void> {
   const currentAuthUser = auth.currentUser;
   const actorId = params.actorId || currentAuthUser?.uid || 'system';
 
   // Do not send notifications to oneself
-  if (params.recipientId === actorId) {
+  if (!params.recipientId || params.recipientId === actorId) {
     return;
   }
 
   try {
+    // Load recipient's notification settings from their public user profile if available
+    let recipientSettings: UserNotificationSettings = { ...DEFAULT_NOTIFICATION_SETTINGS };
+    try {
+      const recipSnap = await getDoc(doc(db, 'users', params.recipientId));
+      if (recipSnap.exists()) {
+        const data = recipSnap.data();
+        if (data?.notificationSettings) {
+          recipientSettings = {
+            ...DEFAULT_NOTIFICATION_SETTINGS,
+            ...data.notificationSettings
+          };
+        }
+      }
+    } catch {
+      // fallback to default settings if offline
+    }
+
+    const actorName = params.actorName || currentAuthUser?.displayName || 'A Waver';
+    const isMessageNotif = params.type === 'message';
+    const safeBody = isMessageNotif
+      ? buildShortMessagePreview(params.body, recipientSettings.showMessagePreviews !== false)
+      : params.body;
+    const safeTitle =
+      isMessageNotif && recipientSettings.showMessagePreviews === false
+        ? `New message from ${actorName}`
+        : params.title;
+
     const notifId = `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const notification: AppNotification = {
       id: notifId,
       recipientId: params.recipientId,
       actorId,
-      actorName: params.actorName || currentAuthUser?.displayName || 'A Waver',
-      actorUsername: params.actorUsername || (currentAuthUser?.email ? `@${currentAuthUser.email.split('@')[0]}` : undefined),
-      actorPhotoURL: params.actorPhotoURL || params.actorAvatar || currentAuthUser?.photoURL || undefined,
+      actorName,
+      actorUsername:
+        params.actorUsername ||
+        (currentAuthUser?.email ? `@${currentAuthUser.email.split('@')[0]}` : undefined),
+      actorPhotoURL:
+        params.actorPhotoURL || params.actorAvatar || currentAuthUser?.photoURL || undefined,
       type: params.type,
-      title: params.title,
-      body: params.body,
+      title: safeTitle,
+      body: safeBody,
       entityId: params.entityId,
       read: false,
       createdAt: new Date().toISOString()
@@ -57,8 +118,62 @@ export async function sendNotification(params: SendNotificationParams): Promise<
 
     const sanitized = cleanFirestoreData(notification);
     await setDoc(doc(db, 'notifications', notifId), sanitized);
+
+    // Trigger server-only push notification via Firebase Admin SDK
+    const headers = await getAuthHeaders();
+    fetch('/api/notifications/send-push', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        recipientId: params.recipientId,
+        actorId,
+        actorName,
+        type: params.type,
+        title: safeTitle,
+        body: safeBody,
+        entityId: params.entityId || '',
+        recipientSettings
+      })
+    }).catch((pushErr) => {
+      console.warn('Server push dispatch notice (non-fatal):', pushErr);
+    });
   } catch (err) {
     console.warn('Notification dispatch error (non-fatal):', err);
+  }
+}
+
+/**
+ * Broadcasts an announcement notification to recent community members via server push & in-app feed
+ */
+export async function broadcastAnnouncementNotification(params: {
+  announcementId: string;
+  authorId: string;
+  authorName: string;
+  authorPhotoURL?: string;
+  title: string;
+}): Promise<void> {
+  try {
+    const usersSnap = await getDocs(query(collection(db, 'users'), limit(25)));
+    const tasks: Promise<void>[] = [];
+    usersSnap.forEach((uDoc) => {
+      if (uDoc.id && uDoc.id !== params.authorId) {
+        tasks.push(
+          sendNotification({
+            recipientId: uDoc.id,
+            actorId: params.authorId,
+            actorName: params.authorName,
+            actorPhotoURL: params.authorPhotoURL,
+            type: 'announcement',
+            title: `Notice Board: ${params.title.slice(0, 48)}`,
+            body: `${params.authorName} posted a new community announcement.`,
+            entityId: params.announcementId
+          })
+        );
+      }
+    });
+    await Promise.allSettled(tasks);
+  } catch (err) {
+    console.warn('Announcement notification broadcast notice:', err);
   }
 }
 

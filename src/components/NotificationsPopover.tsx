@@ -17,6 +17,11 @@ import {
   sendNotification
 } from '../services/notificationService';
 import {
+  getBrowserNotificationPermission,
+  getSavedDeviceToken,
+  requestPushPermissionAndSaveToken
+} from '../services/fcmService';
+import {
   Bell,
   Check,
   CheckCheck,
@@ -30,6 +35,8 @@ import {
   UserPlus,
   Sparkles,
   ExternalLink,
+  Settings,
+  Megaphone,
   X
 } from 'lucide-react';
 
@@ -42,11 +49,15 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
   onNavigateTab,
   onStartChat
 }) => {
-  const { currentUser, userProfile } = useAuth();
+  const { currentUser, showGlobalToast } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [filterType, setFilterType] = useState<string>('all');
   const [isLoading, setIsLoading] = useState(true);
+  const [isPushEnabled, setIsPushEnabled] = useState<boolean>(
+    () => Boolean(getSavedDeviceToken() && getBrowserNotificationPermission() === 'granted')
+  );
+  const [isEnablingPush, setIsEnablingPush] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -171,18 +182,50 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     });
   };
 
+  const handleOpenNotificationSettings = () => {
+    setIsOpen(false);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('wavelink_settings_initial_section', 'notifications');
+    }
+    if (onNavigateTab) {
+      onNavigateTab('settings');
+    }
+  };
+
+  const handleEnablePushFromPopover = async () => {
+    if (!currentUser) return;
+    setIsEnablingPush(true);
+    try {
+      const res = await requestPushPermissionAndSaveToken(currentUser.uid);
+      if (res.success) {
+        setIsPushEnabled(true);
+        showGlobalToast('Push notifications enabled on this device!');
+      } else if (res.error) {
+        showGlobalToast(res.error);
+      }
+    } finally {
+      setIsEnablingPush(false);
+    }
+  };
+
   const renderIcon = (type: NotificationType) => {
     switch (type) {
       case 'message':
         return <MessageSquare size={14} className="text-blue-400" />;
       case 'call':
+      case 'incoming_call':
         return <PhoneCall size={14} className="text-emerald-400" />;
       case 'post_like':
+      case 'post_reaction':
+      case 'spark_like':
         return <Heart size={14} className="text-rose-400 fill-rose-400" />;
       case 'post_comment':
         return <MessageCircle size={14} className="text-indigo-400" />;
       case 'post_tip':
+      case 'payment_verified':
         return <Coins size={14} className="text-amber-400" />;
+      case 'announcement':
+        return <Megaphone size={14} className="text-amber-500" />;
       case 'follow':
         return <UserPlus size={14} className="text-purple-400" />;
       default:
@@ -237,6 +280,13 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
                 </button>
               )}
               <button
+                onClick={handleOpenNotificationSettings}
+                className="p-1.5 rounded-lg text-slate-500 hover:text-[#3B82F6] hover:bg-blue-50 transition"
+                title="Notification Settings"
+              >
+                <Settings size={15} />
+              </button>
+              <button
                 onClick={() => setIsOpen(false)}
                 className="p-1 rounded-lg text-slate-400 hover:text-[#0F172A]"
               >
@@ -244,6 +294,23 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
               </button>
             </div>
           </div>
+
+          {/* Explicit Push Opt-In Banner (One Kind Sentence, Never Prompts on Load) */}
+          {!isPushEnabled && (
+            <div className="px-3.5 py-2.5 bg-blue-50/80 border-b border-blue-100 flex items-center justify-between gap-2.5">
+              <p className="text-[11px] text-slate-700 leading-snug">
+                Enable push notifications so you never miss a message, call, or update from your friends.
+              </p>
+              <button
+                type="button"
+                disabled={isEnablingPush}
+                onClick={handleEnablePushFromPopover}
+                className="px-2.5 py-1.5 rounded-xl bg-[#3B82F6] hover:bg-blue-700 text-white text-[11px] font-bold shrink-0 transition active:scale-95"
+              >
+                {isEnablingPush ? 'Enabling...' : 'Enable'}
+              </button>
+            </div>
+          )}
 
           {/* Filter Pills */}
           <div className="flex px-3 pt-2 pb-1 gap-1 border-b border-slate-100 bg-white overflow-x-auto scrollbar-none text-[11px] font-semibold">
@@ -346,7 +413,14 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
 
           {/* Footer */}
           <div className="p-2.5 bg-[#F8FAFC] border-t border-slate-100 flex items-center justify-between text-[10px] text-slate-400">
-            <span>Real-Time Notifications</span>
+            <button
+              type="button"
+              onClick={handleOpenNotificationSettings}
+              className="text-slate-600 hover:text-[#3B82F6] font-bold flex items-center gap-1 transition"
+            >
+              <Settings size={11} />
+              <span>Notification Settings</span>
+            </button>
             {onNavigateTab && (
               <button
                 onClick={() => {

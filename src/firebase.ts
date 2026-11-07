@@ -117,16 +117,40 @@ try {
   // App Check optional in local preview when site key is not set
 }
 
+export const OWNER_SESSION_STORAGE_KEY = 'wavelink_owner_session_token';
+export const DEVICE_ID_STORAGE_KEY = 'wavelink_device_id';
+
+export function getClientDeviceId(): string {
+  if (typeof window === 'undefined') return 'server_client';
+  try {
+    let id = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+    if (!id) {
+      id = `dev_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 10)}`;
+      localStorage.setItem(DEVICE_ID_STORAGE_KEY, id);
+    }
+    return id;
+  } catch {
+    return 'browser_device';
+  }
+}
+
 /**
- * Builds authenticated headers including Firebase ID Token (Bearer) and App Check token
- * for protected server routes.
+ * Builds authenticated headers including Firebase ID Token (Bearer), server-issued Owner Session token,
+ * and App Check token for protected server routes.
  */
 export async function getAuthHeaders(extraHeaders: Record<string, string> = {}): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'X-WaveLink-Device-Id': getClientDeviceId(),
     ...extraHeaders
   };
   try {
+    if (typeof window !== 'undefined') {
+      const ownerToken = sessionStorage.getItem(OWNER_SESSION_STORAGE_KEY) || localStorage.getItem(OWNER_SESSION_STORAGE_KEY);
+      if (ownerToken) {
+        headers['X-WaveLink-Owner-Token'] = ownerToken;
+      }
+    }
     if (auth.currentUser) {
       const idToken = await auth.currentUser.getIdToken();
       if (idToken) {
@@ -134,9 +158,6 @@ export async function getAuthHeaders(extraHeaders: Record<string, string> = {}):
       }
       if (auth.currentUser.uid) {
         headers['X-WaveLink-Uid'] = auth.currentUser.uid;
-      }
-      if (auth.currentUser.email) {
-        headers['X-WaveLink-Email'] = auth.currentUser.email;
       }
     }
   } catch {
@@ -155,21 +176,19 @@ export async function getAuthHeaders(extraHeaders: Record<string, string> = {}):
   return headers;
 }
 
-export const ADMIN_EMAIL = 'keylanmbilinyi5@gmail.com';
-export const ADMIN_EMAIL_ALT = 'keylanmbilinyi5@gnail.com';
+// Generic label for UI display only — actual Owner email is kept strictly on the server in process.env.OWNER_EMAIL
+export const ADMIN_EMAIL = 'Platform Administrator';
 
-export function isOwnerEmail(email?: string | null): boolean {
-  if (!email) return false;
-  const normalized = email.trim().toLowerCase();
-  return normalized === ADMIN_EMAIL.toLowerCase() || normalized === ADMIN_EMAIL_ALT.toLowerCase();
+export function isOwnerEmail(_email?: string | null): boolean {
+  return false;
 }
 
-export function isSuperAdminEmail(email?: string | null): boolean {
-  return isOwnerEmail(email);
+export function isSuperAdminEmail(_email?: string | null, role?: string | null): boolean {
+  return role === 'super_admin' || role === 'admin';
 }
 
-export function isAdminEmail(email?: string | null): boolean {
-  return isOwnerEmail(email);
+export function isAdminEmail(_email?: string | null, role?: string | null): boolean {
+  return role === 'super_admin' || role === 'admin' || role === 'sub_admin';
 }
 
 export function isAuthNetworkError(error: unknown): boolean {

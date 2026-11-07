@@ -59,12 +59,14 @@ service cloud.firestore {
       return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
     }
 
-    // Server-designated Super Admin or server-recorded /admins/{uid} document
+    // Server-designated Super Admin (via custom claims, server-managed /admins/{uid}, or server-assigned user role)
     function isSuperAdmin() {
       return isSignedIn() && (
-        request.auth.token.email.lower() == 'keylanmbilinyi5@gmail.com' ||
-        request.auth.token.email.lower() == 'keylanmbilinyi5@gnail.com' ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        request.auth.token.get('admin', false) == true ||
+        request.auth.token.get('role', '') in ['admin', 'super_admin'] ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user') in ['admin', 'super_admin'])
       );
     }
 
@@ -171,10 +173,10 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Server-managed Admins registry
+    // Server-managed Admins registry (writable only by Firebase Admin SDK on the server)
     match /admins/{adminId} {
       allow read: if isSignedIn();
-      allow write: if isSuperAdmin();
+      allow write: if false;
     }
 
     // Connection test document
@@ -189,6 +191,18 @@ service cloud.firestore {
       allow create: if isValidId(userId) && (isSafeUserProfileCreate(userId) || isAdmin());
       allow update: if isValidId(userId) && (isAdmin() || isSafeUserProfileUpdate(userId));
       allow delete: if isValidId(userId) && (isOwner(userId) || isSuperAdmin());
+
+      // Device FCM Push Notification Tokens — strictly private to the user & admin
+      match /fcmTokens/{tokenId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create, update: if (isOwner(userId) || isAdmin()) &&
+          request.resource.data.keys().hasAll(['token', 'userId']) &&
+          request.resource.data.userId == userId &&
+          request.resource.data.token is string &&
+          request.resource.data.token.size() > 0 &&
+          request.resource.data.token.size() <= 1024;
+        allow delete: if isOwner(userId) || isAdmin();
+      }
     }
 
     // Social feed posts (includes approved scheduled bot posts when triggered by an admin)

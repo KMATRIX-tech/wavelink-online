@@ -24,6 +24,7 @@ import { AdsterraAdBanner } from './AdsterraAdBanner';
 import { shouldShowAds } from './AdsterraManager';
 import { RichEventCard } from './RichEventCard';
 import { ImageLightboxModal, LightboxState } from './ImageLightboxModal';
+import { AddToHomeScreenHintCard } from './PWAInstallButton';
 import {
   ThumbsUp,
   Heart,
@@ -1188,6 +1189,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
         <div className="wavelink-feed-column overflow-hidden">
           {/* Background Video Upload Progress Chip at the Top of the Feed */}
           <VideoUploadProgressChip variant="feed-inline" />
+
+          {/* Friendly Add to Home Screen Hint (Especially for iPhone Users) */}
+          <AddToHomeScreenHintCard compact />
 
           {/* Active Hashtag Filter Banner from Global Search */}
           {initialFilterTag && (

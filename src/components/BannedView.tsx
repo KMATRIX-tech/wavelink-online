@@ -57,7 +57,7 @@ export const BannedView: React.FC<BannedViewProps> = ({ onOpenSupport }) => {
 
         <div className="mt-8 pt-4 border-t border-[#EFECE6] text-xs text-[#57534E] flex items-center justify-center gap-1.5">
           <Mail size={13} />
-          <span>Contact Admin directly: keylanmbilinyi5@gmail.com</span>
+          <span>Contact Platform Administration via Support Desk</span>
         </div>
       </div>
     </div>

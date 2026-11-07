@@ -400,7 +400,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const isChattingWithSuperAdmin =
     isDirectMessage &&
     !isChattingWithSupportBot &&
-    Boolean(directRecipient && isSuperAdminEmail(directRecipient.email));
+    Boolean(directRecipient && isSuperAdminEmail(directRecipient.email, directRecipient.role));
   const isBlockedFromAdminChat = isChattingWithSuperAdmin && !canTalkToAdmin;
   const isRecipientBlocked = Boolean(
     directRecipient &&
@@ -1336,7 +1336,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         : chatMediaType === 'audio'
         ? `🎤 Voice note (${formatVoiceDuration(voiceNoteDuration)})`
         : '[Media]';
-      const messagePreview = (sanitizedText || defaultAttachmentLabel).substring(0, 100);
+      const rawSnippet = (sanitizedText || defaultAttachmentLabel).replace(/\s+/g, ' ').trim();
+      const messagePreview =
+        rawSnippet.length > 45 ? `${rawSnippet.substring(0, 45).trim()}…` : rawSnippet;
       const senderDisplayName = userProfile?.displayName || currentUser.displayName || 'Someone';
 
       if (isDirectMessage && directRecipient && !isBotConvo) {
@@ -2064,10 +2066,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                                 isPro={member.isPro}
                                 hasBlueStar={member.hasBlueStar || member.isPro}
                                 isSubAdmin={member.isSubAdmin || member.role === 'sub_admin'}
+                                role={member.role}
                                 size="sm"
                               />
                             </span>
-                            {isSuperAdminEmail(member.email) && !canTalkToAdmin ? (
+                            {isSuperAdminEmail(member.email, member.role) && !canTalkToAdmin ? (
                               <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold flex items-center gap-0.5 shrink-0">
                                 <Lock size={9} />
                                 <span>Pro</span>
@@ -2287,7 +2290,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       <Video size={16} />
                       <span className="hidden sm:inline">Video</span>
                     </button>
-                    {!isSuperAdminEmail(directRecipient.email) && (
+                    {!isSuperAdminEmail(directRecipient.email, directRecipient.role) && (
                       <>
                         <button
                           type="button"

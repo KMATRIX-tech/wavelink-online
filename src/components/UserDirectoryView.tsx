@@ -25,7 +25,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
   const [followingMap, setFollowingMap] = useState<Record<string, boolean>>({});
 
   const handleMessageClick = (targetUser: UserProfile) => {
-    const isTargetAdmin = isSuperAdminEmail(targetUser.email);
+    const isTargetAdmin = isSuperAdminEmail(targetUser.email, targetUser.role);
     // Requirement 8: only admins or verified pple with the bluestar can talk to the admin
     if (isTargetAdmin && !canTalkToAdmin) {
       setShowAdminLockModal(true);
@@ -256,12 +256,12 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                         type="button"
                         onClick={() => handleMessageClick(user)}
                         className={`px-3 py-1.5 rounded-xl font-bold text-xs flex items-center gap-1.5 transition ${
-                          isSuperAdminEmail(user.email) && !canTalkToAdmin
+                          isSuperAdminEmail(user.email, user.role) && !canTalkToAdmin
                             ? 'bg-amber-50 text-amber-900 border border-amber-300/80 hover:bg-amber-100'
                             : 'bg-blue-50 hover:bg-blue-100 text-[#2563EB] border border-blue-200/80'
                         }`}
                       >
-                        {isSuperAdminEmail(user.email) && !canTalkToAdmin ? (
+                        {isSuperAdminEmail(user.email, user.role) && !canTalkToAdmin ? (
                           <>
                             <Lock size={12} className="text-amber-600" />
                             <span>Try Pro</span>

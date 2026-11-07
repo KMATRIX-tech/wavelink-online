@@ -16,6 +16,7 @@ import {
 import { Announcement } from '../types';
 import { RichEventCard } from './RichEventCard';
 import { compressImage } from '../utils/mediaStorage';
+import { broadcastAnnouncementNotification } from '../services/notificationService';
 import {
   CalendarDays,
   Calendar,
@@ -129,8 +130,7 @@ export const AnnouncementsView: React.FC = () => {
         userProfile?.isOfficialPartner ||
           userProfile?.partnerType ||
           isProEffective ||
-          isAdmin ||
-          currentUser.email === 'keylanmbilinyi5@gmail.com'
+          isAdmin
       );
 
       const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'member';
@@ -170,6 +170,13 @@ export const AnnouncementsView: React.FC = () => {
       await setDoc(doc(db, 'announcements', id), cleanFirestoreData(newNotice));
 
       const postedTitle = title.trim();
+      broadcastAnnouncementNotification({
+        announcementId: id,
+        authorId: currentUser.uid,
+        authorName: newNotice.authorName,
+        authorPhotoURL: newNotice.authorPhotoURL,
+        title: postedTitle
+      }).catch(() => {});
 
       // Reset Form
       setTitle('');
