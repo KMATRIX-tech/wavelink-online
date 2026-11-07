@@ -31,7 +31,10 @@ import { CallingModal } from './components/CallingModal';
 import { WelinkAssistantDrawer } from './components/WelinkAssistantDrawer';
 import { SparkUploadQueueBanner } from './components/SparkUploadQueueBanner';
 import { VideoUploadProgressChip } from './components/VideoUploadProgressChip';
-import { Waves, PhoneCall, PhoneOff, Video } from 'lucide-react';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { validateFrontendEnvironment } from './utils/envValidation';
+import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle } from 'lucide-react';
+import type { User as FirebaseUser } from 'firebase/auth';
 
 interface IncomingCallData {
   callId: string;
@@ -43,30 +46,42 @@ interface IncomingCallData {
   createdAt?: string;
 }
 
-function MainApp() {
-  const { currentUser, userProfile, isLoading } = useAuth();
+interface AuthenticatedAppProps {
+  currentUser: FirebaseUser;
+}
+
+function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
+  const { userProfile } = useAuth();
   const { appearanceTheme, setAppearanceTheme } = useTheme();
 
   // Remember user's session tab from where they left off
   const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
-    const saved = localStorage.getItem('wavelink_last_active_tab') as ActiveTab;
-    const validTabs: ActiveTab[] = [
-      'feed',
-      'studio',
-      'videos',
-      'monetization',
-      'announcements',
-      'chat',
-      'directory',
-      'analytics',
-      'admin',
-      'settings'
-    ];
-    return saved && validTabs.includes(saved) ? saved : 'feed';
+    try {
+      const saved = localStorage.getItem('wavelink_last_active_tab') as ActiveTab;
+      const validTabs: ActiveTab[] = [
+        'feed',
+        'studio',
+        'videos',
+        'monetization',
+        'announcements',
+        'chat',
+        'directory',
+        'analytics',
+        'admin',
+        'settings'
+      ];
+      return saved && validTabs.includes(saved) ? saved : 'feed';
+    } catch {
+      return 'feed';
+    }
   });
 
   const [targetChatUserId, setTargetChatUserId] = useState<string | undefined>(() => {
-    return localStorage.getItem('wavelink_last_chat_target') || undefined;
+    try {
+      return localStorage.getItem('wavelink_last_chat_target') || undefined;
+    } catch {
+      return undefined;
+    }
   });
 
   const [incomingCall, setIncomingCall] = useState<IncomingCallData | null>(null);
@@ -117,7 +132,7 @@ function MainApp() {
     if (userProfile?.appearanceTheme && userProfile.appearanceTheme !== appearanceTheme) {
       setAppearanceTheme(userProfile.appearanceTheme);
     }
-  }, [userProfile?.appearanceTheme]);
+  }, [userProfile?.appearanceTheme, appearanceTheme, setAppearanceTheme]);
 
   // Listen for unread reaction/reply notifications to display a small notification dot
   useEffect(() => {
@@ -149,7 +164,11 @@ function MainApp() {
   const setActiveTab = (tab: ActiveTab) => {
     triggerHaptic(tab === 'studio' ? 'medium' : 'tab');
     setActiveTabState(tab);
-    localStorage.setItem('wavelink_last_active_tab', tab);
+    try {
+      localStorage.setItem('wavelink_last_active_tab', tab);
+    } catch {
+      // ignore storage quota
+    }
 
     // Clear unread notification dot when user checks Home or Profile
     if ((tab === 'feed' || tab === 'settings') && unreadNotificationIds.length > 0) {
@@ -161,13 +180,17 @@ function MainApp() {
 
   const handleStartChatWithUser = (userId: string) => {
     setTargetChatUserId(userId);
-    localStorage.setItem('wavelink_last_chat_target', userId);
+    try {
+      localStorage.setItem('wavelink_last_chat_target', userId);
+    } catch {
+      // ignore
+    }
     setActiveTab('chat');
   };
 
   useEffect(() => {
-    testConnection();
-    recordSystemDomain();
+    testConnection().catch(() => {});
+    recordSystemDomain().catch(() => {});
   }, []);
 
   // Ringtone ONLY for the person receiving the call; stops immediately on accept, decline, or call end
@@ -203,16 +226,16 @@ function MainApp() {
       activeOscillators = [];
       if (audioCtx && audioCtx.state !== 'closed') {
         audioCtx.close().catch(() => {});
+        audioCtx = null;
       }
-      audioCtx = null;
     };
 
     ringtoneStopRef.current = cleanupAudio;
 
     try {
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      if (AudioContextClass) {
-        audioCtx = new AudioContextClass();
+      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtxClass) {
+        audioCtx = new AudioCtxClass();
 
         const playChime = () => {
           if (!isPlaying || !audioCtx || audioCtx.state === 'closed') return;
@@ -220,33 +243,38 @@ function MainApp() {
             if (audioCtx.state === 'suspended') {
               audioCtx.resume().catch(() => {});
             }
-            const now = audioCtx.currentTime;
+
             const osc1 = audioCtx.createOscillator();
             const osc2 = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
 
             osc1.type = 'sine';
-            osc2.type = 'triangle';
-            osc1.frequency.setValueAtTime(523.25, now); // C5
-            osc1.frequency.setValueAtTime(659.25, now + 0.2); // E5
-            osc2.frequency.setValueAtTime(783.99, now + 0.4); // G5
+            osc1.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
+            osc1.frequency.exponentialRampToValueAtTime(659.25, audioCtx.currentTime + 0.35); // E5
 
-            gain.gain.setValueAtTime(0.06, now);
-            gain.gain.exponentialRampToValueAtTime(0.001, now + 1.2);
+            osc2.type = 'triangle';
+            osc2.frequency.setValueAtTime(659.25, audioCtx.currentTime); // E5
+            osc2.frequency.exponentialRampToValueAtTime(783.99, audioCtx.currentTime + 0.35); // G5
+
+            gain.gain.setValueAtTime(0.001, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0.12, audioCtx.currentTime + 0.08);
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.9);
 
             osc1.connect(gain);
             osc2.connect(gain);
             gain.connect(audioCtx.destination);
 
-            activeOscillators = [osc1, osc2];
-            osc1.start(now);
-            osc2.start(now + 0.2);
-            osc1.stop(now + 1.2);
-            osc2.stop(now + 1.2);
+            osc1.start();
+            osc2.start();
+            osc1.stop(audioCtx.currentTime + 0.95);
+            osc2.stop(audioCtx.currentTime + 0.95);
 
-            triggerHaptic('medium');
+            activeOscillators.push(osc1, osc2);
+            setTimeout(() => {
+              activeOscillators = activeOscillators.filter((o) => o !== osc1 && o !== osc2);
+            }, 1000);
           } catch {
-            // Audio policy exception handling
+            // chime synth error
           }
 
           if (isPlaying) {
@@ -281,7 +309,7 @@ function MainApp() {
     return () => clearTimeout(timeout);
   }, [incomingCall?.callId, stopIncomingRingtone]);
 
-  // Real-time Firestore listener for calls addressed to the logged-in user (works across all pages/tabs)
+  // Real-time Firestore listener for calls addressed to the logged-in user
   useEffect(() => {
     if (!currentUser?.uid) {
       setIncomingCall(null);
@@ -300,7 +328,6 @@ function MainApp() {
         const status = data.status;
         const parsedTime = data.createdAt ? new Date(data.createdAt).getTime() : now;
         const createdAtMs = isNaN(parsedTime) ? now : parsedTime;
-        // Tolerate up to 2 minutes of clock skew between caller and receiver devices
         const ageMs = now - createdAtMs;
 
         if (
@@ -356,20 +383,25 @@ function MainApp() {
       where('receiver', '==', currentUser.uid)
     );
 
-    let docsById: Array<{ id: string; data: () => any }> = [];
+    let docsByReceiverId: Array<{ id: string; data: () => any }> = [];
     let docsByReceiver: Array<{ id: string; data: () => any }> = [];
 
     const mergeAndProcess = () => {
-      const mergedMap = new Map<string, { id: string; data: () => any }>();
-      docsById.forEach((d) => mergedMap.set(d.id, d));
-      docsByReceiver.forEach((d) => mergedMap.set(d.id, d));
-      processCallSnapshots(Array.from(mergedMap.values()));
+      const seen = new Set<string>();
+      const combined: Array<{ id: string; data: () => any }> = [];
+      [...docsByReceiverId, ...docsByReceiver].forEach((d) => {
+        if (!seen.has(d.id)) {
+          seen.add(d.id);
+          combined.push(d);
+        }
+      });
+      processCallSnapshots(combined);
     };
 
     const unsub1 = onSnapshot(
       qByReceiverId,
       (snapshot) => {
-        docsById = snapshot.docs;
+        docsByReceiverId = snapshot.docs;
         mergeAndProcess();
       },
       (err) => {
@@ -399,67 +431,65 @@ function MainApp() {
     if (!currentUser?.uid) return;
     let isCleanedUp = false;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/chat/ws`;
-    const ws = new WebSocket(wsUrl);
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/api/chat/ws`;
+      const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => {
-      if (isCleanedUp) return;
-      ws.send(
-        JSON.stringify({
-          type: 'chat:join',
-          channelId: `user_${currentUser.uid}`,
-          userId: currentUser.uid,
-          name: userProfile?.displayName || currentUser.displayName || 'Waver'
-        })
-      );
-    };
+      ws.onopen = () => {
+        if (isCleanedUp) return;
+        ws.send(
+          JSON.stringify({
+            type: 'chat:join',
+            channelId: `user_${currentUser.uid}`,
+            userId: currentUser.uid,
+            name: userProfile?.displayName || currentUser.displayName || 'Waver'
+          })
+        );
+      };
 
-    ws.onmessage = (event) => {
-      if (isCleanedUp) return;
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
-          if (data.signalType === 'offer' && !handledCallIdsRef.current.has(data.callId)) {
-            setIncomingCall((prev) => ({
-              callId: data.callId,
-              callerId: data.senderId,
-              callerName: data.senderName || prev?.callerName || 'WaveLink Member',
-              callerPhotoURL: data.senderPhotoURL || prev?.callerPhotoURL,
-              callType: data.callType || prev?.callType || 'video',
-              offer: data.sdp || prev?.offer
-            }));
-          } else if (data.signalType === 'end' || data.signalType === 'declined') {
-            stopIncomingRingtone();
-            setIncomingCall((prev) => (prev?.callId === data.callId ? null : prev));
+      ws.onmessage = (event) => {
+        if (isCleanedUp) return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
+            if (data.signalType === 'offer' && !handledCallIdsRef.current.has(data.callId)) {
+              setIncomingCall((prev) => ({
+                callId: data.callId,
+                callerId: data.senderId,
+                callerName: data.senderName || prev?.callerName || 'WaveLink Member',
+                callerPhotoURL: data.senderPhotoURL || prev?.callerPhotoURL,
+                callType: data.callType || prev?.callType || 'video',
+                offer: data.sdp || prev?.offer
+              }));
+            } else if (data.signalType === 'end' || data.signalType === 'declined') {
+              stopIncomingRingtone();
+              setIncomingCall((prev) => (prev?.callId === data.callId ? null : prev));
+            }
           }
+        } catch (err) {
+          console.warn('Incoming call signal parse notice:', err);
         }
-      } catch (err) {
-        console.warn('Incoming call signal parse notice:', err);
-      }
-    };
+      };
 
-    return () => {
-      isCleanedUp = true;
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-    };
-  }, [currentUser?.uid, stopIncomingRingtone]);
+      return () => {
+        isCleanedUp = true;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      };
+    } catch {
+      // Non-blocking WebSocket setup
+    }
+  }, [currentUser?.uid, stopIncomingRingtone, userProfile?.displayName, currentUser?.displayName]);
 
   const handleOpenCall = (type: 'video' | 'voice', recipient?: CallRecipient) => {
     triggerHaptic('medium');
-    stopIncomingRingtone();
-    // Single popup rule: close any open drawer before opening call modal
     setIsWelinkOpen(false);
-    const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-
-    // CallingModal (Step 1) acquires local tracks, creates the WebRTC SDP offer, and saves the call document with the offer
     setActiveCall({
       type,
       recipient,
-      isInitiator: true,
-      callId
+      isInitiator: true
     });
   };
 
@@ -471,7 +501,6 @@ function MainApp() {
     setIncomingCall(null);
     setIsWelinkOpen(false);
 
-    // CallingModal (Step 2) reads the offer, calls setRemoteDescription, creates the answer, and updates the call document
     setActiveCall({
       type: callType,
       recipient: {
@@ -492,7 +521,6 @@ function MainApp() {
     handledCallIdsRef.current.add(callId);
     setIncomingCall(null);
 
-    // Update Firestore call status to 'declined' so the caller immediately sees "No answer"
     updateDoc(doc(db, 'calls', callId), {
       status: 'declined',
       endedAt: new Date().toISOString(),
@@ -507,8 +535,8 @@ function MainApp() {
           JSON.stringify({
             type: 'call:signal',
             callId,
-            senderId: currentUser?.uid,
-            senderName: userProfile?.displayName || currentUser?.displayName || 'Waver',
+            senderId: currentUser.uid,
+            senderName: userProfile?.displayName || currentUser.displayName || 'Waver',
             targetUserId: callerId,
             signalType: 'declined'
           })
@@ -522,31 +550,10 @@ function MainApp() {
 
   const handleOpenWelink = (mode: 'chat' | 'image' | 'voice' = 'chat') => {
     triggerHaptic('medium');
-    // Single popup rule: close any active call modal before opening WELINK drawer
     setActiveCall(null);
     setWelinkInitialMode(mode);
     setIsWelinkOpen(true);
   };
-
-  if (isLoading) {
-    return (
-      <div className="min-h-[100dvh] flex flex-col items-center justify-center bg-[var(--bg-canvas)] text-[var(--text-primary)] px-4">
-        <div className="p-4 rounded-3xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white shadow-lg mb-4 animate-bounce">
-          <Waves size={36} />
-        </div>
-        <h2 className="text-xl font-extrabold tracking-tight text-[#1C1917]">
-          WaveLink
-        </h2>
-        <p className="text-sm text-[#78716C] mt-1 font-medium text-center">
-          Opening your welcoming community space...
-        </p>
-      </div>
-    );
-  }
-
-  if (!currentUser) {
-    return <AuthPage />;
-  }
 
   if (userProfile?.isBanned) {
     return <BannedView onOpenSupport={() => setActiveTab('settings')} />;
@@ -557,7 +564,7 @@ function MainApp() {
       {/* Top in-app warning notice if issued by admin */}
       <WarningBanner />
 
-      {/* Top Header Bar (with non-floating WELINK button) */}
+      {/* Top Header Bar */}
       <TopHeader
         activeTab={activeTab}
         onOpenMobileMenu={() => {}}
@@ -642,7 +649,7 @@ function MainApp() {
         hasUnreadNotifications={unreadNotificationIds.length > 0}
       />
 
-      {/* WELINK AI Assistant Drawer (Only one popup/drawer at a time, with clear close button) */}
+      {/* WELINK AI Assistant Drawer */}
       <WelinkAssistantDrawer
         isOpen={isWelinkOpen && !activeCall}
         onClose={() => setIsWelinkOpen(false)}
@@ -686,7 +693,7 @@ function MainApp() {
               <button
                 type="button"
                 onClick={handleDeclineIncomingCall}
-                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95"
+                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
               >
                 <PhoneOff size={18} />
                 <span>Decline</span>
@@ -694,7 +701,7 @@ function MainApp() {
               <button
                 type="button"
                 onClick={handleAcceptIncomingCall}
-                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition active:scale-95 animate-pulse"
+                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition active:scale-95 animate-pulse cursor-pointer"
               >
                 <PhoneCall size={18} />
                 <span>Accept</span>
@@ -704,7 +711,7 @@ function MainApp() {
         </div>
       )}
 
-      {/* WebRTC Video & Voice Calling Overlay Modal (Single popup discipline) */}
+      {/* WebRTC Video & Voice Calling Overlay Modal */}
       {activeCall && !isWelinkOpen && (
         <CallingModal
           initialType={activeCall.type}
@@ -719,12 +726,67 @@ function MainApp() {
   );
 }
 
+function RootAppContent() {
+  const envValidation = validateFrontendEnvironment();
+  const { currentUser, isLoading } = useAuth();
+
+  // 1. Build & Runtime Environment Check
+  if (!envValidation.isValid) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A] p-6 text-center font-sans">
+        <div className="max-w-md w-full bg-white rounded-2xl shadow-xl border border-amber-200 p-6 sm:p-8">
+          <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center mx-auto mb-4">
+            <AlertTriangle size={30} />
+          </div>
+          <h2 className="text-xl font-bold text-slate-900 mb-2">Configuration Notice</h2>
+          <p className="text-sm text-slate-600 mb-4 leading-relaxed">
+            {envValidation.message}
+          </p>
+          <div className="bg-slate-100 rounded-xl p-3 text-xs font-mono text-slate-700 text-left overflow-x-auto">
+            Missing configuration: {envValidation.missingKeys.join(', ')}
+          </div>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="mt-5 w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition cursor-pointer"
+          >
+            Retry Loading
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Plain Loading Screen until sign-in state is known (no code reads user, admin or settings before they exist)
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A] px-4 font-sans select-none">
+        <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-blue-600 to-teal-500 flex items-center justify-center text-white shadow-lg shadow-blue-500/20 mb-4 animate-pulse">
+          <Waves size={36} />
+        </div>
+        <h2 className="text-xl font-bold tracking-tight text-[#0F172A]">WaveLink</h2>
+        <p className="text-sm text-[#64748B] mt-2 font-medium">Loading WaveLink...</p>
+      </div>
+    );
+  }
+
+  // 3. Unauthenticated Screen
+  if (!currentUser) {
+    return <AuthPage />;
+  }
+
+  // 4. Authenticated Workspace
+  return <AuthenticatedApp currentUser={currentUser} />;
+}
+
 export default function App() {
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <MainApp />
-      </AuthProvider>
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <AuthProvider>
+          <RootAppContent />
+        </AuthProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }

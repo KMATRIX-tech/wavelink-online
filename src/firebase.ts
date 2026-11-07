@@ -163,15 +163,20 @@ export async function getAuthHeaders(extraHeaders: Record<string, string> = {}):
   } catch {
     // fallback if offline
   }
+  // App Check is non-blocking: fetch token with a 1.5s timeout fallback
   try {
     if (appCheckInstance) {
-      const appCheckRes = await getAppCheckToken(appCheckInstance, false);
+      const tokenPromise = getAppCheckToken(appCheckInstance, false);
+      const timeoutPromise = new Promise<{ token: string }>((resolve) =>
+        setTimeout(() => resolve({ token: '' }), 1500)
+      );
+      const appCheckRes = await Promise.race([tokenPromise, timeoutPromise]);
       if (appCheckRes?.token) {
         headers['X-Firebase-AppCheck'] = appCheckRes.token;
       }
     }
   } catch {
-    // ignore App Check token error in preview
+    // Non-blocking: never fail requests if App Check is unavailable
   }
   return headers;
 }

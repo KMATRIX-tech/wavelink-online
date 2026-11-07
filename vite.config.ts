@@ -4,15 +4,46 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 import {fileURLToPath} from 'url';
+import fs from 'fs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss()],
-    // SECURITY: Only expose non-secret Firebase AppCheck public site key prefix and WebRTC TURN config;
-    // GEMINI_API_KEY, AZAMPAY_CLIENT_SECRET, and OWNER_PHONE remain strictly on the Express server.
-    envPrefix: ['VITE_FIREBASE_', 'VITE_TURN_'],
+    // Expose all safe public VITE_ prefixed environment variables to the frontend.
+    // Secrets (GEMINI_API_KEY, AZAMPAY_CLIENT_SECRET, OWNER_EMAIL, OWNER_PHONE, OWNER_ACCESS_CODE) remain strictly on the server.
+    envPrefix: ['VITE_'],
+    plugins: [
+      react(),
+      tailwindcss(),
+      {
+        name: 'validate-frontend-env',
+        buildStart() {
+          try {
+            const configPath = path.resolve(__dirname, 'firebase-applet-config.json');
+            let config: Record<string, string> = {};
+            if (fs.existsSync(configPath)) {
+              config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            }
+            const required = ['projectId', 'apiKey', 'authDomain', 'appId'];
+            const missing = required.filter(
+              (key) => !config[key] && !process.env[`VITE_FIREBASE_${key.toUpperCase()}`]
+            );
+            if (missing.length > 0) {
+              console.warn(
+                `\n⚠️  [WaveLink Build Notice]: Missing frontend configuration parameters: ${missing.join(
+                  ', '
+                )}. Please check firebase-applet-config.json or frontend environment variables.\n`
+              );
+            } else {
+              console.log('✓ [WaveLink Build]: All required frontend configuration parameters are present.');
+            }
+          } catch (err) {
+            console.warn('[WaveLink Build Notice]: Could not verify frontend environment:', err);
+          }
+        },
+      },
+    ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

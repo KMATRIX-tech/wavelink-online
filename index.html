@@ -71,13 +71,14 @@
     }
     </script>
 
-    <!-- Adsterra Monetization Ad Network Script -->
-    <script data-cfasync="false" src="https://bicea.org/14/7e645d935c503875ebc92cbe20bfda35"></script>
+    <!-- Adsterra Monetization Ad Network Script (Non-blocking with async and safe error fallback) -->
+    <script async data-cfasync="false" src="https://bicea.org/14/7e645d935c503875ebc92cbe20bfda35" onerror="this.onerror=null; console.warn('Ad network script load notice');"></script>
   </head>
   <body class="bg-[#F8FAFC] text-[#0F172A] antialiased selection:bg-blue-500 selection:text-white min-h-screen">
     <div id="root"></div>
     <script>
       (function () {
+        try {
         var root = document.documentElement;
         var baselineHeight = window.innerHeight;
         var rafId = null;
@@ -171,6 +172,9 @@
         document.addEventListener('focusout', function () {
           setTimeout(scheduleViewportUpdate, 100);
         }, { passive: true });
+        } catch (e) {
+          console.warn('Viewport initialization notice:', e);
+        }
       })();
     </script>
     <script type="module" src="/src/main.tsx"></script>

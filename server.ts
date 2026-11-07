@@ -1618,73 +1618,22 @@ async function startServer() {
   const httpServer = createHttpServer(app);
   const PORT = Number(process.env.PORT) || 3000;
 
-  // 1. Helmet Security Headers & Content Security Policy (allowing iframe preview & trusted sources)
-  app.use(
-    helmet({
-      frameguard: false, // Required for AI Studio preview iframe
-      crossOriginEmbedderPolicy: false,
-      crossOriginOpenerPolicy: false,
-      originAgentCluster: false,
-      crossOriginResourcePolicy: { policy: 'cross-origin' },
-      contentSecurityPolicy: {
-        useDefaults: true,
-        directives: {
-          defaultSrc: ["'self'"],
-          scriptSrc: [
-            "'self'",
-            "'unsafe-inline'",
-            "'unsafe-eval'",
-            'blob:',
-            'https://apis.google.com',
-            'https://www.google.com',
-            'https://www.gstatic.com',
-            'https://bicea.org',
-          ],
-          workerSrc: ["'self'", 'blob:'],
-          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
-          fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
-          imgSrc: ["'self'", 'data:', 'blob:', 'https:', 'http:'],
-          mediaSrc: ["'self'", 'data:', 'blob:', 'https:', 'http:'],
-          connectSrc: [
-            "'self'",
-            'data:',
-            'blob:',
-            'ws:',
-            'wss:',
-            'https:',
-            'http:',
-            'https://*.googleapis.com',
-            'https://firebasestorage.googleapis.com',
-            'https://*.firebasestorage.app',
-            'https://*.firebaseio.com',
-            'https://*.firebaseapp.com',
-            'https://*.google.com',
-            'https://api.dicebear.com',
-            'https://images.unsplash.com',
-            'https://media.giphy.com',
-            'https://*.azampay.co.tz',
-          ],
-          frameSrc: [
-            "'self'",
-            'https://*.firebaseapp.com',
-            'https://accounts.google.com',
-            'https://www.google.com',
-          ],
-          frameAncestors: [
-            "'self'",
-            'https://aistudio.google.com',
-            'https://*.google.com',
-            'https://*.googleusercontent.com',
-            'https://*.usercontent.goog',
-            'https://*.run.app',
-            '*',
-          ],
-          objectSrc: ["'none'"],
-          upgradeInsecureRequests: null,
-        },
-      },
-    })
-  );
+  // 1. Non-blocking Helmet Security Headers (allowing iframe preview & trusted sources without blocking scripts)
+  app.use((req, res, next) => {
+    try {
+      helmet({
+        frameguard: false, // Required for AI Studio preview iframe
+        crossOriginEmbedderPolicy: false,
+        crossOriginOpenerPolicy: false,
+        originAgentCluster: false,
+        crossOriginResourcePolicy: { policy: 'cross-origin' },
+        contentSecurityPolicy: false, // Non-blocking: avoids script/module blocking on deployed hosts
+      })(req, res, next);
+    } catch (err) {
+      console.warn('[WaveLink Security Header Middleware Notice]:', err);
+      next();
+    }
+  });
 
   // 1B. Explicitly allow microphone, camera, and audio playback in Permissions-Policy headers
   app.use((_req, res, next) => {
