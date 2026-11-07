@@ -5,12 +5,12 @@ import {
   cleanFirestoreData,
   handleFirestoreError,
   OperationType,
-  formatFirebaseStorageError
+  formatVideoUploadError
 } from '../firebase';
 import {
   compressVideoBeforeUpload,
   generateVideoThumbnail,
-  startDirectVideoUploadToFirebase,
+  startDirectVideoUploadToCloudinary,
   DirectVideoUploadTaskHandle,
   formatVideoFileSize,
   getMaxVideoDurationSeconds
@@ -346,7 +346,7 @@ class VideoUploadQueueManager {
 
       const uploadSizeLabel = formatVideoFileSize(prepared.file.size);
 
-      // Step 2: Direct browser -> Firebase Storage uploadBytesResumable (never Express, never base64)
+      // Step 2: Direct browser -> Cloudinary unsigned upload API (Cloud name monarcking72, preset monarcking72)
       this.updateJob(jobId, {
         phase: 'uploading',
         status: 'uploading',
@@ -357,7 +357,7 @@ class VideoUploadQueueManager {
         statusText: `Uploading 1% • 0 KB / ${uploadSizeLabel}`
       });
 
-      const handle = startDirectVideoUploadToFirebase({
+      const handle = startDirectVideoUploadToCloudinary({
         postId,
         userId: input.authorId,
         file: prepared.file,
@@ -403,11 +403,12 @@ class VideoUploadQueueManager {
         !uploadResult.videoUrl.startsWith('http')
       ) {
         throw new Error(
-          'Firebase Storage upload did not return a valid cloud video URL. Never saving base64 in Firestore.'
+          'Cloudinary upload did not return a valid secure_url. Never saving base64 video in Firestore.'
         );
       }
 
-      // Step 3: Create the post in Firestore ONLY after the Firebase Storage upload succeeds
+      // Step 3: Create the post in Firestore ONLY after the Cloudinary upload has finished,
+      // saving only the returned secure_url and basic metadata.
       const extractedHashtags =
         input.hashtags && input.hashtags.length > 0
           ? input.hashtags
@@ -424,6 +425,12 @@ class VideoUploadQueueManager {
         Math.min(maxAllowedSeconds, Math.round(uploadResult.durationSeconds * 10) / 10)
       );
 
+      // Prefer the lightweight Cloudinary .jpg poster URL over large base64 data URLs
+      const cloudPosterUrl =
+        uploadResult.thumbnailUrl && uploadResult.thumbnailUrl.startsWith('http')
+          ? uploadResult.thumbnailUrl
+          : uploadResult.videoUrl.replace(/\.[a-zA-Z0-9]+(\?.*)?$/, '.jpg');
+
       const postPayload: Post = {
         id: postId,
         authorId: input.authorId,
@@ -434,7 +441,7 @@ class VideoUploadQueueManager {
         content: (input.caption || '').trim(),
         mediaType: 'video',
         videoUrl: uploadResult.videoUrl,
-        thumbnailUrl: uploadResult.thumbnailUrl || undefined,
+        thumbnailUrl: cloudPosterUrl || undefined,
         storagePath: uploadResult.storagePath,
         duration: roundedDuration,
         videoDurationSeconds: roundedDuration,
@@ -512,11 +519,11 @@ class VideoUploadQueueManager {
         return;
       }
 
-      const formattedError = formatFirebaseStorageError(error, {
+      const formattedError = formatVideoUploadError(error, {
         fileSize: job.fileSize,
         maxAllowedSeconds,
         isProUser,
-        storagePath: `users/${input.authorId}/videos/${postId}`
+        storagePath: `wavelink/${input.authorId}/${postId}`
       });
 
       this.updateJob(jobId, {

@@ -1,13 +1,18 @@
-import { db, storage, getAuthHeaders, formatFirebaseStorageError } from '../firebase';
+import {
+  db,
+  getAuthHeaders,
+  formatVideoUploadError,
+  CLOUDINARY_CLOUD_NAME,
+  CLOUDINARY_UPLOAD_PRESET,
+  CLOUDINARY_VIDEO_UPLOAD_URL
+} from '../firebase';
 import { collection, doc, setDoc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
-import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 
 const DB_NAME = 'wavelink_media_db';
 const STORE_NAME = 'videos';
 
 // Session in-memory cache so video playback works immediately even if IndexedDB is restricted
 const memoryVideoCache = new Map<string, string>();
-let storageBucketReachable: boolean | null = null;
 
 // Video Upload Limits (Feed / Reels / Studio):
 // - Maximum file size before compression: 100 MB
@@ -509,9 +514,10 @@ async function writeFastSparkChunksFallback(
 }
 
 /**
- * Uploads a Spark video directly from the user's browser to Firebase Storage using `uploadBytesResumable`
- * with a live progress bar and a strict stall detector so uploads always complete in < 15 seconds (never hanging at 8%).
- * Never uploads through Express and never saves base64 video in the Firestore Spark document.
+ * Uploads a Spark video directly from the user's browser to Cloudinary's unsigned upload API
+ * (`https://api.cloudinary.com/v1_1/monarcking72/video/upload`, preset `monarcking72`)
+ * after checking the 60s Free / 90s Pro duration limit and compressing/downscaling to ~720p in the browser.
+ * Never uploads through Express, never uses Firebase Storage, and never fails silently.
  */
 export async function uploadSparkVideoToStorage(params: {
   sparkId: string;
@@ -533,11 +539,11 @@ export async function uploadSparkVideoToStorage(params: {
     );
   }
 
+  const maxSec = isProUser ? PRO_SPARK_MAX_SECONDS : FREE_SPARK_MAX_SECONDS;
   let rawMeta: SparkVideoMetadata;
   if (params.metadata && params.metadata.durationSeconds > 0) {
     rawMeta = params.metadata;
-    const maxSec = isProUser ? PRO_SPARK_MAX_SECONDS : FREE_SPARK_MAX_SECONDS;
-    if (rawMeta.durationSeconds > maxSec + 0.4) {
+    if (rawMeta.durationSeconds > maxSec + 0.5) {
       throw new Error(
         !isProUser
           ? 'Free Sparks can be up to 60 seconds. Go Pro for 90.'
@@ -557,165 +563,80 @@ export async function uploadSparkVideoToStorage(params: {
   }
 
   if (onProgress) {
-    onProgress(12, 'Preparing 720p Spark video...');
+    onProgress(8, 'Compressing Spark video to 720p...');
   }
 
-  // Run poster thumbnail generation, 720p dimension calculation, and local IndexedDB cache in parallel
-  const [thumbnailUrl, downscaled] = await Promise.all([
-    generateVideoThumbnail(file),
-    downscaleSparkVideoTo720p(file, rawMeta),
+  // Compress/downscale Spark video in browser to ~720p and generate poster thumbnail
+  const [thumbnailUrl, compressed] = await Promise.all([
+    generateVideoThumbnail(file, 1.0),
+    compressVideoBeforeUpload(file, {
+      trimStart: 0,
+      trimEnd: Math.min(maxSec, rawMeta.durationSeconds),
+      isProUser,
+      onProgress: (pct) => {
+        if (onProgress) {
+          const mapped = Math.max(8, Math.min(28, Math.round(8 + pct * 0.2)));
+          onProgress(mapped, `Compressing to 720p (${pct}%)...`);
+        }
+      }
+    }),
     cacheVideoLocally(sparkId, file)
   ]);
 
-  const { file: processedFile, width, height } = downscaled;
+  const processedFile = compressed.file;
+  const width = compressed.width || rawMeta.width || 720;
+  const height = compressed.height || rawMeta.height || 1280;
+  const durationSeconds = Math.min(
+    maxSec,
+    Math.round((compressed.durationSeconds || rawMeta.durationSeconds) * 100) / 100
+  );
+
   if (onProgress) {
-    onProgress(22, 'Uploading Spark video...');
+    onProgress(30, `Uploading to Cloudinary (0% • ${formatVideoFileSize(processedFile.size)})...`);
   }
 
-  const safeExt =
-    processedFile.type.includes('webm')
-      ? 'webm'
-      : processedFile.type.includes('quicktime')
-      ? 'mov'
-      : 'mp4';
-  const cleanName = (processedFile.name || `${sparkId}.${safeExt}`).replace(/[^a-zA-Z0-9._-]/g, '_');
-  const storagePath = `sparks/${userId}/${sparkId}_${cleanName}`;
-  const durationInt = Math.max(1, Math.min(isProUser ? 90 : 60, Math.round(rawMeta.durationSeconds)));
-  const expiresAtIso = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-
-  // Attempt direct Browser -> Firebase Storage resumable upload with a strict stall timeout
-  if (storageBucketReachable !== false) {
-    try {
-      const storageRef = ref(storage, storagePath);
-      const uploadTask = uploadBytesResumable(storageRef, processedFile, {
-        contentType: typeCheck.mimeType || processedFile.type || 'video/mp4',
-        cacheControl: 'public, max-age=86400',
-        customMetadata: {
-          userId,
-          sparkId,
-          durationSeconds: String(durationInt),
-          rawDurationSeconds: String(Math.round(rawMeta.durationSeconds * 100) / 100),
-          isPro: isProUser ? 'true' : 'false',
-          width: String(width),
-          height: String(height),
-          expiresAt: expiresAtIso
-        }
-      });
-
-      const downloadUrl = await new Promise<string>((resolve, reject) => {
-        let lastBytes = 0;
-        let stallTimer: ReturnType<typeof setTimeout> | null = null;
-        let maxOverallTimer: ReturnType<typeof setTimeout> | null = null;
-
-        const cleanupTimers = () => {
-          if (stallTimer) clearTimeout(stallTimer);
-          if (maxOverallTimer) clearTimeout(maxOverallTimer);
-        };
-
-        const resetStallTimer = (timeoutMs: number) => {
-          if (stallTimer) clearTimeout(stallTimer);
-          stallTimer = setTimeout(() => {
-            cleanupTimers();
-            try {
-              uploadTask.cancel();
-            } catch {}
-            reject(new Error('STORAGE_STALLED'));
-          }, timeoutMs);
-        };
-
-        // Fail fast in 2.5s if 0 bytes transfer (e.g. CORS / bucket unreachable), or 18s max overall
-        resetStallTimer(2500);
-        maxOverallTimer = setTimeout(() => {
-          cleanupTimers();
-          try {
-            uploadTask.cancel();
-          } catch {}
-          reject(new Error('STORAGE_MAX_TIME'));
-        }, 18000);
-
-        uploadTask.on(
-          'state_changed',
-          (snapshot) => {
-            if (snapshot.bytesTransferred > lastBytes) {
-              lastBytes = snapshot.bytesTransferred;
-              storageBucketReachable = true;
-              resetStallTimer(4500);
-            }
-            if (snapshot.totalBytes > 0 && onProgress && snapshot.bytesTransferred > 0) {
-              const rawPct = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-              const mappedPct = Math.max(24, Math.min(99, Math.round(24 + rawPct * 0.75)));
-              onProgress(mappedPct, `Uploading Spark video (${Math.round(rawPct)}%)...`);
-            }
-          },
-          (error) => {
-            cleanupTimers();
-            reject(error);
-          },
-          async () => {
-            cleanupTimers();
-            try {
-              const url = await getDownloadURL(uploadTask.snapshot.ref);
-              resolve(url);
-            } catch (err) {
-              reject(err);
-            }
-          }
-        );
-      });
-
-      storageBucketReachable = true;
+  const handle = startDirectVideoUploadToCloudinary({
+    postId: sparkId,
+    userId,
+    file: processedFile,
+    thumbnailDataUrl: thumbnailUrl,
+    durationSeconds,
+    width,
+    height,
+    isProUser,
+    onProgress: (pct, _statusText, bytesTransferred, totalBytes) => {
       if (onProgress) {
-        onProgress(100, 'Spark video uploaded!');
-      }
-
-      return {
-        downloadUrl,
-        storagePath,
-        thumbnailUrl,
-        durationSeconds: Math.round(rawMeta.durationSeconds * 100) / 100,
-        width,
-        height,
-        fileSize: processedFile.size,
-        mimeType: typeCheck.mimeType || processedFile.type || 'video/mp4',
-        hasVideoChunks: false
-      };
-    } catch {
-      if (storageBucketReachable === null) {
-        storageBucketReachable = false;
+        const mappedPct = Math.max(30, Math.min(99, Math.round(30 + pct * 0.69)));
+        onProgress(
+          mappedPct,
+          `Uploading Spark video ${pct}% (${formatVideoFileSize(bytesTransferred)} / ${formatVideoFileSize(totalBytes)})...`
+        );
       }
     }
-  }
+  });
 
-  // Instant resilient completion when Firebase Storage bucket is unreachable in preview:
-  // Advance progress smoothly and finish within 1–4 seconds
-  if (onProgress) {
-    onProgress(45, 'Finalizing Spark video...');
-  }
-
-  const hasChunks = await writeFastSparkChunksFallback(sparkId, processedFile, onProgress);
-  const localBlobUrl =
-    (await getCachedVideo(sparkId)) || URL.createObjectURL(processedFile);
+  const uploadRes = await handle.promise;
 
   if (onProgress) {
-    onProgress(100, 'Spark video ready!');
+    onProgress(100, 'Spark video uploaded!');
   }
 
   return {
-    downloadUrl: localBlobUrl,
-    storagePath,
-    thumbnailUrl,
-    durationSeconds: Math.round(rawMeta.durationSeconds * 100) / 100,
+    downloadUrl: uploadRes.videoUrl,
+    storagePath: uploadRes.storagePath,
+    thumbnailUrl: uploadRes.thumbnailUrl || thumbnailUrl,
+    durationSeconds,
     width,
     height,
     fileSize: processedFile.size,
     mimeType: typeCheck.mimeType || processedFile.type || 'video/mp4',
-    hasVideoChunks: hasChunks
+    hasVideoChunks: false
   };
 }
 
 /**
- * Uploads a Spark image directly to Firebase Storage (`sparks/{userId}/{sparkId}.jpg`) with resumable progress
- * and a 2.2s stall timeout, falling back immediately to the compressed JPEG dataUrl if Storage is unreachable.
+ * Keeps Spark photos working as they are now using the compressed JPEG DataURL
+ * (no Firebase Storage).
  */
 export async function uploadSparkImageToStorage(params: {
   sparkId: string;
@@ -724,100 +645,16 @@ export async function uploadSparkImageToStorage(params: {
   dataUrl: string;
   onProgress?: (percentage: number) => void;
 }): Promise<{ downloadUrl: string; storagePath?: string }> {
-  const { sparkId, userId, file, dataUrl, onProgress } = params;
-
-  if (storageBucketReachable === false) {
-    if (onProgress) onProgress(100);
-    return { downloadUrl: dataUrl };
-  }
-
-  try {
-    let blobToUpload: Blob | null = file || null;
-    if (!blobToUpload && dataUrl && dataUrl.startsWith('data:image/')) {
-      const res = await fetch(dataUrl);
-      blobToUpload = await res.blob();
-    }
-    if (!blobToUpload) {
-      if (onProgress) onProgress(100);
-      return { downloadUrl: dataUrl };
-    }
-
-    const storagePath = `sparks/${userId}/${sparkId}.jpg`;
-    const storageRef = ref(storage, storagePath);
-    const expiresAtIso = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-
-    const uploadTask = uploadBytesResumable(storageRef, blobToUpload, {
-      contentType: blobToUpload.type || 'image/jpeg',
-      cacheControl: 'public, max-age=86400',
-      customMetadata: {
-        userId,
-        sparkId,
-        expiresAt: expiresAtIso
-      }
-    });
-
-    const downloadUrl = await new Promise<string>((resolve, reject) => {
-      let lastBytes = 0;
-      let stallTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        try {
-          uploadTask.cancel();
-        } catch {}
-        reject(new Error('IMAGE_STORAGE_STALLED'));
-      }, 2200);
-
-      uploadTask.on(
-        'state_changed',
-        (snapshot) => {
-          if (snapshot.bytesTransferred > lastBytes) {
-            lastBytes = snapshot.bytesTransferred;
-            storageBucketReachable = true;
-            if (stallTimer) clearTimeout(stallTimer);
-            stallTimer = setTimeout(() => {
-              try {
-                uploadTask.cancel();
-              } catch {}
-              reject(new Error('IMAGE_STORAGE_STALLED'));
-            }, 3500);
-          }
-          if (snapshot.totalBytes > 0 && onProgress && snapshot.bytesTransferred > 0) {
-            const pct = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-            onProgress(Math.max(20, Math.min(99, pct)));
-          }
-        },
-        (err) => {
-          if (stallTimer) clearTimeout(stallTimer);
-          reject(err);
-        },
-        async () => {
-          if (stallTimer) clearTimeout(stallTimer);
-          try {
-            const url = await getDownloadURL(uploadTask.snapshot.ref);
-            resolve(url);
-          } catch (e) {
-            reject(e);
-          }
-        }
-      );
-    });
-
-    storageBucketReachable = true;
-    if (onProgress) onProgress(100);
-    return { downloadUrl, storagePath };
-  } catch {
-    if (storageBucketReachable === null) {
-      storageBucketReachable = false;
-    }
-    if (onProgress) onProgress(100);
-    return { downloadUrl: dataUrl };
-  }
+  const { dataUrl, onProgress } = params;
+  if (onProgress) onProgress(100);
+  return { downloadUrl: dataUrl };
 }
 
 // Track expired Spark IDs already cleaned up in this session so we don't repeat calls
 const cleanedExpiredSparkIds = new Set<string>();
 
 /**
- * Deletes a Spark's file from Firebase Storage and removes the Firestore Spark document
- * when a Spark expires (after 24 hours) or when a user deletes their Spark.
+ * Deletes an expired or user-removed Spark document from Firestore.
  */
 export async function deleteSparkAndStorageFile(
   spark: { id: string; storagePath?: string; mediaUrl?: string },
@@ -827,24 +664,6 @@ export async function deleteSparkAndStorageFile(
   if (cleanedExpiredSparkIds.has(spark.id) && !deleteFirestoreDoc) return;
   cleanedExpiredSparkIds.add(spark.id);
 
-  // 1. Delete file from Firebase Storage if storagePath or firebasestorage URL exists
-  try {
-    if (spark.storagePath) {
-      const fileRef = ref(storage, spark.storagePath);
-      await deleteObject(fileRef);
-    } else if (
-      spark.mediaUrl &&
-      (spark.mediaUrl.includes('firebasestorage.googleapis.com') ||
-        spark.mediaUrl.includes('.firebasestorage.app'))
-    ) {
-      const fileRef = ref(storage, spark.mediaUrl);
-      await deleteObject(fileRef);
-    }
-  } catch {
-    // Ignore if file was already deleted or not in Storage
-  }
-
-  // 2. Delete expired/removed Spark document from Firestore
   if (deleteFirestoreDoc) {
     try {
       await deleteDoc(doc(db, 'sparks', spark.id));
@@ -1588,58 +1407,24 @@ export async function compressVideoBeforeUpload(
 }
 
 /**
- * Uploads a video thumbnail image to Firebase Storage (`users/{userId}/thumbnails/{postId}.jpg`)
- * alongside the video so the feed can display the thumbnail immediately.
+ * Returns a safe thumbnail DataURL or derives a fast JPEG frame URL from a Cloudinary video `secure_url`.
  */
 export async function uploadVideoThumbnailToStorage(
-  userId: string,
-  postId: string,
-  thumbnailDataUrl: string
+  _userId: string,
+  _postId: string,
+  thumbnailDataUrl: string,
+  cloudinaryVideoUrl?: string
 ): Promise<string> {
-  if (!thumbnailDataUrl) return '';
-
-  try {
-    const res = await fetch(thumbnailDataUrl);
-    const blob = await res.blob();
-    const thumbPath = `users/${userId}/thumbnails/${postId}.jpg`;
-    const thumbRef = ref(storage, thumbPath);
-    const uploadTask = uploadBytesResumable(thumbRef, blob, {
-      contentType: 'image/jpeg',
-      cacheControl: 'public, max-age=31536000'
-    });
-
-    const downloadUrl = await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        try {
-          uploadTask.cancel();
-        } catch {}
-        reject(new Error('THUMB_TIMEOUT'));
-      }, 8000);
-
-      uploadTask.on(
-        'state_changed',
-        undefined,
-        (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-        async () => {
-          clearTimeout(timer);
-          try {
-            const url = await getDownloadURL(uploadTask.snapshot.ref);
-            resolve(url);
-          } catch (e) {
-            reject(e);
-          }
-        }
-      );
-    });
-
-    return downloadUrl || '';
-  } catch (err) {
-    console.warn('[WaveLink Thumbnail Upload Notice]', err);
-    return '';
+  if (cloudinaryVideoUrl && cloudinaryVideoUrl.includes('res.cloudinary.com/')) {
+    const derivedThumb = cloudinaryVideoUrl.replace(/\.(mp4|webm|mov|ogv|m4v|3gp)$/i, '.jpg');
+    if (derivedThumb !== cloudinaryVideoUrl) {
+      return derivedThumb;
+    }
   }
+  if (thumbnailDataUrl && thumbnailDataUrl.length < 75000) {
+    return thumbnailDataUrl;
+  }
+  return '';
 }
 
 export interface DirectVideoUploadTaskHandle {
@@ -1652,19 +1437,22 @@ export interface DirectVideoUploadTaskHandle {
     storagePath: string;
     durationSeconds: number;
     fileSize: number;
+    width?: number;
+    height?: number;
     hasVideoChunks: boolean;
   }>;
 }
 
 /**
- * Uploads a video directly from the browser to Firebase Storage using `uploadBytesResumable`
- * (`users/{userId}/videos/{postId}_${fileName}`).
- * - Never sends the file through the Express server and never stores base64 video in Firestore.
- * - Reports real progress with percentage and file size (`bytesTransferred / totalBytes`).
- * - Passes `durationSeconds` and `isPro` in `customMetadata` so `storage.rules` enforces 60s Free / 90s Pro.
- * - Logs the real error to `console.error` and surfaces a clear error message if Storage fails.
+ * Uploads a video directly from the user's browser to Cloudinary's unsigned upload API:
+ * - Endpoint: `https://api.cloudinary.com/v1_1/monarcking72/video/upload`
+ * - Cloud name: `monarcking72`
+ * - Upload preset: `monarcking72`
+ * - Uses XMLHttpRequest with `xhr.upload.onprogress` for a live progress bar with percentage and file size.
+ * - Enforces 60s max for Free users and 90s max for Pro users before upload.
+ * - Never sends video through Express, never uses Firebase Storage, and never fails silently.
  */
-export function startDirectVideoUploadToFirebase(params: {
+export function startDirectVideoUploadToCloudinary(params: {
   postId: string;
   userId: string;
   file: File;
@@ -1683,7 +1471,6 @@ export function startDirectVideoUploadToFirebase(params: {
 }): DirectVideoUploadTaskHandle {
   const {
     postId,
-    userId,
     file,
     thumbnailDataUrl = '',
     durationSeconds,
@@ -1697,18 +1484,7 @@ export function startDirectVideoUploadToFirebase(params: {
   const maxAllowedSeconds = getMaxVideoDurationSeconds(isProUser);
   const roundedDuration = Math.max(0.5, Math.round(durationSeconds * 10) / 10);
 
-  const ext = file.type.includes('webm')
-    ? 'webm'
-    : file.type.includes('quicktime')
-    ? 'mov'
-    : 'mp4';
-  const cleanName = (file.name || `${postId}.${ext}`).replace(/[^a-zA-Z0-9._-]/g, '_');
-  const finalFileName = /\.(mp4|webm|mov)$/i.test(cleanName) ? cleanName : `${cleanName}.${ext}`;
-  const storagePath = `users/${userId}/videos/${postId}_${finalFileName}`;
-  const contentType = file.type && file.type.startsWith('video/') ? file.type : 'video/mp4';
-
-  let uploadTask: ReturnType<typeof uploadBytesResumable> | null = null;
-  let isPausedByUser = false;
+  let xhr: XMLHttpRequest | null = null;
   let isCancelledByUser = false;
 
   const promise = new Promise<{
@@ -1717,12 +1493,13 @@ export function startDirectVideoUploadToFirebase(params: {
     storagePath: string;
     durationSeconds: number;
     fileSize: number;
+    width?: number;
+    height?: number;
     hasVideoChunks: boolean;
   }>((resolve, reject) => {
-    // 1. Validate size & duration before starting upload
     if (!file || file.size <= 0) {
       const err = new Error('Selected video file is empty.');
-      console.error('[WaveLink Video Upload Error]', err);
+      console.error('[WaveLink Cloudinary Video Upload Error]', err);
       reject(err);
       return;
     }
@@ -1731,7 +1508,7 @@ export function startDirectVideoUploadToFirebase(params: {
       const err = new Error(
         `File too big: ${formatVideoFileSize(file.size)} exceeds the ${MAX_VIDEO_RAW_MB} MB limit.`
       );
-      console.error('[WaveLink Video Upload Error]', err);
+      console.error('[WaveLink Cloudinary Video Upload Error]', err);
       reject(err);
       return;
     }
@@ -1742,212 +1519,100 @@ export function startDirectVideoUploadToFirebase(params: {
           ? `Pro videos can be up to 90 seconds (yours is ${Math.round(roundedDuration)}s).`
           : `Free users can upload videos up to 60 seconds, and Pro users up to 90 seconds (yours is ${Math.round(roundedDuration)}s).`
       );
-      console.error('[WaveLink Video Upload Error]', err);
+      console.error('[WaveLink Cloudinary Video Upload Error]', err);
       reject(err);
       return;
     }
 
-    // Cache locally in memory/IndexedDB in background without blocking uploadTask listener attachment
+    // Cache locally in memory/IndexedDB for instant playback on the uploader's device
     void cacheVideoLocally(postId, file);
 
-    let storageRef: ReturnType<typeof ref>;
-    try {
-      storageRef = ref(storage, storagePath);
-      uploadTask = uploadBytesResumable(storageRef, file, {
-        contentType,
-        cacheControl: 'public, max-age=31536000',
-        customMetadata: {
-          userId,
-          postId,
-          durationSeconds: String(roundedDuration),
-          isPro: isProUser ? 'true' : 'false',
-          width: String(width),
-          height: String(height)
-        }
-      });
-    } catch (initError) {
-      const formatted = formatFirebaseStorageError(initError, {
-        fileSize: file.size,
-        maxAllowedSeconds,
-        isProUser,
-        storagePath
-      });
-      reject(new Error(formatted));
-      return;
-    }
+    const totalSizeLabel = formatVideoFileSize(file.size);
+    let lastLoadedBytes = 0;
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
 
-    // Start thumbnail upload in parallel
-    const thumbPromise = thumbnailDataUrl
-      ? uploadVideoThumbnailToStorage(userId, postId, thumbnailDataUrl)
-      : generateVideoThumbnail(file, 1.0).then((gen) =>
-          gen ? uploadVideoThumbnailToStorage(userId, postId, gen) : ''
-        );
-
-    let lastBytes = 0;
-    let noProgressTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const clearNoProgressTimer = () => {
-      if (noProgressTimer) {
-        clearTimeout(noProgressTimer);
-        noProgressTimer = null;
+    const clearStallTimer = () => {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
       }
     };
 
-    const resetNoProgressTimer = (timeoutMs: number) => {
-      clearNoProgressTimer();
-      if (isPausedByUser || isCancelledByUser) return;
-      noProgressTimer = setTimeout(() => {
-        if (isPausedByUser || isCancelledByUser) return;
+    const resetStallTimer = (timeoutMs: number) => {
+      clearStallTimer();
+      if (isCancelledByUser) return;
+      stallTimer = setTimeout(() => {
+        if (isCancelledByUser) return;
         try {
-          uploadTask?.cancel();
+          xhr?.abort();
         } catch {}
-        cleanupNetworkListeners();
-        const isZeroBytes = lastBytes <= 0;
-        const stallErr = new Error(
-          isZeroBytes
-            ? 'STORAGE_NOT_ENABLED_OR_CORS: 0 bytes transferred to Firebase Storage within 18 seconds.'
-            : 'UPLOAD_TIMEOUT: No upload progress for 25 seconds.'
-        );
-        const formatted = formatFirebaseStorageError(stallErr, {
+        const stallErr = new Error('UPLOAD_TIMEOUT: No upload progress for 30 seconds.');
+        const formatted = formatVideoUploadError(stallErr, {
           fileSize: file.size,
           maxAllowedSeconds,
-          isProUser,
-          storagePath
+          isProUser
         });
         reject(new Error(formatted));
       }, timeoutMs);
     };
 
-    const totalSizeLabel = formatVideoFileSize(file.size);
+    try {
+      xhr = new XMLHttpRequest();
+      xhr.open('POST', CLOUDINARY_VIDEO_UPLOAD_URL, true);
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
 
-    const handleOnline = () => {
-      if (isCancelledByUser || isPausedByUser) return;
-      try {
-        uploadTask?.resume();
-        if (onStateChange) onStateChange('running');
-        if (onProgress && file.size > 0) {
-          const pct = Math.round((Math.max(0, lastBytes) / file.size) * 100);
-          const transferredLabel = formatVideoFileSize(Math.max(0, lastBytes));
-          onProgress(
-            pct,
-            `Resuming upload • ${transferredLabel} / ${totalSizeLabel}`,
-            Math.max(0, lastBytes),
-            file.size
-          );
-        }
-        resetNoProgressTimer(25000);
-      } catch {}
-    };
+      if (onStateChange) onStateChange('running');
+      resetStallTimer(30000);
 
-    const handleOffline = () => {
-      if (isCancelledByUser || isPausedByUser) return;
-      if (onStateChange) onStateChange('waiting_network');
-      if (onProgress && file.size > 0) {
-        const pct = Math.round((Math.max(0, lastBytes) / file.size) * 100);
-        const transferredLabel = formatVideoFileSize(Math.max(0, lastBytes));
-        onProgress(
-          pct,
-          `Waiting for network • ${transferredLabel} / ${totalSizeLabel}`,
-          Math.max(0, lastBytes),
-          file.size
-        );
-      }
-    };
-
-    const cleanupNetworkListeners = () => {
-      clearNoProgressTimer();
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('online', handleOnline);
-        window.removeEventListener('offline', handleOffline);
-      }
-    };
-
-    if (typeof window !== 'undefined') {
-      window.addEventListener('online', handleOnline);
-      window.addEventListener('offline', handleOffline);
-    }
-
-    // 18s initial connection timeout if 0 bytes transfer, then 25s per chunk progress
-    resetNoProgressTimer(18000);
-
-    uploadTask.on(
-      'state_changed',
-      (snapshot) => {
+      xhr.upload.onprogress = (event: ProgressEvent) => {
         if (isCancelledByUser) return;
+        const total = event.lengthComputable && event.total > 0 ? event.total : file.size;
+        const loaded = Math.max(0, event.loaded);
 
-        const total = snapshot.totalBytes > 0 ? snapshot.totalBytes : file.size;
-        const transferred = Math.max(0, snapshot.bytesTransferred);
-        const transferredLabel = formatVideoFileSize(transferred);
-        const totalLabel = formatVideoFileSize(total);
-
-        if (snapshot.state === 'paused') {
-          clearNoProgressTimer();
-          if (onStateChange) onStateChange('paused');
-          const pct = total > 0 ? Math.round((transferred / total) * 100) : 0;
-          if (onProgress) {
-            onProgress(
-              pct,
-              `Upload paused • ${transferredLabel} / ${totalLabel}`,
-              transferred,
-              total
-            );
-          }
-          return;
-        }
-
-        if (snapshot.state === 'running') {
-          if (onStateChange) onStateChange('running');
-        }
-
-        if (transferred > lastBytes) {
-          lastBytes = transferred;
-          storageBucketReachable = true;
-          resetNoProgressTimer(25000);
+        if (loaded > lastLoadedBytes) {
+          lastLoadedBytes = loaded;
+          resetStallTimer(30000);
         }
 
         if (total > 0 && onProgress) {
-          const rawPct = Math.round((transferred / total) * 100);
-          const displayPct = transferred === 0 ? 1 : Math.max(1, Math.min(99, rawPct));
+          const rawPct = Math.round((loaded / total) * 100);
+          const displayPct = loaded === 0 ? 1 : Math.max(1, Math.min(99, rawPct));
           onProgress(
             displayPct,
-            `Uploading ${displayPct}% • ${transferredLabel} / ${totalLabel}`,
-            transferred,
+            `Uploading ${displayPct}% • ${formatVideoFileSize(loaded)} / ${formatVideoFileSize(total)}`,
+            loaded,
             total
           );
         }
-      },
-      (error: any) => {
-        if (isCancelledByUser || error?.code === 'storage/canceled') {
-          cleanupNetworkListeners();
+      };
+
+      xhr.onload = async () => {
+        clearStallTimer();
+        if (isCancelledByUser) {
           reject(new Error('UPLOAD_CANCELLED'));
           return;
         }
 
-        cleanupNetworkListeners();
-        const formatted = formatFirebaseStorageError(error, {
-          fileSize: file.size,
-          maxAllowedSeconds,
-          isProUser,
-          storagePath
-        });
-        reject(new Error(formatted));
-      },
-      async () => {
-        cleanupNetworkListeners();
+        const status = xhr?.status || 0;
+        const rawText = xhr?.responseText || '';
+        let parsed: any = null;
         try {
-          if (!uploadTask) {
-            throw new Error('Upload task missing after completion.');
-          }
-          const [downloadUrl, resolvedStorageThumb] = await Promise.all([
-            getDownloadURL(uploadTask.snapshot.ref),
-            thumbPromise.catch(() => '')
-          ]);
+          parsed = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          parsed = null;
+        }
 
-          if (!downloadUrl || !downloadUrl.startsWith('http')) {
-            throw new Error('Firebase Storage did not return a valid download URL.');
-          }
+        if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+          const secureUrl: string = parsed.secure_url;
+          const publicId: string = String(parsed.public_id || `wavelink_${postId}`);
+          const cloudDuration =
+            typeof parsed.duration === 'number' && parsed.duration > 0
+              ? Math.round(parsed.duration * 10) / 10
+              : roundedDuration;
+          const cloudWidth = typeof parsed.width === 'number' && parsed.width > 0 ? parsed.width : width;
+          const cloudHeight = typeof parsed.height === 'number' && parsed.height > 0 ? parsed.height : height;
+          const cloudBytes = typeof parsed.bytes === 'number' && parsed.bytes > 0 ? parsed.bytes : file.size;
 
-          storageBucketReachable = true;
           if (onProgress) {
             onProgress(
               100,
@@ -1957,53 +1622,92 @@ export function startDirectVideoUploadToFirebase(params: {
             );
           }
 
-          // Use Firebase Storage thumbnail URL if available, or a compact poster (< 60 KB)
-          const safeThumb =
-            resolvedStorageThumb ||
-            (thumbnailDataUrl && thumbnailDataUrl.length < 65000 ? thumbnailDataUrl : '');
+          const resolvedThumb = await uploadVideoThumbnailToStorage(
+            params.userId,
+            postId,
+            thumbnailDataUrl,
+            secureUrl
+          );
 
           resolve({
-            videoUrl: downloadUrl,
-            thumbnailUrl: safeThumb,
-            storagePath,
-            durationSeconds: roundedDuration,
-            fileSize: file.size,
+            videoUrl: secureUrl,
+            thumbnailUrl:
+              resolvedThumb ||
+              (thumbnailDataUrl && thumbnailDataUrl.length < 75000 ? thumbnailDataUrl : ''),
+            storagePath: publicId,
+            durationSeconds: cloudDuration,
+            fileSize: cloudBytes,
+            width: cloudWidth,
+            height: cloudHeight,
             hasVideoChunks: false
           });
-        } catch (err: any) {
-          const formatted = formatFirebaseStorageError(err, {
-            fileSize: file.size,
-            maxAllowedSeconds,
-            isProUser,
-            storagePath
-          });
-          reject(new Error(formatted));
+          return;
         }
-      }
-    );
+
+        const cloudinaryErrMsg =
+          parsed?.error?.message ||
+          (status ? `Cloudinary HTTP ${status} error` : 'Cloudinary upload failed');
+        const err = Object.assign(new Error(`Cloudinary upload error: ${cloudinaryErrMsg}`), {
+          httpStatus: status,
+          cloudinaryMessage: cloudinaryErrMsg
+        });
+        const formatted = formatVideoUploadError(err, {
+          fileSize: file.size,
+          maxAllowedSeconds,
+          isProUser,
+          httpStatus: status
+        });
+        reject(new Error(formatted));
+      };
+
+      xhr.onerror = () => {
+        clearStallTimer();
+        if (isCancelledByUser) {
+          reject(new Error('UPLOAD_CANCELLED'));
+          return;
+        }
+        const netErr = new Error(
+          'NETWORK_ERROR: Could not reach Cloudinary upload server. Check your internet connection.'
+        );
+        const formatted = formatVideoUploadError(netErr, {
+          fileSize: file.size,
+          maxAllowedSeconds,
+          isProUser
+        });
+        reject(new Error(formatted));
+      };
+
+      xhr.onabort = () => {
+        clearStallTimer();
+        if (isCancelledByUser) {
+          reject(new Error('UPLOAD_CANCELLED'));
+        }
+      };
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+
+      xhr.send(formData);
+    } catch (initErr) {
+      clearStallTimer();
+      const formatted = formatVideoUploadError(initErr, {
+        fileSize: file.size,
+        maxAllowedSeconds,
+        isProUser
+      });
+      reject(new Error(formatted));
+    }
   });
 
   return {
-    pause: () => {
-      isPausedByUser = true;
-      try {
-        return uploadTask ? uploadTask.pause() : false;
-      } catch {
-        return false;
-      }
-    },
-    resume: () => {
-      isPausedByUser = false;
-      try {
-        return uploadTask ? uploadTask.resume() : false;
-      } catch {
-        return false;
-      }
-    },
+    pause: () => false,
+    resume: () => false,
     cancel: () => {
       isCancelledByUser = true;
       try {
-        return uploadTask ? uploadTask.cancel() : false;
+        xhr?.abort();
+        return true;
       } catch {
         return false;
       }
@@ -2012,164 +1716,39 @@ export function startDirectVideoUploadToFirebase(params: {
   };
 }
 
-async function saveVideoFallbackChunks(
-  postId: string,
-  file: File | Blob,
-  collectionName: 'posts' | 'sparks' = 'posts',
-  onProgress?: (percentage: number) => void
-): Promise<{ videoUrl?: string; hasVideoChunks: boolean }> {
-  const resolvedDataUrl = await readFileAsDataUrlSafe(file, 4.5 * 1024 * 1024);
-  if (collectionName === 'posts' && resolvedDataUrl && resolvedDataUrl.length < 320 * 1024) {
-    if (onProgress) onProgress(100);
-    return { videoUrl: resolvedDataUrl, hasVideoChunks: false };
-  }
-
-  try {
-    if (!resolvedDataUrl) {
-      if (onProgress) onProgress(100);
-      const cachedUrl = await getCachedVideo(postId);
-      return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
-    }
-
-    const totalChunks = Math.ceil(resolvedDataUrl.length / CHUNK_SIZE);
-    if (totalChunks > MAX_CHUNKS) {
-      if (onProgress) onProgress(100);
-      const cachedUrl = await getCachedVideo(postId);
-      return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
-    }
-
-    const chunksRef = collection(db, collectionName, postId, 'chunks');
-    const BATCH_SIZE = 6;
-    const startTime = Date.now();
-    for (let i = 0; i < totalChunks; i += BATCH_SIZE) {
-      if (Date.now() - startTime > 4500) {
-        if (onProgress) onProgress(100);
-        const cachedUrl = await getCachedVideo(postId);
-        return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
-      }
-      const batchPromises: Promise<boolean>[] = [];
-      const currentBatchEnd = Math.min(i + BATCH_SIZE, totalChunks);
-      for (let j = i; j < currentBatchEnd; j++) {
-        const chunkData = resolvedDataUrl.substring(j * CHUNK_SIZE, (j + 1) * CHUNK_SIZE);
-        const chunkId = `chunk_${j.toString().padStart(4, '0')}`;
-        batchPromises.push(
-          writeChunkWithRetry(
-            doc(chunksRef, chunkId),
-            { index: j, total: totalChunks, data: chunkData },
-            0
-          )
-        );
-      }
-      const results = await Promise.all(batchPromises);
-      if (onProgress) {
-        const progress = Math.min(98, Math.round(20 + (currentBatchEnd / totalChunks) * 78));
-        onProgress(progress);
-      }
-      if (results.some((ok) => !ok)) {
-        if (onProgress) onProgress(100);
-        const cachedUrl = await getCachedVideo(postId);
-        return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
-      }
-    }
-    if (onProgress) onProgress(100);
-    return { videoUrl: undefined, hasVideoChunks: true };
-  } catch {
-    if (onProgress) onProgress(100);
-    const cachedUrl = await getCachedVideo(postId);
-    return { videoUrl: cachedUrl || undefined, hasVideoChunks: false };
-  }
-}
+export const startDirectVideoUploadToFirebase = startDirectVideoUploadToCloudinary;
 
 export async function uploadVideoResumableWithRetry(
   entityId: string,
   file: File | Blob,
-  folder: string = 'videos',
-  onProgress?: (percentage: number) => void,
-  maxAttempts: number = 1
+  _folder: string = 'videos',
+  onProgress?: (percentage: number) => void
 ): Promise<string | null> {
-  if (storageBucketReachable === false) {
-    return null;
-  }
-
-  const fileName = (file as File).name
-    ? (file as File).name.replace(/[^a-zA-Z0-9._-]/g, '_')
-    : `${entityId}.mp4`;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const storageRef = ref(storage, `${folder}/${entityId}_${attempt}_${fileName}`);
-      const uploadTask = uploadBytesResumable(storageRef, file, {
-        contentType: file.type || 'video/mp4'
-      });
-
-      const downloadUrl = await new Promise<string>((resolve, reject) => {
-        let lastBytes = 0;
-        let stallTimer: ReturnType<typeof setTimeout> | null = null;
-
-        const resetStallTimer = () => {
-          if (stallTimer) clearTimeout(stallTimer);
-          stallTimer = setTimeout(() => {
-            try {
-              uploadTask.cancel();
-            } catch {}
-            reject(new Error('No upload progress for 30 seconds'));
-          }, 30000);
-        };
-
-        resetStallTimer();
-
-        uploadTask.on(
-          'state_changed',
-          (snapshot) => {
-            if (snapshot.bytesTransferred > lastBytes) {
-              lastBytes = snapshot.bytesTransferred;
-              storageBucketReachable = true;
-              resetStallTimer();
-            }
-            if (snapshot.totalBytes > 0 && onProgress) {
-              const pct = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-              onProgress(Math.max(5, Math.min(99, pct)));
-            }
-          },
-          (error) => {
-            if (stallTimer) clearTimeout(stallTimer);
-            reject(error);
-          },
-          async () => {
-            if (stallTimer) clearTimeout(stallTimer);
-            try {
-              const url = await getDownloadURL(uploadTask.snapshot.ref);
-              resolve(url);
-            } catch (urlErr) {
-              reject(urlErr);
-            }
-          }
-        );
-      });
-
-      if (downloadUrl) {
-        storageBucketReachable = true;
-        if (onProgress) onProgress(100);
-        return downloadUrl;
-      }
-    } catch {
-      if (storageBucketReachable === null) {
-        storageBucketReachable = false;
-      }
+  const videoFile =
+    file instanceof File
+      ? file
+      : new File([file], `${entityId}.mp4`, { type: file.type || 'video/mp4' });
+  const handle = startDirectVideoUploadToCloudinary({
+    postId: entityId,
+    userId: 'wavelink_user',
+    file: videoFile,
+    durationSeconds: 30,
+    isProUser: true,
+    onProgress: (pct) => {
+      if (onProgress) onProgress(pct);
     }
-  }
-
-  return null;
+  });
+  const result = await handle.promise;
+  return result.videoUrl;
 }
 
 /**
- * Uploads video directly from the browser to Firebase Storage using `uploadBytesResumable`
- * (never sending the file through the Render server).
+ * Uploads video directly from the browser to Cloudinary using unsigned preset `monarcking72`.
  */
 export async function saveVideoPost(
   postId: string,
   file: File | Blob,
-  dataUrl?: string,
+  _dataUrl?: string,
   collectionName: 'posts' | 'sparks' = 'posts',
   onProgress?: (percentage: number) => void,
   userId?: string
@@ -2177,29 +1756,17 @@ export async function saveVideoPost(
   await cacheVideoLocally(postId, file);
   if (onProgress) onProgress(10);
 
-  const targetFolder = userId ? `users/${userId}/videos` : collectionName;
-
-  // 1. Primary path: Direct browser-to-Firebase Storage resumable upload (`uploadBytesResumable`)
-  const storageDownloadUrl = await uploadVideoResumableWithRetry(
+  const cloudUrl = await uploadVideoResumableWithRetry(
     postId,
     file,
-    targetFolder,
-    (pct) => {
-      if (onProgress) onProgress(pct);
-    },
-    1
+    userId ? `users/${userId}/videos` : collectionName,
+    onProgress
   );
 
-  if (storageDownloadUrl) {
-    if (onProgress) onProgress(100);
-    return {
-      videoUrl: storageDownloadUrl,
-      hasVideoChunks: false
-    };
-  }
-
-  // 2. Fallback path if Firebase Storage rules are not yet deployed in preview
-  return saveVideoFallbackChunks(postId, file, collectionName, onProgress);
+  return {
+    videoUrl: cloudUrl || undefined,
+    hasVideoChunks: false
+  };
 }
 
 // Retrieve full video for a post or spark

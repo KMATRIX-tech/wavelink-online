@@ -140,6 +140,40 @@ html[data-theme="sunrise"] {
   padding-bottom: calc(4rem + env(safe-area-inset-bottom, 0px));
 }
 
+.wavelink-main-content--reels {
+  padding-bottom: 0 !important;
+  height: calc(var(--vv-height, 100dvh) - 4rem - env(safe-area-inset-bottom, 0px));
+  max-height: calc(var(--vv-height, 100dvh) - 4rem - env(safe-area-inset-bottom, 0px));
+  overflow: hidden;
+}
+
+.wavelink-reels-pager {
+  width: 100%;
+  height: 100%;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  scroll-snap-type: y mandatory;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.wavelink-reels-pager::-webkit-scrollbar {
+  display: none;
+}
+
+.wavelink-reel-slide {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  max-height: 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  overflow: hidden;
+  user-select: none;
+}
+
 /* When virtual keyboard is open on mobile (< 768px), hide bottom nav, adjust shell height to visualViewport, and prevent input clipping */
 @media (max-width: 767px) {
   input,
@@ -553,6 +587,18 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     max-width: 100%;
     min-width: 0;
     padding-bottom: 2rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .wavelink-main-content--reels {
+    flex: 1 1 0%;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    padding-bottom: 0 !important;
+    height: calc(100dvh - 4rem);
+    max-height: calc(100dvh - 4rem);
+    overflow: hidden;
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
 

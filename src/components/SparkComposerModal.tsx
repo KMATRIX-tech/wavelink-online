@@ -423,13 +423,13 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
             </div>
           </div>
 
-          {/* Resumable Firebase Storage Upload Progress Bar */}
+          {/* Live Cloudinary Upload Progress Bar */}
           {isUploading && (
             <div className="space-y-1.5 p-3 rounded-xl bg-blue-50 border border-blue-200">
               <div className="flex items-center justify-between text-xs font-bold text-[#0F172A]">
                 <span className="flex items-center gap-1.5">
                   <Flame size={14} className="animate-bounce text-[#3B82F6]" />
-                  <span>{uploadStatusText || 'Uploading Spark to Firebase Storage...'}</span>
+                  <span>{uploadStatusText || 'Uploading Spark to Cloudinary...'}</span>
                 </span>
                 <span className="font-mono tabular-numbers">{uploadProgress}%</span>
               </div>

@@ -23,6 +23,7 @@ import { SparkTray } from './SparkTray';
 import { AdsterraAdBanner } from './AdsterraAdBanner';
 import { shouldShowAds } from './AdsterraManager';
 import { RichEventCard } from './RichEventCard';
+import { ImageLightboxModal, LightboxState } from './ImageLightboxModal';
 import {
   ThumbsUp,
   Heart,
@@ -247,6 +248,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [boostingPost, setBoostingPost] = useState<Post | null>(null);
   const [postsForSpark, setPostsForSpark] = useState<Post[] | null>(null);
   const [focusedPost, setFocusedPost] = useState<Post | null>(null);
+  const [lightboxState, setLightboxState] = useState<LightboxState | null>(null);
   const [detailReadProgress, setDetailReadProgress] = useState<number>(0);
 
   // Feed Reading Progress state (0–100% and count of waves consumed)
@@ -1750,7 +1752,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       {/* Image (with preloaded aspect ratio reservation to prevent layout shift) */}
                       {post.imageUrl && (
                         <div
-                          className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 min-h-[180px] bg-slate-50 flex items-center justify-center"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setLightboxState({
+                              images: [post.imageUrl!],
+                              initialIndex: 0,
+                              caption: post.content,
+                              authorName: post.authorName,
+                              authorUsername: post.authorUsername,
+                              authorPhotoURL: post.authorPhotoURL
+                            });
+                          }}
+                          className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 min-h-[180px] bg-slate-50 flex items-center justify-center cursor-zoom-in group relative"
                           style={
                             (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))
                               ? {
@@ -1765,7 +1778,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             src={post.imageUrl}
                             alt="Sponsored item"
                             decoding="async"
-                            className="w-full h-auto max-h-96 object-cover"
+                            className="w-full h-auto max-h-96 object-cover transition-transform duration-300 group-hover:scale-[1.01]"
                           />
                         </div>
                       )}
@@ -2081,7 +2094,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
                         return (
                           <div
-                            className="relative rounded-2xl overflow-hidden mb-3 border border-slate-200/80 max-h-[480px] min-h-[200px] bg-[#F8FAFC] flex items-center justify-center group"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setLightboxState({
+                                images: slides.length > 0 ? slides : [currentImgUrl],
+                                initialIndex: activeSlideIdx,
+                                caption: post.content,
+                                authorName: post.authorName,
+                                authorUsername: post.authorUsername,
+                                authorPhotoURL: post.authorPhotoURL
+                              });
+                            }}
+                            className="relative rounded-2xl overflow-hidden mb-3 border border-slate-200/80 max-h-[480px] min-h-[200px] bg-[#F8FAFC] flex items-center justify-center group cursor-zoom-in"
                             style={
                               post.aspectRatio === '1:1'
                                 ? { aspectRatio: '1 / 1' }
@@ -2104,7 +2128,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                               src={currentImgUrl}
                               alt="Wave attachment"
                               decoding="async"
-                              className="w-full h-full max-h-[480px] object-cover"
+                              className="w-full h-full max-h-[480px] object-cover transition-transform duration-300 group-hover:scale-[1.01]"
                               onError={(e) => {
                                 (e.target as HTMLElement).style.display = 'none';
                               }}
@@ -2489,12 +2513,32 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 />
               )}
 
-              {focusedPost.imageUrl && !focusedPost.videoUrl && !focusedPost.hasVideoChunks && focusedPost.mediaType !== 'video' && (
-                <div className="rounded-2xl overflow-hidden border border-stone-200 bg-stone-50">
+              {(focusedPost.imageUrl || (focusedPost.imageUrls && focusedPost.imageUrls.length > 0)) && !focusedPost.videoUrl && !focusedPost.hasVideoChunks && focusedPost.mediaType !== 'video' && (
+                <div
+                  onClick={() => {
+                    const imgs =
+                      focusedPost.imageUrls && focusedPost.imageUrls.length > 0
+                        ? focusedPost.imageUrls
+                        : focusedPost.imageUrl
+                        ? [focusedPost.imageUrl]
+                        : [];
+                    if (imgs.length > 0) {
+                      setLightboxState({
+                        images: imgs,
+                        initialIndex: 0,
+                        caption: focusedPost.content,
+                        authorName: focusedPost.authorName,
+                        authorUsername: focusedPost.authorUsername,
+                        authorPhotoURL: focusedPost.authorPhotoURL
+                      });
+                    }
+                  }}
+                  className="rounded-2xl overflow-hidden border border-stone-200 bg-stone-50 cursor-zoom-in group"
+                >
                   <img
-                    src={focusedPost.imageUrl}
+                    src={focusedPost.imageUrls?.[0] || focusedPost.imageUrl}
                     alt="Post media"
-                    className="w-full h-auto max-h-[480px] object-contain mx-auto"
+                    className="w-full h-auto max-h-[480px] object-contain mx-auto transition-transform duration-300 group-hover:scale-[1.01]"
                   />
                 </div>
               )}
@@ -2609,6 +2653,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
           <span>{toastNotice.message}</span>
         </div>
       )}
+      {/* Full-Screen Pinch-to-Zoom Image Lightbox Viewer */}
+      <ImageLightboxModal
+        lightbox={lightboxState}
+        onClose={() => setLightboxState(null)}
+      />
     </div>
   );
 };

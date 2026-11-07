@@ -113,7 +113,11 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   return (
     <header
       className={`sticky top-0 z-20 w-full max-w-full bg-[var(--bg-surface)]/95 backdrop-blur-md border-b border-[var(--border-hairline)] safe-area-top transition-all ${
-        activeTab === 'feed' && isOnline && !justReconnected ? 'hidden md:block' : 'block'
+        activeTab === 'feed' && isOnline && !justReconnected
+          ? 'hidden md:block'
+          : activeTab === 'videos' && isOnline && !justReconnected
+          ? 'hidden lg:block'
+          : 'block'
       }`}
     >
       {/* Immediate slim banner when connection is lost */}
@@ -130,7 +134,11 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
       <div
         className={`w-full max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 ${
-          activeTab === 'feed' ? 'hidden md:block' : 'block'
+          activeTab === 'feed'
+            ? 'hidden md:block'
+            : activeTab === 'videos'
+            ? 'hidden lg:block'
+            : 'block'
         }`}
       >
         <div className="flex items-center justify-between min-h-[3.5rem] sm:min-h-[4rem] gap-2 sm:gap-3">

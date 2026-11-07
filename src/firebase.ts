@@ -1,7 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore, setLogLevel, doc, getDoc } from 'firebase/firestore';
-import { getStorage } from 'firebase/storage';
 import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
 
@@ -16,50 +15,41 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export const auth = getAuth(app);
 
-export const storage = getStorage(
-  app,
-  firebaseConfig.storageBucket ? `gs://${firebaseConfig.storageBucket}` : undefined
-);
-try {
-  storage.maxUploadRetryTime = 25000;
-  storage.maxOperationRetryTime = 15000;
-} catch {
-  // ignore if read-only in environment
-}
+export const CLOUDINARY_CLOUD_NAME = 'monarcking72';
+export const CLOUDINARY_UPLOAD_PRESET = 'monarcking72';
+export const CLOUDINARY_VIDEO_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/video/upload`;
 
 /**
- * Logs the real Firebase Storage / upload error to the console and returns a clear,
- * human-readable message explaining the exact cause (Storage not enabled, permission denied,
- * file too big, duration limit exceeded, or network lost).
+ * Logs the real Cloudinary / browser video upload error to the console and returns a clear,
+ * human-readable message explaining the exact cause (preset/cloud config, file too big,
+ * duration limit exceeded, network lost, or Firestore permission error).
  */
-export function formatFirebaseStorageError(
+export function formatVideoUploadError(
   error: unknown,
   context?: {
     fileSize?: number;
     maxAllowedSeconds?: number;
     isProUser?: boolean;
     storagePath?: string;
+    httpStatus?: number;
   }
 ): string {
   const errObj = error as {
     code?: string;
     message?: string;
-    serverResponse?: string;
-    status_?: number;
-    customData?: { serverResponse?: string };
+    httpStatus?: number;
+    cloudinaryMessage?: string;
   };
   const code = String(errObj?.code || '');
   const rawMessage = error instanceof Error ? error.message : String(error || '');
-  const serverResponse = String(
-    errObj?.serverResponse || errObj?.customData?.serverResponse || ''
-  );
+  const httpStatus = errObj?.httpStatus ?? context?.httpStatus;
 
-  console.error('[WaveLink Video Upload Error]', {
-    code: code || 'unknown',
+  console.error('[WaveLink Cloudinary Video Upload Error]', {
+    cloudName: CLOUDINARY_CLOUD_NAME,
+    uploadPreset: CLOUDINARY_UPLOAD_PRESET,
+    httpStatus,
+    code: code || undefined,
     message: rawMessage,
-    serverResponse: serverResponse || undefined,
-    bucket: firebaseConfig.storageBucket,
-    storagePath: context?.storagePath,
     fileSize: context?.fileSize,
     isProUser: context?.isProUser,
     rawError: error
@@ -67,55 +57,32 @@ export function formatFirebaseStorageError(
 
   if (
     rawMessage.startsWith('Free users can upload videos up to') ||
+    rawMessage.startsWith('Free Sparks can be up to') ||
     rawMessage.startsWith('Pro videos can be up to') ||
+    rawMessage.startsWith('Pro Sparks can be up to') ||
     rawMessage.startsWith('Videos can be up to') ||
     rawMessage.startsWith('File too big:') ||
-    rawMessage.startsWith('This video is ')
+    rawMessage.startsWith('This video is ') ||
+    rawMessage.startsWith('Cloudinary upload error:')
   ) {
     return rawMessage;
   }
 
-  if (
-    code === 'storage/unauthorized' ||
-    rawMessage.includes('storage/unauthorized') ||
-    serverResponse.includes('Permission denied') ||
-    serverResponse.includes('403')
-  ) {
-    const limitSec = context?.maxAllowedSeconds || (context?.isProUser ? 90 : 60);
-    return `Permission denied by Firebase Storage rules (storage/unauthorized). Check that you are signed in, uploading to users/{userId}/videos/, and your video is under 100 MB and within the ${limitSec}s ${context?.isProUser ? 'Pro' : 'Free'} duration limit.`;
+  if (httpStatus === 413 || rawMessage.toLowerCase().includes('file size too large') || rawMessage.toLowerCase().includes('too large')) {
+    return 'File too big: this video exceeds the maximum file size allowed by Cloudinary (100 MB limit for unsigned uploads).';
+  }
+
+  if (httpStatus === 400 || httpStatus === 401 || httpStatus === 403) {
+    return `Cloudinary rejected the upload (HTTP ${httpStatus}): ${rawMessage || `Check that cloud name "${CLOUDINARY_CLOUD_NAME}" and unsigned upload preset "${CLOUDINARY_UPLOAD_PRESET}" are active.`}`;
   }
 
   if (
-    code === 'storage/bucket-not-found' ||
-    code === 'storage/project-not-found' ||
-    code === 'storage/no-default-bucket' ||
-    rawMessage.includes('STORAGE_NOT_ENABLED_OR_CORS') ||
-    rawMessage.includes('bucket-not-found') ||
-    serverResponse.includes('404') ||
-    serverResponse.includes('Not Found')
-  ) {
-    return `Firebase Storage is not enabled or bucket "${firebaseConfig.storageBucket}" is not initialized/CORS-configured (${code || 'storage/bucket-unreachable'}). Enable Storage in Firebase Console → Build → Storage and publish storage.rules.`;
-  }
-
-  if (code === 'storage/quota-exceeded' || rawMessage.includes('quota-exceeded')) {
-    return 'Firebase Storage quota exceeded (storage/quota-exceeded). Free up storage space or upgrade your Firebase plan.';
-  }
-
-  if (
-    code === 'storage/EntityTooLarge' ||
-    rawMessage.toLowerCase().includes('too large') ||
-    rawMessage.toLowerCase().includes('entity too large')
-  ) {
-    return 'File too big: this video exceeds the 100 MB maximum upload size allowed by Firebase Storage.';
-  }
-
-  if (
-    code === 'storage/retry-limit-exceeded' ||
+    rawMessage.includes('NETWORK_ERROR') ||
     rawMessage.includes('UPLOAD_TIMEOUT') ||
     rawMessage.includes('No upload progress') ||
     rawMessage.toLowerCase().includes('network')
   ) {
-    return `Network lost or upload timed out reaching Firebase Storage (${code || 'network-timeout'}). Check your internet connection and that Firebase Storage is enabled for "${firebaseConfig.storageBucket}", then tap Retry.`;
+    return 'Network connection lost or timed out while uploading video to Cloudinary. Check your internet connection and tap Retry.';
   }
 
   if (
@@ -126,14 +93,12 @@ export function formatFirebaseStorageError(
     return `Permission denied by Firestore rules when saving post (permission-denied). Ensure you are signed in and the video duration is within ${limitSec}s.`;
   }
 
-  if (code === 'storage/unknown' && serverResponse) {
-    return `Firebase Storage error (storage/unknown): ${serverResponse.slice(0, 180)}`;
-  }
-
   return rawMessage
     ? `Video upload failed: ${rawMessage}`
-    : 'Video upload failed due to an unexpected Firebase Storage error. Tap Retry to try again.';
+    : 'Video upload to Cloudinary failed due to an unexpected error. Tap Retry to try again.';
 }
+
+export const formatFirebaseStorageError = formatVideoUploadError;
 
 // Initialize Firebase App Check when VITE_FIREBASE_APPCHECK_KEY is configured
 let appCheckInstance: ReturnType<typeof initializeAppCheck> | null = null;

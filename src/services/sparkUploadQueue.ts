@@ -1,6 +1,12 @@
 import { useState, useEffect } from 'react';
 import { doc, setDoc } from 'firebase/firestore';
-import { db, cleanFirestoreData, handleFirestoreError, OperationType } from '../firebase';
+import {
+  db,
+  cleanFirestoreData,
+  handleFirestoreError,
+  OperationType,
+  formatVideoUploadError
+} from '../firebase';
 import { OnlineSong } from '../types';
 import {
   compressImage,
@@ -256,32 +262,45 @@ class SparkUploadQueueManager {
               sparkPayload.storagePath = imgUpload.storagePath;
             }
           } else if (slide.mediaType === 'video') {
-            if (slide.file) {
-              const videoRes = await uploadSparkVideoToStorage({
-                sparkId,
-                userId: input.authorId,
-                file: slide.file,
-                isProUser: input.isProTier,
-                metadata: slide.videoMeta || undefined,
-                onProgress: (pct, statusLabel) => {
-                  updateOverallProgress(i, pct, statusLabel);
-                },
-              });
-
-              sparkPayload.mediaUrl = videoRes.downloadUrl;
-              sparkPayload.storagePath = videoRes.storagePath;
-              sparkPayload.thumbnailUrl = videoRes.thumbnailUrl;
-              sparkPayload.videoFileName = slide.file.name;
-              sparkPayload.videoDurationSeconds = videoRes.durationSeconds;
-              sparkPayload.videoWidth = videoRes.width;
-              sparkPayload.videoHeight = videoRes.height;
-              sparkPayload.videoFileSize = videoRes.fileSize;
-              sparkPayload.videoMimeType = videoRes.mimeType;
-              sparkPayload.hasVideoChunks = Boolean(videoRes.hasVideoChunks);
-            } else {
-              sparkPayload.mediaUrl = slide.mediaDataUrl;
-              sparkPayload.hasVideoChunks = Boolean(slide.hasVideoChunks);
+            if (!slide.file) {
+              throw new Error('Video file is missing for Spark upload. Please select the video again.');
             }
+            const videoRes = await uploadSparkVideoToStorage({
+              sparkId,
+              userId: input.authorId,
+              file: slide.file,
+              isProUser: input.isProTier,
+              metadata: slide.videoMeta || undefined,
+              onProgress: (pct, statusLabel) => {
+                updateOverallProgress(i, pct, statusLabel);
+              },
+            });
+
+            if (
+              !videoRes.downloadUrl ||
+              videoRes.downloadUrl.startsWith('data:video/') ||
+              !videoRes.downloadUrl.startsWith('http')
+            ) {
+              throw new Error(
+                'Cloudinary upload did not return a valid secure_url for Spark video.'
+              );
+            }
+
+            const cloudThumbUrl =
+              videoRes.thumbnailUrl && videoRes.thumbnailUrl.startsWith('http')
+                ? videoRes.thumbnailUrl
+                : videoRes.downloadUrl.replace(/\.[a-zA-Z0-9]+(\?.*)?$/, '.jpg');
+
+            sparkPayload.mediaUrl = videoRes.downloadUrl;
+            sparkPayload.storagePath = videoRes.storagePath;
+            sparkPayload.thumbnailUrl = cloudThumbUrl;
+            sparkPayload.videoFileName = slide.file.name;
+            sparkPayload.videoDurationSeconds = videoRes.durationSeconds;
+            sparkPayload.videoWidth = videoRes.width;
+            sparkPayload.videoHeight = videoRes.height;
+            sparkPayload.videoFileSize = videoRes.fileSize;
+            sparkPayload.videoMimeType = videoRes.mimeType;
+            sparkPayload.hasVideoChunks = false;
           }
 
           await setDoc(doc(db, 'sparks', sparkId), cleanFirestoreData(sparkPayload));
@@ -313,19 +332,16 @@ class SparkUploadQueueManager {
         this.dismissJob(jobId);
       }, 4500);
     } catch (error: any) {
-      const msg = error instanceof Error ? error.message : String(error || '');
+      const formattedError = formatVideoUploadError(error, {
+        isProUser: input.isProTier,
+        maxAllowedSeconds: input.isProTier ? 90 : 60,
+        storagePath: `wavelink/${input.authorId}/spark`
+      });
       this.updateJob(jobId, {
         status: 'failed',
-        error: msg || 'Spark upload encountered an issue. Tap Retry to try again.',
-        statusText: 'Spark upload paused — tap Retry',
+        error: formattedError || 'Spark upload encountered an issue. Tap Retry to try again.',
+        statusText: 'Spark upload failed — tap Retry',
       });
-      if (!msg.includes('Free Sparks can be up to 60 seconds')) {
-        try {
-          handleFirestoreError(error, OperationType.CREATE, 'sparks');
-        } catch {
-          // Do not throw unhandled rejection in background worker
-        }
-      }
     }
   }
 }

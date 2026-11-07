@@ -102,7 +102,7 @@ const VideoUploadJobCard: React.FC<{ job: VideoUploadJob }> = ({ job }) => {
                 {isPreparing
                   ? 'Compressing to 720p...'
                   : isUploading
-                  ? 'Uploading to Firebase Storage'
+                  ? 'Uploading to Cloudinary'
                   : job.statusText}
               </span>
             </div>

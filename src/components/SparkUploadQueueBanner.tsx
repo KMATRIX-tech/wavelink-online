@@ -70,7 +70,7 @@ export const SparkUploadQueueBanner: React.FC<SparkUploadQueueBannerProps> = ({
                     </div>
 
                     {isFailed ? (
-                      <p className="text-[11px] text-rose-700 font-medium truncate mt-0.5">
+                      <p className="text-[11px] text-rose-700 font-medium break-words leading-snug mt-0.5">
                         {job.error || 'Upload interrupted. Tap Retry to resume.'}
                       </p>
                     ) : (
@@ -175,7 +175,7 @@ export const SparkUploadQueueBanner: React.FC<SparkUploadQueueBannerProps> = ({
                   </div>
 
                   {isFailed ? (
-                    <p className="text-[11px] text-rose-600 font-medium truncate mt-0.5">
+                    <p className="text-[11px] text-rose-600 font-medium break-words leading-snug mt-0.5">
                       {job.error || 'Upload interrupted. Tap Retry.'}
                     </p>
                   ) : (

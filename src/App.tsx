@@ -586,7 +586,7 @@ function MainApp() {
         <main
           className={`wavelink-main-content ${
             activeTab === 'chat' ? 'wavelink-main-content--chat' : ''
-          }`}
+          } ${activeTab === 'videos' ? 'wavelink-main-content--reels' : ''}`}
         >
           {activeTab === 'feed' && (
             <FeedView
