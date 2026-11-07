@@ -582,9 +582,10 @@ function MainApp() {
           onOpenWelink={() => handleOpenWelink('chat')}
         />
 
-        {/* Main Body View */}
+        {/* Main Body View with subtle fade-in transition when switching tabs */}
         <main
-          className={`wavelink-main-content ${
+          key={activeTab}
+          className={`wavelink-main-content wavelink-tab-fade-in ${
             activeTab === 'chat' ? 'wavelink-main-content--chat' : ''
           } ${activeTab === 'videos' ? 'wavelink-main-content--reels' : ''}`}
         >

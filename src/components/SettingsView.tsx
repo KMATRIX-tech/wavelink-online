@@ -56,7 +56,7 @@ import { inviteFriends } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
 import { compressImage } from '../utils/mediaStorage';
 import { validateStrongPassword } from '../utils/security';
-import { db } from '../firebase';
+import { db, formatEmailVerificationError, extractSafeFirebaseAuthCode } from '../firebase';
 import { collection, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { UpgradeFeedbackItem, UpgradeCategory } from '../types';
 import { recordUpgradeFeedback } from '../services/upgradeFeedbackService';
@@ -317,6 +317,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   const [isSendingVerifyEmail, setIsSendingVerifyEmail] = useState(false);
   const [verifyLinkSent, setVerifyLinkSent] = useState(false);
   const [verifyCooldownSeconds, setVerifyCooldownSeconds] = useState(0);
+  const [verifyErrorCode, setVerifyErrorCode] = useState<string | null>(null);
   const [reloadedEmailVerified, setReloadedEmailVerified] = useState(false);
 
   useEffect(() => {
@@ -585,6 +586,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
 
   const handleSendVerifyEmail = async () => {
     setPasswordStatus(null);
+    setVerifyErrorCode(null);
     if (!currentUser?.email) {
       setPasswordStatus({
         type: 'error',
@@ -604,15 +606,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     try {
       await sendVerificationEmail();
       setVerifyLinkSent(true);
+      setVerifyErrorCode(null);
       setVerifyCooldownSeconds(60);
       setPasswordStatus({
         type: 'success',
         message: 'Verification link sent. Check your inbox and spam folder.'
       });
     } catch (err: any) {
+      const formatted = formatEmailVerificationError(err);
+      const code = formatted.code || extractSafeFirebaseAuthCode(err);
+      setVerifyErrorCode(code);
       setPasswordStatus({
         type: 'error',
-        message: err.message || 'Could not send verification email right now.'
+        message: formatted.message || 'Could not send verification email right now.'
       });
     } finally {
       setIsSendingVerifyEmail(false);
@@ -1460,6 +1466,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               )}
             </div>
 
+            {verifyErrorCode && !currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
+              <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 space-y-1">
+                {passwordStatus?.type === 'error' && (
+                  <p className="text-xs font-bold">{passwordStatus.message}</p>
+                )}
+                <p className="text-[11px] font-mono text-rose-600">{verifyErrorCode}</p>
+              </div>
+            )}
+
             {verifyLinkSent && !currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
               <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
                 <p className="text-xs font-extrabold text-[#0D9488]">
@@ -1491,18 +1506,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
 
             {passwordStatus && (
               <div
-                className={`p-3.5 rounded-2xl border text-xs font-bold flex items-center gap-2 ${
+                className={`p-3.5 rounded-2xl border text-xs font-bold flex items-start gap-2 ${
                   passwordStatus.type === 'success'
                     ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
                     : 'bg-amber-50 border-amber-200 text-amber-900'
                 }`}
               >
                 {passwordStatus.type === 'success' ? (
-                  <CheckCircle2 size={16} className="text-[#0D9488] shrink-0" />
+                  <CheckCircle2 size={16} className="text-[#0D9488] shrink-0 mt-0.5" />
                 ) : (
-                  <AlertCircle size={16} className="text-amber-600 shrink-0" />
+                  <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
                 )}
-                <span>{passwordStatus.message}</span>
+                <div className="space-y-1">
+                  <span className="block">{passwordStatus.message}</span>
+                  {passwordStatus.type === 'error' && verifyErrorCode && (
+                    <span className="block text-[11px] font-mono text-rose-700">
+                      {verifyErrorCode}
+                    </span>
+                  )}
+                </div>
               </div>
             )}
 

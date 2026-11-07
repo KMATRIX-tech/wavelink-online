@@ -210,19 +210,91 @@ export function isIframeEnvironment(): boolean {
   }
 }
 
+/**
+ * Scrubs any URLs, links, query parameters, OOB codes, or JWT/bearer tokens from error text
+ * so that tokens or links never appear on screen.
+ */
+export function sanitizeErrorTextNoTokensOrLinks(rawText: string): string {
+  if (!rawText) return '';
+  return rawText
+    .replace(/https?:\/\/\S+/gi, '[redacted-link]')
+    .replace(/\bwww\.\S+/gi, '[redacted-link]')
+    .replace(/\b(oobCode|apiKey|token|idToken|accessToken|refreshToken|continueUrl)=[^\s&)]+/gi, '$1=[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted-token]')
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, '[redacted-token]')
+    .trim();
+}
+
+/**
+ * Extracts a clean Firebase Auth error code (e.g. auth/unauthorized-domain,
+ * auth/operation-not-allowed, auth/too-many-requests) without any tokens or links.
+ */
+export function extractSafeFirebaseAuthCode(err: unknown): string | null {
+  if (!err) return null;
+  const rawCode = typeof (err as { code?: unknown })?.code === 'string' ? (err as { code: string }).code.trim() : '';
+  if (/^auth\/[a-z0-9-]+$/i.test(rawCode)) {
+    return rawCode.toLowerCase();
+  }
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  const match = rawMsg.match(/\b(auth\/[a-z0-9-]+)\b/i);
+  if (match && match[1]) {
+    return match[1].toLowerCase();
+  }
+  return null;
+}
+
+/**
+ * Formats an error from sendEmailVerification (or account initialization for email verification),
+ * returning a safe user-facing message (never containing links or tokens) and the Firebase error code.
+ */
+export function formatEmailVerificationError(err: unknown): { message: string; code: string | null } {
+  const code = extractSafeFirebaseAuthCode(err);
+
+  if (code === 'auth/unauthorized-domain') {
+    return {
+      message: 'Could not send verification email because this domain is not authorized in Firebase Authentication.',
+      code
+    };
+  }
+  if (code === 'auth/operation-not-allowed') {
+    return {
+      message: 'Could not send verification email because this sign-in operation is not enabled in Firebase Authentication.',
+      code
+    };
+  }
+  if (code === 'auth/too-many-requests') {
+    return {
+      message: 'Too many verification email requests. Please wait a few minutes and try again.',
+      code
+    };
+  }
+  if (code === 'auth/invalid-continue-uri' || code === 'auth/missing-continue-uri' || code === 'auth/unauthorized-continue-uri') {
+    return {
+      message: 'Could not send verification email due to an invalid or unauthorized continue URL configuration.',
+      code
+    };
+  }
+
+  const friendly = sanitizeErrorTextNoTokensOrLinks(getFriendlyAuthErrorMessage(err, 'email'));
+  return {
+    message: friendly || 'Could not send verification email. Please try again.',
+    code
+  };
+}
+
 export function getFriendlyAuthErrorMessage(
   err: unknown,
   context: 'google' | 'email' | 'quick' = 'email'
 ): string {
   if (!err) return '';
-  const code = (err as { code?: string })?.code || '';
+  const code = extractSafeFirebaseAuthCode(err) || (err as { code?: string })?.code || '';
   const msg = err instanceof Error ? err.message : String(err);
 
   if (isAuthNetworkError(err)) {
     if (context === 'google') {
       return 'Google Sign-In popup could not connect (often blocked by browser iframe third-party cookie restrictions). Please sign in with Email & Password or use the 1-Click Platform Owner button.';
     }
-    return 'Authentication connection timed out. Please check your internet connection or use 1-Click Launch.';
+    return 'Authentication connection timed out. Please check your internet connection and try again.';
   }
 
   if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
@@ -234,13 +306,19 @@ export function getFriendlyAuthErrorMessage(
   if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
     return 'Popup was blocked by your browser. Please allow popups or use Email Sign-In.';
   }
+  if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
+    return 'This domain is not authorized for Firebase Authentication operations.';
+  }
+  if (code === 'auth/operation-not-allowed' || msg.includes('operation-not-allowed')) {
+    return 'This authentication method is currently not enabled in Firebase Authentication.';
+  }
   if (
     code === 'auth/user-not-found' ||
     code === 'auth/invalid-credential' ||
     msg.includes('user-not-found') ||
     msg.includes('invalid-credential')
   ) {
-    return 'Invalid credentials. Please verify your details or use 1-Click Launch.';
+    return 'Invalid credentials. Please check your username/email and password.';
   }
   if (code === 'auth/wrong-password' || msg.includes('wrong-password')) {
     return 'Incorrect password. Please verify and try again.';
@@ -249,7 +327,7 @@ export function getFriendlyAuthErrorMessage(
     return 'An account with this email already exists. Please sign in instead.';
   }
   if (code === 'auth/weak-password' || msg.includes('weak-password')) {
-    return 'Password is too weak. Please use at least 6 characters.';
+    return 'Password must be between 8 and 24 characters and contain at least one letter and one number.';
   }
   if (code === 'auth/invalid-email' || msg.includes('invalid-email')) {
     return 'Please enter a valid email address.';
@@ -258,12 +336,13 @@ export function getFriendlyAuthErrorMessage(
     return 'Too many attempts. Please wait a minute and try again.';
   }
 
-  return (
+  const cleaned = sanitizeErrorTextNoTokensOrLinks(
     msg
       .replace(/^Firebase:\s*/i, '')
       .replace(/\(auth\/[^)]+\)\.?/i, '')
-      .trim() || 'Authentication failed. Please try again.'
+      .trim()
   );
+  return cleaned || 'Authentication failed. Please try again.';
 }
 
 export enum OperationType {

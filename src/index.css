@@ -126,6 +126,23 @@ html[data-theme="sunrise"] {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
+/* Subtle fade-in transition when switching between tabs in the App shell */
+@keyframes wavelink-tab-fade-in {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.wavelink-tab-fade-in {
+  animation: wavelink-tab-fade-in 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity;
+}
+
 /* Main viewport column on mobile (< 768px) */
 .wavelink-main-content {
   flex: 1 1 auto;

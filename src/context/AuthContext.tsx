@@ -1225,7 +1225,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!resp.ok || !data.success) {
       throw new Error(data.error || 'Please wait before resending the verification email.');
     }
-    await fbSendEmailVerification(activeUser);
+    try {
+      await fbSendEmailVerification(activeUser);
+    } catch (err: any) {
+      throw err;
+    }
     showGlobalToast('Verification link sent. Check your inbox and spam folder.');
   };
 

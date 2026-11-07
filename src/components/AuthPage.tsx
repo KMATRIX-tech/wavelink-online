@@ -23,6 +23,8 @@ import {
   getClientDeviceId,
   isAuthNetworkError,
   getFriendlyAuthErrorMessage,
+  formatEmailVerificationError,
+  extractSafeFirebaseAuthCode,
   cleanFirestoreData
 } from '../firebase';
 import { recordSystemDomain } from '../services/verificationService';
@@ -65,6 +67,7 @@ export const AuthPage: React.FC = () => {
   // Firebase Authentication built-in email verification state (never displays any code, link, or token in UI)
   const [verificationLinkSent, setVerificationLinkSent] = useState(false);
   const [verificationNotice, setVerificationNotice] = useState<string | null>(null);
+  const [verificationErrorCode, setVerificationErrorCode] = useState<string | null>(null);
   const [isEmailVerified, setIsEmailVerified] = useState(false);
   const [isSendingVerification, setIsSendingVerification] = useState(false);
   const [resendCooldownSeconds, setResendCooldownSeconds] = useState<number>(0);
@@ -188,6 +191,7 @@ export const AuthPage: React.FC = () => {
         await activeUser.getIdToken(true).catch(() => {});
         setIsEmailVerified(true);
         setVerificationNotice(null);
+        setVerificationErrorCode(null);
         setError(null);
         setStatusMessage('Email verified');
         return true;
@@ -236,6 +240,7 @@ export const AuthPage: React.FC = () => {
     if (resendCooldownSeconds > 0 || isSendingVerification) return;
     setError(null);
     setVerificationNotice(null);
+    setVerificationErrorCode(null);
 
     const cleanEmail = emailInput.trim().toLowerCase();
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
@@ -344,6 +349,7 @@ export const AuthPage: React.FC = () => {
         setIsEmailVerified(true);
         setVerificationLinkSent(true);
         setVerificationNotice(null);
+        setVerificationErrorCode(null);
         setStatusMessage('Email verified');
         return;
       }
@@ -353,6 +359,7 @@ export const AuthPage: React.FC = () => {
 
       setVerificationLinkSent(true);
       setIsEmailVerified(false);
+      setVerificationErrorCode(null);
       setResendCooldownSeconds(
         typeof cooldownData?.cooldownSeconds === 'number' ? cooldownData.cooldownSeconds : 60
       );
@@ -360,7 +367,9 @@ export const AuthPage: React.FC = () => {
       setVerificationNotice(sentMsg);
       setStatusMessage(sentMsg);
     } catch (err: any) {
-      setError(getFriendlyAuthErrorMessage(err, 'email'));
+      const formatted = formatEmailVerificationError(err);
+      setError(formatted.message);
+      setVerificationErrorCode(formatted.code || extractSafeFirebaseAuthCode(err));
     } finally {
       setIsSendingVerification(false);
     }
@@ -800,8 +809,13 @@ export const AuthPage: React.FC = () => {
             {error && (
               <div className="mb-4 p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-start gap-2.5 animate-in fade-in">
                 <AlertCircle size={16} className="text-rose-500 shrink-0 mt-0.5" />
-                <div className="flex-1 font-medium">
-                  <span>{error}</span>
+                <div className="flex-1 font-medium space-y-1">
+                  <span className="block">{error}</span>
+                  {verificationErrorCode && (
+                    <span className="block text-[11px] font-mono text-rose-600/90">
+                      {verificationErrorCode}
+                    </span>
+                  )}
                 </div>
               </div>
             )}
@@ -910,6 +924,7 @@ export const AuthPage: React.FC = () => {
                         setIsEmailVerified(false);
                         setVerificationLinkSent(false);
                         setVerificationNotice(null);
+                        setVerificationErrorCode(null);
                       }}
                       placeholder="name@domain.com"
                       className="w-full min-h-[42px] pl-10 pr-28 py-2 rounded-xl bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-blue-500 text-xs sm:text-sm"
@@ -939,6 +954,12 @@ export const AuthPage: React.FC = () => {
                       </button>
                     )}
                   </div>
+
+                  {verificationErrorCode && !isEmailVerified && (
+                    <p className="text-[11px] font-mono text-rose-600 px-1">
+                      {verificationErrorCode}
+                    </p>
+                  )}
 
                   {verificationLinkSent && !isEmailVerified && (
                     <div className="space-y-2 pt-1">
