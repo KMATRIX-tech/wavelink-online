@@ -71,7 +71,7 @@ export interface UserProfile {
   notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;
   // Administrative and Security Roles
-  role?: 'super_admin' | 'sub_admin' | 'user' | 'bot';
+  role?: 'admin' | 'super_admin' | 'sub_admin' | 'user' | 'bot';
   isBot?: boolean;
   isSubAdmin?: boolean;
   hasBlueStar?: boolean;

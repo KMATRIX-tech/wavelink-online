@@ -179,16 +179,34 @@ export async function getAuthHeaders(extraHeaders: Record<string, string> = {}):
 // Generic label for UI display only — actual Owner email is kept strictly on the server in process.env.OWNER_EMAIL
 export const ADMIN_EMAIL = 'Platform Administrator';
 
+/**
+ * Single canonical source of truth for admin role resolution across UI, Server, and Firestore rules:
+ * Based on the user's `role` field (`'admin'` / `'super_admin'` / `'sub_admin'`).
+ */
+export function resolveCanonicalAdminRole(
+  role?: string | null,
+  isSubAdmin?: boolean | null
+): 'admin' | 'sub_admin' | 'user' {
+  if (role === 'admin' || role === 'super_admin') {
+    return 'admin';
+  }
+  if (role === 'sub_admin' || isSubAdmin === true) {
+    return 'sub_admin';
+  }
+  return 'user';
+}
+
 export function isOwnerEmail(_email?: string | null): boolean {
   return false;
 }
 
 export function isSuperAdminEmail(_email?: string | null, role?: string | null): boolean {
-  return role === 'super_admin' || role === 'admin';
+  return resolveCanonicalAdminRole(role) === 'admin';
 }
 
-export function isAdminEmail(_email?: string | null, role?: string | null): boolean {
-  return role === 'super_admin' || role === 'admin' || role === 'sub_admin';
+export function isAdminEmail(_email?: string | null, role?: string | null, isSubAdmin?: boolean | null): boolean {
+  const resolved = resolveCanonicalAdminRole(role, isSubAdmin);
+  return resolved === 'admin' || resolved === 'sub_admin';
 }
 
 export function isAuthNetworkError(error: unknown): boolean {

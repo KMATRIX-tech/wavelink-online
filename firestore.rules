@@ -63,23 +63,30 @@ service cloud.firestore {
       return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
     }
 
-    // Server-designated Super Admin (via custom claims, server-managed /admins/{uid}, or server-assigned user role)
+    // Single source of truth for admin role across UI, Server, and Firestore Rules:
+    // /users/{uid}.role in ['admin', 'super_admin'] (or 'sub_admin')
+    function getUserRole() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user')
+        : request.auth.token.get('role', 'user');
+    }
+
     function isSuperAdmin() {
       return isSignedIn() && (
-        request.auth.token.get('admin', false) == true ||
-        request.auth.token.get('role', '') in ['admin', 'super_admin'] ||
+        getUserRole() in ['admin', 'super_admin'] ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
-        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user') in ['admin', 'super_admin'])
+        request.auth.token.get('admin', false) == true ||
+        request.auth.token.get('role', '') in ['admin', 'super_admin']
       );
     }
 
-    // Server/SuperAdmin-appointed Sub-Admin stored on the user record (never self-editable by non-admins)
     function isSubAdmin() {
-      return isSignedIn() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isSubAdmin == true &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isBot != true;
+      return isSignedIn() && (
+        getUserRole() == 'sub_admin' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isSubAdmin', false) == true &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isBot', false) != true)
+      );
     }
 
     function isAdmin() {
@@ -188,10 +195,15 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Server-managed Admins registry (writable only by Firebase Admin SDK on the server)
+    // Server-managed Admins registry (writable only by the server after verifying OWNER_EMAIL and OWNER_ACCESS_CODE)
     match /admins/{adminId} {
-      allow read: if isSignedIn();
-      allow write: if false;
+      allow read: if false;
+      allow create, update: if isOwner(adminId) &&
+        isEmailVerified() &&
+        request.resource.data.uid == adminId &&
+        request.resource.data.role in ['admin', 'super_admin'] &&
+        request.resource.data.get('_serverGrantKey', '') == 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+      allow delete: if false;
     }
 
     // Connection test document

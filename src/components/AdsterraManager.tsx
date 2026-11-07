@@ -34,6 +34,7 @@ export function shouldShowAds(
 
   // 3. Admin / Moderator role -> HIDE ADS
   if (
+    userProfile.role === 'admin' ||
     userProfile.role === 'super_admin' ||
     userProfile.role === 'sub_admin' ||
     Boolean(userProfile.isSubAdmin) ||

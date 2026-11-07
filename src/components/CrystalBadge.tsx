@@ -1,6 +1,6 @@
 import React from 'react';
 import { ShieldCheck, Star, Bot } from 'lucide-react';
-import { isAdminEmail } from '../firebase';
+import { resolveCanonicalAdminRole } from '../firebase';
 import { isSupportBotUser } from '../utils/security';
 
 interface CrystalBadgeProps {
@@ -12,7 +12,7 @@ interface CrystalBadgeProps {
   hasBlueStar?: boolean;
   isSubAdmin?: boolean;
   isBot?: boolean;
-  role?: 'super_admin' | 'sub_admin' | 'user' | 'bot';
+  role?: 'admin' | 'super_admin' | 'sub_admin' | 'user' | 'bot';
   proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
   size?: 'sm' | 'md' | 'lg';
 }
@@ -30,8 +30,9 @@ export const CrystalBadge: React.FC<CrystalBadgeProps> = ({
   size = 'md'
 }) => {
   const isAutomatedBot = Boolean(isBot || role === 'bot' || isSupportBotUser(email));
-  const isSuperAdmin = !isAutomatedBot && (role === 'super_admin' || isAdminEmail(email, role));
-  const isModerator = !isAutomatedBot && !isSuperAdmin && (isSubAdmin || role === 'sub_admin');
+  const canonicalRole = resolveCanonicalAdminRole(role, isSubAdmin);
+  const isSuperAdmin = !isAutomatedBot && canonicalRole === 'admin';
+  const isModerator = !isAutomatedBot && canonicalRole === 'sub_admin';
   const hasProBadge = !isAutomatedBot && (isPro || hasBlueStar);
 
   const textSize = size === 'sm' ? 'text-xs' : size === 'lg' ? 'text-lg' : 'text-sm sm:text-base';

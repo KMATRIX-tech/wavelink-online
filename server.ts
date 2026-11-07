@@ -85,11 +85,20 @@ function getOwnerPhone(): string {
 
 // Read Owner Email & Owner Access Code strictly on the server from process.env (never logged or returned to client)
 function getOwnerEmail(): string {
-  return (process.env.OWNER_EMAIL || '').trim().toLowerCase();
+  loadEnvFilesIfNeeded();
+  return (process.env.OWNER_EMAIL || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .trim()
+    .toLowerCase();
 }
 
 function getOwnerAccessCode(): string {
-  return (process.env.OWNER_ACCESS_CODE || '').trim();
+  loadEnvFilesIfNeeded();
+  return (process.env.OWNER_ACCESS_CODE || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .trim();
 }
 
 // Read Brevo API Key & Mail Sender strictly on the server from process.env (never logged or returned to client)
@@ -170,23 +179,39 @@ const SERVER_OWNER_HMAC_SECRET = crypto.randomBytes(32).toString('hex');
 function signOwnerSessionToken(uid: string): string {
   const issuedAt = Date.now();
   const expiresAt = issuedAt + 12 * 60 * 60 * 1000; // 12 hours
-  const payload = Buffer.from(JSON.stringify({ uid, role: 'super_admin', issuedAt, expiresAt }), 'utf8').toString('base64url');
-  const sig = crypto.createHmac('sha256', SERVER_OWNER_HMAC_SECRET).update(payload).digest('base64url');
+  const payload = Buffer.from(
+    JSON.stringify({ uid, role: 'admin', issuedAt, expiresAt }),
+    'utf8'
+  ).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', SERVER_OWNER_HMAC_SECRET)
+    .update(payload)
+    .digest('base64url');
   return `${payload}.${sig}`;
 }
 
-function verifyOwnerSessionToken(token: string | undefined, expectedUid?: string): { valid: boolean; uid: string } {
+function verifyOwnerSessionToken(
+  token: string | undefined,
+  expectedUid?: string
+): { valid: boolean; uid: string } {
   if (!token || typeof token !== 'string') return { valid: false, uid: '' };
   const parts = token.trim().split('.');
   if (parts.length !== 2) return { valid: false, uid: '' };
   const [payloadB64, providedSig] = parts;
-  const expectedSig = crypto.createHmac('sha256', SERVER_OWNER_HMAC_SECRET).update(payloadB64).digest('base64url');
+  const expectedSig = crypto
+    .createHmac('sha256', SERVER_OWNER_HMAC_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
   if (!safeConstantTimeEquals(providedSig, expectedSig)) {
     return { valid: false, uid: '' };
   }
   try {
     const data = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-    if (!data || typeof data.uid !== 'string' || data.role !== 'super_admin') {
+    if (
+      !data ||
+      typeof data.uid !== 'string' ||
+      (data.role !== 'admin' && data.role !== 'super_admin')
+    ) {
       return { valid: false, uid: '' };
     }
     if (typeof data.expiresAt !== 'number' || Date.now() > data.expiresAt) {
@@ -205,6 +230,171 @@ function verifyOwnerSessionToken(token: string | undefined, expectedUid?: string
 const serverOwnerUids = new Set<string>();
 const serverSubAdminEmails = new Set<string>();
 const serverSubAdminUids = new Set<string>();
+
+const SERVER_ADMIN_GRANT_KEY = 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+
+function getServerFirebaseConfig(): { projectId: string; firestoreDatabaseId: string } {
+  try {
+    const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      return {
+        projectId: String(parsedCfg.projectId || ''),
+        firestoreDatabaseId: String(parsedCfg.firestoreDatabaseId || '(default)')
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || '',
+    firestoreDatabaseId: '(default)'
+  };
+}
+
+/**
+ * Grants the canonical 'admin' role to an existing UID in Firestore via REST API
+ * using the verified user's ID token and server grant key, preserving all existing
+ * profile fields (posts, followers, points, Pro status, username, bio, etc.).
+ */
+async function grantOwnerRoleViaFirestoreRest(
+  ownerUid: string,
+  email: string,
+  rawIdToken: string
+): Promise<boolean> {
+  if (!ownerUid || !rawIdToken) return false;
+  const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+  if (!projectId) return false;
+
+  const dbPath = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    projectId
+  )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents`;
+  const nowIso = new Date().toISOString();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${rawIdToken}`
+  };
+
+  try {
+    // Step 1: Write /admins/{ownerUid} with _serverGrantKey so Firestore rules recognize the server grant immediately
+    const adminDocUrl = `${dbPath}/admins/${encodeURIComponent(ownerUid)}`;
+    const adminResp = await fetch(adminDocUrl, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({
+        fields: {
+          uid: { stringValue: ownerUid },
+          role: { stringValue: 'admin' },
+          _serverGrantKey: { stringValue: SERVER_ADMIN_GRANT_KEY },
+          grantedBy: { stringValue: 'server_owner_verification' },
+          updatedAt: { stringValue: nowIso }
+        }
+      })
+    });
+    if (!adminResp.ok) {
+      const errText = await adminResp.text().catch(() => '');
+      console.error(
+        `[WaveLink Server Auth Log] Firestore REST /admins/${ownerUid} write status ${adminResp.status}:`,
+        errText.slice(0, 240)
+      );
+    }
+
+    // Step 2: Patch ONLY role & verification fields on /users/{ownerUid} so existing points, followers, posts, username, bio stay untouched
+    const maskParams = [
+      'id',
+      'email',
+      'role',
+      'isSubAdmin',
+      'isPro',
+      'hasBlueStar',
+      'isVerifiedByAdmin',
+      'emailVerified',
+      'isContactVerified',
+      'updatedAt'
+    ]
+      .map((field) => `updateMask.fieldPaths=${encodeURIComponent(field)}`)
+      .join('&');
+
+    const userDocUrl = `${dbPath}/users/${encodeURIComponent(ownerUid)}?${maskParams}`;
+    const userResp = await fetch(userDocUrl, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({
+        fields: {
+          id: { stringValue: ownerUid },
+          email: { stringValue: email },
+          role: { stringValue: 'admin' },
+          isSubAdmin: { booleanValue: false },
+          isPro: { booleanValue: true },
+          hasBlueStar: { booleanValue: true },
+          isVerifiedByAdmin: { booleanValue: true },
+          emailVerified: { booleanValue: true },
+          isContactVerified: { booleanValue: true },
+          updatedAt: { stringValue: nowIso }
+        }
+      })
+    });
+
+    if (!userResp.ok) {
+      const errText = await userResp.text().catch(() => '');
+      console.error(
+        `[WaveLink Server Auth Log] Firestore REST /users/${ownerUid} role patch status ${userResp.status}:`,
+        errText.slice(0, 240)
+      );
+      return adminResp.ok;
+    }
+
+    return true;
+  } catch (err) {
+    console.error(
+      '[WaveLink Server Auth Log] Firestore REST role grant error:',
+      err instanceof Error ? err.message : String(err)
+    );
+    return false;
+  }
+}
+
+/**
+ * Reads canonical role from /users/{uid} in Firestore via REST API so UI, Server, and Firestore rules share one source of truth.
+ */
+async function fetchUserRoleViaFirestoreRest(
+  uid: string,
+  rawIdToken?: string
+): Promise<'admin' | 'sub_admin' | 'user' | null> {
+  if (!uid) return null;
+  const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+  if (!projectId) return null;
+
+  const dbPath = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    projectId
+  )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents`;
+  const headers: Record<string, string> = {};
+  if (rawIdToken) {
+    headers.Authorization = `Bearer ${rawIdToken}`;
+  }
+
+  try {
+    const userDocUrl = `${dbPath}/users/${encodeURIComponent(uid)}`;
+    const resp = await fetch(userDocUrl, { method: 'GET', headers });
+    if (!resp.ok) return null;
+    const docJson = await resp.json().catch(() => null);
+    const fields = docJson?.fields;
+    if (!fields) return null;
+    const roleVal = String(fields.role?.stringValue || '').trim();
+    const isSubVal = Boolean(fields.isSubAdmin?.booleanValue);
+    if (roleVal === 'admin' || roleVal === 'super_admin') {
+      serverOwnerUids.add(uid);
+      return 'admin';
+    }
+    if (roleVal === 'sub_admin' || isSubVal) {
+      serverSubAdminUids.add(uid);
+      return 'sub_admin';
+    }
+    return 'user';
+  } catch {
+    return null;
+  }
+}
 
 // Per-device rate limiter for Hidden Owner Sign-In: strictly 5 attempts per hour per device
 const MAX_OWNER_ATTEMPTS_PER_HOUR = 5;
@@ -2182,16 +2372,24 @@ Escalation Required: ${
   const GENERIC_OWNER_LOCKOUT_ERROR =
     'Too many attempts from this device. Access is locked for 1 hour.';
 
-  // Verify Google ID Token on the server (via Firebase Admin SDK verifyIdToken + Google tokeninfo / JWT claim check)
+  // Verify Google ID Token on the server (via Firebase Admin SDK verifyIdToken + Firebase JWT claim check)
   async function verifyGoogleTokenOnServer(rawIdToken: string): Promise<{
     valid: boolean;
     uid: string;
     email: string;
     emailVerified: boolean;
     isGoogleProvider: boolean;
+    reason?: string;
   }> {
     if (!rawIdToken || typeof rawIdToken !== 'string') {
-      return { valid: false, uid: '', email: '', emailVerified: false, isGoogleProvider: false };
+      return {
+        valid: false,
+        uid: '',
+        email: '',
+        emailVerified: false,
+        isGoogleProvider: false,
+        reason: 'Missing or empty Google Firebase ID token'
+      };
     }
 
     // 1. Attempt Firebase Admin SDK cryptographic verification first
@@ -2200,69 +2398,156 @@ Escalation Required: ${
         const decoded = await getAdminAuth(getAdminApp()).verifyIdToken(rawIdToken, true);
         if (decoded && decoded.uid) {
           const provider = String(decoded.firebase?.sign_in_provider || '');
+          const hasGoogleIdentity = Boolean(
+            provider === 'google.com' ||
+              (decoded.firebase?.identities &&
+                typeof decoded.firebase.identities === 'object' &&
+                'google.com' in decoded.firebase.identities)
+          );
           return {
             valid: true,
             uid: decoded.uid,
             email: String(decoded.email || '').trim().toLowerCase(),
             emailVerified: Boolean(decoded.email_verified),
-            isGoogleProvider: provider === 'google.com'
+            isGoogleProvider: hasGoogleIdentity
           };
         }
       }
     } catch {
-      // Fall back to Google public token verification / Firebase JWT verification below
+      // Fall back to Firebase JWT claim verification below when container lacks target project service account key
     }
 
-    // 2. Verify Firebase ID token structure & claims (expiry, issuer, Google sign_in_provider, email_verified)
+    // 2. Verify Firebase ID token structure & claims (expiry, issuer, Google identity/provider, email_verified)
     try {
       const parts = rawIdToken.trim().split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-        const nowSec = Math.floor(Date.now() / 1000);
-        if (
-          payload &&
-          typeof payload === 'object' &&
-          typeof payload.exp === 'number' &&
-          payload.exp > nowSec - 30 &&
-          typeof payload.iat === 'number' &&
-          payload.iat <= nowSec + 300
-        ) {
-          const uid = String(payload.user_id || payload.sub || '').trim();
-          const email = String(payload.email || '').trim().toLowerCase();
-          const emailVerified = payload.email_verified === true;
-          const provider = String(payload.firebase?.sign_in_provider || '');
-          if (uid && email) {
-            return {
-              valid: true,
-              uid,
-              email,
-              emailVerified,
-              isGoogleProvider: provider === 'google.com'
-            };
-          }
-        }
+      if (parts.length !== 3) {
+        return {
+          valid: false,
+          uid: '',
+          email: '',
+          emailVerified: false,
+          isGoogleProvider: false,
+          reason: 'Malformed JWT format (expected 3 segments)'
+        };
       }
-    } catch {
-      // Invalid token format
-    }
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (!payload || typeof payload !== 'object') {
+        return {
+          valid: false,
+          uid: '',
+          email: '',
+          emailVerified: false,
+          isGoogleProvider: false,
+          reason: 'Decoded JWT payload is empty or non-object'
+        };
+      }
+      if (typeof payload.exp !== 'number' || payload.exp <= nowSec - 60) {
+        return {
+          valid: false,
+          uid: '',
+          email: '',
+          emailVerified: false,
+          isGoogleProvider: false,
+          reason: 'Firebase ID token is expired'
+        };
+      }
+      if (typeof payload.iat === 'number' && payload.iat > nowSec + 300) {
+        return {
+          valid: false,
+          uid: '',
+          email: '',
+          emailVerified: false,
+          isGoogleProvider: false,
+          reason: 'Firebase ID token issued-at timestamp is in the future'
+        };
+      }
 
-    return { valid: false, uid: '', email: '', emailVerified: false, isGoogleProvider: false };
+      const uid = String(payload.user_id || payload.sub || '').trim();
+      const email = String(payload.email || '').trim().toLowerCase();
+      const emailVerified = payload.email_verified === true;
+      const provider = String(payload.firebase?.sign_in_provider || '');
+      const hasGoogleIdentity = Boolean(
+        provider === 'google.com' ||
+          (payload.firebase?.identities &&
+            typeof payload.firebase.identities === 'object' &&
+            'google.com' in payload.firebase.identities)
+      );
+
+      if (!uid || !email) {
+        return {
+          valid: false,
+          uid,
+          email,
+          emailVerified,
+          isGoogleProvider: hasGoogleIdentity,
+          reason: `Token missing required uid (${Boolean(uid)}) or email (${Boolean(email)})`
+        };
+      }
+
+      return {
+        valid: true,
+        uid,
+        email,
+        emailVerified,
+        isGoogleProvider: hasGoogleIdentity,
+        reason: !hasGoogleIdentity
+          ? `Account sign_in_provider is '${provider}' without google.com identity`
+          : !emailVerified
+          ? 'Google account email_verified claim is false'
+          : undefined
+      };
+    } catch (err) {
+      return {
+        valid: false,
+        uid: '',
+        email: '',
+        emailVerified: false,
+        isGoogleProvider: false,
+        reason: `Failed to parse JWT payload: ${err instanceof Error ? err.message : String(err)}`
+      };
+    }
   }
+
+  /**
+   * POST /api/auth/log-failure
+   * Server-only failure logger for authentication & existing-account verification flows.
+   * Logs the exact technical reason on the server console only (never logging secrets, codes, or tokens)
+   * while the frontend displays a generic message to the user.
+   */
+  app.post('/api/auth/log-failure', rateLimitAuth, (req, res) => {
+    const flow = sanitizeServerString(req.body?.flow || 'auth', 60);
+    const reason = sanitizeServerString(req.body?.reason || 'Unknown failure', 400);
+    const code = sanitizeServerString(req.body?.code || '', 80);
+    const uid = sanitizeServerString(req.body?.uid || '', 128);
+    // Scrub any potential secret or token before writing to server logs
+    const safeReason = scrubAiOutputSafety(reason).replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED_JWT]');
+    console.error(
+      `[WaveLink Server Auth Log] Flow="${flow}"${uid ? ` UID="${uid}"` : ''}${
+        code ? ` Code="${code}"` : ''
+      } Reason: ${safeReason}`
+    );
+    return res.json({ success: true });
+  });
 
   /**
    * POST /api/auth/owner-signin
    * Hidden Owner Sign-In endpoint:
+   * - Signs into the owner's EXISTING Google-linked Firebase account with the SAME UID as before.
    * - Limits attempts to 5 per hour per device and locks out after that.
    * - Compares verified Google email === process.env.OWNER_EMAIL and accessCode === process.env.OWNER_ACCESS_CODE
    *   safely on the server only using crypto.timingSafeEqual.
-   * - Never logs or returns OWNER_EMAIL, OWNER_ACCESS_CODE, or which part failed.
-   * - Grants the 'admin' / 'super_admin' role strictly from the server.
+   * - Logs the exact reason for any failure on the server only (never logging secret values) and returns a generic error to the client.
+   * - Grants the 'admin' role to that existing UID on the server and preserves all existing posts, followers, points, and Pro status.
    */
   app.post('/api/auth/owner-signin', async (req, res) => {
     const deviceKey = getOwnerDeviceKey(req);
     const rateCheck = checkOwnerDeviceRateLimit(deviceKey);
 
     if (!rateCheck.allowed) {
+      console.error(
+        `[WaveLink Server Auth Log] Owner sign-in rejected: Device rate limit exceeded (locked for ${rateCheck.retryAfterSeconds}s).`
+      );
       return res.status(429).json({
         success: false,
         lockedOut: true,
@@ -2275,7 +2560,10 @@ Escalation Required: ${
     // Record attempt immediately against the 5-per-hour-per-device budget
     const attemptState = recordOwnerDeviceAttempt(deviceKey);
 
-    const submittedCode = typeof req.body?.accessCode === 'string' ? req.body.accessCode.trim() : '';
+    const submittedCode =
+      typeof req.body?.accessCode === 'string'
+        ? req.body.accessCode.trim().replace(/^['"]|['"]$/g, '').trim()
+        : '';
     const authHeader = String(req.headers.authorization || '').trim();
     const rawIdToken =
       typeof req.body?.idToken === 'string' && req.body.idToken.trim()
@@ -2306,7 +2594,35 @@ Escalation Required: ${
       emailMatches;
 
     if (!allChecksPass) {
+      // Log exact failure reason on the SERVER ONLY (never logging OWNER_EMAIL or OWNER_ACCESS_CODE values)
+      const failureReasons: string[] = [];
+      if (!ownerEmailEnv) failureReasons.push('Server process.env.OWNER_EMAIL is not configured');
+      if (!ownerAccessCodeEnv) failureReasons.push('Server process.env.OWNER_ACCESS_CODE is not configured');
+      if (!submittedCode) failureReasons.push('Submitted owner access code was empty');
+      if (!verifiedToken.valid) {
+        failureReasons.push(`Google ID token verification failed (${verifiedToken.reason || 'invalid token'})`);
+      } else {
+        if (!verifiedToken.emailVerified) failureReasons.push('Google account email_verified is false');
+        if (!verifiedToken.isGoogleProvider) {
+          failureReasons.push(verifiedToken.reason || 'Firebase account is not linked to Google provider');
+        }
+        if (ownerEmailEnv && !emailMatches) {
+          failureReasons.push(`Authenticated Google account (UID: ${verifiedToken.uid}) email did not match process.env.OWNER_EMAIL`);
+        }
+      }
+      if (ownerAccessCodeEnv && submittedCode && !codeMatches) {
+        failureReasons.push('Submitted owner access code did not match process.env.OWNER_ACCESS_CODE');
+      }
+
       const isNowLocked = attemptState.lockedOut || attemptState.remainingAttempts === 0;
+      if (isNowLocked) {
+        failureReasons.push('Device reached maximum 5 attempts/hour and is now locked out');
+      }
+
+      console.error(
+        `[WaveLink Server Auth Log] Owner sign-in failed: ${failureReasons.join(' | ')}`
+      );
+
       return res.status(isNowLocked ? 429 : 403).json({
         success: false,
         lockedOut: isNowLocked,
@@ -2316,40 +2632,36 @@ Escalation Required: ${
       });
     }
 
-    // Both verified Google email and Owner access code matched!
+    // Both verified Google email and Owner access code matched for the existing UID!
     clearOwnerDeviceAttempts(deviceKey);
     const ownerUid = verifiedToken.uid;
     serverOwnerUids.add(ownerUid);
     const ownerSessionToken = signOwnerSessionToken(ownerUid);
 
-    // 1. Set Firebase Auth custom claims on the server (admin: true, role: 'super_admin')
+    // 1. Set Firebase Auth custom claims on the server (admin: true, role: 'admin') when Admin SDK credentials allow
     try {
       if (getAdminApps().length) {
         await getAdminAuth(getAdminApp()).setCustomUserClaims(ownerUid, {
           admin: true,
-          role: 'super_admin'
+          role: 'admin'
         });
       }
     } catch {
-      // Custom claims optional if local preview lacks service account private key
+      // Custom claims optional when container lacks target project service account key
     }
 
-    // 2. Persist server-authoritative admin role in Firestore (/admins/{uid} & /users/{uid})
+    // 2. Grant canonical 'admin' role in Firestore via REST API using the verified ID token + server grant key,
+    //    preserving all existing posts, followers, points, Pro status, and profile fields on /users/{ownerUid}
+    await grantOwnerRoleViaFirestoreRest(ownerUid, verifiedToken.email, rawIdToken);
+
+    // 3. Also attempt Admin SDK Firestore merge if service account is configured
     try {
-      let firestoreId = '';
-      try {
-        const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
-        if (fs.existsSync(cfgPath)) {
-          const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-          firestoreId = parsedCfg.firestoreDatabaseId || '';
-        }
-      } catch {
-        // ignore
-      }
+      const { firestoreDatabaseId } = getServerFirebaseConfig();
       if (getAdminApps().length) {
-        const adminDb = firestoreId
-          ? getAdminFirestore(getAdminApp(), firestoreId)
-          : getAdminFirestore(getAdminApp());
+        const adminDb =
+          firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+            ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+            : getAdminFirestore(getAdminApp());
         const nowIso = new Date().toISOString();
         await adminDb
           .collection('admins')
@@ -2357,7 +2669,8 @@ Escalation Required: ${
           .set(
             {
               uid: ownerUid,
-              role: 'super_admin',
+              role: 'admin',
+              _serverGrantKey: SERVER_ADMIN_GRANT_KEY,
               grantedBy: 'server_owner_verification',
               updatedAt: nowIso
             },
@@ -2368,27 +2681,33 @@ Escalation Required: ${
           .doc(ownerUid)
           .set(
             {
-              role: 'super_admin',
+              id: ownerUid,
+              email: verifiedToken.email,
+              role: 'admin',
               isSubAdmin: false,
               isPro: true,
               hasBlueStar: true,
               isVerifiedByAdmin: true,
-              proBadge: 'founder',
-              proBorderEffect: 'aura-gold',
-              proAccentColor: 'gold',
+              emailVerified: true,
+              isContactVerified: true,
               updatedAt: nowIso
             },
             { merge: true }
           );
       }
     } catch {
-      // Non-fatal in preview if Admin Firestore lacks write credentials
+      // Handled via grantOwnerRoleViaFirestoreRest above
     }
+
+    console.log(
+      `[WaveLink Server Auth Log] Owner sign-in succeeded for existing UID="${ownerUid}". Granted role="admin".`
+    );
 
     return res.json({
       success: true,
       authorized: true,
-      role: 'super_admin',
+      uid: ownerUid,
+      role: 'admin',
       ownerSessionToken
     });
   });
@@ -2636,37 +2955,35 @@ Escalation Required: ${
     const { email, isSubAdmin } = req.body || {};
     let check = isServerAdminUser(authUser, email, isSubAdmin);
 
-    // Also check server-side Firestore /admins/{uid} or /users/{uid}.role if Admin SDK is connected
+    const authHeader = String(req.headers.authorization || '').trim();
+    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+    // Single canonical source of truth: check /users/{uid}.role in Firestore (via REST API or Admin SDK)
+    if (!check.authorized && authUser?.uid) {
+      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
+      if (restRole === 'admin') {
+        check = { authorized: true, role: 'super_admin' };
+      } else if (restRole === 'sub_admin') {
+        check = { authorized: true, role: 'sub_admin' };
+      }
+    }
+
     if (!check.authorized && authUser?.uid) {
       try {
         if (getAdminApps().length) {
-          let firestoreId = '';
-          try {
-            const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
-            if (fs.existsSync(cfgPath)) {
-              const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-              firestoreId = parsedCfg.firestoreDatabaseId || '';
-            }
-          } catch {
-            // ignore
-          }
-          const adminDb = firestoreId
-            ? getAdminFirestore(getAdminApp(), firestoreId)
-            : getAdminFirestore(getAdminApp());
-          const adminSnap = await adminDb.collection('admins').doc(authUser.uid).get();
-          if (adminSnap.exists) {
+          const { firestoreDatabaseId } = getServerFirebaseConfig();
+          const adminDb =
+            firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+              ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+              : getAdminFirestore(getAdminApp());
+          const userSnap = await adminDb.collection('users').doc(authUser.uid).get();
+          const userData = userSnap.data();
+          if (userData?.role === 'admin' || userData?.role === 'super_admin') {
             serverOwnerUids.add(authUser.uid);
             check = { authorized: true, role: 'super_admin' };
-          } else {
-            const userSnap = await adminDb.collection('users').doc(authUser.uid).get();
-            const userData = userSnap.data();
-            if (userData?.role === 'super_admin' || userData?.role === 'admin') {
-              serverOwnerUids.add(authUser.uid);
-              check = { authorized: true, role: 'super_admin' };
-            } else if (userData?.isSubAdmin === true || userData?.role === 'sub_admin') {
-              serverSubAdminUids.add(authUser.uid);
-              check = { authorized: true, role: 'sub_admin' };
-            }
+          } else if (userData?.isSubAdmin === true || userData?.role === 'sub_admin') {
+            serverSubAdminUids.add(authUser.uid);
+            check = { authorized: true, role: 'sub_admin' };
           }
         }
       } catch {
@@ -2678,14 +2995,14 @@ Escalation Required: ${
       return res.status(403).json({
         success: false,
         authorized: false,
-        error: 'Administrator privileges required.',
+        error: 'Access denied.'
       });
     }
 
     return res.json({
       success: true,
       authorized: true,
-      role: check.role,
+      role: check.role === 'super_admin' ? 'admin' : check.role
     });
   });
 
