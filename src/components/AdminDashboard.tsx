@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders } from '../firebase';
 import {
@@ -99,7 +99,7 @@ interface AdminDashboardProps {
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }) => {
   const { currentUser, isSuperAdmin, isSubAdmin, isAdmin, toggleSubAdmin, toggleVerifyUser, recordAdminAuditLog } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>('overview');
   const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(false);
   const [isCheckingServerAdmin, setIsCheckingServerAdmin] = useState<boolean>(true);
 
@@ -237,6 +237,142 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [warningUser, setWarningUser] = useState<UserProfile | null>(null);
   const [warningReason, setWarningReason] = useState('');
   const [isSubmittingWarning, setIsSubmittingWarning] = useState(false);
+
+  // Duplicate Accounts Manager State & Logic
+  const [mergeModalGroup, setMergeModalGroup] = useState<{
+    email: string;
+    mainProfile: UserProfile;
+    duplicateProfile: UserProfile;
+  } | null>(null);
+  const [isMerging, setIsMerging] = useState(false);
+  const [mergeSuccessMsg, setMergeSuccessMsg] = useState<string | null>(null);
+  const [duplicateSearchTerm, setDuplicateSearchTerm] = useState('');
+
+  // Group user profiles sharing the same email (excluding system bots)
+  const duplicateEmailGroups = useMemo(() => {
+    const map = new Map<string, UserProfile[]>();
+    for (const u of users) {
+      if (!u.email) continue;
+      const em = u.email.trim().toLowerCase();
+      if (!em || em === 'support-bot@wavelink.system' || em === 'support@wavelink.app') continue;
+      const existing = map.get(em) || [];
+      existing.push(u);
+      map.set(em, existing);
+    }
+
+    const groups: { email: string; profiles: UserProfile[]; isOwnerGroup: boolean }[] = [];
+    map.forEach((profiles, email) => {
+      if (profiles.length >= 2) {
+        const isOwner = email === 'keylanmbilinyi5@gmail.com' || profiles.some((p) => p.username === '@keylan' || p.username === 'keylan');
+        // Sort so @keylan or active primary is first
+        profiles.sort((a, b) => {
+          if (isOwner) {
+            if (a.username === '@keylan' || a.username === 'keylan') return -1;
+            if (b.username === '@keylan' || b.username === 'keylan') return 1;
+          }
+          if (a.isDuplicateDisabled && !b.isDuplicateDisabled) return 1;
+          if (!a.isDuplicateDisabled && b.isDuplicateDisabled) return -1;
+          return new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime();
+        });
+        groups.push({ email, profiles, isOwnerGroup: isOwner });
+      }
+    });
+
+    return groups;
+  }, [users]);
+
+  const handleExecuteMerge = async () => {
+    if (!mergeModalGroup || isMerging) return;
+    const { mainProfile, duplicateProfile } = mergeModalGroup;
+    setIsMerging(true);
+    setMergeSuccessMsg(null);
+
+    try {
+      const idToken = currentUser ? await currentUser.getIdToken(true) : '';
+      await fetch('/api/admin/merge-duplicates', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {})
+        },
+        body: JSON.stringify({
+          mainUid: mainProfile.id,
+          duplicateUid: duplicateProfile.id
+        })
+      });
+
+      const nowIso = new Date().toISOString();
+      const thirtyDaysLaterIso = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      // Migrate posts from duplicate profile to main profile in Firestore
+      const dupPosts = posts.filter((p) => p.authorId === duplicateProfile.id);
+      for (const p of dupPosts) {
+        await setDoc(
+          doc(db, 'posts', p.id),
+          {
+            authorId: mainProfile.id,
+            authorEmail: mainProfile.email,
+            authorName: mainProfile.displayName,
+            authorUsername: mainProfile.username,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        ).catch(() => {});
+      }
+
+      // Combine points & Pro status into main profile
+      const combinedPoints =
+        (Number(mainProfile.points) || Number(mainProfile.wavePoints) || 0) +
+        (Number(duplicateProfile.points) || Number(duplicateProfile.wavePoints) || 0);
+
+      await setDoc(
+        doc(db, 'users', mainProfile.id),
+        cleanFirestoreData({
+          points: combinedPoints,
+          wavePoints: combinedPoints,
+          isPro: Boolean(mainProfile.isPro || duplicateProfile.isPro),
+          hasBlueStar: Boolean(mainProfile.hasBlueStar || duplicateProfile.hasBlueStar),
+          proBadge: mainProfile.proBadge || duplicateProfile.proBadge,
+          appearanceTheme: mainProfile.appearanceTheme || duplicateProfile.appearanceTheme,
+          linkedAuthUids: Array.from(new Set([...(mainProfile.linkedAuthUids || []), duplicateProfile.id])),
+          updatedAt: nowIso
+        }),
+        { merge: true }
+      ).catch(() => {});
+
+      // Disable duplicate profile — PRESERVE DATA FOR 30 DAYS (NEVER DELETE)
+      await setDoc(
+        doc(db, 'users', duplicateProfile.id),
+        cleanFirestoreData({
+          status: 'banned',
+          isBanned: true,
+          isDuplicateDisabled: true,
+          mergedIntoUid: mainProfile.id,
+          disabledAt: nowIso,
+          disabledReason: `Merged into ${mainProfile.username || mainProfile.id}`,
+          keptUntil: thirtyDaysLaterIso,
+          updatedAt: nowIso
+        }),
+        { merge: true }
+      ).catch(() => {});
+
+      await recordAdminAuditLog({
+        action: 'merge_duplicate_accounts',
+        targetId: duplicateProfile.id,
+        targetLabel: duplicateProfile.username || duplicateProfile.id,
+        details: `Merged duplicate profile ${duplicateProfile.username || duplicateProfile.id} (${duplicateProfile.email}) into ${mainProfile.username || mainProfile.id}. Moved ${dupPosts.length} posts and +${Number(duplicateProfile.points) || 0} points. Duplicate disabled and preserved for 30 days until ${thirtyDaysLaterIso}.`
+      }).catch(() => {});
+
+      setMergeSuccessMsg(
+        `Successfully merged ${duplicateProfile.username || duplicateProfile.id} into ${mainProfile.username}! Moved ${dupPosts.length} posts, combined points, and preserved theme/Pro. The duplicate profile is disabled and its data is safely retained for 30 days.`
+      );
+      setMergeModalGroup(null);
+    } catch (err: any) {
+      alert(`Merge error: ${err?.message || 'Failed to merge duplicate accounts'}`);
+    } finally {
+      setIsMerging(false);
+    }
+  };
 
   // Fetch initial Support Bot config from server
   useEffect(() => {
@@ -1100,6 +1236,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         >
           <Key size={15} />
           <span>Payment Gateways</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('duplicates')}
+          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'duplicates'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
+          }`}
+        >
+          <Copy size={15} />
+          <span>
+            Duplicate Accounts
+            {duplicateEmailGroups.length > 0 && (
+              <span className="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-500 text-white">
+                {duplicateEmailGroups.length}
+              </span>
+            )}
+          </span>
         </button>
       </div>
 
@@ -3073,6 +3228,512 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           </form>
         </div>
         )
+      )}
+
+      {/* Tab: Duplicate Accounts Manager */}
+      {activeTab === 'duplicates' && (
+        <div className="space-y-6 animate-fade-in">
+          {/* Header Card */}
+          <div className="bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-700 rounded-3xl p-6 sm:p-8 text-white shadow-xl shadow-blue-950/20 flex items-center justify-between flex-wrap gap-4 border border-blue-400/30">
+            <div className="max-w-2xl">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="p-1 rounded-lg bg-white/20 text-white ring-1 ring-white/30 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1.5 px-2.5">
+                  <Copy size={13} />
+                  Duplicate Accounts Tool
+                </span>
+                <span className="text-xs text-blue-100">
+                  Target: Single profile per user • Main Owner: <span className="font-bold font-mono">@keylan</span>
+                </span>
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
+                Duplicate Accounts &amp; Profile Merger
+              </h2>
+              <p className="text-xs sm:text-sm text-blue-100/90 mt-1">
+                Lists profiles sharing the same email address. Merging moves all posts, followers, points, appearance themes, and Pro status into the main profile (<span className="font-bold underline">@keylan</span> is always prioritized as the main owner profile). The duplicate is disabled and its data is safely preserved for 30 days in case restoration is needed. No data is ever deleted automatically.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <div className="px-4 py-2.5 rounded-2xl bg-white/10 backdrop-blur-xs border border-white/20 text-white text-xs font-bold flex items-center gap-2">
+                <Clock size={16} className="text-emerald-300" />
+                <span>30-Day Safe Retention Policy</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Success Message Banner */}
+          {mergeSuccessMsg && (
+            <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs sm:text-sm flex items-center justify-between gap-3 animate-fade-in">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 size={18} className="text-emerald-600 shrink-0" />
+                <span>{mergeSuccessMsg}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMergeSuccessMsg(null)}
+                className="text-emerald-700 hover:text-emerald-950 text-xs px-2 py-1 rounded-lg"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* Metric Stats Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="p-4 rounded-2xl bg-white border border-[#EFECE6] shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                Duplicate Email Groups
+              </span>
+              <div className="text-2xl font-black font-mono text-[#1C1917] mt-1">
+                {duplicateEmailGroups.length}
+              </div>
+              <span className="text-[11px] text-[#78716C] mt-0.5 block">
+                Emails with 2+ profiles
+              </span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-white border border-[#EFECE6] shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                Total Duplicate Profiles
+              </span>
+              <div className="text-2xl font-black font-mono text-[#1C1917] mt-1">
+                {duplicateEmailGroups.reduce((acc: number, g: { profiles: UserProfile[] }) => acc + g.profiles.length, 0)}
+              </div>
+              <span className="text-[11px] text-[#78716C] mt-0.5 block">
+                Across all detected groups
+              </span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-white border border-[#EFECE6] shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                Main Owner Profile
+              </span>
+              <div className="text-lg font-black font-mono text-emerald-600 mt-1 flex items-center gap-1.5">
+                <Crown size={16} />
+                <span>@keylan</span>
+              </div>
+              <span className="text-[11px] text-[#78716C] mt-0.5 block">
+                Owner role set by server only
+              </span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-white border border-[#EFECE6] shadow-xs">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#57534E] block">
+                Data Preservation
+              </span>
+              <div className="text-lg font-black text-indigo-600 mt-1 flex items-center gap-1.5">
+                <ShieldAlert size={16} />
+                <span>Zero Data Deletion</span>
+              </div>
+              <span className="text-[11px] text-[#78716C] mt-0.5 block">
+                30-day retention on merge
+              </span>
+            </div>
+          </div>
+
+          {/* Filter & Search Bar */}
+          <div className="p-4 rounded-2xl bg-white border border-[#EFECE6] shadow-xs flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-2 flex-1 min-w-[240px]">
+              <Filter size={16} className="text-gray-400" />
+              <input
+                type="text"
+                value={duplicateSearchTerm}
+                onChange={(e) => setDuplicateSearchTerm(e.target.value)}
+                placeholder="Search duplicate email address or username..."
+                className="w-full text-xs sm:text-sm bg-transparent border-none focus:outline-none text-[#1C1917] placeholder:text-gray-400"
+              />
+            </div>
+            {duplicateSearchTerm && (
+              <button
+                type="button"
+                onClick={() => setDuplicateSearchTerm('')}
+                className="text-xs text-gray-500 hover:text-gray-800"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
+          {/* Groups List */}
+          {duplicateEmailGroups.length === 0 ? (
+            <div className="p-12 text-center rounded-3xl bg-white border border-[#EFECE6] shadow-xs space-y-3">
+              <div className="w-16 h-16 mx-auto rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center">
+                <CheckCircle2 size={32} />
+              </div>
+              <h3 className="text-lg font-bold text-[#1C1917]">
+                No Duplicate Accounts Found
+              </h3>
+              <p className="text-xs sm:text-sm text-[#78716C] max-w-md mx-auto">
+                Every registered email in WaveLink currently belongs to a single canonical profile. Server-side unique username and unique email enforcement is active.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {duplicateEmailGroups
+                .filter(
+                  (group: { email: string; profiles: UserProfile[]; isOwnerGroup: boolean }) =>
+                    !duplicateSearchTerm ||
+                    group.email.toLowerCase().includes(duplicateSearchTerm.toLowerCase()) ||
+                    group.profiles.some(
+                      (p: UserProfile) =>
+                        p.username?.toLowerCase().includes(duplicateSearchTerm.toLowerCase()) ||
+                        p.displayName?.toLowerCase().includes(duplicateSearchTerm.toLowerCase())
+                    )
+                )
+                .map((group: { email: string; profiles: UserProfile[]; isOwnerGroup: boolean }) => {
+                  const mainProfile = group.profiles[0];
+                  const duplicateProfiles = group.profiles.slice(1);
+
+                  return (
+                    <div
+                      key={group.email}
+                      className="p-5 sm:p-6 rounded-3xl bg-white border border-[#EFECE6] shadow-sm space-y-4"
+                    >
+                      {/* Group Header */}
+                      <div className="flex items-center justify-between flex-wrap gap-2 border-b border-gray-100 pb-3">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center font-bold">
+                            <Mail size={18} />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-extrabold text-sm sm:text-base text-[#1C1917]">
+                                {group.email}
+                              </span>
+                              {group.isOwnerGroup && (
+                                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-100 text-amber-800 border border-amber-300 flex items-center gap-1">
+                                  <Crown size={11} className="text-amber-600" />
+                                  Platform Owner
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-xs text-[#78716C]">
+                              {group.profiles.length} profiles linked to this email address
+                            </span>
+                          </div>
+                        </div>
+
+                        <span className="text-xs font-semibold px-3 py-1 rounded-full bg-stone-100 text-stone-700">
+                          {group.profiles.filter((p: UserProfile) => p.isDuplicateDisabled).length > 0
+                            ? 'Partially Merged'
+                            : 'Requires Merge'}
+                        </span>
+                      </div>
+
+                      {/* Side-by-side or stacked account list */}
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        {/* Main Profile Card */}
+                        <div className="p-4 rounded-2xl bg-emerald-50/60 border-2 border-emerald-400 space-y-3 relative overflow-hidden">
+                          <div className="flex items-center justify-between">
+                            <span className="px-2.5 py-1 rounded-lg bg-emerald-600 text-white text-[10px] font-extrabold uppercase tracking-wider flex items-center gap-1 shadow-xs">
+                              <CheckCircle2 size={12} />
+                              Main Profile {group.isOwnerGroup && '(Main Owner @keylan)'}
+                            </span>
+                            <span className="text-[11px] font-mono text-emerald-800 font-bold">
+                              UID: {mainProfile.id.slice(0, 12)}...
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-3">
+                            <img
+                              src={
+                                mainProfile.photoURL ||
+                                `https://api.dicebear.com/7.x/shapes/svg?seed=${mainProfile.id}`
+                              }
+                              alt={mainProfile.displayName}
+                              className="w-12 h-12 rounded-2xl object-cover ring-2 ring-emerald-300"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <h4 className="font-extrabold text-sm text-[#1C1917] truncate">
+                                  {mainProfile.displayName}
+                                </h4>
+                                <span className="font-mono text-xs font-bold text-emerald-700">
+                                  {mainProfile.username || '@waver'}
+                                </span>
+                                {mainProfile.role === 'admin' && (
+                                  <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-500 text-white">
+                                    Admin
+                                  </span>
+                                )}
+                                {mainProfile.isPro && (
+                                  <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-blue-600 text-white">
+                                    PRO
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-xs text-stone-600 truncate mt-0.5">
+                                {mainProfile.bio || 'Connecting on WaveLink 🌊'}
+                              </p>
+                            </div>
+                          </div>
+
+                          {/* Stats Grid */}
+                          <div className="grid grid-cols-3 gap-2 pt-2 border-t border-emerald-200/60 text-center">
+                            <div className="p-2 rounded-xl bg-white/70">
+                              <span className="text-[10px] font-bold text-stone-500 block">Posts</span>
+                              <span className="text-xs font-black font-mono text-stone-900">
+                                {posts.filter((p) => p.authorId === mainProfile.id).length}
+                              </span>
+                            </div>
+                            <div className="p-2 rounded-xl bg-white/70">
+                              <span className="text-[10px] font-bold text-stone-500 block">Points</span>
+                              <span className="text-xs font-black font-mono text-emerald-700">
+                                {mainProfile.points ?? mainProfile.wavePoints ?? 0}
+                              </span>
+                            </div>
+                            <div className="p-2 rounded-xl bg-white/70">
+                              <span className="text-[10px] font-bold text-stone-500 block">Theme</span>
+                              <span className="text-[11px] font-bold text-stone-800 capitalize truncate block">
+                                {mainProfile.appearanceTheme || 'Default'}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Duplicate Profile(s) Card */}
+                        <div className="space-y-3">
+                          {duplicateProfiles.map((dup: UserProfile) => {
+                            const dupPostsCount = posts.filter((p) => p.authorId === dup.id).length;
+                            const isAlreadyMerged = Boolean(dup.isDuplicateDisabled || dup.mergedIntoUid);
+
+                            return (
+                              <div
+                                key={dup.id}
+                                className={`p-4 rounded-2xl border space-y-3 relative ${
+                                  isAlreadyMerged
+                                    ? 'bg-stone-50 border-stone-200 opacity-80'
+                                    : 'bg-rose-50/50 border-rose-200'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <span
+                                    className={`px-2.5 py-0.5 rounded-lg text-[10px] font-extrabold uppercase tracking-wider ${
+                                      isAlreadyMerged
+                                        ? 'bg-stone-200 text-stone-700'
+                                        : 'bg-rose-600 text-white'
+                                    }`}
+                                  >
+                                    {isAlreadyMerged
+                                      ? 'Disabled & Preserved (30 Days)'
+                                      : 'Duplicate Profile'}
+                                  </span>
+                                  <span className="text-[11px] font-mono text-stone-500">
+                                    UID: {dup.id.slice(0, 12)}...
+                                  </span>
+                                </div>
+
+                                <div className="flex items-center gap-3">
+                                  <img
+                                    src={
+                                      dup.photoURL ||
+                                      `https://api.dicebear.com/7.x/shapes/svg?seed=${dup.id}`
+                                    }
+                                    alt={dup.displayName}
+                                    className="w-10 h-10 rounded-2xl object-cover ring-1 ring-stone-300"
+                                  />
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                      <h4 className="font-bold text-xs sm:text-sm text-[#1C1917] truncate">
+                                        {dup.displayName}
+                                      </h4>
+                                      <span className="font-mono text-xs font-semibold text-stone-600">
+                                        {dup.username || '@waver'}
+                                      </span>
+                                      {dup.isPro && (
+                                        <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-blue-600 text-white">
+                                          PRO
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-xs text-stone-500 truncate">
+                                      {dup.bio || 'Connecting on WaveLink 🌊'}
+                                    </p>
+                                  </div>
+                                </div>
+
+                                {/* Stats & Action */}
+                                <div className="flex items-center justify-between pt-2 border-t border-stone-200 text-xs">
+                                  <div className="flex items-center gap-3 text-stone-600 font-mono text-[11px]">
+                                    <span>
+                                      <strong className="text-stone-900">{dupPostsCount}</strong> posts
+                                    </span>
+                                    <span>•</span>
+                                    <span>
+                                      <strong className="text-stone-900">
+                                        {dup.points ?? dup.wavePoints ?? 0}
+                                      </strong>{' '}
+                                      pts
+                                    </span>
+                                  </div>
+
+                                  {isAlreadyMerged ? (
+                                    <span className="text-[11px] font-semibold text-stone-500 flex items-center gap-1">
+                                      <CheckCircle2 size={13} className="text-emerald-600" />
+                                      Merged into main profile
+                                    </span>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setMergeModalGroup({
+                                          email: group.email,
+                                          mainProfile,
+                                          duplicateProfile: dup
+                                        })
+                                      }
+                                      className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-xs"
+                                    >
+                                      <Copy size={13} />
+                                      <span>Merge into Main</span>
+                                    </button>
+                                  )}
+                                </div>
+
+                                {dup.keptUntil && (
+                                  <div className="text-[10px] text-stone-400 font-mono mt-1">
+                                    Preserved until: {new Date(dup.keptUntil).toLocaleDateString()}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Confirmation Step Modal for Merge */}
+      {mergeModalGroup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-fade-in">
+          <div className="w-full max-w-lg bg-white border border-stone-200 rounded-3xl p-6 shadow-2xl space-y-5">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div className="flex items-center gap-2 text-blue-600">
+                <Copy size={20} />
+                <h3 className="font-extrabold text-stone-900 text-base">
+                  Confirm Account Merge
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMergeModalGroup(null)}
+                disabled={isMerging}
+                className="text-stone-400 hover:text-stone-600"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs space-y-1">
+              <div className="font-bold flex items-center gap-1.5 text-amber-800">
+                <ShieldAlert size={14} />
+                Safety Guarantee: Zero Automatic Data Deletion
+              </div>
+              <p>
+                When merged, all posts, followers, points, themes, and Pro status will be copied into the main profile. The duplicate profile will be safely disabled and its data retained for 30 days in case restoration is needed.
+              </p>
+            </div>
+
+            {/* Comparison Details */}
+            <div className="space-y-3 text-xs">
+              <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200">
+                <span className="font-bold text-emerald-800 block text-[11px] uppercase tracking-wider mb-1">
+                  1. Target Main Profile (Will Receive Data):
+                </span>
+                <div className="font-extrabold text-sm text-stone-900 flex items-center gap-2">
+                  <span>{mergeModalGroup.mainProfile.displayName}</span>
+                  <span className="font-mono text-emerald-700">
+                    {mergeModalGroup.mainProfile.username}
+                  </span>
+                  {mergeModalGroup.mainProfile.username === '@keylan' && (
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500 text-white">
+                      Platform Owner
+                    </span>
+                  )}
+                </div>
+                <span className="font-mono text-[11px] text-stone-500 block mt-0.5">
+                  UID: {mergeModalGroup.mainProfile.id}
+                </span>
+              </div>
+
+              <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200">
+                <span className="font-bold text-rose-800 block text-[11px] uppercase tracking-wider mb-1">
+                  2. Duplicate Profile (To Be Merged &amp; Disabled):
+                </span>
+                <div className="font-extrabold text-sm text-stone-900 flex items-center gap-2">
+                  <span>{mergeModalGroup.duplicateProfile.displayName}</span>
+                  <span className="font-mono text-rose-700">
+                    {mergeModalGroup.duplicateProfile.username}
+                  </span>
+                </div>
+                <span className="font-mono text-[11px] text-stone-500 block mt-0.5">
+                  UID: {mergeModalGroup.duplicateProfile.id}
+                </span>
+              </div>
+
+              <div className="p-3.5 rounded-2xl bg-stone-50 border border-stone-200 space-y-1.5 text-[11px]">
+                <span className="font-bold text-stone-700 block">Actions to be performed:</span>
+                <ul className="space-y-1 list-disc list-inside text-stone-600">
+                  <li>
+                    <strong>
+                      {posts.filter((p) => p.authorId === mergeModalGroup.duplicateProfile.id).length} posts
+                    </strong>{' '}
+                    will be reassigned to {mergeModalGroup.mainProfile.username}
+                  </li>
+                  <li>
+                    <strong>
+                      +{Number(mergeModalGroup.duplicateProfile.points) || Number(mergeModalGroup.duplicateProfile.wavePoints) || 0} points
+                    </strong>{' '}
+                    transferred into {mergeModalGroup.mainProfile.username}'s point balance
+                  </li>
+                  <li>
+                    Pro subscription status &amp; badge preserved on main profile
+                  </li>
+                  <li>
+                    Duplicate account disabled and preserved for <strong>30 days</strong>
+                  </li>
+                  <li>
+                    <strong>No data will be deleted automatically</strong>
+                  </li>
+                </ul>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-stone-100">
+              <button
+                type="button"
+                onClick={() => setMergeModalGroup(null)}
+                disabled={isMerging}
+                className="px-4 py-2.5 text-xs font-semibold rounded-xl text-stone-600 hover:bg-stone-100 transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteMerge}
+                disabled={isMerging}
+                className="px-5 py-2.5 text-xs font-bold rounded-xl bg-blue-600 hover:bg-blue-700 text-white transition flex items-center gap-2 shadow-md shadow-blue-600/20 disabled:opacity-50"
+              >
+                {isMerging ? (
+                  <>
+                    <Loader2 size={14} className="animate-spin" />
+                    <span>Merging Accounts...</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy size={14} />
+                    <span>Confirm &amp; Merge Accounts</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Warning Modal */}

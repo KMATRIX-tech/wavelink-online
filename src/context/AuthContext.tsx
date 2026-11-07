@@ -447,20 +447,77 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const nowIso = new Date().toISOString();
 
     try {
-      const snap = await getDoc(userDocRef);
-      const emailPrefix = user.email ? user.email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '') : 'waver';
+      const cleanUserEmail = (user.email || '').trim().toLowerCase();
+      const isOwner =
+        cleanUserEmail === 'keylanmbilinyi5@gmail.com' ||
+        Boolean(import.meta.env.VITE_OWNER_EMAIL && cleanUserEmail === (import.meta.env.VITE_OWNER_EMAIL || '').trim().toLowerCase());
 
-      if (!snap.exists()) {
+      // 1. Look up existing user document by Firebase UID first
+      let resolvedData: UserProfile | null = null;
+      let resolvedDocId = user.uid;
+      const snap = await getDoc(userDocRef);
+
+      if (snap.exists()) {
+        resolvedData = snap.data() as UserProfile;
+        // If this document was previously merged into another primary account, use the primary account
+        if (resolvedData.mergedIntoUid) {
+          try {
+            const primarySnap = await getDoc(doc(db, 'users', resolvedData.mergedIntoUid));
+            if (primarySnap.exists()) {
+              resolvedData = primarySnap.data() as UserProfile;
+              resolvedDocId = primarySnap.id;
+            }
+          } catch {
+            // fallback to current snapshot data
+          }
+        }
+      }
+
+      // 2. For the owner email, always open the existing profile with the username keylan (@keylan)
+      if (isOwner) {
+        try {
+          const qKeylan = query(collection(db, 'users'), where('username', 'in', ['@keylan', 'keylan']));
+          const keylanSnap = await getDocs(qKeylan);
+          if (!keylanSnap.empty) {
+            const mainOwnerDoc = keylanSnap.docs[0];
+            resolvedData = mainOwnerDoc.data() as UserProfile;
+            resolvedDocId = mainOwnerDoc.id;
+          }
+        } catch (ownerLookupErr) {
+          console.warn('Owner profile lookup notice:', ownerLookupErr);
+        }
+      }
+
+      // 3. If no document was found by UID, look up by verified email and ALWAYS reuse it (never create a duplicate)
+      if (!resolvedData && cleanUserEmail) {
+        try {
+          const qEmail = query(collection(db, 'users'), where('email', '==', cleanUserEmail));
+          const emailSnap = await getDocs(qEmail);
+          if (!emailSnap.empty) {
+            // Prefer an active/unmerged profile if available
+            const bestMatch = emailSnap.docs.find((d) => !d.data()?.isDuplicateDisabled) || emailSnap.docs[0];
+            resolvedData = bestMatch.data() as UserProfile;
+            resolvedDocId = bestMatch.id;
+          }
+        } catch (emailLookupErr) {
+          console.warn('Existing email lookup notice:', emailLookupErr);
+        }
+      }
+
+      const emailPrefix = cleanUserEmail ? cleanUserEmail.split('@')[0].replace(/[^a-z0-9_]/g, '') : 'waver';
+
+      if (!resolvedData) {
+        // No existing profile found for UID or verified email: initialize single primary profile
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, null);
-        const initialRole = verifiedRoleOverride === 'admin' ? 'admin' : verifiedRoleOverride === 'sub_admin' ? 'sub_admin' : 'user';
+        const initialRole = isOwner || verifiedRoleOverride === 'admin' ? 'admin' : verifiedRoleOverride === 'sub_admin' ? 'sub_admin' : 'user';
         const isInitialAdmin = initialRole === 'admin';
         const initialProfile: UserProfile = {
           id: user.uid,
-          email: user.email || '',
-          username: customUsername || `@${emailPrefix}`,
-          displayName: customName || user.displayName || user.email?.split('@')[0] || 'Waver',
+          email: cleanUserEmail,
+          username: isOwner ? '@keylan' : customUsername || `@${emailPrefix}`,
+          displayName: isOwner ? 'Keylan' : customName || user.displayName || emailPrefix || 'Waver',
           photoURL: user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.uid}`,
-          bio: 'Connecting on WaveLink 🌊',
+          bio: isOwner ? 'Platform Owner & Founder of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
           status: 'active',
           isBanned: false,
           savedPostIds: [],
@@ -492,12 +549,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           showGlobalToast(`🎁 Daily Login Bonus: +${pointsAwarded} WavePoints! (${rewardFields.loginStreak}-Day Streak 🔥)`);
         }
       } else {
-        const data = snap.data() as UserProfile;
+        // REUSE existing profile: all existing posts, followers, points, Pro status, and themes stay attached!
+        const data = resolvedData;
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, data);
 
         const canonicalExistingRole = resolveCanonicalAdminRole(data.role, data.isSubAdmin);
         const effectiveRole: UserProfile['role'] =
-          verifiedRoleOverride === 'admin' || canonicalExistingRole === 'admin'
+          isOwner || verifiedRoleOverride === 'admin' || canonicalExistingRole === 'admin'
             ? 'admin'
             : verifiedRoleOverride === 'sub_admin' || canonicalExistingRole === 'sub_admin'
             ? 'sub_admin'
@@ -507,15 +565,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const mergedProfile: UserProfile = {
           ...data,
           id: user.uid,
-          email: data.email || user.email || '',
-          username: customUsername || data.username || `@${emailPrefix}`,
-          displayName: customName || data.displayName || user.displayName || user.email?.split('@')[0] || 'Waver',
+          email: data.email || cleanUserEmail,
+          username: isOwner ? '@keylan' : customUsername || data.username || `@${emailPrefix}`,
+          displayName: isOwner ? (data.displayName || 'Keylan') : customName || data.displayName || user.displayName || emailPrefix || 'Waver',
           role: effectiveRole,
           isSubAdmin: effectiveRole === 'sub_admin',
           isPro: Boolean(data.isPro || localPro || isEffectiveAdmin),
           hasBlueStar: Boolean(data.hasBlueStar || data.isPro || localPro || isEffectiveAdmin),
           isVerifiedByAdmin: Boolean(data.isVerifiedByAdmin || localPro || isEffectiveAdmin),
-          proBadge: data.proBadge || (isEffectiveAdmin ? 'founder' : localPro ? 'verified' : undefined),
+          proBadge: isEffectiveAdmin ? 'founder' : data.proBadge || (localPro ? 'verified' : undefined),
           isOnline: true,
           lastSeenAt: nowIso,
           ...rewardFields
@@ -524,6 +582,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (effectiveRole === 'admin' || effectiveRole === 'sub_admin') {
           setServerVerifiedRole(effectiveRole);
         }
+
+        // Keep user document in sync with the reused profile data
+        await setDoc(
+          userDocRef,
+          cleanFirestoreData({
+            ...mergedProfile,
+            authUid: user.uid,
+            linkedAuthUids: Array.from(new Set([...(data.linkedAuthUids || []), user.uid])),
+            isOnline: true,
+            lastSeenAt: nowIso,
+            updatedAt: nowIso
+          }),
+          { merge: true }
+        ).catch(() => {});
 
         // Non-blocking presence + daily reward sync (preserves all existing posts, followers, points, and Pro status)
         setDoc(

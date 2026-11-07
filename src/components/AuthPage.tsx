@@ -1050,6 +1050,7 @@ export const AuthPage: React.FC = () => {
       if (auth.currentUser) {
         await auth.currentUser.getIdToken(true).catch(() => {});
       }
+      await completeVerifiedAuthSession('Keylan', '@keylan');
       await refreshAdminVerification();
       setShowOwnerModal(false);
       setOwnerAccessCode('');

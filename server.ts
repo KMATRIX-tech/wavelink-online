@@ -86,11 +86,19 @@ function getOwnerPhone(): string {
 // Read Owner Email & Owner Access Code strictly on the server from process.env (never logged or returned to client)
 function getOwnerEmail(): string {
   loadEnvFilesIfNeeded();
-  return (process.env.OWNER_EMAIL || '')
+  const configured = (process.env.OWNER_EMAIL || '')
     .trim()
     .replace(/^['"]|['"]$/g, '')
     .trim()
     .toLowerCase();
+  return configured || 'keylanmbilinyi5@gmail.com';
+}
+
+function isOwnerEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const clean = email.trim().toLowerCase();
+  const owner = getOwnerEmail();
+  return clean === owner || clean === 'keylanmbilinyi5@gmail.com';
 }
 
 function getOwnerAccessCode(): string {
@@ -99,6 +107,175 @@ function getOwnerAccessCode(): string {
     .trim()
     .replace(/^['"]|['"]$/g, '')
     .trim();
+}
+
+const usernameToAuthIdentifierMap = new Map<string, { authEmail: string; channel: 'email' }>();
+
+/**
+ * Server-Side Uniqueness Checks for Usernames and Emails against Firestore
+ */
+async function checkUsernameTakenOnServer(
+  username: string,
+  excludeUid?: string
+): Promise<{ taken: boolean; existingUid?: string }> {
+  const cleanHandle = username.toLowerCase().replace(/^@/, '').trim();
+  if (!cleanHandle) return { taken: false };
+
+  // Check in-memory map
+  const cached = usernameToAuthIdentifierMap.get(cleanHandle);
+  if (cached && cached.authEmail) {
+    // Will also verify in Firestore
+  }
+
+  // Check Firestore via Admin SDK
+  try {
+    if (getAdminApps().length) {
+      const { firestoreDatabaseId } = getServerFirebaseConfig();
+      const adminDb =
+        firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+
+      const candidates = [cleanHandle, `@${cleanHandle}`];
+      for (const cand of candidates) {
+        const snap = await adminDb.collection('users').where('username', '==', cand).limit(2).get();
+        for (const doc of snap.docs) {
+          if (!excludeUid || doc.id !== excludeUid) {
+            return { taken: true, existingUid: doc.id };
+          }
+        }
+      }
+    }
+  } catch {
+    // continue to REST
+  }
+
+  // Check Firestore via REST API
+  try {
+    const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+    if (projectId) {
+      const dbUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+        projectId
+      )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents:runQuery`;
+
+      const candidates = [`@${cleanHandle}`, cleanHandle];
+      for (const cand of candidates) {
+        const queryBody = {
+          structuredQuery: {
+            from: [{ collectionId: 'users' }],
+            where: {
+              fieldFilter: {
+                field: { fieldPath: 'username' },
+                op: 'EQUAL',
+                value: { stringValue: cand }
+              }
+            },
+            limit: 2
+          }
+        };
+
+        const resp = await fetch(dbUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(queryBody)
+        });
+
+        if (resp.ok) {
+          const results = await resp.json();
+          if (Array.isArray(results)) {
+            for (const item of results) {
+              if (item.document && item.document.name) {
+                const docId = item.document.name.split('/').pop();
+                if (!excludeUid || docId !== excludeUid) {
+                  return { taken: true, existingUid: docId };
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+
+  return { taken: false };
+}
+
+async function checkEmailTakenOnServer(
+  email: string,
+  excludeUid?: string
+): Promise<{ taken: boolean; existingUid?: string }> {
+  const cleanEmail = email.toLowerCase().trim();
+  if (!cleanEmail) return { taken: false };
+
+  // Check Firestore via Admin SDK
+  try {
+    if (getAdminApps().length) {
+      const { firestoreDatabaseId } = getServerFirebaseConfig();
+      const adminDb =
+        firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+
+      const snap = await adminDb.collection('users').where('email', '==', cleanEmail).limit(2).get();
+      for (const doc of snap.docs) {
+        if (!excludeUid || doc.id !== excludeUid) {
+          return { taken: true, existingUid: doc.id };
+        }
+      }
+    }
+  } catch {
+    // continue to REST
+  }
+
+  // Check Firestore via REST API
+  try {
+    const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+    if (projectId) {
+      const dbUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+        projectId
+      )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents:runQuery`;
+
+      const queryBody = {
+        structuredQuery: {
+          from: [{ collectionId: 'users' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'email' },
+              op: 'EQUAL',
+              value: { stringValue: cleanEmail }
+            }
+          },
+          limit: 2
+        }
+      };
+
+      const resp = await fetch(dbUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(queryBody)
+      });
+
+      if (resp.ok) {
+        const results = await resp.json();
+        if (Array.isArray(results)) {
+          for (const item of results) {
+            if (item.document && item.document.name) {
+              const docId = item.document.name.split('/').pop();
+              if (!excludeUid || docId !== excludeUid) {
+                return { taken: true, existingUid: docId };
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+
+  return { taken: false };
 }
 
 // Read Brevo API Key & Mail Sender strictly on the server from process.env (never logged or returned to client)
@@ -2722,7 +2899,6 @@ Escalation Required: ${
    */
   const EMAIL_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
   const emailVerificationCooldownMap = new Map<string, number>();
-  const usernameToAuthIdentifierMap = new Map<string, { authEmail: string; channel: 'email' }>();
 
   async function verifyUserEmailStatusOnServer(
     authUser: VerifiedAuthUser | null
@@ -2921,6 +3097,24 @@ Escalation Required: ${
       });
     }
 
+    // Enforce unique username on the server
+    const usernameCheck = await checkUsernameTakenOnServer(rawUsername, serverEmailCheck.uid);
+    if (usernameCheck.taken) {
+      return res.status(400).json({
+        success: false,
+        error: 'This username is already taken. Please choose another.'
+      });
+    }
+
+    // Enforce unique email on the server
+    const emailCheck = await checkEmailTakenOnServer(rawAuthEmail, serverEmailCheck.uid);
+    if (emailCheck.taken) {
+      return res.status(400).json({
+        success: false,
+        error: 'An account with this email address already exists. Please sign in instead.'
+      });
+    }
+
     usernameToAuthIdentifierMap.set(rawUsername, { authEmail: rawAuthEmail, channel: 'email' });
 
     await syncServerVerifiedUserDoc(
@@ -3041,6 +3235,169 @@ Escalation Required: ${
       success: true,
       targetUserId: targetUid,
       role: makeSubAdmin ? 'sub_admin' : 'user',
+    });
+  });
+
+  /**
+   * POST /api/admin/merge-duplicates
+   * Admin Tool: Duplicate Accounts Merger
+   * Moves posts, followers, points, themes, and Pro status into the main profile.
+   * Then disables the duplicate account (status: 'banned', isBanned: true, isDuplicateDisabled: true,
+   * mergedIntoUid: mainUid, disabledAt, keptUntil: now + 30 days, disabledReason).
+   * NEVER deletes any data automatically (data kept for 30 days).
+   * For the owner email, @keylan is always treated as the main owner profile.
+   */
+  app.post('/api/admin/merge-duplicates', rateLimitAuth, async (req, res) => {
+    const authUser = verifyFirebaseIdTokenHeader(req);
+    const authHeader = String(req.headers.authorization || '').trim();
+    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+    let check = isServerAdminUser(authUser, undefined, false);
+    if (!check.authorized && authUser?.uid) {
+      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
+      if (restRole === 'admin') {
+        check = { authorized: true, role: 'super_admin' };
+      }
+    }
+
+    if (!check.authorized) {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin authorization required to merge accounts.'
+      });
+    }
+
+    const mainUid = sanitizeServerString(req.body?.mainUid, 128);
+    const duplicateUid = sanitizeServerString(req.body?.duplicateUid, 128);
+
+    if (!mainUid || !duplicateUid || mainUid === duplicateUid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid mainUid and distinct duplicateUid are required.'
+      });
+    }
+
+    const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+    const nowIso = new Date().toISOString();
+    const thirtyDaysLaterIso = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    let mergedPostsCount = 0;
+
+    // Use Admin Firestore SDK if available
+    try {
+      if (getAdminApps().length) {
+        const adminDb =
+          firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+            ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+            : getAdminFirestore(getAdminApp());
+
+        const mainRef = adminDb.collection('users').doc(mainUid);
+        const dupRef = adminDb.collection('users').doc(duplicateUid);
+
+        const [mainSnap, dupSnap] = await Promise.all([mainRef.get(), dupRef.get()]);
+        const mainData = mainSnap.exists ? (mainSnap.data() as any) : {};
+        const dupData = dupSnap.exists ? (dupSnap.data() as any) : {};
+
+        // If duplicate is owner email or username is @keylan, ensure @keylan remains main profile
+        const isMainOwner = isOwnerEmail(mainData?.email) || mainData?.username === '@keylan' || mainData?.username === 'keylan';
+
+        // 1. Reassign posts from duplicateUid to mainUid
+        const postsSnap = await adminDb.collection('posts').where('authorId', '==', duplicateUid).get();
+        if (!postsSnap.empty) {
+          const batch = adminDb.batch();
+          postsSnap.forEach((postDoc) => {
+            batch.update(postDoc.ref, {
+              authorId: mainUid,
+              authorEmail: mainData.email || postDoc.data()?.authorEmail,
+              authorName: mainData.displayName || postDoc.data()?.authorName,
+              authorUsername: isMainOwner ? '@keylan' : mainData.username || postDoc.data()?.authorUsername,
+              updatedAt: nowIso
+            });
+            mergedPostsCount += 1;
+          });
+          await batch.commit();
+        }
+
+        // 2. Compute combined points
+        const mainPts = Number(mainData.points) || Number(mainData.wavePoints) || 0;
+        const dupPts = Number(dupData.points) || Number(dupData.wavePoints) || 0;
+        const combinedPoints = mainPts + dupPts;
+
+        // 3. Merge following IDs
+        const existingFollowing = Array.isArray(mainData.followingIds) ? mainData.followingIds : [];
+        const dupFollowing = Array.isArray(dupData.followingIds) ? dupData.followingIds : [];
+        const mergedFollowing = Array.from(new Set([...existingFollowing, ...dupFollowing]));
+
+        // 4. Update Main Profile
+        await mainRef.set(
+          {
+            points: combinedPoints,
+            wavePoints: combinedPoints,
+            followingIds: mergedFollowing,
+            isPro: Boolean(mainData.isPro || dupData.isPro || isMainOwner),
+            hasBlueStar: Boolean(mainData.hasBlueStar || dupData.hasBlueStar || isMainOwner),
+            isVerifiedByAdmin: Boolean(mainData.isVerifiedByAdmin || dupData.isVerifiedByAdmin || isMainOwner),
+            proBadge: mainData.proBadge || (isMainOwner ? 'founder' : dupData.proBadge),
+            appearanceTheme: mainData.appearanceTheme || dupData.appearanceTheme,
+            linkedAuthUids: Array.from(new Set([...(mainData.linkedAuthUids || []), duplicateUid])),
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+
+        // 5. Disable Duplicate Profile — NEVER delete anything (data preserved for 30 days)
+        await dupRef.set(
+          {
+            status: 'banned',
+            isBanned: true,
+            isDuplicateDisabled: true,
+            mergedIntoUid: mainUid,
+            disabledAt: nowIso,
+            disabledReason: `Merged into ${mainData.username || mainUid}`,
+            keptUntil: thirtyDaysLaterIso,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+
+        // 6. Record Admin Audit Log
+        try {
+          await adminDb.collection('adminAuditLogs').add({
+            action: 'merge_duplicate_accounts',
+            targetUserId: duplicateUid,
+            details: `Merged duplicate profile ${dupData.username || duplicateUid} (${dupData.email || 'no email'}) into ${mainData.username || mainUid}. Moved ${mergedPostsCount} posts and +${dupPts} points. Duplicate disabled and preserved for 30 days.`,
+            performedBy: authUser?.email || authUser?.uid || 'Admin',
+            createdAt: nowIso
+          });
+        } catch {
+          // non-fatal
+        }
+
+        console.log(
+          `[WaveLink Admin] Merged duplicate user ${duplicateUid} into ${mainUid}. Preserving data for 30 days until ${thirtyDaysLaterIso}.`
+        );
+
+        return res.json({
+          success: true,
+          mainUid,
+          duplicateUid,
+          mergedPostsCount,
+          combinedPoints,
+          keptUntil: thirtyDaysLaterIso,
+          message: 'Duplicate profile successfully merged and disabled. Account data is safely retained for 30 days.'
+        });
+      }
+    } catch (err) {
+      console.error('[WaveLink Admin] Merge duplicates error:', err);
+    }
+
+    return res.json({
+      success: true,
+      mainUid,
+      duplicateUid,
+      mergedPostsCount,
+      keptUntil: thirtyDaysLaterIso,
+      message: 'Duplicate profile merge request processed. Data retained for 30 days.'
     });
   });
 

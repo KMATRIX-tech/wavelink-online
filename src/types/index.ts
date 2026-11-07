@@ -98,6 +98,14 @@ export interface UserProfile {
   lastDailyRewardAmount?: number;
   totalLoginDays?: number;
   pointTransactions?: PointTransaction[];
+  // Duplicate Account Resolution & Data Preservation (30-day retention)
+  mergedIntoUid?: string;
+  isDuplicateDisabled?: boolean;
+  disabledAt?: string;
+  disabledReason?: string;
+  keptUntil?: string;
+  authUid?: string;
+  linkedAuthUids?: string[];
   emailVerified?: boolean;
   phoneVerified?: boolean;
   isContactVerified?: boolean;
@@ -674,7 +682,8 @@ export type AuditActionType =
   | 'bot_toggle'
   | 'approve_draft'
   | 'report_submitted'
-  | 'upgrade_status_change';
+  | 'upgrade_status_change'
+  | 'merge_duplicate_accounts';
 
 export interface AdminAuditLog {
   id: string;
