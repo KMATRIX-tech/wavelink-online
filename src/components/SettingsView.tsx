@@ -315,6 +315,51 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   const [passwordStatus, setPasswordStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [isSendingResetEmail, setIsSendingResetEmail] = useState(false);
   const [isSendingVerifyEmail, setIsSendingVerifyEmail] = useState(false);
+  const [verifyLinkSent, setVerifyLinkSent] = useState(false);
+  const [verifyCooldownSeconds, setVerifyCooldownSeconds] = useState(0);
+  const [reloadedEmailVerified, setReloadedEmailVerified] = useState(false);
+
+  useEffect(() => {
+    if (verifyCooldownSeconds <= 0) return;
+    const timer = window.setInterval(() => {
+      setVerifyCooldownSeconds((prev) => (prev <= 1 ? 0 : prev - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [verifyCooldownSeconds]);
+
+  useEffect(() => {
+    const checkReloadVerified = async () => {
+      if (!currentUser || currentUser.emailVerified || reloadedEmailVerified) return;
+      try {
+        await currentUser.reload();
+        if (currentUser.emailVerified) {
+          await currentUser.getIdToken(true).catch(() => {});
+          setReloadedEmailVerified(true);
+          setVerifyLinkSent(false);
+          setPasswordStatus({
+            type: 'success',
+            message: 'Email verified'
+          });
+        }
+      } catch {
+        // ignore transient reload error
+      }
+    };
+    const onFocus = () => {
+      checkReloadVerified().catch(() => {});
+    };
+    const onVisChange = () => {
+      if (document.visibilityState === 'visible') {
+        checkReloadVerified().catch(() => {});
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisChange);
+    };
+  }, [currentUser, reloadedEmailVerified]);
 
   // Delete My Account state
   const [showDeleteAccountConfirm, setShowDeleteAccountConfirm] = useState(false);
@@ -484,7 +529,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     if (!strength.valid) {
       setPasswordStatus({
         type: 'error',
-        message: strength.message || 'Password must be at least 8 characters with letters and numbers.'
+        message:
+          strength.message ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
       });
       return;
     }
@@ -538,12 +585,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
 
   const handleSendVerifyEmail = async () => {
     setPasswordStatus(null);
+    if (!currentUser?.email) {
+      setPasswordStatus({
+        type: 'error',
+        message: 'No email address is linked to this account.'
+      });
+      return;
+    }
+    if (verifyCooldownSeconds > 0) {
+      setPasswordStatus({
+        type: 'error',
+        message: `Please wait ${verifyCooldownSeconds} seconds before resending the verification email.`
+      });
+      return;
+    }
+
     setIsSendingVerifyEmail(true);
     try {
       await sendVerificationEmail();
+      setVerifyLinkSent(true);
+      setVerifyCooldownSeconds(60);
       setPasswordStatus({
         type: 'success',
-        message: `Verification email sent to ${currentUser?.email || 'your email'}. Please check your inbox!`
+        message: 'Verification link sent. Check your inbox and spam folder.'
       });
     } catch (err: any) {
       setPasswordStatus({
@@ -1348,42 +1412,63 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
       {activeSettingsSection === 'security' && (
         <div className="space-y-6">
           {/* Email Verification Card */}
-          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs flex items-center justify-between gap-4 flex-wrap">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-2xl bg-blue-50 text-[#2563EB] border border-blue-200/70 flex items-center justify-center shrink-0">
-                <Mail size={19} />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h4 className="font-extrabold text-base text-[#1C1917]">Email Verification</h4>
-                  {currentUser?.emailVerified || isAdmin ? (
-                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-50 text-[#0D9488] border border-emerald-200">
-                      Verified ✓
-                    </span>
-                  ) : (
-                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-50 text-amber-800 border border-amber-200">
-                      Unverified
-                    </span>
-                  )}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between gap-4 flex-wrap">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-blue-50 text-[#2563EB] border border-blue-200/70 flex items-center justify-center shrink-0">
+                  <Mail size={19} />
                 </div>
-                <p className="text-xs text-[#78716C] mt-0.5">
-                  {currentUser?.emailVerified || isAdmin
-                    ? `Your email (${currentUser?.email}) is verified for posting and messaging.`
-                    : `Verify ${currentUser?.email || 'your email'} to keep your account protected before posting or messaging.`}
-                </p>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="font-extrabold text-base text-[#1C1917]">Email Verification</h4>
+                    {currentUser?.emailVerified || reloadedEmailVerified || isAdmin ? (
+                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-50 text-[#0D9488] border border-emerald-200">
+                        Email verified ✓
+                      </span>
+                    ) : (
+                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-50 text-amber-800 border border-amber-200">
+                        Unverified
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-[#78716C] mt-0.5">
+                    {currentUser?.emailVerified || reloadedEmailVerified || isAdmin
+                      ? `Your email (${currentUser?.email}) is verified for posting and messaging.`
+                      : `Verify ${currentUser?.email || 'your email'} via Firebase Authentication email verification link.`}
+                  </p>
+                </div>
               </div>
+
+              {!currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
+                <button
+                  type="button"
+                  onClick={handleSendVerifyEmail}
+                  disabled={isSendingVerifyEmail || verifyCooldownSeconds > 0}
+                  className="min-h-[44px] px-4 py-2.5 rounded-2xl bg-[#0D9488] hover:bg-teal-700 text-white font-extrabold text-xs flex items-center gap-2 transition disabled:opacity-50"
+                >
+                  <Mail size={14} />
+                  <span>
+                    {isSendingVerifyEmail
+                      ? 'Sending...'
+                      : verifyCooldownSeconds > 0
+                      ? `Resend (${verifyCooldownSeconds}s)`
+                      : verifyLinkSent
+                      ? 'Resend'
+                      : 'Verify'}
+                  </span>
+                </button>
+              )}
             </div>
 
-            {!currentUser?.emailVerified && !isAdmin && (
-              <button
-                type="button"
-                onClick={handleSendVerifyEmail}
-                disabled={isSendingVerifyEmail}
-                className="min-h-[44px] px-4 py-2.5 rounded-2xl bg-[#0D9488] hover:bg-teal-700 text-white font-extrabold text-xs flex items-center gap-2 transition disabled:opacity-50"
-              >
-                <Mail size={14} />
-                <span>{isSendingVerifyEmail ? 'Sending...' : 'Send Verification Email'}</span>
-              </button>
+            {verifyLinkSent && !currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
+              <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
+                <p className="text-xs font-extrabold text-[#0D9488]">
+                  Verification link sent. Check your inbox and spam folder.
+                </p>
+                <p className="text-[11px] text-[#78716C]">
+                  Click the verification link sent to <span className="font-bold text-[#1C1917]">{currentUser?.email}</span>, then return here.
+                </p>
+              </div>
             )}
           </div>
 
@@ -1398,7 +1483,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                     Change Your Password
                   </h3>
                   <p className="text-xs text-[#78716C]">
-                    Minimum 8 characters with both letters and numbers, or request a password reset email.
+                    Minimum 8 and maximum 24 characters, requiring at least one letter and one number.
                   </p>
                 </div>
               </div>
@@ -1448,16 +1533,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-[#1C1917] mb-1">
-                    New Password (8+ chars, letters &amp; numbers)
+                    New Password (8–24 chars, letter &amp; number)
                   </label>
                   <div className="relative">
                     <input
                       type={showNewPassword ? 'text' : 'password'}
                       required
                       minLength={8}
+                      maxLength={24}
                       value={newPassword}
                       onChange={(e) => setNewPassword(e.target.value)}
-                      placeholder="At least 8 chars with letters & numbers"
+                      placeholder="8–24 chars with letter & number"
                       className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                     />
                     <button
@@ -1479,6 +1565,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                     type={showNewPassword ? 'text' : 'password'}
                     required
                     minLength={8}
+                    maxLength={24}
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     placeholder="Re-enter new password"

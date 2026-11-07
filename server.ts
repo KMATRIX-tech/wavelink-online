@@ -92,6 +92,64 @@ function getOwnerAccessCode(): string {
   return (process.env.OWNER_ACCESS_CODE || '').trim();
 }
 
+// Read Brevo API Key & Mail Sender strictly on the server from process.env (never logged or returned to client)
+function getBrevoApiKey(): string {
+  return (process.env.BREVO_API_KEY || '').trim().replace(/^['"]|['"]$/g, '');
+}
+
+function getMailSender(): { name: string; email: string } {
+  const raw = (process.env.MAIL_SENDER || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!raw) {
+    return { name: 'WaveLink', email: '' };
+  }
+  const match = raw.match(/^(.+?)\s*<([^<>]+@[^<>]+)>$/);
+  if (match) {
+    return {
+      name: match[1].trim().replace(/^['"]|['"]$/g, '') || 'WaveLink',
+      email: match[2].trim().toLowerCase()
+    };
+  }
+  return {
+    name: 'WaveLink',
+    email: raw.toLowerCase()
+  };
+}
+
+/**
+ * Server-side password rule enforcement:
+ * - Minimum 8 characters and maximum 24 characters
+ * - At least one letter and at least one number
+ */
+function validateServerPasswordRule(rawPassword: unknown): { valid: boolean; error?: string } {
+  if (typeof rawPassword !== 'string') {
+    return {
+      valid: false,
+      error: 'Password must be 8 to 24 characters long and include at least one letter and one number.'
+    };
+  }
+  if (rawPassword.length < 8) {
+    return {
+      valid: false,
+      error: 'Password must be 8 to 24 characters long and include at least one letter and one number (currently too short).'
+    };
+  }
+  if (rawPassword.length > 24) {
+    return {
+      valid: false,
+      error: 'Password must be between 8 and 24 characters long (maximum 24 characters exceeded).'
+    };
+  }
+  const hasLetter = /[a-zA-Z]/.test(rawPassword);
+  const hasNumber = /[0-9]/.test(rawPassword);
+  if (!hasLetter || !hasNumber) {
+    return {
+      valid: false,
+      error: 'Password must be 8–24 characters long and contain at least one letter and at least one number.'
+    };
+  }
+  return { valid: true };
+}
+
 /**
  * Constant-time string comparison using crypto.timingSafeEqual on SHA-256 digests + byte length
  * Prevents timing side-channel attacks and never leaks length or character prefix matches.
@@ -250,9 +308,11 @@ function scrubAiOutputSafety(text: string): string {
   const ownerPhone = getOwnerPhone();
   const ownerEmail = getOwnerEmail();
   const ownerCode = getOwnerAccessCode();
+  const brevoKey = getBrevoApiKey();
   let safe = text
     .replace(/AIza[0-9A-Za-z_-]{30,}/g, '[REDACTED]')
-    .replace(/GEMINI_API_KEY|AZAMPAY_CLIENT_SECRET|OWNER_PHONE|OWNER_EMAIL|OWNER_ACCESS_CODE/gi, '[PROTECTED]');
+    .replace(/xkeysib-[0-9A-Za-z_-]{20,}/g, '[REDACTED]')
+    .replace(/GEMINI_API_KEY|AZAMPAY_CLIENT_SECRET|OWNER_PHONE|OWNER_EMAIL|OWNER_ACCESS_CODE|BREVO_API_KEY|MAIL_SENDER/gi, '[PROTECTED]');
   if (ownerPhone && ownerPhone.length >= 6) {
     safe = safe.split(ownerPhone).join('WaveLink');
   }
@@ -261,6 +321,9 @@ function scrubAiOutputSafety(text: string): string {
   }
   if (ownerCode && ownerCode.length >= 4) {
     safe = safe.split(ownerCode).join('[PROTECTED]');
+  }
+  if (brevoKey && brevoKey.length >= 8) {
+    safe = safe.split(brevoKey).join('[REDACTED]');
   }
   return safe;
 }
@@ -339,7 +402,7 @@ function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | n
     return {
       uid,
       email: fallbackEmail,
-      emailVerified: true,
+      emailVerified: false,
       isVerifiedOwnerSession: serverOwnerUids.has(uid)
     };
   }
@@ -2331,27 +2394,229 @@ Escalation Required: ${
   });
 
   /**
-   * Normal User Email / Phone Verification & Username Mapping (Server-side OTP store)
+   * Normal User Email Verification (Firebase Authentication Built-In Email Verification)
+   * - Phone verification is disabled.
+   * - Enforces a 60-second resend cooldown per email address.
+   * - Never generates, logs, or returns any verification code, link, or token in API responses or logs.
+   * - Enforces on the server that sign-up cannot complete unless the user's Firebase Auth emailVerified is true.
+   * - Enforces password rule (8–24 characters, at least 1 letter and 1 number) on the server.
    */
-  interface PendingVerificationCode {
-    codeHash: string;
-    channel: 'email' | 'phone';
-    target: string;
-    expiresAt: number;
-    attempts: number;
-  }
-  const pendingUserVerifications = new Map<string, PendingVerificationCode>();
-  const usernameToAuthIdentifierMap = new Map<string, { authEmail: string; channel: 'email' | 'phone' }>();
+  const EMAIL_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
+  const emailVerificationCooldownMap = new Map<string, number>();
+  const usernameToAuthIdentifierMap = new Map<string, { authEmail: string; channel: 'email' }>();
 
-  app.post('/api/auth/register-username', rateLimitAuth, (req, res) => {
+  async function verifyUserEmailStatusOnServer(
+    authUser: VerifiedAuthUser | null
+  ): Promise<{ verified: boolean; email: string; uid: string }> {
+    if (!authUser || !authUser.uid) {
+      return { verified: false, email: '', uid: '' };
+    }
+
+    // 1. Check Firebase Admin SDK authoritative user record when available
+    try {
+      if (getAdminApps().length) {
+        const userRecord = await getAdminAuth(getAdminApp()).getUser(authUser.uid);
+        if (userRecord) {
+          return {
+            verified: Boolean(userRecord.emailVerified),
+            email: (userRecord.email || authUser.email || '').trim().toLowerCase(),
+            uid: userRecord.uid
+          };
+        }
+      }
+    } catch {
+      // Fallback to verified JWT claim from Firebase Auth ID token
+    }
+
+    return {
+      verified: Boolean(authUser.emailVerified),
+      email: (authUser.email || '').trim().toLowerCase(),
+      uid: authUser.uid
+    };
+  }
+
+  async function syncServerVerifiedUserDoc(
+    uid: string,
+    email: string,
+    username: string,
+    displayName?: string
+  ): Promise<void> {
+    if (!uid) return;
+    try {
+      if (getAdminApps().length) {
+        let firestoreId = '';
+        try {
+          const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+          if (fs.existsSync(cfgPath)) {
+            const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            firestoreId = parsedCfg.firestoreDatabaseId || '';
+          }
+        } catch {
+          // ignore
+        }
+        const adminDb = firestoreId
+          ? getAdminFirestore(getAdminApp(), firestoreId)
+          : getAdminFirestore(getAdminApp());
+        const nowIso = new Date().toISOString();
+        await adminDb
+          .collection('users')
+          .doc(uid)
+          .set(
+            {
+              id: uid,
+              email,
+              username: username.startsWith('@') ? username : `@${username}`,
+              ...(displayName ? { displayName } : {}),
+              emailVerified: true,
+              isContactVerified: true,
+              verificationMethod: 'email',
+              verifiedAt: nowIso,
+              updatedAt: nowIso
+            },
+            { merge: true }
+          )
+          .catch(() => {});
+      }
+    } catch {
+      // non-fatal if local preview lacks service account key
+    }
+  }
+
+  /**
+   * POST /api/auth/validate-password
+   * Server-side enforcement of the 8–24 character password rule (at least 1 letter and 1 number)
+   */
+  app.post('/api/auth/validate-password', rateLimitAuth, (req, res) => {
+    const check = validateServerPasswordRule(req.body?.password);
+    if (!check.valid) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        error: check.error
+      });
+    }
+    return res.json({
+      success: true,
+      valid: true
+    });
+  });
+
+  /**
+   * POST /api/auth/check-verification-cooldown
+   * Enforces the 60-second cooldown before sending/resending Firebase Auth email verification.
+   * Rejects phone verification since phone verification is disabled.
+   * Never returns or logs any code, link, or token.
+   */
+  app.post('/api/auth/check-verification-cooldown', rateLimitAuth, (req, res) => {
+    if (req.body?.channel === 'phone') {
+      return res.status(400).json({
+        success: false,
+        error: 'Phone verification is disabled. Please verify using your email address.'
+      });
+    }
+
+    const email = sanitizeServerString(req.body?.email || req.body?.target, 160).toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter a valid email address.'
+      });
+    }
+
+    if (req.body?.password !== undefined) {
+      const pwCheck = validateServerPasswordRule(req.body.password);
+      if (!pwCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          error: pwCheck.error
+        });
+      }
+    }
+
+    const now = Date.now();
+    const lastSentAt = emailVerificationCooldownMap.get(email) || 0;
+    if (lastSentAt > 0 && now - lastSentAt < EMAIL_RESEND_COOLDOWN_MS) {
+      const cooldownRemainingSeconds = Math.max(
+        1,
+        Math.ceil((EMAIL_RESEND_COOLDOWN_MS - (now - lastSentAt)) / 1000)
+      );
+      return res.status(429).json({
+        success: false,
+        cooldownRemainingSeconds,
+        error: `Please wait ${cooldownRemainingSeconds} seconds before resending the verification email.`
+      });
+    }
+
+    emailVerificationCooldownMap.set(email, now);
+    return res.json({
+      success: true,
+      cooldownSeconds: 60,
+      message: 'Verification link sent. Check your inbox and spam folder.'
+    });
+  });
+
+  /**
+   * POST /api/auth/register-username
+   * Server-side enforcement that:
+   * 1. Phone verification is disabled.
+   * 2. Password meets the 8–24 character rule with at least 1 letter and 1 number.
+   * 3. The user's Firebase Auth account has emailVerified === true (cannot complete sign-up with an unverified email).
+   */
+  app.post('/api/auth/register-username', rateLimitAuth, async (req, res) => {
+    if (req.body?.channel === 'phone') {
+      return res.status(400).json({
+        success: false,
+        error: 'Phone verification is disabled. Please verify your email address.'
+      });
+    }
+
     const rawUsername = sanitizeServerString(req.body?.username, 50).toLowerCase().replace(/^@/, '');
     const rawAuthEmail = sanitizeServerString(req.body?.authEmail, 160).toLowerCase();
-    const channel = req.body?.channel === 'phone' ? 'phone' : 'email';
-    if (!rawUsername || !rawAuthEmail) {
-      return res.status(400).json({ success: false, error: 'Username and account identifier are required.' });
+    const rawDisplayName = sanitizeServerString(req.body?.displayName, 80);
+
+    if (!rawUsername || !rawAuthEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawAuthEmail)) {
+      return res.status(400).json({
+        success: false,
+        error: 'A valid username and email address are required.'
+      });
     }
-    usernameToAuthIdentifierMap.set(rawUsername, { authEmail: rawAuthEmail, channel });
-    return res.json({ success: true });
+
+    // Enforce password rule (8–24 chars, at least 1 letter and 1 number) on the server
+    const pwCheck = validateServerPasswordRule(req.body?.password);
+    if (!pwCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        error: pwCheck.error
+      });
+    }
+
+    // Verify on the server that the Firebase Auth user's emailVerified is true
+    const authUser = verifyFirebaseIdTokenHeader(req);
+    const serverEmailCheck = await verifyUserEmailStatusOnServer(authUser);
+
+    if (!serverEmailCheck.verified) {
+      return res.status(403).json({
+        success: false,
+        emailVerified: false,
+        error: 'Email not verified. Please click the verification link sent to your email and return to WaveLink before completing sign-up.'
+      });
+    }
+
+    usernameToAuthIdentifierMap.set(rawUsername, { authEmail: rawAuthEmail, channel: 'email' });
+
+    await syncServerVerifiedUserDoc(
+      serverEmailCheck.uid,
+      serverEmailCheck.email || rawAuthEmail,
+      rawUsername,
+      rawDisplayName
+    );
+
+    return res.json({
+      success: true,
+      verified: true,
+      emailVerified: true,
+      channel: 'email'
+    });
   });
 
   app.post('/api/auth/lookup-username', rateLimitAuth, async (req, res) => {
@@ -2361,84 +2626,9 @@ Escalation Required: ${
     }
     const cached = usernameToAuthIdentifierMap.get(rawUsername);
     if (cached) {
-      return res.json({ success: true, authEmail: cached.authEmail, channel: cached.channel });
+      return res.json({ success: true, authEmail: cached.authEmail, channel: 'email' });
     }
     return res.json({ success: true, authEmail: null });
-  });
-
-  app.post('/api/auth/send-verification-code', rateLimitAuth, (req, res) => {
-    const channel: 'email' | 'phone' = req.body?.channel === 'phone' ? 'phone' : 'email';
-    const target = sanitizeServerString(req.body?.target, 160).toLowerCase();
-    if (!target || target.length < 5) {
-      return res.status(400).json({
-        success: false,
-        error: channel === 'phone' ? 'Please enter a valid phone number.' : 'Please enter a valid email address.'
-      });
-    }
-
-    const code = String(crypto.randomInt(100000, 999999));
-    const codeHash = crypto.createHash('sha256').update(code, 'utf8').digest('hex');
-    pendingUserVerifications.set(`${channel}:${target}`, {
-      codeHash,
-      channel,
-      target,
-      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
-      attempts: 0
-    });
-
-    const maskedTarget =
-      channel === 'phone'
-        ? `${target.slice(0, 4)}••••${target.slice(-3)}`
-        : `${target.slice(0, 2)}•••@${target.split('@')[1] || 'mail'}`;
-
-    return res.json({
-      success: true,
-      channel,
-      maskedTarget,
-      verificationCodePreview: code,
-      message: `A 6-digit verification code has been sent to ${maskedTarget}.`
-    });
-  });
-
-  app.post('/api/auth/confirm-verification-code', rateLimitAuth, (req, res) => {
-    const channel: 'email' | 'phone' = req.body?.channel === 'phone' ? 'phone' : 'email';
-    const target = sanitizeServerString(req.body?.target, 160).toLowerCase();
-    const submittedCode = sanitizeServerString(req.body?.code, 12).replace(/\s+/g, '');
-    const key = `${channel}:${target}`;
-    const entry = pendingUserVerifications.get(key);
-
-    if (!entry || Date.now() > entry.expiresAt) {
-      pendingUserVerifications.delete(key);
-      return res.status(400).json({
-        success: false,
-        error: 'Verification code has expired or was not found. Please request a new code.'
-      });
-    }
-
-    entry.attempts += 1;
-    if (entry.attempts > 5) {
-      pendingUserVerifications.delete(key);
-      return res.status(429).json({
-        success: false,
-        error: 'Too many incorrect verification code attempts. Please request a new code.'
-      });
-    }
-
-    const submittedHash = crypto.createHash('sha256').update(submittedCode, 'utf8').digest('hex');
-    if (!safeConstantTimeEquals(submittedHash, entry.codeHash)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Incorrect verification code. Please check the 6-digit code and try again.'
-      });
-    }
-
-    pendingUserVerifications.delete(key);
-    return res.json({
-      success: true,
-      verified: true,
-      channel,
-      verifiedAt: new Date().toISOString()
-    });
   });
 
   app.post('/api/admin/verify', rateLimitAuth, async (req, res) => {

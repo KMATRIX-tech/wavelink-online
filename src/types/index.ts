@@ -98,6 +98,10 @@ export interface UserProfile {
   lastDailyRewardAmount?: number;
   totalLoginDays?: number;
   pointTransactions?: PointTransaction[];
+  emailVerified?: boolean;
+  phoneVerified?: boolean;
+  isContactVerified?: boolean;
+  verifiedAt?: string;
   createdAt: string;
   updatedAt?: string;
 }

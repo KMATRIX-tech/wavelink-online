@@ -47,6 +47,10 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.get('email_verified', false) == true;
+    }
+
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 160 && id.matches('^[a-zA-Z0-9_\\-@.:]+$');
     }
@@ -110,15 +114,21 @@ service cloud.firestore {
         isValidOptionalString(data, 'photoURL', 150000);
     }
 
-    // Protect RBAC, Pro status, badges, and points from unauthorized client self-escalation
+    // Protect RBAC, contact verification flags, Pro status, badges, and points from unauthorized client self-escalation
+    // Enforce that no user can create or complete a user profile without a verified email in Firebase Auth
     function isSafeUserProfileCreate(userId) {
       let data = request.resource.data;
       return isOwner(userId) &&
+        isEmailVerified() &&
         isValidUserProfilePayload(data) &&
         (!('uid' in data) || data.uid == userId) &&
         (!('role' in data) || data.role == 'user' || isSuperAdmin()) &&
         (!('isSubAdmin' in data) || data.isSubAdmin == false || isSuperAdmin()) &&
         (!('isBot' in data) || data.isBot == false) &&
+        // Email verification must match Firebase Auth token email_verified; phone verification is disabled
+        (!('emailVerified' in data) || data.emailVerified == isEmailVerified()) &&
+        (!('phoneVerified' in data) || data.phoneVerified == false) &&
+        (!('isContactVerified' in data) || data.isContactVerified == isEmailVerified()) &&
         (!('points' in data) || (data.points is number && data.points >= 0 && data.points <= 500)) &&
         (!('wavePoints' in data) || (data.wavePoints is number && data.wavePoints >= 0 && data.wavePoints <= 500));
     }
@@ -127,12 +137,17 @@ service cloud.firestore {
       let incoming = request.resource.data;
       let existing = resource.data;
       return isOwner(userId) &&
+        isEmailVerified() &&
         isValidUserProfilePayload(incoming) &&
         (!('uid' in incoming) || incoming.uid == userId) &&
         // Block non-admins from editing their own role or sub-admin status
         (!('role' in incoming) || (existing != null && incoming.role == existing.role) || incoming.role == 'user') &&
         (!('isSubAdmin' in incoming) || (existing != null && incoming.isSubAdmin == existing.isSubAdmin) || incoming.isSubAdmin == false) &&
         (!('isBot' in incoming) || incoming.isBot == false) &&
+        // Email verification must match Firebase Auth token email_verified; phone verification is disabled
+        (!('emailVerified' in incoming) || incoming.emailVerified == isEmailVerified() || (existing != null && 'emailVerified' in existing && incoming.emailVerified == existing.emailVerified)) &&
+        (!('phoneVerified' in incoming) || (existing != null && 'phoneVerified' in existing && incoming.phoneVerified == existing.phoneVerified) || incoming.phoneVerified == false) &&
+        (!('isContactVerified' in incoming) || incoming.isContactVerified == isEmailVerified() || (existing != null && 'isContactVerified' in existing && incoming.isContactVerified == existing.isContactVerified)) &&
         // Block non-admins from unbanning themselves
         (!('isBanned' in incoming) || (existing != null && incoming.isBanned == existing.isBanned) || incoming.isBanned == false) &&
         // Prevent arbitrary point inflation (daily check-in & Spark rewards bounded to <= 100 per update)

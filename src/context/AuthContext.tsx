@@ -331,6 +331,7 @@ interface AuthContextType {
   verifyAndRedeemCoupon: (rawCode: string) => Promise<boolean>;
   showGlobalToast: (message: string) => void;
   refreshAdminVerification: () => Promise<boolean>;
+  completeVerifiedAuthSession: (customName?: string, customUsername?: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -403,6 +404,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     setServerVerifiedRole('user');
     return false;
+  };
+
+  // Transition a verified Firebase Auth user into the active WaveLink session after emailVerified === true
+  const completeVerifiedAuthSession = async (customName?: string, customUsername?: string): Promise<void> => {
+    const activeUser = auth.currentUser;
+    if (!activeUser) {
+      throw new Error('Please sign in first.');
+    }
+    await activeUser.reload();
+    if (!activeUser.emailVerified) {
+      throw new Error('Please verify your email address before completing sign-up.');
+    }
+    await activeUser.getIdToken(true).catch(() => {});
+    try {
+      if (typeof window !== 'undefined') {
+        sessionStorage.removeItem('wavelink_signup_verification_pending');
+      }
+    } catch {
+      // ignore
+    }
+    setCurrentUser(activeUser);
+    await syncUserProfileDoc(activeUser, customName, customUsername);
   };
 
   // Sync profile document in Firestore & evaluate Daily Login Reward
@@ -645,10 +668,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     let presenceInterval: ReturnType<typeof setInterval> | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
-      // If a Hidden Owner Sign-In popup is currently awaiting server verification, do not transition yet
+      // If Hidden Owner Sign-In or Sign-Up Email Verification is pending, or if emailVerified is false, keep user on AuthPage
       try {
-        if (user && typeof window !== 'undefined' && sessionStorage.getItem('wavelink_owner_flow_pending') === 'true') {
-          return;
+        if (user && typeof window !== 'undefined') {
+          if (sessionStorage.getItem('wavelink_owner_flow_pending') === 'true') {
+            return;
+          }
+          const isOwnerTokenPresent = Boolean(
+            sessionStorage.getItem(OWNER_SESSION_STORAGE_KEY) ||
+              localStorage.getItem(OWNER_SESSION_STORAGE_KEY)
+          );
+          if (
+            !isOwnerTokenPresent &&
+            (sessionStorage.getItem('wavelink_signup_verification_pending') === 'true' ||
+              !user.emailVerified)
+          ) {
+            setCurrentUser(null);
+            setIsLoading(false);
+            return;
+          }
         }
       } catch {
         // ignore
@@ -840,7 +878,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const registerWithEmail = async (email: string, pass: string, displayName: string, username?: string) => {
     const pwCheck = validateStrongPassword(pass);
     if (!pwCheck.valid) {
-      throw new Error(pwCheck.message || 'Please choose a stronger password (at least 8 characters with letters and numbers).');
+      throw new Error(
+        pwCheck.message ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+      );
+    }
+    const serverPwResp = await fetch('/api/auth/validate-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pass })
+    });
+    const serverPwData = await serverPwResp.json().catch(() => ({}));
+    if (!serverPwResp.ok || !serverPwData.valid) {
+      throw new Error(
+        serverPwData.error ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+      );
     }
     try {
       const cleanEmail = email.trim();
@@ -852,8 +905,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (safeDisplayName) {
         await fbUpdateProfile(res.user, { displayName: safeDisplayName });
       }
-      // Send verification email automatically on registration (non-blocking)
-      fbSendEmailVerification(res.user).catch(() => {});
       clearClientFailedLogins();
       await syncUserProfileDoc(res.user, safeDisplayName, safeUsername);
     } catch (err: unknown) {
@@ -942,6 +993,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           sessionStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
           localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
           sessionStorage.removeItem('wavelink_owner_flow_pending');
+          sessionStorage.removeItem('wavelink_signup_verification_pending');
         }
       } catch {
         // ignore
@@ -971,7 +1023,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const cleanNew = newPassword.trim();
     const pwCheck = validateStrongPassword(cleanNew);
     if (!pwCheck.valid) {
-      throw new Error(pwCheck.message || 'New password must be at least 8 characters long and include letters and numbers.');
+      throw new Error(
+        pwCheck.message ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+      );
+    }
+
+    const serverPwResp = await fetch('/api/auth/validate-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: cleanNew })
+    });
+    const serverPwData = await serverPwResp.json().catch(() => ({}));
+    if (!serverPwResp.ok || !serverPwData.valid) {
+      throw new Error(
+        serverPwData.error ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+      );
     }
 
     // Re-authenticate first if currentPassword is provided and user has an email
@@ -1141,11 +1209,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const sendVerificationEmail = async () => {
-    if (!currentUser) {
-      throw new Error('Please sign in first.');
+    const activeUser = auth.currentUser || currentUser;
+    if (!activeUser || !activeUser.email) {
+      throw new Error('Please sign in with an email address first.');
     }
-    await fbSendEmailVerification(currentUser);
-    showGlobalToast(`Verification email sent to ${currentUser.email}!`);
+    const resp = await fetch('/api/auth/check-verification-cooldown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel: 'email',
+        email: activeUser.email
+      })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.success) {
+      throw new Error(data.error || 'Please wait before resending the verification email.');
+    }
+    await fbSendEmailVerification(activeUser);
+    showGlobalToast('Verification link sent. Check your inbox and spam folder.');
   };
 
   const recordAdminAuditLog = async (params: {
@@ -1515,7 +1596,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         activateHarvestPass,
         verifyAndRedeemCoupon,
         showGlobalToast,
-        refreshAdminVerification
+        refreshAdminVerification,
+        completeVerifiedAuthSession
       }}
     >
       {globalToast && (

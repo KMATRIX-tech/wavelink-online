@@ -88,9 +88,9 @@ export function sanitizeSafeUrl(rawUrl?: string | null): string {
 }
 
 /**
- * Enforces minimum password strength:
- * - At least 8 characters
- * - Contains at least one letter and one number
+ * Enforces password rule:
+ * - Minimum 8 characters and maximum 24 characters
+ * - Contains at least one letter and at least one number
  */
 export function validateStrongPassword(password: string): {
   valid: boolean;
@@ -101,7 +101,14 @@ export function validateStrongPassword(password: string): {
   if (clean.length < 8) {
     return {
       valid: false,
-      message: 'Password must be at least 8 characters long.',
+      message: 'Password must be 8 to 24 characters long and include at least one letter and one number (currently too short).',
+      score: 1
+    };
+  }
+  if (clean.length > 24) {
+    return {
+      valid: false,
+      message: 'Password must be between 8 and 24 characters long (maximum 24 characters exceeded).',
       score: 1
     };
   }
@@ -110,10 +117,24 @@ export function validateStrongPassword(password: string): {
   const hasUpper = /[A-Z]/.test(clean);
   const hasSymbol = /[^a-zA-Z0-9]/.test(clean);
 
-  if (!hasLetter || !hasNumber) {
+  if (!hasLetter && !hasNumber) {
     return {
       valid: false,
-      message: 'Password must include both letters and numbers for your security.',
+      message: 'Password must be 8–24 characters and contain at least one letter and one number.',
+      score: 2
+    };
+  }
+  if (!hasLetter) {
+    return {
+      valid: false,
+      message: 'Password must include at least one letter (8–24 characters total).',
+      score: 2
+    };
+  }
+  if (!hasNumber) {
+    return {
+      valid: false,
+      message: 'Password must include at least one number (8–24 characters total).',
       score: 2
     };
   }

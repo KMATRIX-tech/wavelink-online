@@ -1,11 +1,11 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   GoogleAuthProvider,
   signInWithPopup,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
+  sendEmailVerification,
   updateProfile as fbUpdateProfile,
-  sendEmailVerification as fbSendEmailVerification,
   signOut as fbSignOut
 } from 'firebase/auth';
 import {
@@ -26,11 +26,11 @@ import {
   cleanFirestoreData
 } from '../firebase';
 import { recordSystemDomain } from '../services/verificationService';
+import { validateStrongPassword } from '../utils/security';
 import { useAuth } from '../context/AuthContext';
 import {
   Waves,
   Mail,
-  Phone,
   Lock,
   User,
   AtSign,
@@ -50,27 +50,24 @@ import {
 const GENERIC_OWNER_ERROR = 'Authentication failed. Unable to verify owner credentials.';
 
 export const AuthPage: React.FC = () => {
-  const { refreshAdminVerification } = useAuth();
+  const { refreshAdminVerification, completeVerifiedAuthSession } = useAuth();
 
   // Tab state: 'signin' | 'signup'
   const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
 
-  // Normal user fields: Username & Password + Email or Phone verification
+  // Normal user fields: Username & Password + Email verification (Phone verification is disabled and hidden)
   const [usernameInput, setUsernameInput] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [verificationChannel, setVerificationChannel] = useState<'email' | 'phone'>('email');
   const [emailInput, setEmailInput] = useState('');
-  const [phoneInput, setPhoneInput] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
-  // Email or Phone OTP verification state for normal users
-  const [verificationCodeSent, setVerificationCodeSent] = useState(false);
-  const [verificationCodeInput, setVerificationCodeInput] = useState('');
-  const [verificationPreviewCode, setVerificationPreviewCode] = useState<string | null>(null);
-  const [isContactVerified, setIsContactVerified] = useState(false);
-  const [isSendingCode, setIsSendingCode] = useState(false);
-  const [isConfirmingCode, setIsConfirmingCode] = useState(false);
+  // Firebase Authentication built-in email verification state (never displays any code, link, or token in UI)
+  const [verificationLinkSent, setVerificationLinkSent] = useState(false);
+  const [verificationNotice, setVerificationNotice] = useState<string | null>(null);
+  const [isEmailVerified, setIsEmailVerified] = useState(false);
+  const [isSendingVerification, setIsSendingVerification] = useState(false);
+  const [resendCooldownSeconds, setResendCooldownSeconds] = useState<number>(0);
 
   // Status & feedback
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -88,9 +85,18 @@ export const AuthPage: React.FC = () => {
   const [isOwnerSubmitting, setIsOwnerSubmitting] = useState(false);
 
   // Automatically record current domain in Firebase on mount for tracking
-  React.useEffect(() => {
+  useEffect(() => {
     recordSystemDomain().catch(() => {});
   }, []);
+
+  // 60-second resend cooldown timer
+  useEffect(() => {
+    if (resendCooldownSeconds <= 0) return;
+    const timer = setInterval(() => {
+      setResendCooldownSeconds((prev) => (prev > 1 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [resendCooldownSeconds]);
 
   /**
    * Hidden Owner Sign-In Trigger: Tapping the WaveLink logo 5 times
@@ -164,105 +170,206 @@ export const AuthPage: React.FC = () => {
   };
 
   /**
-   * Send 6-digit verification code to Email or Phone for normal users
+   * When the user returns to the app, call reload() on the Firebase Auth user and check emailVerified.
+   * Only when emailVerified is true, show 'Email verified' and allow sign-up to finish.
    */
-  const handleSendVerificationCode = async () => {
-    setError(null);
-    const target =
-      verificationChannel === 'phone'
-        ? phoneInput.trim().replace(/\s+/g, '')
-        : emailInput.trim().toLowerCase();
+  const checkFirebaseEmailVerified = useCallback(async (): Promise<boolean> => {
+    const activeUser = auth.currentUser;
+    if (!activeUser) return false;
 
-    if (verificationChannel === 'email' && (!target || !target.includes('@'))) {
+    const cleanTypedEmail = emailInput.trim().toLowerCase();
+    if (cleanTypedEmail && activeUser.email && activeUser.email.toLowerCase() !== cleanTypedEmail) {
+      return false;
+    }
+
+    try {
+      await activeUser.reload();
+      if (activeUser.emailVerified) {
+        await activeUser.getIdToken(true).catch(() => {});
+        setIsEmailVerified(true);
+        setVerificationNotice(null);
+        setError(null);
+        setStatusMessage('Email verified');
+        return true;
+      }
+    } catch {
+      // ignore transient reload error while offline
+    }
+    return false;
+  }, [emailInput]);
+
+  useEffect(() => {
+    const handleAppReturn = () => {
+      if (document.visibilityState === 'visible') {
+        checkFirebaseEmailVerified().catch(() => {});
+      }
+    };
+    const handleWindowFocus = () => {
+      checkFirebaseEmailVerified().catch(() => {});
+    };
+
+    window.addEventListener('focus', handleWindowFocus);
+    document.addEventListener('visibilitychange', handleAppReturn);
+
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    if (verificationLinkSent && !isEmailVerified) {
+      pollTimer = setInterval(() => {
+        checkFirebaseEmailVerified().catch(() => {});
+      }, 3500);
+    }
+
+    return () => {
+      window.removeEventListener('focus', handleWindowFocus);
+      document.removeEventListener('visibilitychange', handleAppReturn);
+      if (pollTimer) clearInterval(pollTimer);
+    };
+  }, [verificationLinkSent, isEmailVerified, checkFirebaseEmailVerified]);
+
+  /**
+   * When a user taps Verify (or Resend) on their email:
+   * - Validates email and password rule (8–24 chars, at least 1 letter and 1 number, frontend + server)
+   * - Enforces a 60-second resend cooldown
+   * - Creates or uses their Firebase Auth account and calls sendEmailVerification(user)
+   * - Shows 'Verification link sent. Check your inbox and spam folder.'
+   */
+  const handleSendEmailVerificationLink = async () => {
+    if (resendCooldownSeconds > 0 || isSendingVerification) return;
+    setError(null);
+    setVerificationNotice(null);
+
+    const cleanEmail = emailInput.trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       setError('Please enter a valid email address for verification.');
       return;
     }
-    if (verificationChannel === 'phone' && (!target || target.replace(/[^0-9+]/g, '').length < 8)) {
-      setError('Please enter a valid phone number for verification.');
+
+    // Enforce password rule (8–24 chars, at least 1 letter and 1 number) on frontend before creating/using Firebase Auth account
+    const pwValidation = validateStrongPassword(password);
+    if (!pwValidation.valid) {
+      setError(
+        pwValidation.message ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+      );
       return;
     }
 
-    setIsSendingCode(true);
+    setIsSendingVerification(true);
     try {
-      const resp = await fetch('/api/auth/send-verification-code', {
+      // 1. Validate password rule on the server
+      const pwServerResp = await fetch('/api/auth/validate-password', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-WaveLink-Device-Id': getClientDeviceId()
+        },
+        body: JSON.stringify({ password })
+      });
+      const pwServerData = await pwServerResp.json().catch(() => ({}));
+      if (!pwServerResp.ok || !pwServerData?.valid) {
+        setError(
+          pwServerData?.error ||
+            'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+        );
+        return;
+      }
+
+      // 2. Check 60-second resend cooldown on the server
+      const cooldownResp = await fetch('/api/auth/check-verification-cooldown', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-WaveLink-Device-Id': getClientDeviceId()
         },
         body: JSON.stringify({
-          channel: verificationChannel,
-          target
+          channel: 'email',
+          email: cleanEmail,
+          password
         })
       });
-      const data = await resp.json();
-      if (!resp.ok || !data?.success) {
-        setError(data?.error || 'Could not send verification code. Please try again.');
+      const cooldownData = await cooldownResp.json().catch(() => ({}));
+      if (!cooldownResp.ok || !cooldownData?.success) {
+        if (
+          typeof cooldownData?.cooldownRemainingSeconds === 'number' &&
+          cooldownData.cooldownRemainingSeconds > 0
+        ) {
+          setResendCooldownSeconds(cooldownData.cooldownRemainingSeconds);
+        }
+        setError(cooldownData?.error || 'Please wait before resending the verification link.');
         return;
       }
-      setVerificationCodeSent(true);
-      setIsContactVerified(false);
-      setVerificationPreviewCode(data.verificationCodePreview || null);
-      setStatusMessage(
-        data.message ||
-          `Verification code sent to your ${verificationChannel === 'phone' ? 'phone' : 'email'}.`
+
+      // 3. Keep user on AuthPage until emailVerified is true and sign-up finishes
+      try {
+        sessionStorage.setItem('wavelink_signup_verification_pending', 'true');
+      } catch {
+        // ignore
+      }
+
+      // 4. Create or use the user's Firebase Auth account
+      let targetUser = auth.currentUser;
+      if (!targetUser || targetUser.email?.toLowerCase() !== cleanEmail) {
+        if (targetUser) {
+          await fbSignOut(auth).catch(() => {});
+        }
+        try {
+          const createRes = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+          targetUser = createRes.user;
+        } catch (authErr: any) {
+          if (authErr?.code === 'auth/email-already-in-use') {
+            const signInRes = await signInWithEmailAndPassword(auth, cleanEmail, password);
+            targetUser = signInRes.user;
+          } else if (isAuthNetworkError(authErr)) {
+            await new Promise((r) => setTimeout(r, 600));
+            const retryRes = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+            targetUser = retryRes.user;
+          } else {
+            throw authErr;
+          }
+        }
+      }
+
+      if (!targetUser) {
+        setError('Could not initialize your account for email verification. Please try again.');
+        return;
+      }
+
+      if (displayName.trim()) {
+        await fbUpdateProfile(targetUser, { displayName: displayName.trim() }).catch(() => {});
+      }
+
+      // 5. Check if already verified upon reload()
+      await targetUser.reload();
+      if (targetUser.emailVerified) {
+        await targetUser.getIdToken(true).catch(() => {});
+        setIsEmailVerified(true);
+        setVerificationLinkSent(true);
+        setVerificationNotice(null);
+        setStatusMessage('Email verified');
+        return;
+      }
+
+      // 6. Send Firebase Authentication's built-in email verification link
+      await sendEmailVerification(targetUser);
+
+      setVerificationLinkSent(true);
+      setIsEmailVerified(false);
+      setResendCooldownSeconds(
+        typeof cooldownData?.cooldownSeconds === 'number' ? cooldownData.cooldownSeconds : 60
       );
-    } catch {
-      setError('Network error while sending verification code. Please try again.');
+      const sentMsg = 'Verification link sent. Check your inbox and spam folder.';
+      setVerificationNotice(sentMsg);
+      setStatusMessage(sentMsg);
+    } catch (err: any) {
+      setError(getFriendlyAuthErrorMessage(err, 'email'));
     } finally {
-      setIsSendingCode(false);
+      setIsSendingVerification(false);
     }
   };
 
   /**
-   * Confirm the 6-digit Email or Phone verification code
-   */
-  const handleConfirmVerificationCode = async () => {
-    setError(null);
-    const target =
-      verificationChannel === 'phone'
-        ? phoneInput.trim().replace(/\s+/g, '')
-        : emailInput.trim().toLowerCase();
-    const cleanCode = verificationCodeInput.trim();
-
-    if (!cleanCode || cleanCode.length < 4) {
-      setError('Please enter the 6-digit verification code.');
-      return;
-    }
-
-    setIsConfirmingCode(true);
-    try {
-      const resp = await fetch('/api/auth/confirm-verification-code', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-WaveLink-Device-Id': getClientDeviceId()
-        },
-        body: JSON.stringify({
-          channel: verificationChannel,
-          target,
-          code: cleanCode
-        })
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data?.verified) {
-        setError(data?.error || 'Incorrect verification code. Please try again.');
-        return;
-      }
-      setIsContactVerified(true);
-      setVerificationPreviewCode(null);
-      setStatusMessage(
-        `${verificationChannel === 'phone' ? 'Phone number' : 'Email address'} verified! You can now complete sign-up.`
-      );
-    } catch {
-      setError('Could not verify code right now. Please try again.');
-    } finally {
-      setIsConfirmingCode(false);
-    }
-  };
-
-  /**
-   * Normal User Sign-In & Sign-Up Form Handler (Username & Password + Email or Phone Verification)
+   * Normal User Sign-In & Sign-Up Form Handler (Username & Password + Firebase Built-In Email Verification)
+   * Enforces 8–24 character password with at least 1 letter and 1 number on both frontend and server.
+   * Does not let anyone complete sign-up with an unverified email (enforced on frontend, server, and Firestore rules).
    */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -271,105 +378,125 @@ export const AuthPage: React.FC = () => {
       setError('Please enter your username.');
       return;
     }
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters.');
+
+    // 1. Frontend password rule check (8–24 chars, at least 1 letter and 1 number)
+    const pwValidation = validateStrongPassword(password);
+    if (!pwValidation.valid) {
+      setError(
+        pwValidation.message ||
+          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+      );
       return;
     }
 
     setError(null);
     setIsLoading(true);
 
-    if (authMode === 'signup') {
-      const targetContact =
-        verificationChannel === 'phone'
-          ? phoneInput.trim().replace(/\s+/g, '')
-          : emailInput.trim().toLowerCase();
+    // 2. Server-side password rule check
+    try {
+      const pwServerResp = await fetch('/api/auth/validate-password', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-WaveLink-Device-Id': getClientDeviceId()
+        },
+        body: JSON.stringify({ password })
+      });
+      const pwServerData = await pwServerResp.json().catch(() => ({}));
+      if (!pwServerResp.ok || !pwServerData?.valid) {
+        setError(
+          pwServerData?.error ||
+            'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+        );
+        setIsLoading(false);
+        return;
+      }
+    } catch {
+      // fallback to frontend check if offline
+    }
 
-      if (verificationChannel === 'email' && (!targetContact || !targetContact.includes('@'))) {
+    if (authMode === 'signup') {
+      const cleanEmail = emailInput.trim().toLowerCase();
+      if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
         setError('Please enter a valid email address for verification.');
         setIsLoading(false);
         return;
       }
-      if (verificationChannel === 'phone' && (!targetContact || targetContact.replace(/[^0-9+]/g, '').length < 8)) {
-        setError('Please enter a valid phone number for verification.');
-        setIsLoading(false);
-        return;
-      }
-      if (!isContactVerified) {
+
+      // Reload the Firebase Auth user and check emailVerified before allowing sign-up to finish
+      const verifiedNow = await checkFirebaseEmailVerified();
+      const activeUser = auth.currentUser;
+
+      if (
+        !verifiedNow ||
+        !activeUser ||
+        !activeUser.emailVerified ||
+        activeUser.email?.toLowerCase() !== cleanEmail
+      ) {
+        setIsEmailVerified(false);
         setError(
-          `Please verify your ${verificationChannel === 'phone' ? 'phone number' : 'email address'} with the 6-digit verification code first.`
+          'Please verify your email address before completing sign-up. Tap Verify, open the link in your email, and return to WaveLink.'
         );
         setIsLoading(false);
         return;
       }
 
-      const cleanHandle = rawUsername.replace(/^@/, '').toLowerCase().replace(/[^a-z0-9_.-]/g, '') || 'waver';
+      const cleanHandle =
+        rawUsername.replace(/^@/, '').toLowerCase().replace(/[^a-z0-9_.-]/g, '') || 'waver';
       const formattedUsername = `@${cleanHandle}`;
-      const authEmail =
-        verificationChannel === 'email'
-          ? targetContact
-          : `${cleanHandle}.${targetContact.replace(/[^0-9]/g, '').slice(-6) || 'phone'}@users.wavelink.app`;
       const name = displayName.trim() || rawUsername.replace(/^@/, '');
 
-      setStatusMessage('Creating your verified WaveLink account...');
+      setStatusMessage('Completing your verified WaveLink account...');
 
       try {
-        let res;
-        try {
-          res = await createUserWithEmailAndPassword(auth, authEmail, password);
-        } catch (initialErr) {
-          if (isAuthNetworkError(initialErr)) {
-            await new Promise((r) => setTimeout(r, 600));
-            res = await createUserWithEmailAndPassword(auth, authEmail, password);
-          } else {
-            throw initialErr;
-          }
-        }
+        await fbUpdateProfile(activeUser, { displayName: name }).catch(() => {});
+        const idToken = await activeUser.getIdToken(true);
 
-        await fbUpdateProfile(res.user, { displayName: name });
-
-        if (verificationChannel === 'email') {
-          fbSendEmailVerification(res.user).catch(() => {});
-        }
-
-        // Register username -> authEmail mapping on server & Firestore
-        fetch('/api/auth/register-username', {
+        // Server enforces that emailVerified is true and password meets the 8–24 char rule
+        const regResp = await fetch('/api/auth/register-username', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-WaveLink-Device-Id': getClientDeviceId()
+            'X-WaveLink-Device-Id': getClientDeviceId(),
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {})
           },
           body: JSON.stringify({
+            uid: activeUser.uid,
             username: cleanHandle,
-            authEmail,
-            channel: verificationChannel
+            displayName: name,
+            authEmail: cleanEmail,
+            channel: 'email',
+            password
           })
-        }).catch(() => {});
+        });
+        const regData = await regResp.json().catch(() => ({}));
+        if (!regResp.ok || !regData?.success) {
+          setError(
+            regData?.error ||
+              'Email verification is required on the server before completing sign-up.'
+          );
+          setStatusMessage(null);
+          setIsLoading(false);
+          return;
+        }
 
+        // Write Firestore profile document (enforced by Firestore rules requiring request.auth.token.email_verified == true)
         await setDoc(
-          doc(db, 'users', res.user.uid),
+          doc(db, 'users', activeUser.uid),
           cleanFirestoreData({
-            id: res.user.uid,
-            email: authEmail,
+            id: activeUser.uid,
+            email: cleanEmail,
             username: formattedUsername,
             displayName: name,
-            verificationMethod: verificationChannel,
-            verifiedContact: targetContact,
-            isContactVerified: true,
             updatedAt: new Date().toISOString()
           }),
           { merge: true }
-        ).catch(() => {});
+        );
 
+        await completeVerifiedAuthSession(name, formattedUsername);
         setStatusMessage('Welcome to WaveLink! Opening your feed...');
       } catch (err: any) {
-        const friendly = getFriendlyAuthErrorMessage(err, 'email');
-        if (err?.code === 'auth/email-already-in-use') {
-          setError('An account with these details already exists. Switching to Sign In...');
-          setAuthMode('signin');
-        } else {
-          setError(friendly);
-        }
+        setError(getFriendlyAuthErrorMessage(err, 'email'));
         setStatusMessage(null);
       } finally {
         setIsLoading(false);
@@ -383,16 +510,36 @@ export const AuthPage: React.FC = () => {
       try {
         const resolvedEmail = await resolveAuthEmailFromIdentifier(rawUsername);
 
+        let signInRes;
         try {
-          await signInWithEmailAndPassword(auth, resolvedEmail, password);
+          signInRes = await signInWithEmailAndPassword(auth, resolvedEmail, password);
         } catch (initialErr) {
           if (isAuthNetworkError(initialErr)) {
             await new Promise((r) => setTimeout(r, 600));
-            await signInWithEmailAndPassword(auth, resolvedEmail, password);
+            signInRes = await signInWithEmailAndPassword(auth, resolvedEmail, password);
           } else {
             throw initialErr;
           }
         }
+
+        await signInRes.user.reload();
+        if (!signInRes.user.emailVerified) {
+          try {
+            sessionStorage.setItem('wavelink_signup_verification_pending', 'true');
+          } catch {
+            // ignore
+          }
+          setAuthMode('signup');
+          setEmailInput(signInRes.user.email || resolvedEmail);
+          setIsEmailVerified(false);
+          setStatusMessage(null);
+          setError(
+            'Your email address is not verified yet. Please tap Verify on your email to receive a verification link before continuing.'
+          );
+          return;
+        }
+
+        await completeVerifiedAuthSession();
         setStatusMessage('Welcome back! Logging you in...');
       } catch (err: any) {
         const friendly = getFriendlyAuthErrorMessage(err, 'email');
@@ -644,7 +791,7 @@ export const AuthPage: React.FC = () => {
               </h2>
               <p className="text-xs text-slate-500 mt-1 font-medium">
                 {authMode === 'signup'
-                  ? 'Choose a username and password, then verify with your email or phone number'
+                  ? 'Choose a username and password (8–24 characters), then verify your email'
                   : 'Enter your username and password to jump right into the feed'}
               </p>
             </div>
@@ -661,13 +808,13 @@ export const AuthPage: React.FC = () => {
 
             {statusMessage && !error && (
               <div className="mb-4 p-3.5 rounded-2xl bg-blue-50 border border-blue-200 text-blue-700 text-xs flex items-center gap-2.5 animate-in fade-in font-medium">
-                <div className="w-3.5 h-3.5 border-2 border-[#3B82F6] border-t-transparent rounded-full animate-spin shrink-0" />
+                <CheckCircle2 size={16} className="text-blue-600 shrink-0" />
                 <span>{statusMessage}</span>
               </div>
             )}
 
-            {/* Normal User Form: Username & Password + Email or Phone Verification */}
-            <form onSubmit={handleSubmit} className="space-y-4">
+            {/* Normal User Form: Username & Password + Firebase Built-In Email Verification */}
+            <form onSubmit={handleSubmit} className="space-y-4" noValidate>
               {authMode === 'signup' && (
                 <div>
                   <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
@@ -709,7 +856,9 @@ export const AuthPage: React.FC = () => {
                   <label className="block text-xs font-bold text-[#0F172A]">
                     Password
                   </label>
-                  <span className="text-[10px] text-pink-600 font-semibold">Min. 6 characters</span>
+                  <span className="text-[10px] text-pink-600 font-semibold">
+                    8–24 chars, at least 1 letter &amp; 1 number
+                  </span>
                 </div>
                 <div className="relative">
                   <Lock className="absolute left-3.5 top-3.5 text-pink-500" size={16} />
@@ -718,8 +867,9 @@ export const AuthPage: React.FC = () => {
                     required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    minLength={6}
+                    placeholder="8–24 characters with letters & numbers"
+                    minLength={8}
+                    maxLength={24}
                     className="w-full min-h-[44px] pl-10 pr-10 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-pink-500 focus:ring-2 focus:ring-pink-500/25 text-base sm:text-sm transition"
                   />
                   <button
@@ -733,134 +883,88 @@ export const AuthPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Email or Phone Verification Section for Normal Users */}
+              {/* Email Verification Section for Normal Users (Phone option disabled & hidden) */}
               {authMode === 'signup' && (
                 <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/90 space-y-3">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-extrabold text-[#0F172A]">
-                      Account Verification
+                    <span className="text-xs font-extrabold text-[#0F172A] flex items-center gap-1.5">
+                      <Mail size={14} className="text-blue-600" />
+                      <span>Email Verification</span>
                     </span>
-                    <div className="inline-flex rounded-xl bg-white p-0.5 border border-slate-200 text-[11px] font-bold">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setVerificationChannel('email');
-                          setVerificationCodeSent(false);
-                          setIsContactVerified(false);
-                          setVerificationPreviewCode(null);
-                        }}
-                        className={`px-2.5 py-1 rounded-lg flex items-center gap-1 transition ${
-                          verificationChannel === 'email'
-                            ? 'bg-blue-600 text-white'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        <Mail size={12} />
-                        <span>Email</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setVerificationChannel('phone');
-                          setVerificationCodeSent(false);
-                          setIsContactVerified(false);
-                          setVerificationPreviewCode(null);
-                        }}
-                        className={`px-2.5 py-1 rounded-lg flex items-center gap-1 transition ${
-                          verificationChannel === 'phone'
-                            ? 'bg-emerald-600 text-white'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        <Phone size={12} />
-                        <span>Phone</span>
-                      </button>
-                    </div>
+                    {isEmailVerified && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] font-extrabold">
+                        <CheckCircle2 size={12} className="text-emerald-600" />
+                        <span>Email verified</span>
+                      </span>
+                    )}
                   </div>
 
-                  {verificationChannel === 'email' ? (
-                    <div className="relative">
-                      <Mail className="absolute left-3.5 top-3.5 text-blue-500" size={16} />
-                      <input
-                        type="email"
-                        required
-                        value={emailInput}
-                        onChange={(e) => {
-                          setEmailInput(e.target.value);
-                          setIsContactVerified(false);
-                        }}
-                        placeholder="name@domain.com"
-                        className="w-full min-h-[42px] pl-10 pr-28 py-2 rounded-xl bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-blue-500 text-xs sm:text-sm"
-                      />
+                  <div className="relative">
+                    <Mail className="absolute left-3.5 top-3.5 text-blue-500" size={16} />
+                    <input
+                      type="email"
+                      required
+                      value={emailInput}
+                      onChange={(e) => {
+                        setEmailInput(e.target.value);
+                        setIsEmailVerified(false);
+                        setVerificationLinkSent(false);
+                        setVerificationNotice(null);
+                      }}
+                      placeholder="name@domain.com"
+                      className="w-full min-h-[42px] pl-10 pr-28 py-2 rounded-xl bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-blue-500 text-xs sm:text-sm"
+                    />
+                    {!verificationLinkSent && !isEmailVerified && (
                       <button
                         type="button"
-                        disabled={isSendingCode || isContactVerified}
-                        onClick={handleSendVerificationCode}
+                        disabled={isSendingVerification || isEmailVerified}
+                        onClick={handleSendEmailVerificationLink}
+                        className="absolute right-1.5 top-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] disabled:opacity-50 transition"
+                      >
+                        {isSendingVerification ? 'Sending...' : 'Verify'}
+                      </button>
+                    )}
+                    {verificationLinkSent && !isEmailVerified && (
+                      <button
+                        type="button"
+                        disabled={isSendingVerification || resendCooldownSeconds > 0}
+                        onClick={handleSendEmailVerificationLink}
                         className="absolute right-1.5 top-1.5 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] disabled:opacity-50 transition"
                       >
-                        {isContactVerified ? 'Verified' : isSendingCode ? 'Sending...' : 'Send Code'}
+                        {isSendingVerification
+                          ? 'Sending...'
+                          : resendCooldownSeconds > 0
+                          ? `Resend (${resendCooldownSeconds}s)`
+                          : 'Resend'}
                       </button>
-                    </div>
-                  ) : (
-                    <div className="relative">
-                      <Phone className="absolute left-3.5 top-3.5 text-emerald-500" size={16} />
-                      <input
-                        type="tel"
-                        required
-                        value={phoneInput}
-                        onChange={(e) => {
-                          setPhoneInput(e.target.value);
-                          setIsContactVerified(false);
-                        }}
-                        placeholder="+255 7XX XXX XXX"
-                        className="w-full min-h-[42px] pl-10 pr-28 py-2 rounded-xl bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-emerald-500 text-xs sm:text-sm"
-                      />
-                      <button
-                        type="button"
-                        disabled={isSendingCode || isContactVerified}
-                        onClick={handleSendVerificationCode}
-                        className="absolute right-1.5 top-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] disabled:opacity-50 transition"
-                      >
-                        {isContactVerified ? 'Verified' : isSendingCode ? 'Sending...' : 'Send SMS'}
-                      </button>
-                    </div>
-                  )}
+                    )}
+                  </div>
 
-                  {verificationCodeSent && !isContactVerified && (
+                  {verificationLinkSent && !isEmailVerified && (
                     <div className="space-y-2 pt-1">
-                      {verificationPreviewCode && (
-                        <p className="text-[11px] text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-2.5 py-1.5 font-semibold">
-                          Verification code dispatch: <span className="font-mono font-extrabold">{verificationPreviewCode}</span>
-                        </p>
-                      )}
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="text"
-                          inputMode="numeric"
-                          maxLength={6}
-                          value={verificationCodeInput}
-                          onChange={(e) => setVerificationCodeInput(e.target.value)}
-                          placeholder="Enter 6-digit code"
-                          className="flex-1 min-h-[40px] px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-xs sm:text-sm font-mono tracking-widest text-[#0F172A] focus:outline-none focus:border-blue-500"
-                        />
+                      <p className="text-[11px] text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-2.5 py-2 font-semibold">
+                        {verificationNotice ||
+                          'Verification link sent. Check your inbox and spam folder.'}
+                      </p>
+                      <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
+                        <span>
+                          Click the link in your email, then return here to finish sign-up.
+                        </span>
                         <button
                           type="button"
-                          disabled={isConfirmingCode}
-                          onClick={handleConfirmVerificationCode}
-                          className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-[#0F172A] hover:bg-slate-800 text-white font-bold text-xs transition disabled:opacity-50"
+                          onClick={() => checkFirebaseEmailVerified()}
+                          className="shrink-0 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-bold text-[11px] transition"
                         >
-                          {isConfirmingCode ? 'Checking...' : 'Verify Code'}
+                          I&apos;ve Verified
                         </button>
                       </div>
                     </div>
                   )}
 
-                  {isContactVerified && (
+                  {isEmailVerified && (
                     <div className="flex items-center gap-1.5 text-emerald-700 text-xs font-bold">
                       <CheckCircle2 size={15} className="text-emerald-600 shrink-0" />
-                      <span>
-                        {verificationChannel === 'phone' ? 'Phone number' : 'Email address'} verified
-                      </span>
+                      <span>Email verified</span>
                     </div>
                   )}
                 </div>
@@ -868,7 +972,7 @@ export const AuthPage: React.FC = () => {
 
               <button
                 type="submit"
-                disabled={isLoading}
+                disabled={isLoading || (authMode === 'signup' && !isEmailVerified)}
                 className="w-full min-h-[48px] mt-2 py-3.5 px-5 rounded-2xl font-extrabold text-xs sm:text-sm text-white flex items-center justify-center gap-2 shadow-lg shadow-blue-500/30 hover:shadow-pink-500/35 hover:scale-[1.01] active:scale-[0.99] transition-all duration-200 disabled:opacity-50 animate-moving-btn"
               >
                 {isLoading ? (
