@@ -63,8 +63,15 @@ service cloud.firestore {
       return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
     }
 
-    // Single source of truth for admin role across UI, Server, and Firestore Rules:
-    // /users/{uid}.role in ['admin', 'super_admin'] (or 'sub_admin')
+    // Single source of truth for admin role across Admin Desk, Server Routes, and Firestore Rules:
+    // Checks Firebase custom claims (token.role == 'admin' / token.admin == true), /users/{uid}.role, and /admins/{uid}
+    function hasAdminCustomClaim() {
+      return isSignedIn() && (
+        request.auth.token.get('role', '') in ['admin', 'super_admin'] ||
+        request.auth.token.get('admin', false) == true
+      );
+    }
+
     function getUserRole() {
       return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
         ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user')
@@ -73,15 +80,15 @@ service cloud.firestore {
 
     function isSuperAdmin() {
       return isSignedIn() && (
+        hasAdminCustomClaim() ||
         getUserRole() in ['admin', 'super_admin'] ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
-        request.auth.token.get('admin', false) == true ||
-        request.auth.token.get('role', '') in ['admin', 'super_admin']
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
 
     function isSubAdmin() {
       return isSignedIn() && (
+        request.auth.token.get('role', '') == 'sub_admin' ||
         getUserRole() == 'sub_admin' ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isSubAdmin', false) == true &&
@@ -195,15 +202,16 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Server-managed Admins registry (writable only by the server after verifying OWNER_EMAIL and OWNER_ACCESS_CODE)
+    // Server-managed Admins registry (writable by custom-claim admin or by server after verifying OWNER_EMAIL and OWNER_ACCESS_CODE)
     match /admins/{adminId} {
-      allow read: if false;
-      allow create, update: if isOwner(adminId) &&
-        isEmailVerified() &&
+      allow read: if isOwner(adminId) || isAdmin();
+      allow create, update: if isSuperAdmin() || (
+        isOwner(adminId) &&
         request.resource.data.uid == adminId &&
         request.resource.data.role in ['admin', 'super_admin'] &&
-        request.resource.data.get('_serverGrantKey', '') == 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
-      allow delete: if false;
+        request.resource.data.get('_serverGrantKey', '') == 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'
+      );
+      allow delete: if isSuperAdmin();
     }
 
     // Connection test document
@@ -212,11 +220,18 @@ service cloud.firestore {
       allow write: if isSignedIn();
     }
 
+    // Check if update/create is a server-verified owner admin role grant
+    function isServerVerifiedOwnerRoleGrant(userId) {
+      return isOwner(userId) &&
+        request.resource.data.get('role', '') in ['admin', 'super_admin'] &&
+        request.resource.data.get('_serverGrantKey', '') == 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+    }
+
     // User profiles: users can read directory profiles, create/update only their own (with RBAC/Pro/points guards), or delete their own account
     match /users/{userId} {
       allow read: if true;
-      allow create: if isValidId(userId) && (isSafeUserProfileCreate(userId) || isAdmin());
-      allow update: if isValidId(userId) && (isAdmin() || isSafeUserProfileUpdate(userId));
+      allow create: if isValidId(userId) && (isAdmin() || isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileCreate(userId));
+      allow update: if isValidId(userId) && (isAdmin() || isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileUpdate(userId));
       allow delete: if isValidId(userId) && (isOwner(userId) || isSuperAdmin());
 
       // Device FCM Push Notification Tokens — strictly private to the user & admin

@@ -190,6 +190,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     userProfile,
     isAdmin,
     isSubAdmin,
+    adminCheckFailedReason,
     isProEffective,
     updateUserProfile,
     changeUserPassword,
@@ -826,8 +827,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             <ChevronRight size={18} className="text-[#78716C] shrink-0" />
           </button>
 
-          {/* Admin Panel Row — Visible ONLY to Admin accounts */}
-          {isAdmin && onOpenAdminPanel && (
+          {/* Admin Panel Row — Visible to Admin accounts or Owner session needing re-verification */}
+          {(isAdmin ||
+            adminCheckFailedReason === 'owner sign-in not used' ||
+            adminCheckFailedReason === 'session needs refresh') &&
+            onOpenAdminPanel && (
             <button
               type="button"
               onClick={onOpenAdminPanel}

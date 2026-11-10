@@ -46,7 +46,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   isCollapsed: controlledCollapsed,
   onToggleCollapse
 }) => {
-  const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, signOut } = useAuth();
+  const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, adminCheckFailedReason, signOut } = useAuth();
   const [internalCollapsed, setInternalCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem('wavelink_left_sidebar_collapsed') === 'true';
@@ -84,13 +84,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'monetization', label: 'Monetization Hub', icon: <Coins size={18} />, badge: 'TZS' },
     { id: 'directory', label: 'Members', icon: <Users size={18} /> },
     { id: 'analytics', label: 'Creator Analytics', icon: <BarChart3 size={18} />, badge: isProUser ? 'Pro' : undefined },
-    // Restrict Admin / Moderator Desk to authorized admins
-    ...(isAdmin
+    // Restrict Admin / Moderator Desk to authorized admins (or owner session needing re-verification)
+    ...(isAdmin ||
+    adminCheckFailedReason === 'owner sign-in not used' ||
+    adminCheckFailedReason === 'session needs refresh'
       ? [{
           id: 'admin' as ActiveTab,
-          label: isSuperAdmin ? 'Admin Desk' : 'Moderator Desk',
+          label: isSuperAdmin || !isSubAdmin ? 'Admin Desk' : 'Moderator Desk',
           icon: <Shield size={18} />,
-          badge: isSuperAdmin ? 'Owner' : 'Mod'
+          badge: isSuperAdmin || !isSubAdmin ? 'Owner' : 'Mod'
         }]
       : []),
     { id: 'settings', label: 'Profile & Settings', icon: <Settings size={18} /> },

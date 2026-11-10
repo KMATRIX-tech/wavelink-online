@@ -350,18 +350,27 @@ function safeConstantTimeEquals(inputA: string, inputB: string): boolean {
   return hashesMatch && lengthsMatch;
 }
 
-// Ephemeral server secret for signing Owner session tokens (never exposed to client)
-const SERVER_OWNER_HMAC_SECRET = crypto.randomBytes(32).toString('hex');
+const SERVER_ADMIN_GRANT_KEY = 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+
+// Deterministic server-only HMAC secret for signing Owner session tokens (survives server restarts, never exposed to client)
+function getOwnerHmacSecret(): string {
+  const email = getOwnerEmail();
+  const code = getOwnerAccessCode() || 'wavelink_default_owner_secret';
+  return crypto
+    .createHash('sha256')
+    .update(`wavelink_owner_hmac_v2:${email}:${code}:${SERVER_ADMIN_GRANT_KEY}`)
+    .digest('hex');
+}
 
 function signOwnerSessionToken(uid: string): string {
   const issuedAt = Date.now();
-  const expiresAt = issuedAt + 12 * 60 * 60 * 1000; // 12 hours
+  const expiresAt = issuedAt + 24 * 60 * 60 * 1000; // 24 hours
   const payload = Buffer.from(
     JSON.stringify({ uid, role: 'admin', issuedAt, expiresAt }),
     'utf8'
   ).toString('base64url');
   const sig = crypto
-    .createHmac('sha256', SERVER_OWNER_HMAC_SECRET)
+    .createHmac('sha256', getOwnerHmacSecret())
     .update(payload)
     .digest('base64url');
   return `${payload}.${sig}`;
@@ -370,13 +379,13 @@ function signOwnerSessionToken(uid: string): string {
 function verifyOwnerSessionToken(
   token: string | undefined,
   expectedUid?: string
-): { valid: boolean; uid: string } {
+): { valid: boolean; uid: string; expired?: boolean } {
   if (!token || typeof token !== 'string') return { valid: false, uid: '' };
   const parts = token.trim().split('.');
   if (parts.length !== 2) return { valid: false, uid: '' };
   const [payloadB64, providedSig] = parts;
   const expectedSig = crypto
-    .createHmac('sha256', SERVER_OWNER_HMAC_SECRET)
+    .createHmac('sha256', getOwnerHmacSecret())
     .update(payloadB64)
     .digest('base64url');
   if (!safeConstantTimeEquals(providedSig, expectedSig)) {
@@ -392,7 +401,7 @@ function verifyOwnerSessionToken(
       return { valid: false, uid: '' };
     }
     if (typeof data.expiresAt !== 'number' || Date.now() > data.expiresAt) {
-      return { valid: false, uid: '' };
+      return { valid: false, uid: data.uid, expired: true };
     }
     if (expectedUid && data.uid !== expectedUid) {
       return { valid: false, uid: '' };
@@ -403,12 +412,44 @@ function verifyOwnerSessionToken(
   }
 }
 
-// Server-side authoritative Owner & Sub-Admin sets (populated only by the server)
+// Server-side authoritative Owner & Sub-Admin sets (populated only by the server and persisted in /tmp across restarts)
+const VERIFIED_OWNERS_CACHE_FILE = '/tmp/wavelink_verified_owners.json';
 const serverOwnerUids = new Set<string>();
 const serverSubAdminEmails = new Set<string>();
 const serverSubAdminUids = new Set<string>();
 
-const SERVER_ADMIN_GRANT_KEY = 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+function loadPersistedOwnerUids(): void {
+  try {
+    if (fs.existsSync(VERIFIED_OWNERS_CACHE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(VERIFIED_OWNERS_CACHE_FILE, 'utf8'));
+      if (Array.isArray(parsed?.ownerUids)) {
+        for (const uid of parsed.ownerUids) {
+          if (typeof uid === 'string' && uid.trim()) {
+            serverOwnerUids.add(uid.trim());
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore cache read errors
+  }
+}
+
+function persistOwnerUidOnServer(uid: string): void {
+  if (!uid) return;
+  serverOwnerUids.add(uid);
+  try {
+    fs.writeFileSync(
+      VERIFIED_OWNERS_CACHE_FILE,
+      JSON.stringify({ ownerUids: Array.from(serverOwnerUids), updatedAt: new Date().toISOString() }),
+      'utf8'
+    );
+  } catch {
+    // ignore cache write errors
+  }
+}
+
+loadPersistedOwnerUids();
 
 function getServerFirebaseConfig(): { projectId: string; firestoreDatabaseId: string } {
   try {
@@ -427,6 +468,54 @@ function getServerFirebaseConfig(): { projectId: string; firestoreDatabaseId: st
     projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || '',
     firestoreDatabaseId: '(default)'
   };
+}
+
+function ensureFirebaseAdminInitialized(): boolean {
+  try {
+    if (getAdminApps().length > 0) return true;
+    const rawSa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    const { projectId } = getServerFirebaseConfig();
+    if (rawSa) {
+      const parsed = JSON.parse(rawSa);
+      initializeAdminApp({
+        credential: cert(parsed),
+        projectId: parsed.project_id || projectId || undefined
+      });
+    } else {
+      initializeAdminApp({
+        projectId: projectId || process.env.GOOGLE_CLOUD_PROJECT || undefined
+      });
+    }
+    return getAdminApps().length > 0;
+  } catch {
+    return getAdminApps().length > 0;
+  }
+}
+
+/**
+ * Sets Firebase custom claims { role: 'admin', admin: true } on the existing UID on the server.
+ * Logs the outcome on the server only.
+ */
+async function setServerAdminCustomClaims(ownerUid: string): Promise<boolean> {
+  if (!ownerUid) return false;
+  try {
+    if (!ensureFirebaseAdminInitialized()) return false;
+    await getAdminAuth(getAdminApp()).setCustomUserClaims(ownerUid, {
+      role: 'admin',
+      admin: true
+    });
+    console.log(
+      `[WaveLink Server Auth Log] Firebase custom claims { role: 'admin', admin: true } set on existing UID="${ownerUid}".`
+    );
+    return true;
+  } catch (err) {
+    console.warn(
+      `[WaveLink Server Auth Log] Firebase Admin setCustomUserClaims fallback notice for UID="${ownerUid}": ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return false;
+  }
 }
 
 /**
@@ -474,13 +563,18 @@ async function grantOwnerRoleViaFirestoreRest(
         `[WaveLink Server Auth Log] Firestore REST /admins/${ownerUid} write status ${adminResp.status}:`,
         errText.slice(0, 240)
       );
+    } else {
+      console.log(
+        `[WaveLink Server Auth Log] Firestore REST /admins/${ownerUid} role='admin' persisted.`
+      );
     }
 
-    // Step 2: Patch ONLY role & verification fields on /users/{ownerUid} so existing points, followers, posts, username, bio stay untouched
+    // Step 2: Patch ONLY role & verification fields on /users/{ownerUid} (including _serverGrantKey) so existing points, followers, posts, username, bio stay untouched
     const maskParams = [
       'id',
       'email',
       'role',
+      '_serverGrantKey',
       'isSubAdmin',
       'isPro',
       'hasBlueStar',
@@ -501,6 +595,7 @@ async function grantOwnerRoleViaFirestoreRest(
           id: { stringValue: ownerUid },
           email: { stringValue: email },
           role: { stringValue: 'admin' },
+          _serverGrantKey: { stringValue: SERVER_ADMIN_GRANT_KEY },
           isSubAdmin: { booleanValue: false },
           isPro: { booleanValue: true },
           hasBlueStar: { booleanValue: true },
@@ -521,6 +616,9 @@ async function grantOwnerRoleViaFirestoreRest(
       return adminResp.ok;
     }
 
+    console.log(
+      `[WaveLink Server Auth Log] Firestore REST /users/${ownerUid} role='admin' persisted.`
+    );
     return true;
   } catch (err) {
     console.error(
@@ -532,7 +630,7 @@ async function grantOwnerRoleViaFirestoreRest(
 }
 
 /**
- * Reads canonical role from /users/{uid} in Firestore via REST API so UI, Server, and Firestore rules share one source of truth.
+ * Reads canonical role from /users/{uid} (and /admins/{uid}) in Firestore via REST API so Admin Desk, Server Routes, and Firestore rules share one source of truth.
  */
 async function fetchUserRoleViaFirestoreRest(
   uid: string,
@@ -553,21 +651,36 @@ async function fetchUserRoleViaFirestoreRest(
   try {
     const userDocUrl = `${dbPath}/users/${encodeURIComponent(uid)}`;
     const resp = await fetch(userDocUrl, { method: 'GET', headers });
-    if (!resp.ok) return null;
-    const docJson = await resp.json().catch(() => null);
-    const fields = docJson?.fields;
-    if (!fields) return null;
-    const roleVal = String(fields.role?.stringValue || '').trim();
-    const isSubVal = Boolean(fields.isSubAdmin?.booleanValue);
-    if (roleVal === 'admin' || roleVal === 'super_admin') {
-      serverOwnerUids.add(uid);
-      return 'admin';
+    if (resp.ok) {
+      const docJson = await resp.json().catch(() => null);
+      const fields = docJson?.fields;
+      if (fields) {
+        const roleVal = String(fields.role?.stringValue || '').trim();
+        const isSubVal = Boolean(fields.isSubAdmin?.booleanValue);
+        if (roleVal === 'admin' || roleVal === 'super_admin') {
+          persistOwnerUidOnServer(uid);
+          return 'admin';
+        }
+        if (roleVal === 'sub_admin' || isSubVal) {
+          serverSubAdminUids.add(uid);
+          return 'sub_admin';
+        }
+      }
     }
-    if (roleVal === 'sub_admin' || isSubVal) {
-      serverSubAdminUids.add(uid);
-      return 'sub_admin';
+
+    // Also check /admins/{uid}
+    const adminDocUrl = `${dbPath}/admins/${encodeURIComponent(uid)}`;
+    const adminResp = await fetch(adminDocUrl, { method: 'GET', headers });
+    if (adminResp.ok) {
+      const adminJson = await adminResp.json().catch(() => null);
+      const adminRole = String(adminJson?.fields?.role?.stringValue || '').trim();
+      if (adminRole === 'admin' || adminRole === 'super_admin') {
+        persistOwnerUidOnServer(uid);
+        return 'admin';
+      }
     }
-    return 'user';
+
+    return resp.ok ? 'user' : null;
   } catch {
     return null;
   }
@@ -703,8 +816,10 @@ interface VerifiedAuthUser {
   email: string;
   emailVerified: boolean;
   signInProvider?: string;
+  tokenRole?: 'admin' | 'sub_admin' | 'user';
   customAdminClaim?: boolean;
   isVerifiedOwnerSession?: boolean;
+  tokenExpired?: boolean;
 }
 
 function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | null {
@@ -723,24 +838,43 @@ function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | n
         const payload = JSON.parse(payloadJson);
         const nowSec = Math.floor(Date.now() / 1000);
         if (payload && typeof payload === 'object') {
-          if (payload.exp && Number(payload.exp) < nowSec - 60) {
-            return null;
-          }
           const uid = String(payload.user_id || payload.sub || fallbackUid || '').trim();
           const email = String(payload.email || fallbackEmail || '').trim().toLowerCase();
           const emailVerified = Boolean(payload.email_verified ?? false);
           const signInProvider = String(payload.firebase?.sign_in_provider || '').trim();
+          const tokenExpired = Boolean(payload.exp && Number(payload.exp) < nowSec - 60);
           const customAdminClaim = Boolean(
-            payload.admin === true ||
-            payload.role === 'super_admin' ||
-            payload.role === 'admin'
+            !tokenExpired &&
+              (payload.admin === true ||
+                payload.role === 'super_admin' ||
+                payload.role === 'admin')
           );
+          const tokenRole: 'admin' | 'sub_admin' | 'user' = customAdminClaim
+            ? 'admin'
+            : !tokenExpired && payload.role === 'sub_admin'
+            ? 'sub_admin'
+            : 'user';
+
+          if (tokenExpired) {
+            return {
+              uid,
+              email,
+              emailVerified,
+              signInProvider,
+              tokenRole: 'user',
+              customAdminClaim: false,
+              isVerifiedOwnerSession: false,
+              tokenExpired: true
+            };
+          }
+
           if (uid) {
             return {
               uid,
               email,
               emailVerified,
               signInProvider,
+              tokenRole,
               customAdminClaim,
               isVerifiedOwnerSession:
                 (ownerTokenCheck.valid && ownerTokenCheck.uid === uid) ||
@@ -759,6 +893,7 @@ function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | n
       uid: ownerTokenCheck.uid,
       email: fallbackEmail,
       emailVerified: true,
+      tokenRole: 'admin',
       customAdminClaim: true,
       isVerifiedOwnerSession: true
     };
@@ -766,11 +901,14 @@ function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | n
 
   if (fallbackUid || fallbackEmail) {
     const uid = fallbackUid || 'authenticated_user';
+    const isOwnerSession = serverOwnerUids.has(uid);
     return {
       uid,
       email: fallbackEmail,
       emailVerified: false,
-      isVerifiedOwnerSession: serverOwnerUids.has(uid)
+      tokenRole: isOwnerSession ? 'admin' : 'user',
+      customAdminClaim: isOwnerSession,
+      isVerifiedOwnerSession: isOwnerSession
     };
   }
   return null;
@@ -780,18 +918,23 @@ function isServerAdminUser(user: VerifiedAuthUser | null, bodyEmail?: string, bo
   authorized: boolean;
   role: 'super_admin' | 'sub_admin' | 'user';
 } {
+  if (user?.tokenExpired) {
+    return { authorized: false, role: 'user' };
+  }
   const candidateEmail = (user?.email || bodyEmail || '').trim().toLowerCase();
   const candidateUid = (user?.uid || '').trim();
 
   if (
-    Boolean(user?.isVerifiedOwnerSession) ||
+    user?.tokenRole === 'admin' ||
     Boolean(user?.customAdminClaim) ||
+    Boolean(user?.isVerifiedOwnerSession) ||
     (candidateUid && serverOwnerUids.has(candidateUid))
   ) {
     return { authorized: true, role: 'super_admin' };
   }
 
   if (
+    user?.tokenRole === 'sub_admin' ||
     (candidateEmail && serverSubAdminEmails.has(candidateEmail)) ||
     (candidateUid && serverSubAdminUids.has(candidateUid)) ||
     Boolean(bodySubAdmin && candidateEmail && candidateEmail !== 'support-bot@wavelink.system')
@@ -2676,6 +2819,8 @@ Escalation Required: ${
       );
       return res.status(429).json({
         success: false,
+        authorized: false,
+        failedCheck: 'owner sign-in not used',
         lockedOut: true,
         remainingAttempts: 0,
         retryAfterSeconds: rateCheck.retryAfterSeconds,
@@ -2698,42 +2843,54 @@ Escalation Required: ${
         ? authHeader.slice(7).trim()
         : '';
 
-    const ownerEmailEnv = getOwnerEmail();
-    const ownerAccessCodeEnv = getOwnerAccessCode();
+    const ownerEmailEnv = getOwnerEmail().trim().toLowerCase();
+    const ownerAccessCodeEnv = getOwnerAccessCode().trim();
 
     const verifiedToken = await verifyGoogleTokenOnServer(rawIdToken);
+    const normalizedTokenEmail = (verifiedToken.email || '').trim().toLowerCase();
 
-    // Always run both constant-time comparisons so execution time never leaks which check failed
+    // Always run both constant-time comparisons (trimmed & case-insensitive for OWNER_EMAIL, trimmed for OWNER_ACCESS_CODE)
     const codeMatches = safeConstantTimeEquals(submittedCode, ownerAccessCodeEnv);
-    const emailMatches = safeConstantTimeEquals(verifiedToken.email, ownerEmailEnv);
-    const isVerifiedGoogleAccount =
+    const emailMatches = safeConstantTimeEquals(normalizedTokenEmail, ownerEmailEnv);
+    const hasValidExistingAccount =
       verifiedToken.valid &&
-      verifiedToken.emailVerified === true &&
-      verifiedToken.isGoogleProvider === true &&
-      Boolean(verifiedToken.uid);
+      Boolean(verifiedToken.uid) &&
+      Boolean(normalizedTokenEmail);
 
     const allChecksPass =
       Boolean(ownerEmailEnv) &&
       Boolean(ownerAccessCodeEnv) &&
-      isVerifiedGoogleAccount &&
+      hasValidExistingAccount &&
       codeMatches &&
       emailMatches;
 
     if (!allChecksPass) {
+      // Determine safe, non-secret check failure category for the 403 UI
+      let failedCheck: 'owner sign-in not used' | 'email does not match' | 'role missing' | 'session needs refresh' =
+        'owner sign-in not used';
+      if (!verifiedToken.valid || !verifiedToken.uid) {
+        failedCheck = 'session needs refresh';
+      } else if (!emailMatches) {
+        failedCheck = 'email does not match';
+      } else if (!codeMatches) {
+        failedCheck = 'owner sign-in not used';
+      } else {
+        failedCheck = 'role missing';
+      }
+
       // Log exact failure reason on the SERVER ONLY (never logging OWNER_EMAIL or OWNER_ACCESS_CODE values)
       const failureReasons: string[] = [];
       if (!ownerEmailEnv) failureReasons.push('Server process.env.OWNER_EMAIL is not configured');
       if (!ownerAccessCodeEnv) failureReasons.push('Server process.env.OWNER_ACCESS_CODE is not configured');
       if (!submittedCode) failureReasons.push('Submitted owner access code was empty');
       if (!verifiedToken.valid) {
-        failureReasons.push(`Google ID token verification failed (${verifiedToken.reason || 'invalid token'})`);
+        failureReasons.push(`Firebase ID token verification failed (${verifiedToken.reason || 'invalid token'})`);
       } else {
-        if (!verifiedToken.emailVerified) failureReasons.push('Google account email_verified is false');
         if (!verifiedToken.isGoogleProvider) {
-          failureReasons.push(verifiedToken.reason || 'Firebase account is not linked to Google provider');
+          failureReasons.push(verifiedToken.reason || 'Note: token provider was non-Google on existing account');
         }
         if (ownerEmailEnv && !emailMatches) {
-          failureReasons.push(`Authenticated Google account (UID: ${verifiedToken.uid}) email did not match process.env.OWNER_EMAIL`);
+          failureReasons.push(`Authenticated account (UID: ${verifiedToken.uid}) email did not match process.env.OWNER_EMAIL`);
         }
       }
       if (ownerAccessCodeEnv && submittedCode && !codeMatches) {
@@ -2746,11 +2903,13 @@ Escalation Required: ${
       }
 
       console.error(
-        `[WaveLink Server Auth Log] Owner sign-in failed: ${failureReasons.join(' | ')}`
+        `[WaveLink Server Auth Log] Owner sign-in failed (failedCheck="${failedCheck}"): ${failureReasons.join(' | ')}`
       );
 
       return res.status(isNowLocked ? 429 : 403).json({
         success: false,
+        authorized: false,
+        failedCheck,
         lockedOut: isNowLocked,
         remainingAttempts: attemptState.remainingAttempts,
         retryAfterSeconds: attemptState.retryAfterSeconds,
@@ -2758,32 +2917,27 @@ Escalation Required: ${
       });
     }
 
-    // Both verified Google email and Owner access code matched for the existing UID!
+    // Both verified email (trimmed & case-insensitive against OWNER_EMAIL) and OWNER_ACCESS_CODE matched for the existing UID!
     clearOwnerDeviceAttempts(deviceKey);
     const ownerUid = verifiedToken.uid;
-    serverOwnerUids.add(ownerUid);
+    persistOwnerUidOnServer(ownerUid);
     const ownerSessionToken = signOwnerSessionToken(ownerUid);
 
-    // 1. Set Firebase Auth custom claims on the server (admin: true, role: 'admin') when Admin SDK credentials allow
-    try {
-      if (getAdminApps().length) {
-        await getAdminAuth(getAdminApp()).setCustomUserClaims(ownerUid, {
-          admin: true,
-          role: 'admin'
-        });
-      }
-    } catch {
-      // Custom claims optional when container lacks target project service account key
-    }
+    // 1. Set the 'admin' role on the existing UID on the server using Firebase custom claims
+    const customClaimsSet = await setServerAdminCustomClaims(ownerUid);
 
     // 2. Grant canonical 'admin' role in Firestore via REST API using the verified ID token + server grant key,
     //    preserving all existing posts, followers, points, Pro status, and profile fields on /users/{ownerUid}
-    await grantOwnerRoleViaFirestoreRest(ownerUid, verifiedToken.email, rawIdToken);
+    const firestoreGranted = await grantOwnerRoleViaFirestoreRest(
+      ownerUid,
+      normalizedTokenEmail,
+      rawIdToken
+    );
 
     // 3. Also attempt Admin SDK Firestore merge if service account is configured
     try {
       const { firestoreDatabaseId } = getServerFirebaseConfig();
-      if (getAdminApps().length) {
+      if (ensureFirebaseAdminInitialized()) {
         const adminDb =
           firestoreDatabaseId && firestoreDatabaseId !== '(default)'
             ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
@@ -2808,8 +2962,9 @@ Escalation Required: ${
           .set(
             {
               id: ownerUid,
-              email: verifiedToken.email,
+              email: normalizedTokenEmail,
               role: 'admin',
+              _serverGrantKey: SERVER_ADMIN_GRANT_KEY,
               isSubAdmin: false,
               isPro: true,
               hasBlueStar: true,
@@ -2826,7 +2981,7 @@ Escalation Required: ${
     }
 
     console.log(
-      `[WaveLink Server Auth Log] Owner sign-in succeeded for existing UID="${ownerUid}". Granted role="admin".`
+      `[WaveLink Server Auth Log] Owner sign-in succeeded for existing UID="${ownerUid}" (customClaimsSet=${customClaimsSet}, firestoreGranted=${firestoreGranted}). Granted role="admin".`
     );
 
     return res.json({
@@ -2834,6 +2989,8 @@ Escalation Required: ${
       authorized: true,
       uid: ownerUid,
       role: 'admin',
+      customClaimsSet,
+      forceTokenRefresh: true,
       ownerSessionToken
     });
   });
@@ -3340,27 +3497,54 @@ Escalation Required: ${
     return res.json({ success: true, authEmail: null });
   });
 
-  app.post('/api/admin/verify', rateLimitAuth, async (req, res) => {
+  app.post('/api/admin/verify', rateLimitGlobal, async (req, res) => {
     const authUser = verifyFirebaseIdTokenHeader(req);
     const { email, isSubAdmin } = req.body || {};
-    let check = isServerAdminUser(authUser, email, isSubAdmin);
-
     const authHeader = String(req.headers.authorization || '').trim();
     const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const rawOwnerToken = String(req.headers['x-wavelink-owner-token'] || '').trim();
+    const ownerTokenCheck = verifyOwnerSessionToken(rawOwnerToken, authUser?.uid);
 
-    // Single canonical source of truth: check /users/{uid}.role in Firestore (via REST API or Admin SDK)
-    if (!check.authorized && authUser?.uid) {
-      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
-      if (restRole === 'admin') {
+    let check = isServerAdminUser(authUser, email, isSubAdmin);
+    let firestoreRole: 'admin' | 'sub_admin' | 'user' | null = null;
+    let serverCustomClaimAdmin = false;
+
+    // Check Firebase Admin SDK customClaims on the UID if available
+    if (authUser?.uid && !authUser.tokenExpired) {
+      try {
+        if (ensureFirebaseAdminInitialized()) {
+          const userRecord = await getAdminAuth(getAdminApp()).getUser(authUser.uid);
+          const claims = userRecord.customClaims || {};
+          if (claims.role === 'admin' || claims.role === 'super_admin' || claims.admin === true) {
+            serverCustomClaimAdmin = true;
+            persistOwnerUidOnServer(authUser.uid);
+            check = { authorized: true, role: 'super_admin' };
+          } else if (claims.role === 'sub_admin') {
+            serverSubAdminUids.add(authUser.uid);
+            check = { authorized: true, role: 'sub_admin' };
+          }
+        }
+      } catch {
+        // Admin SDK getUser optional in preview container
+      }
+    }
+
+    // Check canonical role in Firestore (/users/{uid}.role and /admins/{uid}) via REST API
+    if (!check.authorized && authUser?.uid && !authUser.tokenExpired) {
+      firestoreRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
+      if (firestoreRole === 'admin') {
+        persistOwnerUidOnServer(authUser.uid);
         check = { authorized: true, role: 'super_admin' };
-      } else if (restRole === 'sub_admin') {
+      } else if (firestoreRole === 'sub_admin') {
+        serverSubAdminUids.add(authUser.uid);
         check = { authorized: true, role: 'sub_admin' };
       }
     }
 
-    if (!check.authorized && authUser?.uid) {
+    // Also check Firestore via Admin SDK if available
+    if (!check.authorized && authUser?.uid && !authUser.tokenExpired) {
       try {
-        if (getAdminApps().length) {
+        if (ensureFirebaseAdminInitialized()) {
           const { firestoreDatabaseId } = getServerFirebaseConfig();
           const adminDb =
             firestoreDatabaseId && firestoreDatabaseId !== '(default)'
@@ -3369,9 +3553,11 @@ Escalation Required: ${
           const userSnap = await adminDb.collection('users').doc(authUser.uid).get();
           const userData = userSnap.data();
           if (userData?.role === 'admin' || userData?.role === 'super_admin') {
-            serverOwnerUids.add(authUser.uid);
+            firestoreRole = 'admin';
+            persistOwnerUidOnServer(authUser.uid);
             check = { authorized: true, role: 'super_admin' };
           } else if (userData?.isSubAdmin === true || userData?.role === 'sub_admin') {
+            firestoreRole = 'sub_admin';
             serverSubAdminUids.add(authUser.uid);
             check = { authorized: true, role: 'sub_admin' };
           }
@@ -3381,18 +3567,100 @@ Escalation Required: ${
       }
     }
 
+    const candidateUid = (authUser?.uid || '').trim();
+    const candidateEmail = (authUser?.email || email || '').trim().toLowerCase();
+    const ownerEmailEnv = getOwnerEmail().trim().toLowerCase();
+    const emailMatchesOwner =
+      Boolean(candidateEmail && ownerEmailEnv) &&
+      safeConstantTimeEquals(candidateEmail, ownerEmailEnv);
+
     if (!check.authorized) {
+      // Determine which check failed (without revealing any secret)
+      let failedCheck:
+        | 'owner sign-in not used'
+        | 'email does not match'
+        | 'role missing'
+        | 'session needs refresh' = 'role missing';
+
+      if (!rawIdToken || authUser?.tokenExpired || !candidateUid) {
+        failedCheck = 'session needs refresh';
+      } else if (!emailMatchesOwner) {
+        failedCheck = 'email does not match';
+      } else if (ownerTokenCheck.expired) {
+        failedCheck = 'session needs refresh';
+      } else if (
+        !rawOwnerToken &&
+        !serverOwnerUids.has(candidateUid) &&
+        !authUser?.customAdminClaim &&
+        firestoreRole !== 'admin'
+      ) {
+        failedCheck = 'owner sign-in not used';
+      } else if (!authUser?.customAdminClaim && (serverCustomClaimAdmin || firestoreRole === 'admin')) {
+        failedCheck = 'session needs refresh';
+      } else {
+        failedCheck = 'role missing';
+      }
+
+      // Log detailed check diagnostics strictly on the server
+      console.warn(
+        `[WaveLink Server Auth Log] Admin Desk 403 for UID="${candidateUid || 'none'}": failedCheck="${failedCheck}" | tokenExpired=${Boolean(
+          authUser?.tokenExpired
+        )} | emailMatchesOwner=${emailMatchesOwner} | tokenAdminClaim=${Boolean(
+          authUser?.customAdminClaim
+        )} | serverCustomClaimAdmin=${serverCustomClaimAdmin} | ownerTokenProvided=${Boolean(
+          rawOwnerToken
+        )} | ownerTokenValid=${ownerTokenCheck.valid} | ownerTokenExpired=${Boolean(
+          ownerTokenCheck.expired
+        )} | inServerOwnerUids=${Boolean(
+          candidateUid && serverOwnerUids.has(candidateUid)
+        )} | firestoreRole="${firestoreRole || 'none'}"`
+      );
+
       return res.status(403).json({
         success: false,
         authorized: false,
+        role: 'user',
+        failedCheck,
         error: 'Access denied.'
       });
     }
 
+    // Ensure custom claims and Firestore role are synchronized for verified owner admin
+    const canonicalRole = check.role === 'super_admin' ? 'admin' : check.role;
+    let needsTokenRefresh = false;
+    if (canonicalRole === 'admin' && candidateUid) {
+      persistOwnerUidOnServer(candidateUid);
+      if (!authUser?.customAdminClaim) {
+        const claimsUpdated = await setServerAdminCustomClaims(candidateUid);
+        if (claimsUpdated) {
+          needsTokenRefresh = true;
+        }
+      }
+      if (rawIdToken && firestoreRole !== 'admin') {
+        await grantOwnerRoleViaFirestoreRest(
+          candidateUid,
+          candidateEmail || ownerEmailEnv,
+          rawIdToken
+        ).catch(() => {});
+      }
+    }
+
+    console.log(
+      `[WaveLink Server Auth Log] Admin Desk verified for UID="${candidateUid}" with role="${canonicalRole}" (tokenClaim=${Boolean(
+        authUser?.customAdminClaim
+      )}, needsTokenRefresh=${needsTokenRefresh}).`
+    );
+
     return res.json({
       success: true,
       authorized: true,
-      role: check.role === 'super_admin' ? 'admin' : check.role
+      role: canonicalRole,
+      failedCheck: null,
+      needsTokenRefresh,
+      ownerSessionToken:
+        canonicalRole === 'admin' && candidateUid
+          ? signOwnerSessionToken(candidateUid)
+          : undefined
     });
   });
 

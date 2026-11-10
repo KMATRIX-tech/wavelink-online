@@ -26,7 +26,8 @@ import {
   cleanFirestoreData,
   isAuthNetworkError,
   getFriendlyAuthErrorMessage,
-  getAuthHeaders
+  getAuthHeaders,
+  getClientDeviceId
 } from '../firebase';
 import {
   UserProfile,
@@ -332,6 +333,12 @@ interface AuthContextType {
   verifyAndRedeemCoupon: (rawCode: string) => Promise<boolean>;
   showGlobalToast: (message: string) => void;
   refreshAdminVerification: () => Promise<boolean>;
+  reverifyOwnerAccess: (accessCode: string) => Promise<{
+    authorized: boolean;
+    failedCheck?: string | null;
+    error?: string;
+  }>;
+  adminCheckFailedReason: string | null;
   completeVerifiedAuthSession: (customName?: string, customUsername?: string) => Promise<void>;
 }
 
@@ -351,7 +358,9 @@ function hasLocalProPass(uid?: string | null): boolean {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [customClaimRole, setCustomClaimRole] = useState<'admin' | 'sub_admin' | 'user'>('user');
   const [serverVerifiedRole, setServerVerifiedRole] = useState<'admin' | 'super_admin' | 'sub_admin' | 'user'>('user');
+  const [adminCheckFailedReason, setAdminCheckFailedReason] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [globalToast, setGlobalToast] = useState<string | null>(null);
   const [dailyRewardJustClaimed, setDailyRewardJustClaimed] = useState<{
@@ -371,16 +380,43 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setDailyRewardJustClaimed(null);
   };
 
+  const readTokenClaimRole = async (
+    user: FirebaseUser,
+    forceRefresh = false
+  ): Promise<'admin' | 'sub_admin' | 'user'> => {
+    try {
+      if (forceRefresh) {
+        await user.getIdToken(true);
+      }
+      const tokenResult = await user.getIdTokenResult(forceRefresh);
+      const claims = tokenResult?.claims || {};
+      if (claims.role === 'admin' || claims.role === 'super_admin' || claims.admin === true) {
+        setCustomClaimRole('admin');
+        return 'admin';
+      }
+      if (claims.role === 'sub_admin') {
+        setCustomClaimRole('sub_admin');
+        return 'sub_admin';
+      }
+    } catch {
+      // ignore token claim read error
+    }
+    setCustomClaimRole('user');
+    return 'user';
+  };
+
   // Verify admin role strictly against the server (/api/admin/verify) and refresh session token immediately
   const refreshAdminVerification = async (): Promise<boolean> => {
     const activeUser = auth.currentUser;
     if (!activeUser) {
+      setCustomClaimRole('user');
       setServerVerifiedRole('user');
+      setAdminCheckFailedReason('session needs refresh');
       return false;
     }
 
-    // Force-refresh Firebase ID token so updated claims & session privileges apply immediately
-    await activeUser.getIdToken(true).catch(() => {});
+    // Force-refresh Firebase ID token so updated custom claims & session privileges apply immediately
+    const claimRole = await readTokenClaimRole(activeUser, true);
 
     // Ensure currentUser state is synced after Owner sign-in completes
     setCurrentUser(activeUser);
@@ -395,20 +431,129 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           isSubAdmin: Boolean(userProfile?.isSubAdmin || userProfile?.role === 'sub_admin')
         })
       });
-      if (resp.ok) {
-        const data = await resp.json();
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data?.authorized) {
+        if (typeof data.ownerSessionToken === 'string' && data.ownerSessionToken.trim()) {
+          try {
+            sessionStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
+            localStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
+          } catch {
+            // ignore storage errors
+          }
+        }
+        if (data.needsTokenRefresh) {
+          await readTokenClaimRole(activeUser, true);
+        }
         const resolvedRole = resolveCanonicalAdminRole(data?.role, data?.role === 'sub_admin');
-        if (data?.authorized && (resolvedRole === 'admin' || resolvedRole === 'sub_admin')) {
+        if (resolvedRole === 'admin' || resolvedRole === 'sub_admin') {
           setServerVerifiedRole(resolvedRole);
+          setAdminCheckFailedReason(null);
           await syncUserProfileDoc(activeUser, undefined, undefined, resolvedRole);
           return true;
         }
+      } else {
+        const reason =
+          typeof data?.failedCheck === 'string' && data.failedCheck.trim()
+            ? data.failedCheck.trim()
+            : claimRole === 'admin'
+            ? 'session needs refresh'
+            : 'owner sign-in not used';
+        setAdminCheckFailedReason(reason);
       }
     } catch {
-      // ignore network error
+      if (claimRole === 'admin') {
+        setServerVerifiedRole('admin');
+        setAdminCheckFailedReason(null);
+        return true;
+      }
+      setAdminCheckFailedReason('session needs refresh');
     }
     setServerVerifiedRole('user');
     return false;
+  };
+
+  // Re-verify owner access using the owner access code on the existing UID, set custom claims on server, and force immediate token refresh
+  const reverifyOwnerAccess = async (
+    accessCode: string
+  ): Promise<{
+    authorized: boolean;
+    failedCheck?: string | null;
+    error?: string;
+  }> => {
+    const cleanCode = accessCode.trim();
+    if (!cleanCode) {
+      return {
+        authorized: false,
+        failedCheck: 'owner sign-in not used',
+        error: 'Please enter your Owner Access Code.'
+      };
+    }
+
+    try {
+      let activeUser = auth.currentUser;
+      if (!activeUser) {
+        const googleProvider = new GoogleAuthProvider();
+        googleProvider.setCustomParameters({ prompt: 'select_account' });
+        const googleRes = await signInWithPopup(auth, googleProvider);
+        activeUser = googleRes.user;
+      }
+
+      const idToken = await activeUser.getIdToken(true);
+      const resp = await fetch('/api/auth/owner-signin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          'X-WaveLink-Device-Id': getClientDeviceId()
+        },
+        body: JSON.stringify({
+          idToken,
+          accessCode: cleanCode,
+          deviceId: getClientDeviceId()
+        })
+      });
+
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data?.success) {
+        const failedCheck =
+          typeof data?.failedCheck === 'string' && data.failedCheck.trim()
+            ? data.failedCheck.trim()
+            : 'owner sign-in not used';
+        setAdminCheckFailedReason(failedCheck);
+        return {
+          authorized: false,
+          failedCheck,
+          error: data?.error || 'Unable to verify owner credentials.'
+        };
+      }
+
+      if (typeof data.ownerSessionToken === 'string' && data.ownerSessionToken.trim()) {
+        try {
+          sessionStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
+          localStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
+        } catch {
+          // ignore storage errors
+        }
+      }
+
+      // Force client to refresh its ID token immediately so Firebase custom claims take effect right away
+      await readTokenClaimRole(activeUser, true);
+      setServerVerifiedRole('admin');
+      setAdminCheckFailedReason(null);
+      await refreshAdminVerification();
+
+      return {
+        authorized: true,
+        failedCheck: null
+      };
+    } catch (err: unknown) {
+      const friendly = getFriendlyAuthErrorMessage(err, 'google');
+      return {
+        authorized: false,
+        failedCheck: 'session needs refresh',
+        error: friendly || 'Unable to complete owner verification. Please try again.'
+      };
+    }
   };
 
   // Transition a verified Firebase Auth user into the active WaveLink session after verification
@@ -448,24 +593,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const cleanUserEmail = (user.email || '').trim().toLowerCase();
-      const isOwner =
-        cleanUserEmail === 'keylanmbilinyi5@gmail.com' ||
-        Boolean(import.meta.env.VITE_OWNER_EMAIL && cleanUserEmail === (import.meta.env.VITE_OWNER_EMAIL || '').trim().toLowerCase());
+      const claimRole = await readTokenClaimRole(user, false);
 
       // 1. Look up existing user document by Firebase UID first
       let resolvedData: UserProfile | null = null;
-      let resolvedDocId = user.uid;
       const snap = await getDoc(userDocRef);
 
       if (snap.exists()) {
         resolvedData = snap.data() as UserProfile;
-        // If this document was previously merged into another primary account, use the primary account
         if (resolvedData.mergedIntoUid) {
           try {
             const primarySnap = await getDoc(doc(db, 'users', resolvedData.mergedIntoUid));
             if (primarySnap.exists()) {
               resolvedData = primarySnap.data() as UserProfile;
-              resolvedDocId = primarySnap.id;
             }
           } catch {
             // fallback to current snapshot data
@@ -473,31 +613,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      // 2. For the owner email, always open the existing profile with the username keylan (@keylan)
-      if (isOwner) {
-        try {
-          const qKeylan = query(collection(db, 'users'), where('username', 'in', ['@keylan', 'keylan']));
-          const keylanSnap = await getDocs(qKeylan);
-          if (!keylanSnap.empty) {
-            const mainOwnerDoc = keylanSnap.docs[0];
-            resolvedData = mainOwnerDoc.data() as UserProfile;
-            resolvedDocId = mainOwnerDoc.id;
-          }
-        } catch (ownerLookupErr) {
-          console.warn('Owner profile lookup notice:', ownerLookupErr);
-        }
-      }
-
-      // 3. If no document was found by UID, look up by verified email and ALWAYS reuse it (never create a duplicate)
+      // 2. If no document was found by UID, look up by verified email and ALWAYS reuse it (never create a duplicate)
       if (!resolvedData && cleanUserEmail) {
         try {
           const qEmail = query(collection(db, 'users'), where('email', '==', cleanUserEmail));
           const emailSnap = await getDocs(qEmail);
           if (!emailSnap.empty) {
-            // Prefer an active/unmerged profile if available
             const bestMatch = emailSnap.docs.find((d) => !d.data()?.isDuplicateDisabled) || emailSnap.docs[0];
             resolvedData = bestMatch.data() as UserProfile;
-            resolvedDocId = bestMatch.id;
           }
         } catch (emailLookupErr) {
           console.warn('Existing email lookup notice:', emailLookupErr);
@@ -509,15 +632,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (!resolvedData) {
         // No existing profile found for UID or verified email: initialize single primary profile
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, null);
-        const initialRole = isOwner || verifiedRoleOverride === 'admin' ? 'admin' : verifiedRoleOverride === 'sub_admin' ? 'sub_admin' : 'user';
+        const initialRole: UserProfile['role'] =
+          verifiedRoleOverride === 'admin' || claimRole === 'admin'
+            ? 'admin'
+            : verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin'
+            ? 'sub_admin'
+            : 'user';
         const isInitialAdmin = initialRole === 'admin';
         const initialProfile: UserProfile = {
           id: user.uid,
           email: cleanUserEmail,
-          username: isOwner ? '@keylan' : customUsername || `@${emailPrefix}`,
-          displayName: isOwner ? 'Keylan' : customName || user.displayName || emailPrefix || 'Waver',
+          username: customUsername || `@${emailPrefix}`,
+          displayName: customName || user.displayName || emailPrefix || 'Waver',
           photoURL: user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.uid}`,
-          bio: isOwner ? 'Platform Owner & Founder of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
+          bio: isInitialAdmin ? 'Platform Owner & Founder of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
           status: 'active',
           isBanned: false,
           savedPostIds: [],
@@ -555,9 +683,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const canonicalExistingRole = resolveCanonicalAdminRole(data.role, data.isSubAdmin);
         const effectiveRole: UserProfile['role'] =
-          isOwner || verifiedRoleOverride === 'admin' || canonicalExistingRole === 'admin'
+          verifiedRoleOverride === 'admin' || claimRole === 'admin' || canonicalExistingRole === 'admin'
             ? 'admin'
-            : verifiedRoleOverride === 'sub_admin' || canonicalExistingRole === 'sub_admin'
+            : verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin' || canonicalExistingRole === 'sub_admin'
             ? 'sub_admin'
             : data.role || 'user';
         const isEffectiveAdmin = effectiveRole === 'admin';
@@ -566,8 +694,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           ...data,
           id: user.uid,
           email: data.email || cleanUserEmail,
-          username: isOwner ? '@keylan' : customUsername || data.username || `@${emailPrefix}`,
-          displayName: isOwner ? (data.displayName || 'Keylan') : customName || data.displayName || user.displayName || emailPrefix || 'Waver',
+          username: customUsername || data.username || `@${emailPrefix}`,
+          displayName: customName || data.displayName || user.displayName || emailPrefix || 'Waver',
           role: effectiveRole,
           isSubAdmin: effectiveRole === 'sub_admin',
           isPro: Boolean(data.isPro || localPro || isEffectiveAdmin),
@@ -581,23 +709,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setUserProfile(mergedProfile);
         if (effectiveRole === 'admin' || effectiveRole === 'sub_admin') {
           setServerVerifiedRole(effectiveRole);
+          setAdminCheckFailedReason(null);
         }
 
-        // Keep user document in sync with the reused profile data
-        await setDoc(
-          userDocRef,
-          cleanFirestoreData({
-            ...mergedProfile,
-            authUid: user.uid,
-            linkedAuthUids: Array.from(new Set([...(data.linkedAuthUids || []), user.uid])),
-            isOnline: true,
-            lastSeenAt: nowIso,
-            updatedAt: nowIso
-          }),
-          { merge: true }
-        ).catch(() => {});
-
-        // Non-blocking presence + daily reward sync (preserves all existing posts, followers, points, and Pro status)
+        // Non-blocking presence + daily reward sync (does not overwrite role from client unless already matching)
         setDoc(
           userDocRef,
           cleanFirestoreData({
@@ -605,15 +720,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             lastSeenAt: nowIso,
             ...(customName ? { displayName: customName } : {}),
             ...(customUsername ? { username: customUsername } : {}),
-            ...(verifiedRoleOverride === 'admin'
-              ? {
-                  role: 'admin',
-                  isSubAdmin: false,
-                  isPro: true,
-                  hasBlueStar: true,
-                  isVerifiedByAdmin: true
-                }
-              : {}),
             ...rewardFields,
             ...(localPro ? { isPro: true, hasBlueStar: true, proBadge: data.proBadge || 'verified' } : {})
           }),
@@ -1474,16 +1580,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // Single canonical source of truth for admin role across UI, Server, and Firestore rules:
+  // Single canonical source of truth for admin role across Admin Desk, Server Routes, and Firestore rules:
+  const canonicalClaimRole = resolveCanonicalAdminRole(customClaimRole, customClaimRole === 'sub_admin');
   const canonicalProfileRole = resolveCanonicalAdminRole(userProfile?.role, userProfile?.isSubAdmin);
   const canonicalServerRole = resolveCanonicalAdminRole(serverVerifiedRole, serverVerifiedRole === 'sub_admin');
 
   const isSuperAdmin =
+    canonicalClaimRole === 'admin' ||
     canonicalProfileRole === 'admin' ||
     canonicalServerRole === 'admin';
   const isSubAdmin =
     !isSuperAdmin &&
-    (canonicalProfileRole === 'sub_admin' || canonicalServerRole === 'sub_admin');
+    (canonicalClaimRole === 'sub_admin' ||
+      canonicalProfileRole === 'sub_admin' ||
+      canonicalServerRole === 'sub_admin');
   const isAdmin = isSuperAdmin || isSubAdmin;
 
   // Verification status: verified by admin, has blue star, or verified badge
@@ -1706,6 +1816,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         verifyAndRedeemCoupon,
         showGlobalToast,
         refreshAdminVerification,
+        reverifyOwnerAccess,
+        adminCheckFailedReason,
         completeVerifiedAuthSession
       }}
     >

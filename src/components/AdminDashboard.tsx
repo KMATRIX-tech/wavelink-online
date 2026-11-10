@@ -97,42 +97,106 @@ interface AdminDashboardProps {
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }) => {
-  const { currentUser, isSuperAdmin, isSubAdmin, isAdmin, toggleSubAdmin, toggleVerifyUser, recordAdminAuditLog } = useAuth();
+  const {
+    currentUser,
+    isSuperAdmin,
+    isSubAdmin,
+    isAdmin,
+    toggleSubAdmin,
+    toggleVerifyUser,
+    recordAdminAuditLog,
+    refreshAdminVerification,
+    reverifyOwnerAccess,
+    adminCheckFailedReason
+  } = useAuth();
 
   const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>('overview');
   const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(false);
   const [isCheckingServerAdmin, setIsCheckingServerAdmin] = useState<boolean>(true);
+  const [failedCheckReason, setFailedCheckReason] = useState<string | null>(null);
 
-  useEffect(() => {
+  // Re-verify owner access state on the 403 screen
+  const [showReverifyForm, setShowReverifyForm] = useState<boolean>(false);
+  const [reverifyCode, setReverifyCode] = useState<string>('');
+  const [showReverifyCodeText, setShowReverifyCodeText] = useState<boolean>(false);
+  const [isReverifyingOwner, setIsReverifyingOwner] = useState<boolean>(false);
+  const [reverifyError, setReverifyError] = useState<string | null>(null);
+
+  const verifyAdminSessionWithServer = async (forceTokenRefresh = false) => {
     if (!currentUser) {
       setServerAdminVerified(false);
+      setFailedCheckReason('session needs refresh');
       setIsCheckingServerAdmin(false);
       return;
     }
     setIsCheckingServerAdmin(true);
-    getAuthHeaders()
-      .then((headers) =>
-        fetch('/api/admin/verify', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ email: currentUser.email, isSubAdmin })
-        })
-      )
-      .then((r) => r.json())
-      .then((d) => {
-        if (d && typeof d.authorized === 'boolean') {
-          setServerAdminVerified(d.authorized);
-        } else {
-          setServerAdminVerified(false);
-        }
-      })
-      .catch(() => {
-        setServerAdminVerified(Boolean(isAdmin));
-      })
-      .finally(() => {
-        setIsCheckingServerAdmin(false);
+    try {
+      if (forceTokenRefresh) {
+        await currentUser.getIdToken(true).catch(() => {});
+      }
+      const headers = await getAuthHeaders();
+      const resp = await fetch('/api/admin/verify', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ email: currentUser.email, isSubAdmin })
       });
+      const d = await resp.json().catch(() => ({}));
+      if (d && d.authorized === true) {
+        setServerAdminVerified(true);
+        setFailedCheckReason(null);
+        if (d.needsTokenRefresh || !isAdmin) {
+          await currentUser.getIdToken(true).catch(() => {});
+          await refreshAdminVerification().catch(() => {});
+        }
+      } else {
+        setServerAdminVerified(false);
+        setFailedCheckReason(
+          typeof d?.failedCheck === 'string' && d.failedCheck.trim()
+            ? d.failedCheck.trim()
+            : adminCheckFailedReason || 'owner sign-in not used'
+        );
+      }
+    } catch {
+      const ok = Boolean(isAdmin);
+      setServerAdminVerified(ok);
+      if (!ok) {
+        setFailedCheckReason(adminCheckFailedReason || 'session needs refresh');
+      }
+    } finally {
+      setIsCheckingServerAdmin(false);
+    }
+  };
+
+  useEffect(() => {
+    verifyAdminSessionWithServer(false);
   }, [currentUser, isSubAdmin, isAdmin]);
+
+  const handleReverifyOwnerSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setReverifyError(null);
+    if (!reverifyCode.trim()) {
+      setReverifyError('Please enter your owner access code.');
+      return;
+    }
+    setIsReverifyingOwner(true);
+    try {
+      const res = await reverifyOwnerAccess(reverifyCode.trim());
+      if (res.authorized) {
+        setReverifyCode('');
+        setShowReverifyForm(false);
+        setFailedCheckReason(null);
+        setServerAdminVerified(true);
+        await verifyAdminSessionWithServer(true);
+      } else {
+        if (res.failedCheck) {
+          setFailedCheckReason(res.failedCheck);
+        }
+        setReverifyError(res.error || 'Owner verification failed. Please check your code and try again.');
+      }
+    } finally {
+      setIsReverifyingOwner(false);
+    }
+  };
 
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [posts, setPosts] = useState<Post[]>([]);
@@ -511,8 +575,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     };
   }, [isAdmin]);
 
-  // Strict Admin Check: Enforced on both client & server
+  if (isCheckingServerAdmin) {
+    return (
+      <div className="min-h-[80vh] flex items-center justify-center p-4">
+        <div className="w-full max-w-sm bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-8 text-center shadow-lg">
+          <Loader2 size={32} className="animate-spin text-purple-600 mx-auto mb-3" />
+          <p className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+            Verifying Admin Desk clearance...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Strict Admin Check: Enforced across Admin Desk, Server Routes, and Firestore Rules
   if (!isAdmin || !serverAdminVerified) {
+    const diagnosticFailedCheck =
+      failedCheckReason ||
+      adminCheckFailedReason ||
+      (!currentUser
+        ? 'session needs refresh'
+        : !isAdmin
+        ? 'role missing'
+        : 'session needs refresh');
+
     return (
       <div className="min-h-[80vh] flex items-center justify-center p-4">
         <div className="w-full max-w-md bg-white dark:bg-[#131927] border border-rose-200 dark:border-rose-900/60 rounded-3xl p-8 text-center shadow-xl shadow-rose-950/5">
@@ -528,13 +614,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
             Administrator Clearance Required
           </h2>
 
-          <p className="text-xs sm:text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed">
+          <p className="text-xs sm:text-sm text-gray-600 dark:text-gray-400 mb-4 leading-relaxed">
             The WaveLink Admin Desk is restricted strictly to Platform Owner{' '}
             <span className="font-semibold text-purple-600 dark:text-purple-400">{ADMIN_EMAIL}</span>{' '}
             and authorized Sub-Administrators.
           </p>
 
-          <div className="p-3.5 rounded-2xl bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 text-left text-xs space-y-1 mb-6">
+          {/* Small non-secret diagnostic line stating which check failed */}
+          <div className="mb-5 px-3.5 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200/80 dark:border-rose-800/50 text-xs text-rose-700 dark:text-rose-300 font-medium">
+            Check failed: <span className="font-bold">{diagnosticFailedCheck}</span>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 text-left text-xs space-y-1 mb-5">
             <span className="text-[10px] uppercase font-bold text-gray-400 block">
               Current Session:
             </span>
@@ -542,17 +633,96 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               {currentUser?.email || 'Unauthenticated Guest'}
             </div>
             <div className="text-[11px] text-rose-500 font-medium">
-              Insufficient administrative privileges.
+              Insufficient administrative privileges ({diagnosticFailedCheck}).
             </div>
           </div>
 
-          <button
-            onClick={onReturnToFeed}
-            className="w-full py-2.5 px-4 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-semibold text-sm flex items-center justify-center gap-2 transition shadow-md shadow-purple-600/30"
-          >
-            <ArrowLeft size={16} />
-            <span>Return to Wave Feed</span>
-          </button>
+          {!showReverifyForm ? (
+            <div className="space-y-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setReverifyError(null);
+                  setShowReverifyForm(true);
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-semibold text-sm flex items-center justify-center gap-2 transition shadow-md shadow-amber-500/25 cursor-pointer"
+              >
+                <Key size={16} />
+                <span>Re-verify owner access</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={onReturnToFeed}
+                className="w-full py-2.5 px-4 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-semibold text-sm flex items-center justify-center gap-2 transition shadow-md shadow-purple-600/30 cursor-pointer"
+              >
+                <ArrowLeft size={16} />
+                <span>Return to Wave Feed</span>
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handleReverifyOwnerSubmit} className="text-left space-y-3 mb-2">
+              <div>
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5">
+                  Owner Access Code
+                </label>
+                <div className="relative">
+                  <input
+                    type={showReverifyCodeText ? 'text' : 'password'}
+                    value={reverifyCode}
+                    onChange={(e) => setReverifyCode(e.target.value)}
+                    placeholder="Enter owner access code"
+                    autoFocus
+                    className="w-full px-3.5 py-2.5 pr-10 rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowReverifyCodeText((v) => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+                  >
+                    {showReverifyCodeText ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+
+              {reverifyError && (
+                <div className="p-2.5 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-xs text-rose-600 dark:text-rose-300 font-medium">
+                  {reverifyError}
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowReverifyForm(false);
+                    setReverifyError(null);
+                  }}
+                  disabled={isReverifyingOwner}
+                  className="flex-1 py-2.5 px-3 rounded-xl border border-gray-300 dark:border-gray-700 text-xs font-semibold text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isReverifyingOwner}
+                  className="flex-[2] py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:opacity-60 text-white font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition shadow-md shadow-amber-500/25 cursor-pointer"
+                >
+                  {isReverifyingOwner ? (
+                    <>
+                      <Loader2 size={15} className="animate-spin" />
+                      <span>Verifying &amp; Refreshing...</span>
+                    </>
+                  ) : (
+                    <>
+                      <ShieldCheck size={16} />
+                      <span>Verify &amp; Refresh Session</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
         </div>
       </div>
     );

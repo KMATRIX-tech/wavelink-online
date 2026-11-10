@@ -1135,9 +1135,10 @@ export const AuthPage: React.FC = () => {
         // ignore
       }
 
-      // Force-refresh Firebase Auth session token so admin privileges apply immediately on the existing UID
+      // Force client to refresh its Firebase ID token immediately so custom claims (role: 'admin') apply on the existing UID
       if (auth.currentUser) {
         await auth.currentUser.getIdToken(true).catch(() => {});
+        await auth.currentUser.getIdTokenResult(true).catch(() => {});
       }
       await completeVerifiedAuthSession('Keylan', '@keylan');
       await refreshAdminVerification();
