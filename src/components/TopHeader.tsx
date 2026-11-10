@@ -3,7 +3,7 @@ import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { ActiveTab } from '../types';
 import { triggerHaptic } from '../utils/haptics';
-import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus } from 'lucide-react';
+import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus, Search } from 'lucide-react';
 import { inviteFriends } from '../utils/share.js';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { CompactPointsDisplay } from './CompactPointsDisplay';
@@ -48,6 +48,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [justReconnected, setJustReconnected] = useState<boolean>(false);
+  const [isMobileSearchOpen, setIsMobileSearchOpen] = useState<boolean>(false);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -111,15 +112,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   }, [isBatterySaver]);
 
   return (
-    <header
-      className={`sticky top-0 z-20 w-full max-w-full bg-[var(--bg-surface)]/95 backdrop-blur-md border-b border-[var(--border-hairline)] safe-area-top transition-all ${
-        activeTab === 'feed' && isOnline && !justReconnected
-          ? 'hidden md:block'
-          : activeTab === 'videos' && isOnline && !justReconnected
-          ? 'hidden lg:block'
-          : 'block'
-      }`}
-    >
+    <header className="sticky top-0 z-20 w-full max-w-full bg-[var(--bg-surface)]/95 backdrop-blur-md border-b border-[var(--border-hairline)] safe-area-top transition-all block">
       {/* Immediate slim banner when connection is lost */}
       {!isOnline && (
         <div
@@ -132,15 +125,36 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
         </div>
       )}
 
-      <div
-        className={`w-full max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 ${
-          activeTab === 'feed'
-            ? 'hidden md:block'
-            : activeTab === 'videos'
-            ? 'hidden lg:block'
-            : 'block'
-        }`}
-      >
+      {/* Mobile Search Overlay Bar */}
+      {isMobileSearchOpen && (
+        <div className="sm:hidden px-3 py-2 bg-white border-b border-slate-200 flex items-center gap-2 animate-in fade-in">
+          <div className="flex-1 min-w-0">
+            <GlobalSearchBar
+              onNavigateTab={(tab) => {
+                setIsMobileSearchOpen(false);
+                if (onNavigateTab) onNavigateTab(tab);
+              }}
+              onStartChat={(userId) => {
+                setIsMobileSearchOpen(false);
+                if (onStartChat) onStartChat(userId);
+              }}
+              onSelectHashtag={(tag) => {
+                setIsMobileSearchOpen(false);
+                if (onSelectHashtag) onSelectHashtag(tag);
+              }}
+            />
+          </div>
+          <button
+            type="button"
+            onClick={() => setIsMobileSearchOpen(false)}
+            className="px-2 py-1 text-xs font-bold text-slate-500 hover:text-slate-800 shrink-0 cursor-pointer"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      <div className="w-full max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 block">
         <div className="flex items-center justify-between min-h-[3.5rem] sm:min-h-[4rem] gap-2 sm:gap-3">
           {/* Left: View Title, Calm Brand & Subtle Connection Indicator */}
           <div className="flex items-center gap-2 sm:gap-3 min-w-0">
@@ -242,6 +256,19 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
           {/* Right: Non-floating WELINK Guide & Live Voice Buttons, Points & Profile Shortcut */}
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {/* Mobile Search Trigger Button */}
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                setIsMobileSearchOpen((prev) => !prev);
+              }}
+              aria-label="Search people, posts, or tags"
+              title="Search people, posts, or tags"
+              className="sm:hidden min-h-[38px] min-w-[38px] p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 hover:text-slate-900 transition flex items-center justify-center cursor-pointer"
+            >
+              <Search size={16} />
+            </button>
             {onOpenWelink && (
               <>
                 <button

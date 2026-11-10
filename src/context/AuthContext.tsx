@@ -1409,11 +1409,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       : [...currentSaves, postId];
 
     try {
+      // 1. Update user profile saved IDs array
       const userRef = doc(db, 'users', currentUser.uid);
       await setDoc(userRef, { savedPostIds: updatedSaves, updatedAt: new Date().toISOString() }, { merge: true });
       setUserProfile((prev) => (prev ? { ...prev, savedPostIds: updatedSaves } : null));
 
-      // Update post savesCount
+      // 2. Persist to private 'savedPosts' subcollection: /users/{userId}/savedPosts/{postId}
+      const userSavedDocRef = doc(db, 'users', currentUser.uid, 'savedPosts', postId);
+      if (isSaved) {
+        await deleteDoc(userSavedDocRef).catch(() => {});
+      } else {
+        await setDoc(userSavedDocRef, {
+          id: postId,
+          postId,
+          userId: currentUser.uid,
+          savedAt: new Date().toISOString()
+        }, { merge: true }).catch(() => {});
+      }
+
+      // 3. Persist to top-level private 'savedPosts' collection: /savedPosts/{userId_postId}
+      const topLevelSavedRef = doc(db, 'savedPosts', `${currentUser.uid}_${postId}`);
+      if (isSaved) {
+        await deleteDoc(topLevelSavedRef).catch(() => {});
+      } else {
+        await setDoc(topLevelSavedRef, {
+          id: `${currentUser.uid}_${postId}`,
+          postId,
+          userId: currentUser.uid,
+          savedAt: new Date().toISOString()
+        }, { merge: true }).catch(() => {});
+      }
+
+      // 4. Update post savesCount
       const postRef = doc(db, 'posts', postId);
       const postSnap = await getDoc(postRef);
       if (postSnap.exists()) {
@@ -1424,7 +1451,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       return !isSaved;
     } catch (err) {
-      console.error('Error toggling save post:', err);
+      console.error('Error toggling save post in Firestore:', err);
       return isSaved;
     }
   };

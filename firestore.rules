@@ -230,6 +230,18 @@ service cloud.firestore {
           request.resource.data.token.size() <= 1024;
         allow delete: if isOwner(userId) || isAdmin();
       }
+
+      // Private Saved Posts subcollection — strictly private to the user & admin
+      match /savedPosts/{savedPostId} {
+        allow read, write: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    // Top-level private 'Saved Posts' collection: readable and writable only by the authenticated owner or admin
+    match /savedPosts/{savedPostId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
     }
 
     // Social feed posts (includes approved scheduled bot posts when triggered by an admin)

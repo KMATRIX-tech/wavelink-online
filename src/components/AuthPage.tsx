@@ -111,6 +111,7 @@ export const AuthPage: React.FC = () => {
   const [isEmailVerified, setIsEmailVerified] = useState(false);
   const [isSendingVerification, setIsSendingVerification] = useState(false);
   const [resendCooldownSeconds, setResendCooldownSeconds] = useState<number>(0);
+  const [existingAccountDetected, setExistingAccountDetected] = useState(false);
 
   // "I already have an account" state (for existing users who first signed up with Google)
   const [existingVerifiedUid, setExistingVerifiedUid] = useState<string | null>(null);
@@ -290,7 +291,9 @@ export const AuthPage: React.FC = () => {
 
   /**
    * When the user returns to the app, call reload() on the Firebase Auth user and check emailVerified.
-   * Only when emailVerified is true, show 'Email verified' and allow sign-up to finish.
+   * When the user returns to the app, call reload() on the Firebase Auth user, force-refresh the ID token,
+   * and confirm with the server.
+   * Only after the server confirms email_verified, show 'Email verified' in the UI and allow sign-up to finish.
    */
   const checkFirebaseEmailVerified = useCallback(async (): Promise<boolean> => {
     const activeUser = auth.currentUser;
@@ -304,24 +307,53 @@ export const AuthPage: React.FC = () => {
     try {
       await activeUser.reload();
       if (activeUser.emailVerified) {
-        await activeUser.getIdToken(true).catch(() => {});
-        if (authMode === 'existing') {
-          await loadExistingAccountProfileIntoForm(
-            activeUser.uid,
-            activeUser.email || cleanTypedEmail,
-            activeUser.displayName
-          );
-          setStatusMessage(
-            'Email verified! Choose your username and password below to keep all your existing data.'
-          );
+        const idToken = await activeUser.getIdToken(true).catch(() => '');
+        if (!idToken) return false;
+
+        // Authoritatively verify on the server before showing 'Email verified'
+        const resp = await fetch('/api/auth/verify-email-status', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-WaveLink-Device-Id': getClientDeviceId(),
+            Authorization: `Bearer ${idToken}`
+          },
+          body: JSON.stringify({ email: cleanTypedEmail })
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        if (resp.ok && data?.verified && data?.emailVerified) {
+          if (data.existingAccount) {
+            setExistingAccountDetected(true);
+            setError('This email already has an account');
+          } else {
+            setExistingAccountDetected(false);
+          }
+
+          if (authMode === 'existing') {
+            await loadExistingAccountProfileIntoForm(
+              activeUser.uid,
+              activeUser.email || cleanTypedEmail,
+              activeUser.displayName
+            );
+            setStatusMessage(
+              'Email verified! Choose your username and password below to keep all your existing data.'
+            );
+            return true;
+          }
+
+          setIsEmailVerified(true);
+          setVerificationNotice(null);
+          setVerificationErrorCode(null);
+          if (!data.existingAccount) {
+            setError(null);
+          }
+          setStatusMessage('Email verified');
           return true;
+        } else {
+          setIsEmailVerified(false);
+          return false;
         }
-        setIsEmailVerified(true);
-        setVerificationNotice(null);
-        setVerificationErrorCode(null);
-        setError(null);
-        setStatusMessage('Email verified');
-        return true;
       }
     } catch {
       // ignore transient reload error while offline
@@ -411,7 +443,27 @@ export const AuthPage: React.FC = () => {
         return;
       }
 
-      // 2. Check 60-second resend cooldown on the server
+      // 2. Check if email already belongs to an existing account on the server
+      try {
+        const checkResp = await fetch('/api/auth/check-email-availability', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-WaveLink-Device-Id': getClientDeviceId()
+          },
+          body: JSON.stringify({ email: cleanEmail })
+        });
+        const checkData = await checkResp.json().catch(() => ({}));
+        if (checkData?.exists) {
+          setExistingAccountDetected(true);
+          setError('This email already has an account');
+          return;
+        }
+      } catch {
+        // continue
+      }
+
+      // 2B. Check 60-second resend cooldown on the server
       const cooldownResp = await fetch('/api/auth/check-verification-cooldown', {
         method: 'POST',
         headers: {
@@ -454,16 +506,9 @@ export const AuthPage: React.FC = () => {
           targetUser = createRes.user;
         } catch (authErr: any) {
           if (authErr?.code === 'auth/email-already-in-use') {
-            try {
-              const signInRes = await signInWithEmailAndPassword(auth, cleanEmail, password);
-              targetUser = signInRes.user;
-            } catch (signInErr) {
-              await logFailureOnServerOnly('signup_email_already_in_use_google_account', signInErr);
-              setError(
-                'An account with this email already exists. If you first signed up with Google, choose "I already have an account" above to set your username and password.'
-              );
-              return;
-            }
+            setExistingAccountDetected(true);
+            setError('This email already has an account');
+            return;
           } else if (isAuthNetworkError(authErr)) {
             await new Promise((r) => setTimeout(r, 600));
             const retryRes = await createUserWithEmailAndPassword(auth, cleanEmail, password);
@@ -483,16 +528,35 @@ export const AuthPage: React.FC = () => {
         await fbUpdateProfile(targetUser, { displayName: displayName.trim() }).catch(() => {});
       }
 
-      // 5. Check if already verified upon reload()
+      // 5. Check if already verified upon reload() and confirm with server
       await targetUser.reload();
       if (targetUser.emailVerified) {
-        await targetUser.getIdToken(true).catch(() => {});
-        setIsEmailVerified(true);
-        setVerificationLinkSent(true);
-        setVerificationNotice(null);
-        setVerificationErrorCode(null);
-        setStatusMessage('Email verified');
-        return;
+        const idToken = await targetUser.getIdToken(true).catch(() => '');
+        if (idToken) {
+          const verifyResp = await fetch('/api/auth/verify-email-status', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-WaveLink-Device-Id': getClientDeviceId(),
+              Authorization: `Bearer ${idToken}`
+            },
+            body: JSON.stringify({ email: cleanEmail })
+          });
+          const verifyData = await verifyResp.json().catch(() => ({}));
+          if (verifyResp.ok && verifyData?.verified && verifyData?.emailVerified) {
+            if (verifyData.existingAccount) {
+              setExistingAccountDetected(true);
+              setError('This email already has an account');
+              return;
+            }
+            setIsEmailVerified(true);
+            setVerificationLinkSent(true);
+            setVerificationNotice(null);
+            setVerificationErrorCode(null);
+            setStatusMessage('Email verified');
+            return;
+          }
+        }
       }
 
       // 6. Send Firebase Authentication's built-in email verification link
@@ -515,6 +579,18 @@ export const AuthPage: React.FC = () => {
     } finally {
       setIsSendingVerification(false);
     }
+  };
+
+  const handleStartExistingAccountLink = (prefillEmail?: string) => {
+    if (prefillEmail) {
+      setEmailInput(prefillEmail);
+    }
+    setAuthMode('existing');
+    setError(null);
+    setExistingAccountDetected(false);
+    setStatusMessage(
+      'Verify your existing account once with Google or an email link to set your username and password.'
+    );
   };
 
   /**
@@ -819,19 +895,28 @@ export const AuthPage: React.FC = () => {
         return;
       }
 
-      // Reload the Firebase Auth user and check emailVerified before allowing sign-up to finish
-      const verifiedNow = await checkFirebaseEmailVerified();
+      // Reload the Firebase Auth user and force-refresh the ID token before calling the sign-up endpoint
       const activeUser = auth.currentUser;
+      if (!activeUser) {
+        setError('Please verify your email address before completing sign-up.');
+        setIsLoading(false);
+        return;
+      }
+
+      await activeUser.reload();
+      const idToken = await activeUser.getIdToken(true);
+
+      const verifiedNow = await checkFirebaseEmailVerified();
 
       if (
         !verifiedNow ||
-        !activeUser ||
+        !isEmailVerified ||
         !activeUser.emailVerified ||
         activeUser.email?.toLowerCase() !== cleanEmail
       ) {
         setIsEmailVerified(false);
         setError(
-          'Please verify your email address before completing sign-up. Tap Verify, open the link in your email, and return to WaveLink.'
+          'Email verification is required on the server before completing sign-up. Please tap Verify, open the link in your email, and return to WaveLink.'
         );
         setIsLoading(false);
         return;
@@ -846,15 +931,14 @@ export const AuthPage: React.FC = () => {
 
       try {
         await fbUpdateProfile(activeUser, { displayName: name }).catch(() => {});
-        const idToken = await activeUser.getIdToken(true);
 
-        // Server enforces that emailVerified is true and password meets the 8–24 char rule
+        // Server authoritatively verifies the ID token with Firebase Admin SDK and checks email_verified directly in Firebase Auth
         const regResp = await fetch('/api/auth/register-username', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'X-WaveLink-Device-Id': getClientDeviceId(),
-            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {})
+            Authorization: `Bearer ${idToken}`
           },
           body: JSON.stringify({
             uid: activeUser.uid,
@@ -872,10 +956,15 @@ export const AuthPage: React.FC = () => {
             regData?.error || 'Server rejected signup',
             activeUser.uid
           );
-          setError(
-            regData?.error ||
-              'Email verification is required on the server before completing sign-up.'
-          );
+          if (regData?.existingAccount || regResp.status === 409) {
+            setExistingAccountDetected(true);
+            setError('This email already has an account');
+          } else {
+            setError(
+              regData?.error ||
+                'Email verification is required on the server before completing sign-up.'
+            );
+          }
           setStatusMessage(null);
           setIsLoading(false);
           return;
@@ -1164,10 +1253,10 @@ export const AuthPage: React.FC = () => {
                   setStatusMessage(null);
                   setVerificationErrorCode(null);
                 }}
-                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all duration-300 ${
+                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-black flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer ${
                   authMode === 'signin'
-                    ? 'animate-moving-btn text-white shadow-md shadow-blue-500/25 scale-[1.01]'
-                    : 'text-slate-600 hover:text-[#0F172A]'
+                    ? 'bg-slate-900 text-white shadow-md shadow-slate-900/25 scale-[1.01]'
+                    : 'text-slate-700 hover:text-slate-950 hover:bg-slate-200/60'
                 }`}
               >
                 <LogIn size={15} />
@@ -1180,11 +1269,12 @@ export const AuthPage: React.FC = () => {
                   setError(null);
                   setStatusMessage(null);
                   setVerificationErrorCode(null);
+                  setExistingAccountDetected(false);
                 }}
-                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all duration-300 ${
+                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-black flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer ${
                   authMode === 'signup'
-                    ? 'animate-moving-btn text-white shadow-md shadow-emerald-500/25 scale-[1.01]'
-                    : 'text-slate-600 hover:text-[#0F172A]'
+                    ? 'bg-slate-900 text-white shadow-md shadow-slate-900/25 scale-[1.01]'
+                    : 'text-slate-700 hover:text-slate-950 hover:bg-slate-200/60'
                 }`}
               >
                 <UserPlus size={15} />
@@ -1427,14 +1517,19 @@ export const AuthPage: React.FC = () => {
                     <button
                       type="submit"
                       disabled={isLoading}
-                      className="w-full min-h-[48px] mt-2 py-3.5 px-5 rounded-2xl font-extrabold text-xs sm:text-sm text-white flex items-center justify-center gap-2 shadow-lg shadow-blue-500/30 hover:scale-[1.01] active:scale-[0.99] transition-all duration-200 disabled:opacity-50 animate-moving-btn"
+                      className="w-full min-h-[48px] mt-3 py-3.5 px-5 rounded-2xl font-black text-sm text-white flex items-center justify-center gap-2 bg-slate-900 hover:bg-black active:scale-[0.99] transition shadow-lg shadow-slate-900/25 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none cursor-pointer"
                     >
                       {isLoading ? (
-                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                        <div className="flex items-center gap-2">
+                          <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                          <span className="text-white font-black text-sm">Saving...</span>
+                        </div>
                       ) : (
                         <>
-                          <span>Save Username &amp; Password &amp; Sign In</span>
-                          <ArrowRight size={15} />
+                          <span className="text-white font-black tracking-wide text-sm">
+                            Save Username &amp; Password &amp; Sign In
+                          </span>
+                          <ArrowRight size={16} className="text-white shrink-0" />
                         </>
                       )}
                     </button>
@@ -1603,20 +1698,62 @@ export const AuthPage: React.FC = () => {
                         <span>Email verified</span>
                       </div>
                     )}
+
+                    {existingAccountDetected && (
+                      <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 space-y-3 animate-in fade-in">
+                        <div className="flex items-center gap-2 font-black text-sm text-amber-950">
+                          <AlertCircle size={18} className="text-amber-600 shrink-0" />
+                          <span>This email already has an account</span>
+                        </div>
+                        <p className="text-xs text-amber-800 leading-relaxed font-medium">
+                          An account with this email already exists on WaveLink (including Google sign-in). You can sign in directly or link a username &amp; password to that existing account, keeping all its data.
+                        </p>
+                        <div className="flex flex-col sm:flex-row gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAuthMode('signin');
+                              setUsernameInput(emailInput.trim().toLowerCase());
+                              setExistingAccountDetected(false);
+                              setError(null);
+                            }}
+                            className="flex-1 py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-black text-white font-black text-xs shadow-md transition flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            <span>Sign In</span>
+                            <ArrowRight size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setExistingAccountDetected(false);
+                              handleStartExistingAccountLink(emailInput.trim().toLowerCase());
+                            }}
+                            className="flex-1 py-2.5 px-4 rounded-xl bg-white border border-amber-300 hover:bg-amber-100 text-amber-950 font-black text-xs transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                          >
+                            <span>Link to Existing Account</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
                 <button
                   type="submit"
                   disabled={isLoading || (authMode === 'signup' && !isEmailVerified)}
-                  className="w-full min-h-[48px] mt-2 py-3.5 px-5 rounded-2xl font-extrabold text-xs sm:text-sm text-white flex items-center justify-center gap-2 shadow-lg shadow-blue-500/30 hover:shadow-pink-500/35 hover:scale-[1.01] active:scale-[0.99] transition-all duration-200 disabled:opacity-50 animate-moving-btn"
+                  className="w-full min-h-[48px] mt-3 py-3.5 px-5 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer shadow-lg active:scale-[0.99] disabled:cursor-not-allowed bg-slate-900 hover:bg-black text-white shadow-slate-900/25 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none border border-transparent disabled:border-slate-300"
                 >
                   {isLoading ? (
-                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span className="text-white font-black text-sm">Please wait...</span>
+                    </div>
                   ) : (
                     <>
-                      <span>{authMode === 'signup' ? 'Create WaveLink Account' : 'Sign In to WaveLink'}</span>
-                      <ArrowRight size={15} />
+                      <span className="text-white font-black tracking-wide text-sm">
+                        {authMode === 'signup' ? 'Create WaveLink Account' : 'Sign In to WaveLink'}
+                      </span>
+                      <ArrowRight size={16} className="text-white shrink-0" />
                     </>
                   )}
                 </button>

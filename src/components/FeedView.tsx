@@ -18,6 +18,7 @@ import {
 import { Post, PostComment, Announcement, ReactionType, UserProfile } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { VideoPlayer } from './VideoPlayer';
+import { PostBody } from './PostBody';
 import { SongPlayerCard } from './SongPlayerCard';
 import { SparkTray } from './SparkTray';
 import { AdsterraAdBanner } from './AdsterraAdBanner';
@@ -63,6 +64,7 @@ import {
   Coins,
   PlusCircle,
   Hash,
+  AtSign,
   CalendarDays,
   CheckCircle2,
   Mic,
@@ -216,6 +218,36 @@ export const FeedView: React.FC<FeedViewProps> = ({
   );
 
   const [posts, setPosts] = useState<Post[]>([]);
+  // Interactive discovery filter from hashtags, mentions, or search
+  const [internalFilterTag, setInternalFilterTag] = useState<string | null>(null);
+
+  useEffect(() => {
+    setInternalFilterTag(initialFilterTag || null);
+  }, [initialFilterTag]);
+
+  useEffect(() => {
+    const handleHashtagEvent = (e: Event) => {
+      const tag = (e as CustomEvent<string>).detail;
+      if (tag) {
+        setInternalFilterTag(tag);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    };
+    const handleMentionEvent = (e: Event) => {
+      const mention = (e as CustomEvent<string>).detail;
+      if (mention) {
+        const query = mention.startsWith('@') ? mention : `@${mention}`;
+        setInternalFilterTag(query);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    };
+    window.addEventListener('wavelink:hashtag', handleHashtagEvent);
+    window.addEventListener('wavelink:mention', handleMentionEvent);
+    return () => {
+      window.removeEventListener('wavelink:hashtag', handleHashtagEvent);
+      window.removeEventListener('wavelink:mention', handleMentionEvent);
+    };
+  }, []);
   const [latestAnnouncement, setLatestAnnouncement] = useState<Announcement | null>(null);
   const [pinnedAnnouncement, setPinnedAnnouncement] = useState<Announcement | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -1079,9 +1111,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
 
-  // If hashtag filter active from global search
-  const filteredSortedPosts = initialFilterTag
-    ? sortedPosts.filter((p) => p.content?.toLowerCase().includes(initialFilterTag.toLowerCase()))
+  const activeFilter = internalFilterTag || initialFilterTag || null;
+
+  // If hashtag or mention filter active (from search or tapped in post body)
+  const filteredSortedPosts = activeFilter
+    ? sortedPosts.filter((p) => {
+        const query = activeFilter.toLowerCase();
+        return (
+          p.content?.toLowerCase().includes(query) ||
+          p.authorUsername?.toLowerCase().includes(query) ||
+          p.authorName?.toLowerCase().includes(query)
+        );
+      })
     : sortedPosts;
 
   // Interleave subtle, non-intrusive sponsored posts every 8 scrolls/items
@@ -1097,7 +1138,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
   });
 
   // For standard free accounts with small feed, append a sponsored post so the feature is visible
-  if (!isProUser && filteredSortedPosts.length < 8 && SPONSORED_ADS.length > 0 && !combinedFeed.some((p) => p.isSponsored) && !initialFilterTag) {
+  if (!isProUser && filteredSortedPosts.length < 8 && SPONSORED_ADS.length > 0 && !combinedFeed.some((p) => p.isSponsored) && !activeFilter) {
     combinedFeed.push(SPONSORED_ADS[0]);
   }
 
@@ -1193,29 +1234,33 @@ export const FeedView: React.FC<FeedViewProps> = ({
           {/* Friendly Add to Home Screen Hint (Especially for iPhone Users) */}
           <AddToHomeScreenHintCard compact />
 
-          {/* Active Hashtag Filter Banner from Global Search */}
-          {initialFilterTag && (
+          {/* Active Hashtag or Mention Filter Banner */}
+          {activeFilter && (
             <div className="p-4 rounded-3xl bg-gradient-to-r from-[#3B82F6] to-[#10B981] text-white flex items-center justify-between gap-3 shadow-md animate-in fade-in">
               <div className="flex items-center gap-2.5 min-w-0">
                 <div className="p-2 rounded-2xl bg-white/20 text-white shrink-0">
-                  <Hash size={18} />
+                  {activeFilter.startsWith('@') ? <AtSign size={18} /> : <Hash size={18} />}
                 </div>
                 <div className="min-w-0">
-                  <span className="text-[10px] text-blue-100 font-bold uppercase tracking-wider block">Hashtag Filter</span>
+                  <span className="text-[10px] text-blue-100 font-bold uppercase tracking-wider block">
+                    {activeFilter.startsWith('@') ? 'Mention Discovery' : 'Hashtag Discovery'}
+                  </span>
                   <h4 className="text-sm font-extrabold truncate">
-                    Filtered by <span className="text-emerald-200">{initialFilterTag}</span> ({filteredSortedPosts.length} waves)
+                    Filtered by <span className="text-emerald-200">{activeFilter}</span> ({filteredSortedPosts.length} waves)
                   </h4>
                 </div>
               </div>
-              {onClearFilterTag && (
-                <button
-                  onClick={onClearFilterTag}
-                  className="min-h-[44px] px-3.5 py-1.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shrink-0"
-                >
-                  <span>Clear</span>
-                  <X size={13} />
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setInternalFilterTag(null);
+                  if (onClearFilterTag) onClearFilterTag();
+                }}
+                className="min-h-[44px] px-3.5 py-1.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shrink-0 cursor-pointer"
+              >
+                <span>Clear</span>
+                <X size={13} />
+              </button>
             </div>
           )}
 
@@ -1749,9 +1794,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       </div>
 
                       {/* Content */}
-                      <p className="wavelink-post-body text-base text-slate-700 whitespace-pre-wrap leading-relaxed mb-3.5">
-                        {post.content}
-                      </p>
+                      <PostBody
+                        postId={post.id}
+                        authorId={post.authorId}
+                        content={post.content}
+                        authorName={post.authorName}
+                        createdAt={post.createdAt}
+                        isSaved={isSaved}
+                        onToggleSave={handleToggleSave}
+                        className="mb-3.5"
+                        textClassName="text-slate-700"
+                      />
 
                       {/* Image (with preloaded aspect ratio reservation to prevent layout shift) */}
                       {post.imageUrl && (
@@ -2023,44 +2076,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       </div>
                     </div>
 
-                    {/* Content or Inline Editor */}
-                    {editingPostId === post.id ? (
-                      <div className="mb-4 p-3.5 rounded-2xl bg-blue-50/50 border border-blue-200 space-y-2.5">
-                        <textarea
-                          rows={3}
-                          value={editPostContent}
-                          onChange={(e) => setEditPostContent(e.target.value)}
-                          className="w-full p-3 rounded-xl bg-white border border-blue-300 text-xs sm:text-sm text-[#0F172A] focus:outline-none focus:ring-2 focus:ring-[#3B82F6] resize-none"
-                        />
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setEditingPostId(null)}
-                            className="px-3.5 py-1.5 rounded-xl text-xs font-semibold text-slate-500 hover:bg-slate-100"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            disabled={isSavingPostEdit}
-                            onClick={() => handleSavePostEdit(post.id)}
-                            className="px-4 py-1.5 rounded-xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs shadow-xs disabled:opacity-50"
-                          >
-                            {isSavingPostEdit ? 'Saving...' : 'Save Wave'}
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      post.content && (
-                        <p className="wavelink-post-body text-base text-[#0F172A] whitespace-pre-wrap leading-relaxed mb-4">
-                          {post.content}
-                          {post.isEdited && (
-                            <span className="text-[10px] text-slate-400 italic ml-2">
-                              (edited)
-                            </span>
-                          )}
-                        </p>
-                      )
+                    {/* Post Body with in-line click-to-edit and temporary input field */}
+                    {post.content && (
+                      <PostBody
+                        postId={post.id}
+                        authorId={post.authorId}
+                        content={post.content}
+                        authorName={post.authorName}
+                        createdAt={post.createdAt}
+                        isEdited={post.isEdited}
+                        isSaved={isSaved}
+                        onToggleSave={handleToggleSave}
+                        isEditing={editingPostId === post.id}
+                        onStartEdit={() => setEditingPostId(post.id)}
+                        onCancelEdit={() => setEditingPostId(null)}
+                        onSaveContent={() => setEditingPostId(null)}
+                        className="mb-4"
+                      />
                     )}
 
                     {/* Attached Video from Firestore (Chunked or Direct) */}
@@ -2499,9 +2531,21 @@ export const FeedView: React.FC<FeedViewProps> = ({
               </div>
 
               {focusedPost.content && (
-                <p className="text-base text-[#1C1917] whitespace-pre-wrap leading-relaxed">
-                  {focusedPost.content}
-                </p>
+                <PostBody
+                  postId={focusedPost.id}
+                  authorId={focusedPost.authorId}
+                  content={focusedPost.content}
+                  authorName={focusedPost.authorName}
+                  createdAt={focusedPost.createdAt}
+                  isEdited={focusedPost.isEdited}
+                  isSaved={(userProfile?.savedPostIds || []).includes(focusedPost.id)}
+                  onToggleSave={handleToggleSave}
+                  onSaveContent={(newContent) => {
+                    setFocusedPost((prev) => (prev ? { ...prev, content: newContent, isEdited: true } : null));
+                  }}
+                  className="mb-4"
+                  textClassName="text-[#1C1917]"
+                />
               )}
 
               {(focusedPost.videoUrl || focusedPost.hasVideoChunks || focusedPost.mediaType === 'video') && (

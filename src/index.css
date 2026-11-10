@@ -265,6 +265,98 @@ html[data-theme="sunrise"] {
   line-height: 1.6;
   overflow-wrap: anywhere;
   word-break: break-word;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  -ms-user-select: text !important;
+  cursor: text;
+  transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+}
+
+/* Subtle lift-on-hover animation for desktop interactivity */
+.wavelink-post-body:hover {
+  transform: translateY(-2px);
+}
+
+/* Avoid compounded double translation on nested paragraph */
+div.wavelink-post-body:hover p.wavelink-post-body {
+  transform: none;
+}
+
+/* When in inline editing mode, disable lift transform and allow seamless typing */
+.wavelink-post-body.wavelink-post-body--editing,
+.wavelink-post-body.wavelink-post-body--editing:hover {
+  transform: none !important;
+}
+
+.wavelink-post-body--editing textarea {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+/* Crisp, high-visibility text selection highlighting */
+.wavelink-post-body ::selection,
+.wavelink-post-body::selection {
+  background-color: rgba(59, 130, 246, 0.25);
+  color: inherit;
+}
+
+/* Preserve full pointer cursor & link interactivity for hashtags, mentions, and URLs */
+.wavelink-post-body a,
+.wavelink-post-body button:not(.wavelink-post-copy-btn):not(.wavelink-post-tts-btn):not(.wavelink-post-bookmark-btn):not(.wavelink-post-edit-btn) {
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.wavelink-post-body a:hover,
+.wavelink-post-body button:hover {
+  pointer-events: auto;
+}
+
+.wavelink-post-timestamp {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: #94a3b8;
+  display: inline-flex;
+  align-items: center;
+  user-select: none;
+  -webkit-user-select: none;
+  vertical-align: baseline;
+  cursor: default;
+}
+
+.wavelink-post-tts-btn,
+.wavelink-speaker-btn,
+.wavelink-post-copy-btn,
+.wavelink-post-bookmark-btn,
+.wavelink-post-edit-btn {
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  cursor: pointer;
+}
+
+.wavelink-speaker-icon {
+  flex-shrink: 0;
+  transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.wavelink-speaker-btn:hover .wavelink-speaker-icon {
+  transform: scale(1.12);
+}
+
+.wavelink-post-body--speaking {
+  position: relative;
+}
+
+.wavelink-post-body--speaking p.wavelink-post-body {
+  background-color: rgba(239, 246, 255, 0.5);
+  border-radius: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  transition: background-color 200ms ease;
 }
 
 /* Chat Mobile Layout (< 768px): Full-width message list, bubbles <= 80%, input bar kept inside visualViewport above keyboard */

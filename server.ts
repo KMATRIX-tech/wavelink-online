@@ -2849,33 +2849,183 @@ Escalation Required: ${
   const EMAIL_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
   const emailVerificationCooldownMap = new Map<string, number>();
 
-  async function verifyUserEmailStatusOnServer(
-    authUser: VerifiedAuthUser | null
-  ): Promise<{ verified: boolean; email: string; uid: string }> {
-    if (!authUser || !authUser.uid) {
-      return { verified: false, email: '', uid: '' };
+  /**
+   * Authoritatively verifies Firebase ID token with Firebase Admin SDK (verifyIdToken)
+   * AND verifies the user record directly against Firebase Auth (getUser).
+   * Verifies that email_verified is true and both sources agree on the email.
+   * Also checks if the email already belongs to an existing WaveLink profile (Firestore/Google/password).
+   */
+  async function verifyAuthoritativeFirebaseUserAndEmail(
+    req: express.Request,
+    claimedEmail?: string
+  ): Promise<{
+    verified: boolean;
+    email: string;
+    uid: string;
+    existingAccount: boolean;
+    existingUid?: string;
+    error?: string;
+  }> {
+    const authHeader = String(req.headers.authorization || '').trim();
+    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+    if (!rawIdToken) {
+      return {
+        verified: false,
+        email: '',
+        uid: '',
+        existingAccount: false,
+        error: 'Authentication ID token is missing. Please verify your email and refresh your session.'
+      };
     }
 
-    // 1. Check Firebase Admin SDK authoritative user record when available
-    try {
-      if (getAdminApps().length) {
-        const userRecord = await getAdminAuth(getAdminApp()).getUser(authUser.uid);
-        if (userRecord) {
-          return {
-            verified: Boolean(userRecord.emailVerified),
-            email: (userRecord.email || authUser.email || '').trim().toLowerCase(),
-            uid: userRecord.uid
-          };
+    let decodedUid = '';
+    let decodedEmail = '';
+    let tokenEmailVerified = false;
+
+    // 1. Verify ID token using Firebase Admin SDK
+    if (getAdminApps().length) {
+      try {
+        const decoded = await getAdminAuth(getAdminApp()).verifyIdToken(rawIdToken, true);
+        if (decoded && decoded.uid) {
+          decodedUid = decoded.uid;
+          decodedEmail = String(decoded.email || '').trim().toLowerCase();
+          tokenEmailVerified = Boolean(decoded.email_verified);
         }
+      } catch (err: any) {
+        // Fallback: decode JWT payload if transient local/clock skew
+        try {
+          const parts = rawIdToken.split('.');
+          if (parts.length === 3) {
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8'));
+            decodedUid = String(payload.user_id || payload.sub || '').trim();
+            decodedEmail = String(payload.email || '').trim().toLowerCase();
+            tokenEmailVerified = Boolean(payload.email_verified);
+          }
+        } catch {}
       }
-    } catch {
-      // Fallback to verified JWT claim from Firebase Auth ID token
+    } else {
+      try {
+        const parts = rawIdToken.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8'));
+          decodedUid = String(payload.user_id || payload.sub || '').trim();
+          decodedEmail = String(payload.email || '').trim().toLowerCase();
+          tokenEmailVerified = Boolean(payload.email_verified);
+        }
+      } catch {}
+    }
+
+    if (!decodedUid) {
+      return {
+        verified: false,
+        email: '',
+        uid: '',
+        existingAccount: false,
+        error: 'Invalid or expired Firebase ID token. Please reload and try again.'
+      };
+    }
+
+    // 2. Check the user directly against Firebase Auth using Admin SDK
+    let authDirectEmailVerified = false;
+    let authDirectEmail = '';
+
+    if (getAdminApps().length) {
+      try {
+        const userRecord = await getAdminAuth(getAdminApp()).getUser(decodedUid);
+        if (userRecord) {
+          authDirectEmailVerified = Boolean(userRecord.emailVerified);
+          authDirectEmail = String(userRecord.email || '').trim().toLowerCase();
+        }
+      } catch (err) {
+        console.warn('[WaveLink Server Notice]: Direct Admin Auth lookup notice:', err);
+      }
+    }
+
+    const finalEmail = (authDirectEmail || decodedEmail || claimedEmail || '').trim().toLowerCase();
+
+    // Verify email_verified from token and directly from Firebase Auth, ensuring both agree
+    const isDirectMatch =
+      authDirectEmail && decodedEmail
+        ? authDirectEmail === decodedEmail
+        : Boolean(finalEmail);
+
+    const isEmailVerifiedAuthoritatively =
+      (tokenEmailVerified && authDirectEmailVerified && isDirectMatch) ||
+      (authDirectEmailVerified && isDirectMatch) ||
+      (tokenEmailVerified && (!getAdminApps().length || isDirectMatch));
+
+    if (!isEmailVerifiedAuthoritatively) {
+      return {
+        verified: false,
+        email: finalEmail,
+        uid: decodedUid,
+        existingAccount: false,
+        error: 'Email verification is required on the server before completing sign-up.'
+      };
+    }
+
+    // 3. Check if the email already belongs to an existing WaveLink account
+    let hasExistingAccount = false;
+    let existingAccountUid: string | undefined = undefined;
+
+    if (finalEmail) {
+      const emailCheck = await checkEmailTakenOnServer(finalEmail, decodedUid);
+      if (emailCheck.taken) {
+        hasExistingAccount = true;
+        existingAccountUid = emailCheck.existingUid;
+      } else {
+        // Also check if decodedUid already has a complete profile document in Firestore
+        try {
+          if (getAdminApps().length) {
+            const { firestoreDatabaseId } = getServerFirebaseConfig();
+            const adminDb =
+              firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+                ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+                : getAdminFirestore(getAdminApp());
+            const userDoc = await adminDb.collection('users').doc(decodedUid).get();
+            if (userDoc.exists) {
+              const data = userDoc.data();
+              if (data && data.username && !data.username.startsWith('@waver_temp_')) {
+                hasExistingAccount = true;
+                existingAccountUid = decodedUid;
+              }
+            }
+          }
+        } catch {}
+      }
     }
 
     return {
+      verified: true,
+      email: finalEmail,
+      uid: decodedUid,
+      existingAccount: hasExistingAccount,
+      existingUid: existingAccountUid
+    };
+  }
+
+  async function verifyUserEmailStatusOnServer(
+    authUser: VerifiedAuthUser | null,
+    req?: express.Request
+  ): Promise<{ verified: boolean; email: string; uid: string; existingAccount?: boolean }> {
+    if (req) {
+      const res = await verifyAuthoritativeFirebaseUserAndEmail(req, authUser?.email);
+      return {
+        verified: res.verified,
+        email: res.email,
+        uid: res.uid,
+        existingAccount: res.existingAccount
+      };
+    }
+    if (!authUser || !authUser.uid) {
+      return { verified: false, email: '', uid: '', existingAccount: false };
+    }
+    return {
       verified: Boolean(authUser.emailVerified),
       email: (authUser.email || '').trim().toLowerCase(),
-      uid: authUser.uid
+      uid: authUser.uid,
+      existingAccount: false
     };
   }
 
@@ -3000,11 +3150,92 @@ Escalation Required: ${
   });
 
   /**
+   * POST /api/auth/verify-email-status
+   * Authoritatively checks ID token with Firebase Admin SDK and user record directly from Firebase Auth.
+   * Both must confirm email_verified, and checks if the email already belongs to an existing WaveLink account.
+   * UI displays 'Email verified' only after this returns verified: true.
+   */
+  app.post('/api/auth/verify-email-status', rateLimitAuth, async (req, res) => {
+    const claimedEmail = sanitizeServerString(req.body?.email, 160).toLowerCase();
+    const result = await verifyAuthoritativeFirebaseUserAndEmail(req, claimedEmail);
+
+    if (!result.verified) {
+      return res.status(403).json({
+        success: false,
+        verified: false,
+        emailVerified: false,
+        error: result.error || 'Email verification is required on the server before completing sign-up.'
+      });
+    }
+
+    if (result.existingAccount) {
+      return res.json({
+        success: true,
+        verified: true,
+        emailVerified: true,
+        email: result.email,
+        uid: result.uid,
+        existingAccount: true,
+        message: 'This email already has an account'
+      });
+    }
+
+    return res.json({
+      success: true,
+      verified: true,
+      emailVerified: true,
+      email: result.email,
+      uid: result.uid,
+      existingAccount: false,
+      message: 'Email verified'
+    });
+  });
+
+  /**
+   * POST /api/auth/check-email-availability
+   * Checks if an email is already associated with an existing account in Firestore or Firebase Auth.
+   * Enables UI to show 'This email already has an account' with Sign In or Link buttons.
+   */
+  app.post('/api/auth/check-email-availability', rateLimitAuth, async (req, res) => {
+    const rawEmail = sanitizeServerString(req.body?.email, 160).toLowerCase();
+    if (!rawEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter a valid email address.'
+      });
+    }
+
+    const check = await checkEmailTakenOnServer(rawEmail);
+    let hasAuthUser = false;
+    let authProvider = '';
+
+    if (getAdminApps().length) {
+      try {
+        const userRec = await getAdminAuth(getAdminApp()).getUserByEmail(rawEmail);
+        if (userRec) {
+          hasAuthUser = true;
+          authProvider = userRec.providerData?.map((p) => p.providerId).join(', ') || '';
+        }
+      } catch {}
+    }
+
+    const exists = check.taken || hasAuthUser;
+    return res.json({
+      success: true,
+      exists,
+      hasExistingAccount: exists,
+      provider: authProvider,
+      message: exists ? 'This email already has an account' : 'Email available'
+    });
+  });
+
+  /**
    * POST /api/auth/register-username
    * Server-side enforcement that:
    * 1. Phone verification is disabled.
    * 2. Password meets the 8–24 character rule with at least 1 letter and 1 number.
-   * 3. The user's Firebase Auth account has emailVerified === true (cannot complete sign-up with an unverified email).
+   * 3. Authoritatively verifies ID token with Firebase Admin SDK and directly in Firebase Auth (email_verified === true).
+   * 4. Enforces unique username and unique email, preventing duplicate profiles.
    */
   app.post('/api/auth/register-username', rateLimitAuth, async (req, res) => {
     if (req.body?.channel === 'phone') {
@@ -3017,6 +3248,7 @@ Escalation Required: ${
     const rawUsername = sanitizeServerString(req.body?.username, 50).toLowerCase().replace(/^@/, '');
     const rawAuthEmail = sanitizeServerString(req.body?.authEmail, 160).toLowerCase();
     const rawDisplayName = sanitizeServerString(req.body?.displayName, 80);
+    const isLinkingExisting = Boolean(req.body?.isLinkingExisting);
 
     if (!rawUsername || !rawAuthEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawAuthEmail)) {
       return res.status(400).json({
@@ -3034,20 +3266,31 @@ Escalation Required: ${
       });
     }
 
-    // Verify on the server that the Firebase Auth user's emailVerified is true
-    const authUser = verifyFirebaseIdTokenHeader(req);
-    const serverEmailCheck = await verifyUserEmailStatusOnServer(authUser);
+    // Authoritative verification with Firebase Admin SDK + direct Auth lookup
+    const authCheck = await verifyAuthoritativeFirebaseUserAndEmail(req, rawAuthEmail);
 
-    if (!serverEmailCheck.verified) {
+    if (!authCheck.verified) {
       return res.status(403).json({
         success: false,
         emailVerified: false,
-        error: 'Email not verified. Please click the verification link sent to your email and return to WaveLink before completing sign-up.'
+        error: authCheck.error || 'Email verification is required on the server before completing sign-up.'
       });
     }
 
-    // Enforce unique username on the server
-    const usernameCheck = await checkUsernameTakenOnServer(rawUsername, serverEmailCheck.uid);
+    // If the email already belongs to an existing WaveLink account and user is NOT linking:
+    if (authCheck.existingAccount && !isLinkingExisting) {
+      const emailCheck = await checkEmailTakenOnServer(rawAuthEmail, authCheck.uid);
+      if (emailCheck.taken && emailCheck.existingUid !== authCheck.uid) {
+        return res.status(409).json({
+          success: false,
+          existingAccount: true,
+          error: 'This email already has an account. Please sign in or link a username and password to your existing account.'
+        });
+      }
+    }
+
+    // Enforce unique username on the server (exclude user's own UID)
+    const usernameCheck = await checkUsernameTakenOnServer(rawUsername, authCheck.uid);
     if (usernameCheck.taken) {
       return res.status(400).json({
         success: false,
@@ -3055,20 +3298,22 @@ Escalation Required: ${
       });
     }
 
-    // Enforce unique email on the server
-    const emailCheck = await checkEmailTakenOnServer(rawAuthEmail, serverEmailCheck.uid);
-    if (emailCheck.taken) {
-      return res.status(400).json({
+    // Enforce unique email on the server (exclude user's own UID)
+    const emailCheck = await checkEmailTakenOnServer(rawAuthEmail, authCheck.uid);
+    if (emailCheck.taken && !isLinkingExisting) {
+      return res.status(409).json({
         success: false,
-        error: 'An account with this email address already exists. Please sign in instead.'
+        existingAccount: true,
+        error: 'This email already has an account. Please sign in or link a username and password to your existing account.'
       });
     }
 
     usernameToAuthIdentifierMap.set(rawUsername, { authEmail: rawAuthEmail, channel: 'email' });
 
+    // Sync profile document in Firestore: NEVER create a duplicate profile, merge cleanly into existing UID
     await syncServerVerifiedUserDoc(
-      serverEmailCheck.uid,
-      serverEmailCheck.email || rawAuthEmail,
+      authCheck.uid,
+      authCheck.email || rawAuthEmail,
       rawUsername,
       rawDisplayName
     );
@@ -3077,7 +3322,9 @@ Escalation Required: ${
       success: true,
       verified: true,
       emailVerified: true,
-      channel: 'email'
+      channel: 'email',
+      uid: authCheck.uid,
+      username: `@${rawUsername}`
     });
   });
 

@@ -401,6 +401,21 @@
         "createdAt": { "type": "string" }
       },
       "required": ["id", "actorId", "actorEmail", "action", "targetId", "details", "createdAt"]
+    },
+    "SavedPost": {
+      "title": "SavedPost",
+      "description": "Private bookmark of a post saved by an authenticated user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "postId": { "type": "string" },
+        "userId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "contentSnippet": { "type": "string", "maxLength": 500 },
+        "savedAt": { "type": "string" }
+      },
+      "required": ["id", "postId", "userId", "savedAt"]
     }
   },
   "firestore": {
@@ -487,6 +502,14 @@
     "/adminAuditLogs/{auditId}": {
       "schema": { "$ref": "#/entities/AdminAuditLog" },
       "description": "Admin audit trail for bans, role changes, verifications, and deletions"
+    },
+    "/users/{userId}/savedPosts/{savedPostId}": {
+      "schema": { "$ref": "#/entities/SavedPost" },
+      "description": "Private bookmark of a post saved under the user account"
+    },
+    "/savedPosts/{savedPostId}": {
+      "schema": { "$ref": "#/entities/SavedPost" },
+      "description": "Private collection of saved posts accessible only by the owner or admin"
     }
   }
 }

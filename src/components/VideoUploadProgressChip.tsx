@@ -17,6 +17,7 @@ import {
   type VideoUploadJob
 } from '../services/videoUploadQueue';
 import { CrystalBadge } from './CrystalBadge';
+import { PostBody } from './PostBody';
 
 interface VideoUploadProgressChipProps {
   /** When 'feed-inline', renders inline at the top of the feed. Otherwise renders a floating notification chip. */
@@ -363,9 +364,14 @@ export const VideoUploadingFeedPostList: React.FC = () => {
 
             {/* Caption */}
             {caption && (
-              <p className="wavelink-post-body text-base text-[#0F172A] whitespace-pre-wrap leading-relaxed mb-3.5">
-                {caption}
-              </p>
+              <PostBody
+                content={caption}
+                createdAt={job.createdAt || Date.now()}
+                showEditButton={false}
+                showBookmarkButton={false}
+                className="mb-3.5"
+                textClassName="text-[#0F172A]"
+              />
             )}
 
             {/* Video Preview Frame in True Aspect Ratio */}

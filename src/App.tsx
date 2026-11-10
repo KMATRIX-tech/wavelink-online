@@ -191,6 +191,50 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   useEffect(() => {
     testConnection().catch(() => {});
     recordSystemDomain().catch(() => {});
+
+    const handleGlobalHashtag = (e: Event) => {
+      const detail = (e as CustomEvent<string | { hashtag?: string; tag?: string }>).detail;
+      const tag = typeof detail === 'string' ? detail : detail?.hashtag || (detail?.tag ? `#${detail.tag}` : '');
+      if (tag) {
+        setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
+        setActiveTab('feed');
+      }
+    };
+    const handleGlobalMention = (e: Event) => {
+      const detail = (e as CustomEvent<string | { handle?: string; username?: string }>).detail;
+      const mention = typeof detail === 'string' ? detail : detail?.handle || detail?.username || '';
+      if (mention) {
+        const query = mention.startsWith('@') ? mention : `@${mention}`;
+        setSelectedHashtag(query);
+        setActiveTab('feed');
+      }
+    };
+    const handleGlobalChat = (e: Event) => {
+      const detail = (e as CustomEvent<{ userId?: string }>).detail;
+      if (detail?.userId) {
+        handleStartChatWithUser(detail.userId);
+      }
+    };
+    const handleGlobalNavigateTab = (e: Event) => {
+      const tab = (e as CustomEvent<ActiveTab>).detail;
+      if (tab) {
+        setActiveTab(tab);
+      }
+    };
+    window.addEventListener('wavelink:hashtag', handleGlobalHashtag);
+    window.addEventListener('wavelink:navigate-tag', handleGlobalHashtag);
+    window.addEventListener('wavelink:mention', handleGlobalMention);
+    window.addEventListener('wavelink:navigate-profile', handleGlobalMention);
+    window.addEventListener('wavelink:start-chat', handleGlobalChat);
+    window.addEventListener('wavelink:navigate-tab', handleGlobalNavigateTab);
+    return () => {
+      window.removeEventListener('wavelink:hashtag', handleGlobalHashtag);
+      window.removeEventListener('wavelink:navigate-tag', handleGlobalHashtag);
+      window.removeEventListener('wavelink:mention', handleGlobalMention);
+      window.removeEventListener('wavelink:navigate-profile', handleGlobalMention);
+      window.removeEventListener('wavelink:start-chat', handleGlobalChat);
+      window.removeEventListener('wavelink:navigate-tab', handleGlobalNavigateTab);
+    };
   }, []);
 
   // Ringtone ONLY for the person receiving the call; stops immediately on accept, decline, or call end
