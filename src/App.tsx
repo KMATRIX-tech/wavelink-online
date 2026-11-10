@@ -24,6 +24,7 @@ import { AnnouncementsView } from './components/AnnouncementsView';
 import { ChatChannelsView } from './components/ChatChannelsView';
 import { UserDirectoryView } from './components/UserDirectoryView';
 import { AdminDashboard } from './components/AdminDashboard';
+import AdminGuard from './components/AdminGuard';
 import { SettingsView } from './components/SettingsView';
 import { CreatorAnalyticsView } from './components/CreatorAnalyticsView';
 import { MonetizationHub } from './components/MonetizationHub';
@@ -672,7 +673,9 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
             <MonetizationHub onNavigateToFeed={() => setActiveTab('feed')} />
           )}
           {activeTab === 'admin' && (
-            <AdminDashboard onReturnToFeed={() => setActiveTab('settings')} />
+            <AdminGuard>
+              <AdminDashboard onReturnToFeed={() => setActiveTab('settings')} />
+            </AdminGuard>
           )}
           {activeTab === 'settings' && (
             <SettingsView onOpenAdminPanel={() => setActiveTab('admin')} />

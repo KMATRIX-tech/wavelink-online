@@ -65,8 +65,15 @@ service cloud.firestore {
 
     // Single source of truth for admin role across Admin Desk, Server Routes, and Firestore Rules:
     // Checks Firebase custom claims (token.role == 'admin' / token.admin == true), /users/{uid}.role, and /admins/{uid}
+    function isOwnerEmailToken() {
+      return isSignedIn() &&
+        request.auth.token.get('email', '') is string &&
+        request.auth.token.get('email', '').lower() == 'keylanmbilinyi5@gmail.com';
+    }
+
     function hasAdminCustomClaim() {
       return isSignedIn() && (
+        isOwnerEmailToken() ||
         request.auth.token.get('role', '') in ['admin', 'super_admin'] ||
         request.auth.token.get('admin', false) == true
       );
@@ -82,6 +89,8 @@ service cloud.firestore {
       return isSignedIn() && (
         hasAdminCustomClaim() ||
         getUserRole() in ['admin', 'super_admin'] ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isOwner', false) == true) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }

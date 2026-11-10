@@ -593,7 +593,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const cleanUserEmail = (user.email || '').trim().toLowerCase();
+      const isOwnerEmail = cleanUserEmail === 'keylanmbilinyi5@gmail.com';
       const claimRole = await readTokenClaimRole(user, false);
+
+      if (isOwnerEmail) {
+        try {
+          await setDoc(
+            userDocRef,
+            {
+              email: user.email,
+              role: 'admin',
+              isOwner: true
+            },
+            { merge: true }
+          );
+        } catch (err) {
+          console.warn('Could not write admin role automatically:', err);
+        }
+      }
 
       // 1. Look up existing user document by Firebase UID first
       let resolvedData: UserProfile | null = null;
@@ -633,7 +650,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // No existing profile found for UID or verified email: initialize single primary profile
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, null);
         const initialRole: UserProfile['role'] =
-          verifiedRoleOverride === 'admin' || claimRole === 'admin'
+          isOwnerEmail || verifiedRoleOverride === 'admin' || claimRole === 'admin'
             ? 'admin'
             : verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin'
             ? 'sub_admin'
@@ -642,8 +659,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const initialProfile: UserProfile = {
           id: user.uid,
           email: cleanUserEmail,
-          username: customUsername || `@${emailPrefix}`,
-          displayName: customName || user.displayName || emailPrefix || 'Waver',
+          username: isOwnerEmail ? '@keylan' : customUsername || `@${emailPrefix}`,
+          displayName: isOwnerEmail ? 'Keylan' : customName || user.displayName || emailPrefix || 'Waver',
           photoURL: user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.uid}`,
           bio: isInitialAdmin ? 'Platform Owner & Founder of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
           status: 'active',
@@ -664,6 +681,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         };
         await setDoc(userDocRef, cleanFirestoreData({
           ...initialProfile,
+          ...(isOwnerEmail ? { isOwner: true } : {}),
           serverTimestamp: serverTimestamp()
         }), { merge: true });
         setUserProfile(initialProfile);
@@ -683,7 +701,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const canonicalExistingRole = resolveCanonicalAdminRole(data.role, data.isSubAdmin);
         const effectiveRole: UserProfile['role'] =
-          verifiedRoleOverride === 'admin' || claimRole === 'admin' || canonicalExistingRole === 'admin'
+          isOwnerEmail || (data as any).isOwner === true || verifiedRoleOverride === 'admin' || claimRole === 'admin' || canonicalExistingRole === 'admin'
             ? 'admin'
             : verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin' || canonicalExistingRole === 'sub_admin'
             ? 'sub_admin'
@@ -694,8 +712,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           ...data,
           id: user.uid,
           email: data.email || cleanUserEmail,
-          username: customUsername || data.username || `@${emailPrefix}`,
-          displayName: customName || data.displayName || user.displayName || emailPrefix || 'Waver',
+          username: customUsername || data.username || (isOwnerEmail ? '@keylan' : `@${emailPrefix}`),
+          displayName: customName || data.displayName || user.displayName || (isOwnerEmail ? 'Keylan' : emailPrefix || 'Waver'),
           role: effectiveRole,
           isSubAdmin: effectiveRole === 'sub_admin',
           isPro: Boolean(data.isPro || localPro || isEffectiveAdmin),
@@ -712,12 +730,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAdminCheckFailedReason(null);
         }
 
-        // Non-blocking presence + daily reward sync (does not overwrite role from client unless already matching)
+        // Non-blocking presence + daily reward sync
         setDoc(
           userDocRef,
           cleanFirestoreData({
             isOnline: true,
             lastSeenAt: nowIso,
+            ...(isOwnerEmail ? { email: user.email || cleanUserEmail, role: 'admin', isOwner: true } : {}),
             ...(customName ? { displayName: customName } : {}),
             ...(customUsername ? { username: customUsername } : {}),
             ...rewardFields,
@@ -1581,11 +1600,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   // Single canonical source of truth for admin role across Admin Desk, Server Routes, and Firestore rules:
+  const isOwnerEmailMatch = Boolean(
+    currentUser?.email && currentUser.email.trim().toLowerCase() === 'keylanmbilinyi5@gmail.com'
+  );
   const canonicalClaimRole = resolveCanonicalAdminRole(customClaimRole, customClaimRole === 'sub_admin');
   const canonicalProfileRole = resolveCanonicalAdminRole(userProfile?.role, userProfile?.isSubAdmin);
   const canonicalServerRole = resolveCanonicalAdminRole(serverVerifiedRole, serverVerifiedRole === 'sub_admin');
 
   const isSuperAdmin =
+    isOwnerEmailMatch ||
+    Boolean((userProfile as any)?.isOwner) ||
     canonicalClaimRole === 'admin' ||
     canonicalProfileRole === 'admin' ||
     canonicalServerRole === 'admin';

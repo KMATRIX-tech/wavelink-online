@@ -925,6 +925,7 @@ function isServerAdminUser(user: VerifiedAuthUser | null, bodyEmail?: string, bo
   const candidateUid = (user?.uid || '').trim();
 
   if (
+    isOwnerEmail(candidateEmail) ||
     user?.tokenRole === 'admin' ||
     Boolean(user?.customAdminClaim) ||
     Boolean(user?.isVerifiedOwnerSession) ||
