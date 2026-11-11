@@ -558,10 +558,9 @@ async function grantOwnerRoleViaFirestoreRest(
       })
     });
     if (!adminResp.ok) {
-      const errText = await adminResp.text().catch(() => '');
+      await adminResp.text().catch(() => '');
       console.log(
-        `[WaveLink Server Auth Info] Firestore REST /admins/${ownerUid} write status ${adminResp.status}:`,
-        errText.slice(0, 240)
+        `[WaveLink Server Auth Info] Firestore REST /admins/${ownerUid} write status ${adminResp.status}.`
       );
     } else {
       console.log(
@@ -608,10 +607,9 @@ async function grantOwnerRoleViaFirestoreRest(
     });
 
     if (!userResp.ok) {
-      const errText = await userResp.text().catch(() => '');
+      await userResp.text().catch(() => '');
       console.log(
-        `[WaveLink Server Auth Info] Firestore REST /users/${ownerUid} role patch status ${userResp.status}:`,
-        errText.slice(0, 240)
+        `[WaveLink Server Auth Info] Firestore REST /users/${ownerUid} role patch status ${userResp.status}.`
       );
       return adminResp.ok;
     }
@@ -623,7 +621,7 @@ async function grantOwnerRoleViaFirestoreRest(
   } catch (err) {
     console.log(
       '[WaveLink Server Auth Info] Firestore REST role grant notice:',
-      err instanceof Error ? err.message : String(err)
+      err instanceof Error ? err.message.replace(/\s+/g, ' ') : String(err)
     );
     return false;
   }

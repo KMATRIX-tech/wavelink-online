@@ -184,7 +184,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
             <div className="flex flex-col min-w-0 ml-0.5 sm:ml-2">
               <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
-                <h1 className="font-bold text-base sm:text-lg text-[#1C1917] tracking-tight truncate">
+                <h1 className="font-bold text-[clamp(0.95rem,3.8vw,1.125rem)] text-[#1C1917] tracking-tight truncate">
                   {activeTab === 'feed' ? 'WaveLink' : t(currentTabInfo.tKey)}
                 </h1>
                 {isProUser && (
@@ -241,7 +241,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     type="button"
                     onClick={() => onNavigateTab && onNavigateTab('settings')}
                     title={`${t('datasaver.title')}: ${formattedSaved}`}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 text-[#0D9488] border border-teal-200/80 text-[11px] font-semibold shrink-0 cursor-pointer"
+                    className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 text-[#0D9488] border border-teal-200/80 text-[11px] font-semibold shrink-0 cursor-pointer"
                   >
                     <Zap size={11} className="shrink-0" />
                     <span className="hidden md:inline">{t('datasaver.badge')} • {formattedSaved}</span>
@@ -254,7 +254,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     type="button"
                     onClick={() => onNavigateTab && onNavigateTab('settings')}
                     title="Battery Saver Mode Active — reduced animations & optimized network checks"
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[#0D9488] border border-emerald-200/80 text-[11px] font-semibold shrink-0"
+                    className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[#0D9488] border border-emerald-200/80 text-[11px] font-semibold shrink-0"
                   >
                     <BatteryCharging size={12} className="shrink-0" />
                     <span className="hidden sm:inline">Saver</span>
@@ -277,7 +277,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
           </div>
 
           {/* Right: Non-floating WELINK Guide & Live Voice Buttons, Points & Profile Shortcut */}
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             {/* Mobile Search Trigger Button */}
             <button
               type="button"
@@ -287,7 +287,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               }}
               aria-label="Search people, posts, or tags"
               title="Search people, posts, or tags"
-              className="sm:hidden min-h-[38px] min-w-[38px] p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 hover:text-slate-900 transition flex items-center justify-center cursor-pointer"
+              className="sm:hidden min-h-[44px] min-w-[44px] p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 hover:text-slate-900 transition flex items-center justify-center cursor-pointer"
             >
               <Search size={16} />
             </button>
@@ -299,10 +299,10 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('medium');
                     onOpenWelink('voice');
                   }}
-                  className="min-h-[42px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95"
+                  className="min-h-[44px] min-w-[44px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95"
                   title="Talk Live with WELINK"
                 >
-                  <Mic size={14} className="text-[#0D9488] shrink-0" />
+                  <Mic size={15} className="text-[#0D9488] shrink-0" />
                   <span className="hidden md:inline">Live Talk</span>
                 </button>
                 <button
@@ -311,10 +311,10 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('light');
                     onOpenWelink('chat');
                   }}
-                  className="min-h-[42px] px-2.5 sm:px-3.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                  className="min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold flex items-center justify-center gap-1.5 transition active:scale-95"
                   title="Open WELINK AI Guide"
                 >
-                  <Sparkles size={14} className="text-[#0D9488] shrink-0" />
+                  <Sparkles size={15} className="text-[#0D9488] shrink-0" />
                   <span className="hidden sm:inline">WELINK AI</span>
                 </button>
               </>
@@ -327,7 +327,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 triggerHaptic('light');
                 if (onNavigateTab) onNavigateTab('settings');
               }}
-              className="min-h-[38px] px-2 py-1.5 rounded-xl bg-amber-50/80 hover:bg-amber-100/80 text-stone-800 border border-amber-200/80 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+              className="hidden sm:flex min-h-[44px] px-2.5 py-1.5 rounded-xl bg-amber-50/80 hover:bg-amber-100/80 text-stone-800 border border-amber-200/80 text-xs font-extrabold items-center gap-1 transition active:scale-95 cursor-pointer"
               title={`${countryMeta.flag} ${countryMeta.nameEn} • ${countryMeta.defaultCurrency}`}
             >
               <span>{countryMeta.flag}</span>
@@ -343,7 +343,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 setLanguage(nextLang);
                 updateUserProfile({ language: nextLang }).catch(() => {});
               }}
-              className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/80 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+              className="min-h-[44px] min-w-[44px] px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/80 text-xs font-extrabold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
               title={language === 'sw' ? 'Badili Lugha (Kiingereza / Kiswahili)' : 'Switch Language (English / Kiswahili)'}
             >
               <Globe size={13} className="text-[#2563EB] shrink-0" />
@@ -357,7 +357,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 triggerHaptic('light');
                 inviteFriends();
               }}
-              className="min-h-[42px] min-w-[42px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 text-xs font-bold flex items-center justify-center gap-1.5 transition active:scale-95"
+              className="hidden sm:flex min-h-[44px] min-w-[44px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 text-xs font-bold items-center justify-center gap-1.5 transition active:scale-95"
               title="Invite Friends to WaveLink via WhatsApp"
             >
               <UserPlus size={15} className="text-emerald-600 shrink-0" />
@@ -366,7 +366,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
             {currentUser && (
               <div className="flex items-center gap-1.5 sm:gap-2">
-                <div className="hidden xs:block">
+                <div className="hidden sm:block">
                   <CompactPointsDisplay
                     userId={currentUser.uid}
                     onClick={() => {
@@ -383,7 +383,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('tab');
                     if (onNavigateTab) onNavigateTab('settings');
                   }}
-                  className={`relative w-9 h-9 rounded-full overflow-hidden border border-[var(--border-hairline)] focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0 ${activeFrameClass}`}
+                  className={`relative w-11 h-11 min-w-[44px] min-h-[44px] rounded-full overflow-hidden border border-[var(--border-hairline)] focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0 flex items-center justify-center ${activeFrameClass}`}
                   title="View Profile"
                 >
                   <img
@@ -393,10 +393,10 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                       `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`
                     }
                     alt="Profile"
-                    className="w-full h-full rounded-full object-cover"
+                    className="w-9 h-9 rounded-full object-cover"
                   />
                   {hasUnreadNotifications && (
-                    <span className="absolute top-0 right-0 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-white" />
+                    <span className="absolute top-0.5 right-0.5 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-white" />
                   )}
                 </button>
               </div>

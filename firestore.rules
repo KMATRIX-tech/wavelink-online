@@ -109,22 +109,30 @@ service cloud.firestore {
       return isSuperAdmin() || isSubAdmin();
     }
 
-    // Verify if the authenticated user is a participant in a Direct Message channelId (`dm_<uidA>_<uidB>`)
-    function isDmMember(channelId) {
+    // Verify if the authenticated user is strictly one of the two participants in a Direct Message conversation (`dm_<uidA>_<uidB>`)
+    function isDmParticipant(channelId) {
       return isSignedIn() && (
-        channelId == 'official_updates' ||
+        channelId == 'dm_' + request.auth.uid ||
         channelId.matches('^dm_' + request.auth.uid + '_.*$') ||
         channelId.matches('^dm_.*_' + request.auth.uid + '$') ||
-        isAdmin()
+        (exists(/databases/$(database)/documents/channels/$(channelId)) &&
+         request.auth.uid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('participants', []))
+      );
+    }
+
+    function isDmMember(channelId) {
+      return isSignedIn() && (
+        (channelId == 'official_updates') ||
+        isDmParticipant(channelId)
       );
     }
 
     // Verify if the authenticated user is a member of a Group (`groups/{groupId}`)
     function isGroupMember(groupId) {
       return isSignedIn() && (
-        isAdmin() ||
         (exists(/databases/$(database)/documents/groups/$(groupId)) &&
-         request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberIds)
+         request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberIds) ||
+        isAdmin()
       );
     }
 
@@ -483,23 +491,65 @@ service cloud.firestore {
       }
     }
 
-    // Real-Time Direct Messages & Official Updates Channel (Chats readable only by their members)
+    // Real-Time Direct Messages & Official Updates Channel (Messages readable and creatable strictly only by conversation participants)
     match /channels/{channelId} {
       allow read: if isSignedIn();
-      allow write: if channelId == 'official_updates' ? isAdmin() : isDmMember(channelId);
+      allow write: if channelId == 'official_updates' ? isAdmin() : (
+        isDmMember(channelId) ||
+        (isSignedIn() && request.auth.uid in request.resource.data.get('participants', []))
+      );
 
       match /messages/{messageId} {
-        allow read: if isDmMember(channelId);
-        allow create: if isDmMember(channelId) && (
+        allow read: if isDmMember(channelId) || (
+          isSignedIn() &&
+          resource != null && (
+            resource.data.get('senderId', '') == request.auth.uid ||
+            resource.data.get('receiverId', '') == request.auth.uid ||
+            request.auth.uid in resource.data.get('participants', [])
+          )
+        );
+        allow create: if (
+          isDmMember(channelId) ||
+          (isSignedIn() && request.auth.uid in request.resource.data.get('participants', []))
+        ) && (
           (request.resource.data.senderId == request.auth.uid && (channelId != 'official_updates' || isAdmin())) ||
           (request.resource.data.senderId == 'wavelink_support_bot' && channelId.matches('.*wavelink_support_bot.*'))
         );
         allow update: if isDmMember(channelId) && (
           resource.data.senderId == request.auth.uid ||
-          isAdmin() ||
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'lastSeenAt', 'reportedBadReply'])
         );
-        allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || isAdmin());
+        allow delete: if isDmMember(channelId) && resource.data.senderId == request.auth.uid;
+      }
+    }
+
+    // Conversations collection alias (strictly only conversation participants can read and create messages)
+    match /conversations/{conversationId} {
+      allow read: if isDmMember(conversationId) || (
+        isSignedIn() && resource != null && request.auth.uid in resource.data.get('participants', [])
+      );
+      allow create, update: if isDmMember(conversationId) || (
+        isSignedIn() && request.auth.uid in request.resource.data.get('participants', [])
+      );
+
+      match /messages/{messageId} {
+        allow read: if isDmMember(conversationId) || (
+          isSignedIn() &&
+          resource != null && (
+            resource.data.get('senderId', '') == request.auth.uid ||
+            resource.data.get('receiverId', '') == request.auth.uid ||
+            request.auth.uid in resource.data.get('participants', [])
+          )
+        );
+        allow create: if (
+          isDmMember(conversationId) ||
+          (isSignedIn() && request.auth.uid in request.resource.data.get('participants', []))
+        ) && request.resource.data.senderId == request.auth.uid;
+        allow update: if isDmMember(conversationId) && (
+          resource.data.senderId == request.auth.uid ||
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'lastSeenAt'])
+        );
+        allow delete: if isDmMember(conversationId) && resource.data.senderId == request.auth.uid;
       }
     }
 

@@ -12,9 +12,10 @@ import {
   deleteDoc,
   getDocs,
   arrayUnion,
-  arrayRemove
+  arrayRemove,
+  serverTimestamp
 } from 'firebase/firestore';
-import { ChannelMessage, UserProfile, CallRecipient, ChatGroup, TypingStatusEntry } from '../types';
+import { ChannelMessage, UserProfile, CallRecipient, ChatGroup, TypingStatusEntry, ChatChannelMeta } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import {
   compressImage,
@@ -59,7 +60,10 @@ import {
   Volume2,
   Flag,
   Ban,
-  Bot
+  Bot,
+  ArrowLeft,
+  AlertTriangle,
+  RefreshCw
 } from 'lucide-react';
 import { ADMIN_EMAIL, isSuperAdminEmail, getAuthHeaders } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
@@ -78,6 +82,63 @@ import {
   isSupportBotUser,
   sanitizeUserText
 } from '../utils/security';
+
+/**
+ * Deterministic conversationId generator:
+ * Always sorts both UIDs alphabetically and joins them as `dm_<uid1>_<uid2>`
+ * so both participants compute the exact same conversationId.
+ */
+export const computeDmConversationId = (uidA: string, uidB: string): string => {
+  const cleanA = String(uidA || '').trim();
+  const cleanB = String(uidB || '').trim();
+  const sorted = [cleanA, cleanB].sort();
+  return `dm_${sorted[0]}_${sorted[1]}`;
+};
+
+/**
+ * Safely extracts the other participant's UID from a `dm_<uid1>_<uid2>` conversationId,
+ * even if one of the UIDs contains underscores (e.g. `wavelink_support_bot`).
+ */
+export const getOtherDmParticipantId = (conversationId: string, myUid: string): string => {
+  if (!conversationId || !conversationId.startsWith('dm_') || !myUid) return '';
+  const body = conversationId.slice(3);
+  if (body.startsWith(`${myUid}_`)) {
+    return body.slice(myUid.length + 1);
+  }
+  if (body.endsWith(`_${myUid}`)) {
+    return body.slice(0, body.length - (myUid.length + 1));
+  }
+  const parts = body.split('_');
+  return parts.find((p) => p !== myUid) || '';
+};
+
+/**
+ * Normalizes a message's timestamp (Firestore Timestamp, number, or ISO string) into milliseconds
+ * for deterministic chronological ordering.
+ */
+const getMessageTimestampMs = (msg: Partial<ChannelMessage> & { timestamp?: any }): number => {
+  const ts = msg.timestamp;
+  if (ts) {
+    if (typeof ts.toMillis === 'function') {
+      return ts.toMillis();
+    }
+    if (typeof ts.seconds === 'number') {
+      return ts.seconds * 1000 + Math.floor((ts.nanoseconds || 0) / 1e6);
+    }
+    if (typeof ts === 'number') {
+      return ts;
+    }
+    if (typeof ts === 'string') {
+      const parsed = Date.parse(ts);
+      if (!isNaN(parsed)) return parsed;
+    }
+  }
+  if (msg.createdAt) {
+    const parsed = Date.parse(msg.createdAt);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return 0;
+};
 
 interface ChatChannelsViewProps {
   onOpenCall: (type: 'video' | 'voice', recipient?: CallRecipient) => void;
@@ -147,9 +208,20 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
   // Active channel identifier: can be a groupId (e.g. `grp_...`) or DM id (`dm_...`)
   const [activeChannel, setActiveChannel] = useState<string>('');
-  const [showMobileChannels, setShowMobileChannels] = useState(false);
+  // On mobile/tablet (< 1024px), start on the Chat List screen unless a specific target user was requested
+  const [showMobileChannels, setShowMobileChannels] = useState<boolean>(() => {
+    if (initialTargetUserId) return false;
+    return typeof window !== 'undefined' ? window.innerWidth < 1024 : true;
+  });
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [chatLoadError, setChatLoadError] = useState<string | null>(null);
+  const [retryTrigger, setRetryTrigger] = useState<number>(0);
   const [channelLastSeen, setChannelLastSeen] = useState<Record<string, string>>({});
+  const [channelMetaMap, setChannelMetaMap] = useState<Record<string, ChatChannelMeta>>({});
+  const [unreadCountsByChannel, setUnreadCountsByChannel] = useState<Record<string, number>>({});
+  const [latestMessageByChannel, setLatestMessageByChannel] = useState<
+    Record<string, { text: string; senderId: string; senderName: string; createdAt: string }>
+  >({});
   const [inputText, setInputText] = useState('');
   const [replyingTo, setReplyingTo] = useState<ChannelMessage | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
@@ -233,7 +305,15 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     if (typeof window === 'undefined') return;
 
     const updateVisualViewportBounds = () => {
-      const isMobileViewport = window.innerWidth < 768;
+      const isCompactViewport = window.innerWidth < 1024;
+      const isConvoScreenOpenOnMobile =
+        isCompactViewport && !showMobileChannels && Boolean(activeChannel);
+
+      document.documentElement.setAttribute(
+        'data-mobile-chat-convo',
+        isConvoScreenOpenOnMobile ? 'open' : 'list'
+      );
+
       const vv = window.visualViewport;
       const vvHeight = vv ? vv.height : window.innerHeight;
       const vvOffsetTop = vv ? vv.offsetTop : 0;
@@ -241,7 +321,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       const keyboardHeight = Math.max(0, Math.round(layoutHeight - vvHeight - vvOffsetTop));
 
       const isKeyboardOpen =
-        isMobileViewport &&
+        isCompactViewport &&
         (keyboardHeight > 85 || (isInputFocusedRef.current && keyboardHeight > 25));
 
       document.documentElement.setAttribute(
@@ -255,7 +335,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       );
       document.documentElement.style.setProperty('--kb-offset', `${keyboardHeight}px`);
 
-      if (!isMobileViewport) {
+      if (!isCompactViewport) {
         if (chatShellRef.current) {
           chatShellRef.current.style.removeProperty('--chat-visual-height');
         }
@@ -269,14 +349,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       }
 
       if (chatShellRef.current) {
-        const rect = chatShellRef.current.getBoundingClientRect();
-        const topWithinVisual = Math.max(0, Math.round(rect.top));
-        const bottomNavReserve = isKeyboardOpen ? 0 : 64;
-        const availableHeight = Math.max(
-          150,
-          Math.floor(vvHeight - topWithinVisual - bottomNavReserve)
-        );
-        chatShellRef.current.style.setProperty('--chat-visual-height', `${availableHeight}px`);
+        if (isConvoScreenOpenOnMobile) {
+          chatShellRef.current.style.setProperty('--chat-visual-height', `${Math.round(vvHeight)}px`);
+        } else {
+          const rect = chatShellRef.current.getBoundingClientRect();
+          const topWithinVisual = Math.max(0, Math.round(rect.top));
+          const bottomNavReserve = isKeyboardOpen ? 0 : 68;
+          const availableHeight = Math.max(
+            240,
+            Math.floor(vvHeight - topWithinVisual - bottomNavReserve)
+          );
+          chatShellRef.current.style.setProperty('--chat-visual-height', `${availableHeight}px`);
+        }
       }
 
       // Keep active message area scrolled to the bottom when the virtual keyboard opens or resizes
@@ -305,6 +389,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       vv?.removeEventListener('scroll', updateVisualViewportBounds);
       window.removeEventListener('resize', updateVisualViewportBounds);
       document.documentElement.removeAttribute('data-keyboard-open');
+      document.documentElement.removeAttribute('data-mobile-chat-convo');
       document.documentElement.style.removeProperty('--vv-height');
       document.documentElement.style.removeProperty('--vv-offset-top');
       document.documentElement.style.removeProperty('--kb-offset');
@@ -313,38 +398,47 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
   // 1. Real-time listener for registered users / online members (with dedicated WaveLink Support Bot pinned first)
   useEffect(() => {
-    const usersQuery = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
+    const usersCol = collection(db, 'users');
     const unsub = onSnapshot(
-      usersQuery,
+      usersCol,
       (snap) => {
-        const list: UserProfile[] = [SUPPORT_BOT_PROFILE];
+        const otherUsers: UserProfile[] = [];
         snap.forEach((d) => {
           if (d.id !== currentUser?.uid && d.id !== SUPPORT_BOT_ID) {
-            list.push({ id: d.id, ...d.data() } as UserProfile);
+            otherUsers.push({ id: d.id, ...d.data() } as UserProfile);
           }
         });
+        // Sort client-side by createdAt descending so users without createdAt are never excluded
+        otherUsers.sort((a, b) => {
+          const timeA = a.createdAt ? Date.parse(a.createdAt) || 0 : 0;
+          const timeB = b.createdAt ? Date.parse(b.createdAt) || 0 : 0;
+          return timeB - timeA;
+        });
+
+        const list: UserProfile[] = [SUPPORT_BOT_PROFILE, ...otherUsers];
         setMembers(list);
 
-        // If target user specified from directory, start DM
+        // If target user specified from directory/feed, open that DM immediately
         if (initialTargetUserId && currentUser?.uid) {
-          const dmId =
-            currentUser.uid < initialTargetUserId
-              ? `dm_${currentUser.uid}_${initialTargetUserId}`
-              : `dm_${initialTargetUserId}_${currentUser.uid}`;
+          const dmId = computeDmConversationId(currentUser.uid, initialTargetUserId);
           setActiveChannel(dmId);
-        } else if (currentUser?.uid && list.length > 0) {
-          // Ensure a default conversation is selected if none is active
+          setShowMobileChannels(false);
+        } else if (
+          currentUser?.uid &&
+          list.length > 0 &&
+          typeof window !== 'undefined' &&
+          window.innerWidth >= 1024
+        ) {
+          // On desktop (>= 1024px), ensure a default conversation is selected if none is active
           setActiveChannel((prev) => {
             if (prev) return prev;
             const firstTarget = list[0];
-            return currentUser.uid < firstTarget.id
-              ? `dm_${currentUser.uid}_${firstTarget.id}`
-              : `dm_${firstTarget.id}_${currentUser.uid}`;
+            return computeDmConversationId(currentUser.uid, firstTarget.id);
           });
         }
       },
       (e) => {
-        console.warn('Chat members listener notice:', e);
+        console.error('[WaveLink Chat] Error loading users directory for chat:', e);
         setMembers([SUPPORT_BOT_PROFILE]);
       }
     );
@@ -353,41 +447,81 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
   // 2. Real-time listener for user-created groups
   useEffect(() => {
-    const groupsQuery = query(collection(db, 'groups'), orderBy('createdAt', 'desc'));
+    const groupsCol = collection(db, 'groups');
     const unsub = onSnapshot(
-      groupsQuery,
+      groupsCol,
       (snapshot) => {
         const list: ChatGroup[] = [];
         snapshot.forEach((d) => {
           list.push({ id: d.id, ...d.data() } as ChatGroup);
         });
+        list.sort((a, b) => {
+          const timeA = a.createdAt ? Date.parse(a.createdAt) || 0 : 0;
+          const timeB = b.createdAt ? Date.parse(b.createdAt) || 0 : 0;
+          return timeB - timeA;
+        });
         setGroups(list);
 
-        // If active channel not set yet, select the first group
-        setActiveChannel((prev) => {
-          if (prev) return prev;
-          if (list.length > 0) return list[0].id;
-          return '';
-        });
+        // On desktop, only fallback to a group if the user is a member and no channel is selected
+        if (typeof window !== 'undefined' && window.innerWidth >= 1024 && currentUser?.uid) {
+          setActiveChannel((prev) => {
+            if (prev) return prev;
+            const joinedGroup = list.find((g) => g.memberIds?.includes(currentUser.uid));
+            return joinedGroup ? joinedGroup.id : '';
+          });
+        }
       },
       (err) => {
-        console.warn('Groups listener notice:', err);
+        console.error('[WaveLink Chat] Error loading groups list:', err);
       }
     );
 
     return () => unsub();
   }, [currentUser?.uid]);
 
-  // Determine current active chat item info
+  // Synthesize any DM participants discovered in `channels` who might not have a document in `users` yet
+  const allMembers = React.useMemo(() => {
+    if (!currentUser?.uid) return members;
+    const knownIds = new Set(members.map((m) => m.id));
+    const extraMembers: UserProfile[] = [];
+
+    Object.values(channelMetaMap).forEach((meta) => {
+      if (!meta?.id?.startsWith('dm_')) return;
+      const otherUid = getOtherDmParticipantId(meta.id, currentUser.uid);
+      if (otherUid && otherUid !== currentUser.uid && !knownIds.has(otherUid)) {
+        knownIds.add(otherUid);
+        extraMembers.push({
+          id: otherUid,
+          email: `${otherUid.slice(0, 8)}@wavelink.user`,
+          username: `@waver_${otherUid.slice(0, 6)}`,
+          displayName:
+            meta.lastMessageSenderId === otherUid && meta.lastMessageSenderName
+              ? meta.lastMessageSenderName
+              : `Waver (${otherUid.slice(0, 6)})`,
+          photoURL: `https://api.dicebear.com/7.x/shapes/svg?seed=${otherUid}`,
+          status: 'active',
+          isBanned: false,
+          createdAt: meta.updatedAt || new Date().toISOString()
+        });
+      }
+    });
+
+    return extraMembers.length > 0 ? [...members, ...extraMembers] : members;
+  }, [members, channelMetaMap, currentUser?.uid]);
+
+  // Determine current active chat item info using deterministic conversationId helpers
   const supportBotChannelId = currentUser?.uid
-    ? currentUser.uid < SUPPORT_BOT_ID
-      ? `dm_${currentUser.uid}_${SUPPORT_BOT_ID}`
-      : `dm_${SUPPORT_BOT_ID}_${currentUser.uid}`
+    ? computeDmConversationId(currentUser.uid, SUPPORT_BOT_ID)
     : '';
   const isDirectMessage = activeChannel.startsWith('dm_');
   const activeGroup = !isDirectMessage ? groups.find((g) => g.id === activeChannel) : null;
+  const activeOtherParticipantId =
+    isDirectMessage && currentUser?.uid
+      ? getOtherDmParticipantId(activeChannel, currentUser.uid)
+      : '';
   const directRecipient = isDirectMessage
-    ? members.find((m) => activeChannel.includes(m.id)) ||
+    ? allMembers.find((m) => m.id === activeOtherParticipantId) ||
+      allMembers.find((m) => activeChannel.includes(m.id)) ||
       (activeChannel.includes(SUPPORT_BOT_ID) ? SUPPORT_BOT_PROFILE : null)
     : null;
   const isChattingWithSupportBot =
@@ -416,7 +550,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     ? activeGroup.memberIds?.includes(currentUser.uid)
     : false;
 
-  // 2b. Real-time listener for all DM channels metadata (lastSeen + typing indicators)
+  // 2b. Real-time listener for all DM channels metadata (lastSeen + typing indicators + lastMessage)
   useEffect(() => {
     if (!currentUser?.uid) return;
 
@@ -425,24 +559,206 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       channelsColRef,
       (snapshot) => {
         const nextTypingMap: Record<string, Record<string, TypingStatusEntry>> = {};
+        const nextMetaMap: Record<string, ChatChannelMeta> = {};
+        const nextLatestMap: Record<
+          string,
+          { text: string; senderId: string; senderName: string; createdAt: string }
+        > = {};
+        const nextBaselineUnread: Record<string, number> = {};
+
         snapshot.forEach((docSnap) => {
-          const data = docSnap.data();
+          const data = docSnap.data() as ChatChannelMeta;
+          const chanId = docSnap.id;
+          nextMetaMap[chanId] = { ...data, id: chanId };
           if (data?.typing && typeof data.typing === 'object') {
-            nextTypingMap[docSnap.id] = data.typing as Record<string, TypingStatusEntry>;
+            nextTypingMap[chanId] = data.typing as Record<string, TypingStatusEntry>;
           }
-          if (docSnap.id === activeChannel) {
+          if (chanId === activeChannel) {
             setChannelLastSeen((data?.lastSeen as Record<string, string>) || {});
           }
+          if (data?.lastMessageText && data?.lastMessageSenderId) {
+            const msgAt = data.lastMessageAt || data.updatedAt || '';
+            nextLatestMap[chanId] = {
+              text: data.lastMessageText,
+              senderId: data.lastMessageSenderId,
+              senderName: data.lastMessageSenderName || 'Waver',
+              createdAt: msgAt
+            };
+            const mySeenIso = data?.lastSeen?.[currentUser.uid] || '';
+            const mySeenMs = mySeenIso ? Date.parse(mySeenIso) || 0 : 0;
+            const msgMs = msgAt ? Date.parse(msgAt) || 0 : 0;
+            if (
+              data.lastMessageSenderId !== currentUser.uid &&
+              msgMs > mySeenMs &&
+              chanId !== activeChannel
+            ) {
+              nextBaselineUnread[chanId] = Math.max(
+                1,
+                Number(data?.unreadCounts?.[currentUser.uid] || 1)
+              );
+            }
+          }
         });
+        setChannelMetaMap(nextMetaMap);
         setFirestoreChannelTyping(nextTypingMap);
+        if (Object.keys(nextLatestMap).length > 0) {
+          setLatestMessageByChannel((prev) => ({ ... nextLatestMap, ...prev }));
+        }
+        if (Object.keys(nextBaselineUnread).length > 0) {
+          setUnreadCountsByChannel((prev) => ({ ...nextBaselineUnread, ...prev }));
+        }
       },
       (err) => {
-        console.warn('Channels metadata listener notice:', err);
+        console.warn('[WaveLink Chat] Channels metadata listener notice:', err?.message || err);
       }
     );
 
     return () => unsub();
   }, [currentUser?.uid, activeChannel]);
+
+  // 2b-ii. Real-time listeners for unread message counts & latest message across active conversations
+  const activeDmChannelIdsKey = React.useMemo(() => {
+    if (!currentUser?.uid) return '';
+    const existingIds = Object.keys(channelMetaMap).filter(
+      (id) =>
+        id.startsWith('dm_') &&
+        (id.startsWith(`dm_${currentUser.uid}_`) || id.endsWith(`_${currentUser.uid}`))
+    );
+    const botConvId = computeDmConversationId(currentUser.uid, SUPPORT_BOT_ID);
+    const combined = Array.from(new Set([botConvId, ...existingIds].filter(Boolean))).slice(0, 10);
+    return combined.join(',');
+  }, [channelMetaMap, currentUser?.uid]);
+
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+
+    const unsubs: Array<() => void> = [];
+    const dmConversationIds = activeDmChannelIdsKey
+      ? activeDmChannelIdsKey.split(',').filter(Boolean)
+      : [];
+    const joinedGroupIds = groups
+      .filter((g) => g.memberIds?.includes(currentUser.uid))
+      .slice(0, 8)
+      .map((g) => g.id);
+
+    dmConversationIds.forEach((convId) => {
+      const colRef = collection(db, 'channels', convId, 'messages');
+      const unsub = onSnapshot(
+        colRef,
+        (snap) => {
+          let unread = 0;
+          let latestMsg: ChannelMessage | null = null;
+          let latestTimeMs = -1;
+
+          snap.forEach((d) => {
+            const msg = { id: d.id, ...d.data() } as ChannelMessage;
+            if (msg.isDeleted) return;
+            const msgMs = getMessageTimestampMs(msg);
+            if (msgMs >= latestTimeMs) {
+              latestTimeMs = msgMs;
+              latestMsg = msg;
+            }
+            if (
+              msg.senderId !== currentUser.uid &&
+              !(msg.readBy || []).includes(currentUser.uid)
+            ) {
+              unread += 1;
+            }
+          });
+
+          setUnreadCountsByChannel((prev) => {
+            if (prev[convId] === unread) return prev;
+            return { ...prev, [convId]: unread };
+          });
+
+          if (latestMsg) {
+            const finalLatest = latestMsg as ChannelMessage;
+            const previewText =
+              finalLatest.text ||
+              (finalLatest.gifUrl
+                ? '[GIF]'
+                : finalLatest.mediaType === 'audio' || finalLatest.audioUrl
+                ? '🎤 Voice note'
+                : finalLatest.mediaUrl
+                ? '📷 Media'
+                : '');
+            setLatestMessageByChannel((prev) => ({
+              ...prev,
+              [convId]: {
+                text: previewText,
+                senderId: finalLatest.senderId,
+                senderName: finalLatest.senderName || 'Waver',
+                createdAt: finalLatest.createdAt || new Date(latestTimeMs || Date.now()).toISOString()
+              }
+            }));
+          }
+        },
+        () => {}
+      );
+      unsubs.push(unsub);
+    });
+
+    joinedGroupIds.forEach((grpId) => {
+      const colRef = collection(db, 'groups', grpId, 'messages');
+      const unsub = onSnapshot(
+        colRef,
+        (snap) => {
+          let unread = 0;
+          let latestMsg: ChannelMessage | null = null;
+          let latestTimeMs = -1;
+
+          snap.forEach((d) => {
+            const msg = { id: d.id, ...d.data() } as ChannelMessage;
+            if (msg.isDeleted) return;
+            const msgMs = getMessageTimestampMs(msg);
+            if (msgMs >= latestTimeMs) {
+              latestTimeMs = msgMs;
+              latestMsg = msg;
+            }
+            if (
+              msg.senderId !== currentUser.uid &&
+              !(msg.readBy || []).includes(currentUser.uid)
+            ) {
+              unread += 1;
+            }
+          });
+
+          setUnreadCountsByChannel((prev) => {
+            if (prev[grpId] === unread) return prev;
+            return { ...prev, [grpId]: unread };
+          });
+
+          if (latestMsg) {
+            const finalLatest = latestMsg as ChannelMessage;
+            const previewText =
+              finalLatest.text ||
+              (finalLatest.gifUrl
+                ? '[GIF]'
+                : finalLatest.mediaType === 'audio' || finalLatest.audioUrl
+                ? '🎤 Voice note'
+                : finalLatest.mediaUrl
+                ? '📷 Media'
+                : '');
+            setLatestMessageByChannel((prev) => ({
+              ...prev,
+              [grpId]: {
+                text: previewText,
+                senderId: finalLatest.senderId,
+                senderName: finalLatest.senderName || 'Member',
+                createdAt: finalLatest.createdAt || new Date(latestTimeMs || Date.now()).toISOString()
+              }
+            }));
+          }
+        },
+        () => {}
+      );
+      unsubs.push(unsub);
+    });
+
+    return () => {
+      unsubs.forEach((u) => u());
+    };
+  }, [currentUser?.uid, activeDmChannelIdsKey, groups.length]);
 
   // 2c. Real-time WebSocket connection for instant (<20ms) typing indicators + 1s expiry clock
   useEffect(() => {
@@ -617,7 +933,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     setDoc(
       targetDocRef,
       {
-        ...(isDm ? { id: channelId } : {}),
+        ...(isDm ? { id: channelId, conversationId: channelId } : {}),
         typing: {
           [currentUser.uid]: typingEntry
         }
@@ -723,7 +1039,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       const updatedMs = new Date(entry.updatedAt).getTime();
       if (entry.isTyping && !isNaN(updatedMs) && typingClockTick - updatedMs < TYPING_TTL_MS) {
         // Enrich name/photo from members list if available
-        const memberProfile = members.find((m) => m.id === entry.userId);
+        const memberProfile = allMembers.find((m) => m.id === entry.userId);
         activeList.push({
           ...entry,
           name: memberProfile?.displayName || entry.name || 'Waver',
@@ -747,9 +1063,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     }
   }, [activeChannelTypingUsers.length]);
 
-  // 3. Real-time message listener for active channel (Group vs DM)
+  // 3. Real-time onSnapshot message listener for active conversation, ordered by timestamp
+  // Loads messages from BOTH participants instantly without filtering by senderId
   useEffect(() => {
     setMessages([]);
+    setChatLoadError(null);
     if (!activeChannel) {
       return;
     }
@@ -759,41 +1077,112 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       ? collection(db, 'channels', activeChannel, 'messages')
       : collection(db, 'groups', activeChannel, 'messages');
 
-    const q = query(messagesCol, orderBy('createdAt', 'asc'));
+    // Primary real-time query ordered by server timestamp; companion query captures any legacy messages that only had createdAt
+    const timestampOrderedQuery = query(messagesCol, orderBy('timestamp', 'asc'));
+    const legacyOrderedQuery = query(messagesCol, orderBy('createdAt', 'asc'));
 
-    const unsub = onSnapshot(
-      q,
+    const mergedDocsMap = new Map<string, ChannelMessage>();
+
+    const publishMergedMessages = (sourceLabel: string) => {
+      const combined: ChannelMessage[] = [];
+      mergedDocsMap.forEach((msgData) => {
+        // Ensure Support Bot messages stay strictly inside the WaveLink Support DM channel
+        if (
+          !isBotChannel &&
+          (msgData.senderId === SUPPORT_BOT_ID ||
+            msgData.isBotReply ||
+            isSupportBotUser(msgData.senderEmail))
+        ) {
+          return;
+        }
+        // IMPORTANT: Never filter by currentUser.uid / senderId — include messages from BOTH participants
+        combined.push(msgData);
+      });
+
+      // Deterministic chronological sort by server timestamp (with createdAt fallback)
+      combined.sort((a, b) => getMessageTimestampMs(a) - getMessageTimestampMs(b));
+
+      const myCount = combined.filter((m) => m.senderId === currentUser?.uid).length;
+      const otherCount = combined.length - myCount;
+      console.log(
+        `[WaveLink Chat] Loaded ${combined.length} messages in conversation "${activeChannel}" (${sourceLabel}) — sent by me: ${myCount}, received from other participant(s): ${otherCount}`
+      );
+
+      setChatLoadError(null);
+      setMessages(combined);
+      setTimeout(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 80);
+    };
+
+    const handleListenerError = (err: any, queryType: string) => {
+      console.error(
+        `[WaveLink Chat] Permission or listener error (${queryType}) on conversation "${activeChannel}":`,
+        {
+          code: err?.code,
+          message: err?.message,
+          conversationId: activeChannel,
+          currentUserId: currentUser?.uid
+        }
+      );
+      const friendlyMsg =
+        err?.code === 'permission-denied'
+          ? `Permission denied while loading messages for conversation "${activeChannel}". Please verify you are a participant in this conversation.`
+          : `Could not load messages (${err?.message || 'connection error'}). Please tap Retry.`;
+      setChatLoadError(friendlyMsg);
+    };
+
+    const unsubTimestamp = onSnapshot(
+      timestampOrderedQuery,
       (snapshot) => {
-        const list: ChannelMessage[] = [];
-        snapshot.forEach((d) => {
-          const msgData = { id: d.id, ...d.data() } as ChannelMessage;
-          // Ensure Support Bot messages stay strictly inside the WaveLink Support DM channel
-          if (
-            !isBotChannel &&
-            (msgData.senderId === SUPPORT_BOT_ID ||
-              msgData.isBotReply ||
-              isSupportBotUser(msgData.senderEmail))
-          ) {
-            return;
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === 'removed') {
+            mergedDocsMap.delete(change.doc.id);
+          } else {
+            mergedDocsMap.set(change.doc.id, {
+              id: change.doc.id,
+              ...change.doc.data()
+            } as ChannelMessage);
           }
-          list.push(msgData);
         });
-        setMessages(list);
-        setTimeout(() => {
-          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-        }, 100);
+        publishMergedMessages('timestamp-query');
       },
       (err) => {
-        console.warn('Chat messages listener notice:', err);
+        handleListenerError(err, 'orderBy-timestamp');
       }
     );
 
-    return () => unsub();
-  }, [activeChannel, isDirectMessage, currentUser?.uid]);
+    const unsubLegacy = onSnapshot(
+      legacyOrderedQuery,
+      (snapshot) => {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === 'removed') {
+            mergedDocsMap.delete(change.doc.id);
+          } else {
+            mergedDocsMap.set(change.doc.id, {
+              id: change.doc.id,
+              ...change.doc.data()
+            } as ChannelMessage);
+          }
+        });
+        publishMergedMessages('createdAt-sync');
+      },
+      (err) => {
+        handleListenerError(err, 'orderBy-createdAt');
+      }
+    );
+
+    return () => {
+      unsubTimestamp();
+      unsubLegacy();
+    };
+  }, [activeChannel, isDirectMessage, currentUser?.uid, retryTrigger]);
 
   // 4. Track & broadcast lastSeen timestamp and per-message readBy receipts in Firestore
   useEffect(() => {
     if (!activeChannel || !currentUser?.uid) return;
+    // On mobile, only mark as seen when the conversation screen is actually open (not when on the Chat List screen)
+    if (showMobileChannels && typeof window !== 'undefined' && window.innerWidth < 1024) return;
 
     const markConversationAsSeen = async () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
@@ -802,16 +1191,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       try {
         // Update channel or group lastSeen map for current user
         if (isDirectMessage) {
+          const otherUid = getOtherDmParticipantId(activeChannel, currentUser.uid);
+          const participants = Array.from(new Set([currentUser.uid, otherUid].filter(Boolean))).sort();
           await setDoc(
             doc(db, 'channels', activeChannel),
             {
               id: activeChannel,
+              conversationId: activeChannel,
+              participants,
               lastSeen: { [currentUser.uid]: nowIso },
+              unreadCounts: { [currentUser.uid]: 0 },
               updatedAt: nowIso
             },
             { merge: true }
           );
-        } else {
+        } else if (isCurrentUserMember) {
           await setDoc(
             doc(db, 'groups', activeChannel),
             {
@@ -871,7 +1265,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           }
         }
       } catch (err) {
-        console.warn('Read receipt sync notice:', err);
+        console.warn('[WaveLink Chat] Read receipt sync notice:', err);
       }
     };
 
@@ -887,7 +1281,15 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [activeChannel, isDirectMessage, currentUser?.uid, messages.length, userProfile?.privacySettings?.showReadReceipts]);
+  }, [
+    activeChannel,
+    isDirectMessage,
+    isCurrentUserMember,
+    showMobileChannels,
+    currentUser?.uid,
+    messages.length,
+    userProfile?.privacySettings?.showReadReceipts
+  ]);
 
   // Helper to evaluate whether a message sent by currentUser has been viewed by the recipient(s)
   const getReadReceiptInfo = (
@@ -899,13 +1301,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     seenByUsers: { id: string; name: string; photoURL: string }[];
   } => {
     const readByOtherIds = (msg.readBy || []).filter((uid) => uid !== msg.senderId);
-    const msgTime = new Date(msg.createdAt).getTime();
+    const msgTime = getMessageTimestampMs(msg);
     const wsSeenForChannel = wsChannelLastSeen[activeChannel] || {};
 
     if (isDirectMessage) {
-      // Extract the recipient UID from directRecipient or dm_<uid1>_<uid2>
-      const parts = activeChannel.replace(/^dm_/, '').split('_');
-      const recipientId = directRecipient?.id || parts.find((id) => id !== msg.senderId) || '';
+      // Safely extract the recipient UID from directRecipient or dm_<uid1>_<uid2>
+      const recipientId =
+        directRecipient?.id ||
+        msg.receiverId ||
+        getOtherDmParticipantId(activeChannel, msg.senderId) ||
+        '';
       const recipientLastSeen =
         (recipientId && wsSeenForChannel[recipientId]) ||
         (recipientId ? channelLastSeen[recipientId] : undefined);
@@ -915,7 +1320,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           : false;
       const isBotSeen =
         recipientId === SUPPORT_BOT_ID &&
-        messages.some((m) => m.senderId === SUPPORT_BOT_ID && new Date(m.createdAt).getTime() >= msgTime);
+        messages.some((m) => m.senderId === SUPPORT_BOT_ID && getMessageTimestampMs(m) >= msgTime);
       const isSeen =
         readByOtherIds.includes(recipientId) ||
         readByOtherIds.length > 0 ||
@@ -1267,7 +1672,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     setRecordingSeconds(0);
   };
 
-  // Send message (with XSS sanitization + automatic WaveLink Support Bot response & ticket escalation)
+  // Send message (with XSS sanitization + deterministic conversationId + serverTimestamp + Support Bot response)
   const handleSendMessage = async (customGifUrl?: string) => {
     if ((!inputText.trim() && !customGifUrl && !chatMediaUrl) || !currentUser || !activeChannel) return;
     if (isRecipientBlocked) {
@@ -1278,18 +1683,45 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     const sanitizedText = sanitizeUserText(inputText.trim(), 2000);
     const spokenTranscript = sanitizeUserText(voiceTranscriptRef.current.trim(), 2000);
     const wasAudioMessage = chatMediaType === 'audio';
-    const targetChannel = activeChannel;
     const isBotConvo = isChattingWithSupportBot;
+
+    // Ensure both users always compute the exact same conversationId (sorted UIDs joined with dm_)
+    const rawOtherId = isDirectMessage
+      ? directRecipient?.id || getOtherDmParticipantId(activeChannel, currentUser.uid)
+      : '';
+    const targetChannel =
+      isDirectMessage && rawOtherId
+        ? computeDmConversationId(currentUser.uid, rawOtherId)
+        : activeChannel;
+    const receiverId = isDirectMessage ? rawOtherId : targetChannel;
+    const participants = isDirectMessage
+      ? Array.from(new Set([currentUser.uid, rawOtherId].filter(Boolean))).sort()
+      : Array.from(new Set(activeGroup?.memberIds || [currentUser.uid]));
 
     try {
       const msgId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const nowIso = new Date().toISOString();
+      const senderDisplayName = userProfile?.displayName || currentUser.displayName || 'Waver';
+      const defaultAttachmentLabel = customGifUrl
+        ? '[GIF]'
+        : chatMediaType === 'audio'
+        ? `🎤 Voice note (${formatVoiceDuration(voiceNoteDuration)})`
+        : chatMediaUrl
+        ? '[Media]'
+        : '';
+      const rawSnippet = (sanitizedText || defaultAttachmentLabel).replace(/\s+/g, ' ').trim();
+      const messagePreview =
+        rawSnippet.length > 45 ? `${rawSnippet.substring(0, 45).trim()}…` : rawSnippet;
+
       const data: Record<string, any> = {
         id: msgId,
+        conversationId: targetChannel,
         channelId: targetChannel,
         senderId: currentUser.uid,
+        receiverId,
+        participants,
         senderEmail: currentUser.email || 'user',
-        senderName: userProfile?.displayName || currentUser.displayName || 'Waver',
+        senderName: senderDisplayName,
         senderUsername: userProfile?.username || `@${currentUser.email?.split('@')[0] || 'waver'}`,
         senderPhotoURL:
           userProfile?.photoURL ||
@@ -1300,6 +1732,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         isEdited: false,
         isDeleted: false,
         readBy: [currentUser.uid],
+        timestamp: serverTimestamp(),
         createdAt: nowIso
       };
 
@@ -1328,14 +1761,30 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         : doc(db, 'groups', targetChannel, 'messages', msgId);
 
       await setDoc(docRef, cleanFirestoreData(data));
+      console.log(
+        `[WaveLink Chat] Sent message "${msgId}" in conversation "${targetChannel}"`,
+        {
+          conversationId: targetChannel,
+          senderId: currentUser.uid,
+          receiverId,
+          participants
+        }
+      );
 
-      // Update sender's lastSeen timestamp on the conversation document
+      // Update conversation metadata document (participants, lastMessage, lastSeen)
       if (isDirectMessage) {
         setDoc(
           doc(db, 'channels', targetChannel),
           {
             id: targetChannel,
+            conversationId: targetChannel,
+            participants,
+            lastMessageText: messagePreview,
+            lastMessageSenderId: currentUser.uid,
+            lastMessageSenderName: senderDisplayName,
+            lastMessageAt: nowIso,
             lastSeen: { [currentUser.uid]: nowIso },
+            timestamp: serverTimestamp(),
             updatedAt: nowIso
           },
           { merge: true }
@@ -1344,22 +1793,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         setDoc(
           doc(db, 'groups', targetChannel),
           {
+            lastMessageText: messagePreview,
+            lastMessageSenderId: currentUser.uid,
+            lastMessageSenderName: senderDisplayName,
+            lastMessageAt: nowIso,
             lastSeen: { [currentUser.uid]: nowIso },
             updatedAt: nowIso
           },
           { merge: true }
         ).catch(() => {});
       }
-
-      const defaultAttachmentLabel = customGifUrl
-        ? '[GIF]'
-        : chatMediaType === 'audio'
-        ? `🎤 Voice note (${formatVoiceDuration(voiceNoteDuration)})`
-        : '[Media]';
-      const rawSnippet = (sanitizedText || defaultAttachmentLabel).replace(/\s+/g, ' ').trim();
-      const messagePreview =
-        rawSnippet.length > 45 ? `${rawSnippet.substring(0, 45).trim()}…` : rawSnippet;
-      const senderDisplayName = userProfile?.displayName || currentUser.displayName || 'Someone';
 
       if (isDirectMessage && directRecipient && !isBotConvo) {
         sendNotification({
@@ -1413,10 +1856,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         (wasAudioMessage ? 'Hello! I just sent you a voice note.' : '');
       if (isBotConvo && botPromptText) {
         const pinnedBotChannel =
-          supportBotChannelId ||
-          (currentUser.uid < SUPPORT_BOT_ID
-            ? `dm_${currentUser.uid}_${SUPPORT_BOT_ID}`
-            : `dm_${SUPPORT_BOT_ID}_${currentUser.uid}`);
+          supportBotChannelId || computeDmConversationId(currentUser.uid, SUPPORT_BOT_ID);
+        const botParticipants = [currentUser.uid, SUPPORT_BOT_ID].sort();
         setIsBotReplying(true);
         try {
           const historyForBot = messages
@@ -1497,8 +1938,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               doc(db, 'channels', pinnedBotChannel, 'messages', botMsgId),
               cleanFirestoreData({
                 id: botMsgId,
+                conversationId: pinnedBotChannel,
                 channelId: pinnedBotChannel,
                 senderId: SUPPORT_BOT_ID,
+                receiverId: currentUser.uid,
+                participants: botParticipants,
                 senderEmail: SUPPORT_BOT_EMAIL,
                 senderName: SUPPORT_BOT_NAME,
                 senderUsername: SUPPORT_BOT_USERNAME,
@@ -1510,6 +1954,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 isBotReply: true,
                 botLogId,
                 readBy: [SUPPORT_BOT_ID, currentUser.uid],
+                timestamp: serverTimestamp(),
                 createdAt: replyIso
               })
             );
@@ -1579,7 +2024,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           setIsBotReplying(false);
         }
       }
-    } catch (err) {
+    } catch (err: any) {
+      console.error('[WaveLink Chat] Error sending message:', err);
+      setChatLoadError(
+        err?.code === 'permission-denied'
+          ? 'Permission error: Unable to send message in this conversation.'
+          : `Failed to send message: ${err?.message || 'Unknown error'}`
+      );
       const path = isDirectMessage
         ? `channels/${activeChannel}/messages`
         : `groups/${activeChannel}/messages`;
@@ -1666,6 +2117,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     try {
       const groupId = `grp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       const memberIds = Array.from(new Set([currentUser.uid, ...selectedMemberIds]));
+      const nowIso = new Date().toISOString();
 
       const groupData: ChatGroup = {
         id: groupId,
@@ -1677,8 +2129,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         creatorEmail: currentUser.email || 'user',
         adminIds: [currentUser.uid],
         memberIds: memberIds,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: nowIso,
+        updatedAt: nowIso
       };
 
       await setDoc(doc(db, 'groups', groupId), cleanFirestoreData(groupData));
@@ -1689,8 +2141,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         doc(db, 'groups', groupId, 'messages', welcomeMsgId),
         cleanFirestoreData({
           id: welcomeMsgId,
+          conversationId: groupId,
           channelId: groupId,
           senderId: currentUser.uid,
+          receiverId: groupId,
+          participants: memberIds,
           senderEmail: currentUser.email || 'system',
           senderName: userProfile?.displayName || currentUser.displayName || 'Group Admin',
           senderUsername: '@admin',
@@ -1702,7 +2157,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           mediaType: 'none',
           isEdited: false,
           isDeleted: false,
-          createdAt: new Date().toISOString()
+          readBy: [currentUser.uid],
+          timestamp: serverTimestamp(),
+          createdAt: nowIso
         })
       );
 
@@ -1856,35 +2313,82 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     }
   };
 
-  // Filter conversations
-  const filteredGroups = groups.filter((g) =>
-    g.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-  const filteredMembers = members.filter(
-    (m) =>
-      m.displayName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      m.email.toLowerCase().includes(searchQuery.toLowerCase())
+  // Filter & sort conversations so unread or recent conversations surface cleanly
+  const filteredGroups = groups
+    .filter((g) => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    .sort((a, b) => {
+      const unreadA = unreadCountsByChannel[a.id] || 0;
+      const unreadB = unreadCountsByChannel[b.id] || 0;
+      if (unreadA !== unreadB) return unreadB - unreadA;
+      const latestA = latestMessageByChannel[a.id]?.createdAt || a.lastMessageAt || a.updatedAt || a.createdAt || '';
+      const latestB = latestMessageByChannel[b.id]?.createdAt || b.lastMessageAt || b.updatedAt || b.createdAt || '';
+      return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
+    });
+
+  const filteredMembers = allMembers
+    .filter(
+      (m) =>
+        (m.displayName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (m.email || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (m.username || '').toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    .sort((a, b) => {
+      if (a.id === SUPPORT_BOT_ID) return -1;
+      if (b.id === SUPPORT_BOT_ID) return 1;
+      if (!currentUser?.uid) return 0;
+      const dmA = computeDmConversationId(currentUser.uid, a.id);
+      const dmB = computeDmConversationId(currentUser.uid, b.id);
+      const unreadA = unreadCountsByChannel[dmA] || 0;
+      const unreadB = unreadCountsByChannel[dmB] || 0;
+      if (unreadA !== unreadB) return unreadB - unreadA;
+      const latestA =
+        latestMessageByChannel[dmA]?.createdAt ||
+        channelMetaMap[dmA]?.lastMessageAt ||
+        channelMetaMap[dmA]?.updatedAt ||
+        a.createdAt ||
+        '';
+      const latestB =
+        latestMessageByChannel[dmB]?.createdAt ||
+        channelMetaMap[dmB]?.lastMessageAt ||
+        channelMetaMap[dmB]?.updatedAt ||
+        b.createdAt ||
+        '';
+      return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
+    });
+
+  // Total unread conversations count for header badge
+  const totalUnreadMessages = Object.entries(unreadCountsByChannel).reduce(
+    (sum, [chId, count]) => (chId === activeChannel && !showMobileChannels ? sum : sum + (count || 0)),
+    0
   );
 
+  // On mobile/tablet (< 1024px), show the Chat List screen when showMobileChannels is true or no conversation is active
+  const isMobileListScreenVisible = showMobileChannels || !activeChannel;
+
   return (
-    <div className="wavelink-chat-wrapper">
+    <div className="wavelink-chat-wrapper w-full max-w-full overflow-x-hidden">
       <div
         ref={chatShellRef}
-        className="wavelink-chat-shell bg-[var(--bg-surface)] border-y md:border border-[var(--border-subtle)] shadow-xs"
+        className="wavelink-chat-shell bg-[var(--bg-surface)] border-y lg:border border-[var(--border-subtle)] shadow-xs w-full max-w-full"
       >
-        {/* Left Sidebar: Groups & Direct Chats (Full-screen when toggled on mobile; side-by-side on tablet/desktop) */}
+        {/* SCREEN 1 (Mobile Full-Width Chat List Screen; Desktop Left Sidebar >= 1024px) */}
         <div
-          className={`w-full md:w-72 lg:w-80 xl:w-96 h-full border-r border-[#EFECE6] flex-col bg-[#FAF7F2] shrink-0 ${
-            showMobileChannels ? 'flex' : 'hidden md:flex'
+          className={`w-full lg:w-80 xl:w-96 h-full lg:border-r border-[#EFECE6] flex-col bg-[#FAF7F2] shrink-0 ${
+            isMobileListScreenVisible ? 'flex' : 'hidden lg:flex'
           }`}
         >
           {/* Top Bar with Create Group Button */}
           <div className="p-3.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
               <MessageSquare size={18} className="text-[#2563EB] shrink-0" />
-              <h3 className="font-extrabold text-xs uppercase tracking-wider text-[#1C1917] truncate">
+              <h3 className="font-extrabold text-xs sm:text-sm uppercase tracking-wider text-[#1C1917] truncate">
                 Conversations
               </h3>
+              {totalUnreadMessages > 0 && (
+                <span className="px-2 py-0.5 rounded-full bg-[#2563EB] text-white text-[11px] font-extrabold shrink-0">
+                  {totalUnreadMessages} new
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
@@ -1902,29 +2406,19 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 <Plus size={14} />
                 <span>New Group</span>
               </button>
-              {showMobileChannels && (
-                <button
-                  type="button"
-                  onClick={() => setShowMobileChannels(false)}
-                  className="min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center text-[#57534E] hover:text-[#1C1917] hover:bg-[#FAF7F2] md:hidden font-semibold"
-                  title="Back to chat"
-                >
-                  <X size={18} />
-                </button>
-              )}
             </div>
           </div>
 
           {/* Search bar & Filter Tabs */}
           <div className="p-3 border-b border-[#EFECE6] bg-white/80 space-y-2">
             <div className="relative">
-              <Search size={15} className="absolute left-3.5 top-3 text-[#57534E]" />
+              <Search size={15} className="absolute left-3.5 top-3.5 text-[#57534E]" />
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search groups or people..."
-                className="w-full pl-9 pr-3 py-2 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-xs sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                className="w-full min-h-[44px] pl-9 pr-3 py-2 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-base sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
               />
             </div>
             <div className="flex items-center gap-1">
@@ -1933,7 +2427,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   key={filter}
                   type="button"
                   onClick={() => setConvoFilter(filter)}
-                  className={`flex-1 py-1.5 text-xs font-bold rounded-xl capitalize transition ${
+                  className={`flex-1 min-h-[44px] py-2 text-xs font-bold rounded-xl capitalize transition ${
                     convoFilter === filter
                       ? 'bg-[#2563EB] text-white shadow-2xs'
                       : 'text-[#57534E] hover:text-[#1C1917] hover:bg-white'
@@ -1965,7 +2459,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                     <button
                       type="button"
                       onClick={() => setIsCreateGroupOpen(true)}
-                      className="text-xs text-[#2563EB] font-bold hover:underline inline-flex items-center gap-1"
+                      className="min-h-[44px] px-3 text-xs text-[#2563EB] font-bold hover:underline inline-flex items-center gap-1"
                     >
                       <Plus size={12} />
                       <span>Create the first group</span>
@@ -1973,10 +2467,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   </div>
                 ) : (
                   filteredGroups.map((group) => {
-                    const isActive = activeChannel === group.id;
+                    const isActive = activeChannel === group.id && !showMobileChannels;
                     const isGrpAdmin =
                       group.adminIds?.includes(currentUser?.uid || '') ||
                       group.creatorId === currentUser?.uid;
+                    const grpUnread =
+                      isActive ? 0 : unreadCountsByChannel[group.id] || 0;
+                    const grpLatest = latestMessageByChannel[group.id];
 
                     return (
                       <button
@@ -1987,9 +2484,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           setReplyingTo(null);
                           setShowMobileChannels(false);
                         }}
-                        className={`w-full flex items-center gap-3 p-2.5 rounded-2xl text-left transition relative group border ${
+                        className={`w-full min-h-[60px] flex items-center gap-3 p-3 rounded-2xl text-left transition relative group border ${
                           isActive
                             ? 'bg-blue-50/95 border-[#2563EB] text-[#1C1917] shadow-2xs'
+                            : grpUnread > 0
+                            ? 'bg-blue-50/50 border-[#2563EB]/50 text-[#1C1917] shadow-2xs'
                             : 'bg-white/80 text-[#1C1917] border-[#EFECE6] hover:bg-white hover:border-[#D6D3CD]'
                         }`}
                       >
@@ -1998,7 +2497,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           <img
                             src={group.logoUrl || PRESET_LOGOS[0].url}
                             alt={group.name}
-                            className={`w-10 h-10 rounded-xl object-cover ring-2 ${
+                            className={`w-11 h-11 rounded-xl object-cover ring-2 ${
                               isActive ? 'ring-[#2563EB]/40' : 'ring-[#EFECE6]'
                             }`}
                           />
@@ -2015,12 +2514,24 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         {/* Group Info */}
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center justify-between gap-1">
-                            <span className="font-bold text-xs sm:text-sm text-[#1C1917] truncate">
+                            <span className="font-bold text-sm text-[#1C1917] truncate">
                               {group.name}
                             </span>
-                            <span className="text-[11px] font-semibold text-[#57534E] shrink-0">
-                              {group.memberIds?.length || 1} members
-                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {grpUnread > 0 && (
+                                <>
+                                  <span className="px-2 py-0.5 rounded-full bg-emerald-600 text-white text-[10px] font-extrabold uppercase tracking-wide">
+                                    New message
+                                  </span>
+                                  <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-[#2563EB] text-white text-[11px] font-extrabold inline-flex items-center justify-center">
+                                    {grpUnread}
+                                  </span>
+                                </>
+                              )}
+                              <span className="text-[11px] font-semibold text-[#57534E]">
+                                {group.memberIds?.length || 1}m
+                              </span>
+                            </div>
                           </div>
                           {(() => {
                             const grpTypers = getActiveTypingUsersForChannel(group.id);
@@ -2037,6 +2548,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                                       ? `${grpTypers[0].name.split(' ')[0]} is typing...`
                                       : `${grpTypers.length} people typing...`}
                                   </span>
+                                </p>
+                              );
+                            }
+                            if (grpLatest?.text) {
+                              return (
+                                <p
+                                  className={`text-xs truncate mt-0.5 ${
+                                    grpUnread > 0
+                                      ? 'font-extrabold text-[#1C1917]'
+                                      : 'text-[#57534E]'
+                                  }`}
+                                >
+                                  {grpLatest.senderId === currentUser?.uid
+                                    ? `You: ${grpLatest.text}`
+                                    : `${grpLatest.senderName.split(' ')[0]}: ${grpLatest.text}`}
                                 </p>
                               );
                             }
@@ -2068,14 +2594,17 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 ) : (
                   filteredMembers.map((member) => {
                     if (!currentUser) return null;
-                    const dmId =
-                      currentUser.uid < member.id
-                        ? `dm_${currentUser.uid}_${member.id}`
-                        : `dm_${member.id}_${currentUser.uid}`;
-                    const isActive = activeChannel === dmId;
+                    const dmId = computeDmConversationId(currentUser.uid, member.id);
+                    const isActive = activeChannel === dmId && !showMobileChannels;
                     const dmTypers = getActiveTypingUsersForChannel(dmId);
                     const isMemberTyping =
                       dmTypers.length > 0 || (member.id === SUPPORT_BOT_ID && isBotReplying);
+                    const unreadCount = isActive ? 0 : unreadCountsByChannel[dmId] || 0;
+                    const latestMsg = latestMessageByChannel[dmId];
+                    const metaLastText = channelMetaMap[dmId]?.lastMessageText;
+                    const metaLastSenderId = channelMetaMap[dmId]?.lastMessageSenderId;
+                    const previewText = latestMsg?.text || metaLastText || '';
+                    const previewSenderId = latestMsg?.senderId || metaLastSenderId || '';
 
                     return (
                       <button
@@ -2086,20 +2615,29 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           setReplyingTo(null);
                           setShowMobileChannels(false);
                         }}
-                        className={`w-full flex items-center gap-3 p-2.5 rounded-2xl text-left transition border ${
+                        className={`w-full min-h-[64px] flex items-center gap-3 p-3 rounded-2xl text-left transition border ${
                           isActive
                             ? 'bg-blue-50/95 border-[#2563EB] text-[#1C1917] shadow-2xs'
+                            : unreadCount > 0
+                            ? 'bg-blue-50/60 border-[#2563EB]/60 text-[#1C1917] shadow-2xs'
                             : 'bg-white/80 text-[#1C1917] border-[#EFECE6] hover:bg-white hover:border-[#D6D3CD]'
                         }`}
                       >
-                        <img
-                          src={
-                            member.photoURL ||
-                            `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
-                          }
-                          alt={member.displayName}
-                          className="w-10 h-10 rounded-full object-cover ring-2 ring-[#2563EB]/20 shrink-0"
-                        />
+                        <div className="relative shrink-0">
+                          <img
+                            src={
+                              member.photoURL ||
+                              `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
+                            }
+                            alt={member.displayName}
+                            className="w-11 h-11 rounded-full object-cover ring-2 ring-[#2563EB]/20 shrink-0"
+                          />
+                          {unreadCount > 0 && (
+                            <span className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1.5 rounded-full bg-[#2563EB] text-white text-[11px] font-extrabold flex items-center justify-center ring-2 ring-white shadow-xs">
+                              {unreadCount}
+                            </span>
+                          )}
+                        </div>
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center justify-between gap-1">
                             <span className="truncate">
@@ -2113,23 +2651,30 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                                 size="sm"
                               />
                             </span>
-                            {isSuperAdminEmail(member.email, member.role) && !canTalkToAdmin ? (
-                              <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold flex items-center gap-0.5 shrink-0">
-                                <Lock size={9} />
-                                <span>Pro</span>
-                              </span>
-                            ) : isMemberTyping ? (
-                              <span className="text-[10px] px-2 py-0.5 rounded-full shrink-0 bg-teal-100 text-[#0D9488] border border-teal-300 font-extrabold animate-pulse">
-                                Typing...
-                              </span>
-                            ) : (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 bg-teal-50 text-[#0D9488] border border-teal-200/70 font-bold">
-                                Live
-                              </span>
-                            )}
+                            <div className="flex items-center gap-1 shrink-0">
+                              {unreadCount > 0 && (
+                                <span className="px-2 py-0.5 rounded-full bg-emerald-600 text-white text-[10px] font-extrabold uppercase tracking-wide shadow-2xs">
+                                  New message
+                                </span>
+                              )}
+                              {isSuperAdminEmail(member.email, member.role) && !canTalkToAdmin ? (
+                                <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold flex items-center gap-0.5 shrink-0">
+                                  <Lock size={9} />
+                                  <span>Pro</span>
+                                </span>
+                              ) : isMemberTyping ? (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full shrink-0 bg-teal-100 text-[#0D9488] border border-teal-300 font-extrabold animate-pulse">
+                                  Typing...
+                                </span>
+                              ) : unreadCount === 0 ? (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 bg-teal-50 text-[#0D9488] border border-teal-200/70 font-bold">
+                                  Live
+                                </span>
+                              ) : null}
+                            </div>
                           </div>
                           {isMemberTyping ? (
-                            <span className="text-[11px] font-bold text-[#0D9488] flex items-center gap-1.5 truncate mt-0.5">
+                            <span className="text-xs font-bold text-[#0D9488] flex items-center gap-1.5 truncate mt-0.5">
                               <span className="inline-flex items-center gap-0.5">
                                 <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.3s]" />
                                 <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.15s]" />
@@ -2137,9 +2682,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                               </span>
                               <span>typing a message...</span>
                             </span>
+                          ) : previewText ? (
+                            <span
+                              className={`text-xs block truncate mt-0.5 ${
+                                unreadCount > 0
+                                  ? 'font-extrabold text-[#1C1917]'
+                                  : 'font-medium text-[#57534E]'
+                              }`}
+                            >
+                              {previewSenderId === currentUser.uid
+                                ? `You: ${previewText}`
+                                : previewText}
+                            </span>
                           ) : (
-                            <span className="text-[11px] font-medium text-[#57534E] block truncate">
-                              {member.username}
+                            <span className="text-xs font-medium text-[#57534E] block truncate mt-0.5">
+                              {member.username || `@${(member.email || 'waver').split('@')[0]}`}
                             </span>
                           )}
                         </div>
@@ -2152,30 +2709,31 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           </div>
         </div>
 
-        {/* Right Main Chat Pane */}
+        {/* SCREEN 2 (Separate Full-Screen Conversation Screen on Phones < 1024px; Right Pane on Desktop >= 1024px) */}
         <div
-          className={`flex-1 flex-col min-w-0 h-full bg-white ${
-            showMobileChannels ? 'hidden md:flex' : 'flex'
+          className={`wavelink-mobile-conversation-screen flex-1 flex-col min-w-0 h-full bg-white ${
+            isMobileListScreenVisible ? 'hidden lg:flex' : 'flex'
           }`}
         >
-          {/* Header Bar */}
+          {/* Header Bar with prominent >= 44px Back Button on mobile */}
           <div className="p-2.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2 shrink-0">
             <div className="flex items-center gap-2 min-w-0">
               <button
                 type="button"
                 onClick={() => setShowMobileChannels(true)}
-                className="md:hidden min-w-[44px] min-h-[44px] px-2.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] hover:bg-[#EFECE6] flex items-center justify-center gap-1 text-xs font-bold shrink-0"
-                title="View Conversations List"
+                className="lg:hidden min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] hover:bg-[#EFECE6] flex items-center justify-center gap-1.5 text-xs font-extrabold shrink-0"
+                title="Back to Conversations List"
+                aria-label="Back to Conversations List"
               >
-                <Users size={16} className="text-[#2563EB]" />
-                <span>Chats</span>
+                <ArrowLeft size={18} className="text-[#2563EB]" />
+                <span>Back</span>
               </button>
 
               {activeGroup ? (
                 // Group Chat Header
                 <div
                   onClick={() => setIsGroupInfoOpen(true)}
-                  className="flex items-center gap-3 cursor-pointer group/title min-w-0"
+                  className="flex items-center gap-2.5 sm:gap-3 cursor-pointer group/title min-w-0"
                 >
                   <img
                     src={activeGroup.logoUrl || PRESET_LOGOS[0].url}
@@ -2220,7 +2778,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 </div>
               ) : directRecipient ? (
                 // Direct Chat Header
-                <div className="flex items-center gap-3 min-w-0">
+                <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
                   <img
                     src={
                       directRecipient.photoURL ||
@@ -2253,12 +2811,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       </p>
                     ) : (
                       <p className="text-xs text-[#57534E] truncate mt-0.5 flex items-center gap-1.5 font-medium">
-                        <span>{directRecipient.username}</span>
+                        <span className="truncate">{directRecipient.username}</span>
                         <span>•</span>
                         {channelLastSeen[directRecipient.id] ||
                         directRecipient.lastSeen ||
                         directRecipient.lastSeenAt ? (
-                          <span className="text-[#0D9488] font-semibold">
+                          <span className="text-[#0D9488] font-semibold truncate">
                             Last seen{' '}
                             {formatLastSeenTimestamp(
                               channelLastSeen[directRecipient.id] ||
@@ -2283,19 +2841,19 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               )}
             </div>
 
-            {/* Right Action Icons: Video/Voice Calling, Block & Report for DMs, Group Info for Groups */}
+            {/* Right Action Icons: Video/Voice Calling, Block & Report for DMs, Group Info for Groups (all >= 44px tap targets) */}
             <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
               {isDirectMessage && directRecipient && (
                 isChattingWithSupportBot ? (
-                  <span className="px-2.5 py-1.5 rounded-xl bg-teal-50 border border-teal-200 text-[#0D9488] text-xs font-extrabold flex items-center gap-1.5">
+                  <span className="hidden sm:flex px-2.5 py-1.5 rounded-xl bg-teal-50 border border-teal-200 text-[#0D9488] text-xs font-extrabold items-center gap-1.5">
                     <Bot size={14} />
-                    <span>Automated Assistant (EN / SW)</span>
+                    <span>Assistant</span>
                   </span>
                 ) : isBlockedFromAdminChat ? (
                   <button
                     type="button"
                     onClick={() => setShowPaymentModal(true)}
-                    className="min-h-[40px] px-3 py-2 rounded-xl bg-amber-50 border border-amber-300/80 hover:bg-amber-100 text-amber-900 text-xs font-bold flex items-center gap-1.5 transition"
+                    className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-xl bg-amber-50 border border-amber-300/80 hover:bg-amber-100 text-amber-900 text-xs font-bold flex items-center gap-1.5 transition"
                     title="Try Pro to message or call Admin directly"
                   >
                     <Lock size={14} className="text-amber-600" />
@@ -2338,7 +2896,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         <button
                           type="button"
                           onClick={() => toggleBlockUser(directRecipient.id)}
-                          className={`hidden sm:flex min-h-[40px] px-2.5 py-2 rounded-xl border text-xs font-bold items-center gap-1 transition shrink-0 ${
+                          className={`hidden sm:flex min-w-[44px] min-h-[44px] px-2.5 py-2 rounded-xl border text-xs font-bold items-center justify-center gap-1 transition shrink-0 ${
                             isRecipientBlocked
                               ? 'bg-rose-600 text-white border-rose-600'
                               : 'bg-[#FAF7F2] hover:bg-rose-50 border-[#EFECE6] text-[#57534E] hover:text-rose-600'
@@ -2361,7 +2919,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                               reason: 'Reported user from Direct Messages'
                             })
                           }
-                          className="hidden sm:flex min-h-[40px] px-2.5 py-2 rounded-xl bg-[#FAF7F2] hover:bg-amber-50 border border-[#EFECE6] text-[#57534E] hover:text-amber-700 text-xs font-bold items-center gap-1 transition shrink-0"
+                          className="hidden sm:flex min-w-[44px] min-h-[44px] px-2.5 py-2 rounded-xl bg-[#FAF7F2] hover:bg-amber-50 border border-[#EFECE6] text-[#57534E] hover:text-amber-700 text-xs font-bold items-center justify-center gap-1 transition shrink-0"
                           title="Report User"
                         >
                           <Flag size={14} />
@@ -2377,7 +2935,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   <button
                     type="button"
                     onClick={() => setIsGroupInfoOpen(true)}
-                    className="min-h-[40px] px-3 py-2 rounded-xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] text-xs font-bold flex items-center gap-1.5 transition"
+                    className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] text-xs font-bold flex items-center justify-center gap-1.5 transition"
                     title="Group Settings & Members"
                   >
                     <Info size={16} className="text-[#2563EB]" />
@@ -2388,7 +2946,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                     <button
                       type="button"
                       onClick={() => handleExitGroup(activeGroup)}
-                      className="min-h-[40px] px-2.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200/80 text-rose-700 text-xs font-bold flex items-center gap-1 transition"
+                      className="min-w-[44px] min-h-[44px] px-2.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200/80 text-rose-700 text-xs font-bold flex items-center justify-center gap-1 transition"
                       title="Exit Group"
                     >
                       <LogOut size={15} />
@@ -2399,6 +2957,37 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               )}
             </div>
           </div>
+
+          {/* Visible Error Banner if loading or syncing conversation messages fails */}
+          {chatLoadError && (
+            <div
+              role="alert"
+              className="mx-3 mt-3 p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-900 flex items-center justify-between gap-3 shrink-0 shadow-2xs"
+            >
+              <div className="flex items-start gap-2.5 min-w-0">
+                <AlertTriangle size={18} className="text-rose-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-xs font-extrabold text-rose-900">
+                    Chat Connection / Permission Notice
+                  </p>
+                  <p className="text-xs text-rose-800 break-words mt-0.5">
+                    {chatLoadError}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setChatLoadError(null);
+                  setRetryTrigger((prev) => prev + 1);
+                }}
+                className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shrink-0 transition"
+              >
+                <RefreshCw size={14} />
+                <span>Retry</span>
+              </button>
+            </div>
+          )}
 
           {/* Messages Feed — Soft Cream Background & Extra Bottom Padding so last message is never hidden */}
           <div
@@ -2440,7 +3029,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   const isEditing = editingMessageId === msg.id;
                   const receipt = isOwn && !msg.isDeleted ? getReadReceiptInfo(msg) : null;
                   const isLatestSeenOwn = isOwn && msg.id === latestSeenOwnMessageId;
-                  const timeString = new Date(msg.createdAt).toLocaleTimeString([], {
+                  const msgMs = getMessageTimestampMs(msg);
+                  const timeString = (msgMs ? new Date(msgMs) : new Date(msg.createdAt)).toLocaleTimeString([], {
                     hour: '2-digit',
                     minute: '2-digit'
                   });
@@ -2448,8 +3038,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   return (
                     <div
                       key={msg.id}
-                      className={`flex items-start gap-2.5 sm:gap-3 group/msg ${
-                        isOwn ? 'flex-row-reverse' : 'flex-row'
+                      className={`w-full flex items-start gap-2.5 sm:gap-3 group/msg ${
+                        isOwn ? 'flex-row-reverse justify-start' : 'flex-row justify-start'
                       }`}
                     >
                       {/* User Avatar */}
@@ -2462,10 +3052,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         className="w-8 h-8 rounded-full object-cover ring-1 ring-[#2563EB]/25 shrink-0 mt-1 bg-white"
                       />
 
-                      {/* Message Bubble Wrapper (strictly up to 80% width on mobile, 70% on desktop) */}
+                      {/* Message Bubble Wrapper (Received on LEFT, Mine on RIGHT, up to 80% width on phones) */}
                       <div
                         className={`wavelink-chat-bubble-wrap max-w-[80%] lg:max-w-[70%] min-w-0 flex flex-col ${
-                          isOwn ? 'items-end' : 'items-start'
+                          isOwn ? 'items-end self-end' : 'items-start self-start'
                         }`}
                       >
                         {/* Sender Name & Single Small Admin Badge Header (Strong Contrast) */}

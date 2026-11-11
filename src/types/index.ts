@@ -415,7 +415,10 @@ export interface SupportTicket {
 export interface ChannelMessage {
   id: string;
   channelId: string;
+  conversationId?: string;
   senderId: string;
+  receiverId?: string;
+  participants?: string[];
   senderEmail: string;
   senderName: string;
   senderUsername?: string;
@@ -436,6 +439,7 @@ export interface ChannelMessage {
   reportedBadReply?: boolean;
   readBy?: string[];
   lastSeenAt?: string;
+  timestamp?: any;
   createdAt: string;
   updatedAt?: string;
 }
@@ -450,6 +454,13 @@ export interface TypingStatusEntry {
 
 export interface ChatChannelMeta {
   id: string;
+  conversationId?: string;
+  participants?: string[];
+  lastMessageText?: string;
+  lastMessageSenderId?: string;
+  lastMessageSenderName?: string;
+  lastMessageAt?: string;
+  unreadCounts?: Record<string, number>;
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
   updatedAt?: string;
@@ -473,6 +484,10 @@ export interface ChatGroup {
   creatorEmail: string;
   adminIds: string[];
   memberIds: string[];
+  lastMessageText?: string;
+  lastMessageSenderId?: string;
+  lastMessageSenderName?: string;
+  lastMessageAt?: string;
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
   createdAt: string;
