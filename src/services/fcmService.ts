@@ -21,6 +21,8 @@ export const DEFAULT_NOTIFICATION_SETTINGS: UserNotificationSettings = {
   calls: true,
   followers: true,
   reactions: true,
+  replies: true,
+  challenges: true,
   announcements: true,
   payments: true,
   showMessagePreviews: true,

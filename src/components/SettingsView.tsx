@@ -1,12 +1,30 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth, DAILY_REWARD_SCHEDULE, getLocalDateKey } from '../context/AuthContext';
 import { useTheme, APPEARANCE_THEMES } from '../context/ThemeContext';
+import { useLanguage } from '../context/LanguageContext';
+import { useDataSaver } from '../services/dataSaverService';
+import { INTEREST_CATALOG } from './InterestPickerModal';
+import {
+  AFRICAN_COUNTRIES,
+  PAN_AFRICAN_LANGUAGES,
+  KANGA_PATTERN_FRAMES,
+  getAfricanCountryMeta,
+  getKangaFrameClass,
+  formatLocalPrice,
+  useAfricanRegion
+} from '../utils/africanCultureConfig';
+import { CreatorAnalyticsView } from './CreatorAnalyticsView';
+import { AddToHomeScreenHintCard } from './PWAInstallButton';
 import {
   AppearanceTheme,
   ProBorderEffect,
   ProAccentColor,
   UserPrivacySettings,
-  UserTermsAgreement
+  UserTermsAgreement,
+  AfricanCountryCode,
+  EastAfricanCurrency,
+  PanAfricanLanguageCode,
+  KangaPatternFrame
 } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { SupportDeskView } from './SupportDeskView';
@@ -48,7 +66,8 @@ import {
   Zap,
   Lightbulb,
   UserPlus,
-  Bell
+  Bell,
+  BarChart3
 } from 'lucide-react';
 import { NotificationSettingsPanel } from './NotificationSettingsPanel';
 
@@ -67,6 +86,7 @@ interface SettingsViewProps {
 
 type SettingsSection =
   | 'profile'
+  | 'stats'
   | 'notifications'
   | 'privacy'
   | 'security'
@@ -150,7 +170,7 @@ const AGREEMENT_SECTIONS: {
     clauses: [
       {
         heading: 'WaveLink Pro Membership',
-        body: 'WaveLink Pro unlocks 25 daily AI image creations, all light appearance themes, Blue Star verification eligibility, and ad-free browsing. Payments are processed securely via AzamPay Mobile Money (Airtel Money, M-Pesa, Tigo Pesa, HaloPesa).'
+        body: 'WaveLink Pro unlocks 25 daily AI image creations, all light appearance themes, Blue Star verification eligibility, and ad-free browsing. Payments are explained in TZS, KES, and UGX via M-Pesa, Mixx by Yas (Tigo Pesa), and Airtel Money.'
       },
       {
         heading: 'Creator Tipping & Transparent Fees',
@@ -201,13 +221,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     signOut
   } = useAuth();
   const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
+  const { language, setLanguage, t } = useLanguage();
+  const { enabled: isDataSaverOn, setEnabled: setDataSaverOn, formattedSaved } = useDataSaver();
+  const {
+    countryCode,
+    currency,
+    panAfricanLang,
+    setCountryCode,
+    setCurrency,
+    setPanAfricanLang
+  } = useAfricanRegion(
+    userProfile?.countryCode,
+    userProfile?.preferredCurrency,
+    userProfile?.panAfricanLanguage
+  );
+  const activeCountryCode = userProfile?.countryCode || countryCode;
+  const activeCountryMeta = getAfricanCountryMeta(activeCountryCode);
+  const activeCurrency = userProfile?.preferredCurrency || currency;
+  const activePanLang = userProfile?.panAfricanLanguage || panAfricanLang;
+  const activePatternFrame: KangaPatternFrame = userProfile?.patternFrame || 'none';
+  const isKangaBgEnabled = Boolean(userProfile?.kangaBackgroundEnabled);
 
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>(() => {
     if (typeof window !== 'undefined') {
       const requested = localStorage.getItem('wavelink_settings_initial_section');
-      if (requested === 'notifications') {
+      if (requested === 'notifications' || requested === 'stats') {
         localStorage.removeItem('wavelink_settings_initial_section');
-        return 'notifications';
+        return requested;
       }
     }
     return 'profile';
@@ -422,27 +462,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     }
   };
 
-  // File upload for profile picture from local folders (compressed for Firestore)
+  // File upload for profile picture directly from the browser to Cloudinary (preset monarcking72)
   const handleAvatarFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
 
     try {
-      const compressed = await compressImage(file, 400, 400, 0.85);
-      if (compressed) {
-        setPhotoURL(compressed);
+      const uploadedUrl = await compressImage(file, 512, 512, 0.88);
+      if (uploadedUrl && uploadedUrl.startsWith('http')) {
+        setPhotoURL(uploadedUrl);
       }
-    } catch {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const result = event.target?.result as string;
-        if (result) {
-          setPhotoURL(result);
-        }
-      };
-      reader.readAsDataURL(file);
+    } catch (err) {
+      console.error('Failed to upload profile picture to Cloudinary:', err);
+      setGentleProNote('Could not upload profile picture to Cloudinary. Please check your connection and try again.');
     }
-    e.target.value = '';
   };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
@@ -451,11 +485,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     setSaveSuccess(false);
 
     try {
+      const trimmedAvatar = photoURL.trim();
+      const safeAvatar =
+        trimmedAvatar && (trimmedAvatar.startsWith('https://') || trimmedAvatar.startsWith('http://'))
+          ? trimmedAvatar
+          : undefined;
+
       await updateUserProfile({
         displayName: displayName.trim(),
         username: username.trim(),
         bio: bio.trim(),
-        photoURL: photoURL.trim() || undefined,
+        photoURL: safeAvatar,
         proBorderEffect,
         proAccentColor,
         appearanceTheme
@@ -690,7 +730,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   return (
     <div className="w-full max-w-3xl mx-auto py-4 sm:py-6 px-3 sm:px-6 space-y-5 sm:space-y-6 overflow-x-hidden">
       {/* User Profile Card */}
-      <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-5">
+      <div
+        className={`bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-5 ${
+          isKangaBgEnabled ? 'kanga-pattern-subtle' : ''
+        }`}
+      >
         <div className="flex items-start justify-between flex-wrap gap-4">
           <div className="flex items-center gap-3.5 sm:gap-4 min-w-0">
             <div className="relative shrink-0">
@@ -702,21 +746,31 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                 }
                 alt="Profile Avatar"
                 className={`w-16 h-16 sm:w-20 sm:h-20 rounded-full object-cover ${
-                  isProUser && proBorderEffect !== 'none'
+                  activePatternFrame !== 'none'
+                    ? getKangaFrameClass(activePatternFrame)
+                    : isProUser && proBorderEffect !== 'none'
                     ? borderOptions.find((b) => b.id === proBorderEffect)?.ringClass
                     : 'ring-2 ring-[#2563EB]/20'
                 }`}
               />
+              <span
+                className="absolute -bottom-1 -right-1 text-xs leading-none bg-white rounded-full px-1 py-0.5 shadow-xs border border-stone-200"
+                title={activeCountryMeta.nameEn}
+              >
+                {activeCountryMeta.flag}
+              </span>
             </div>
 
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <CrystalBadge
+                  userId={currentUser?.uid}
                   email={currentUser?.email}
                   name={userProfile?.displayName || displayName || 'Waver'}
                   isPro={isProUser}
                   hasBlueStar={isProUser}
                   isSubAdmin={isSubAdmin}
+                  weeklyWinnerUntil={userProfile?.weeklyWinnerUntil}
                   size="md"
                   showAdminTag={isAdmin}
                 />
@@ -851,10 +905,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               <ChevronRight size={18} className="text-[#2563EB] shrink-0" />
             </button>
           )}
+          {/* Phase 5: Private Creator Stats Row */}
+          <button
+            type="button"
+            onClick={() => setActiveSettingsSection(activeSettingsSection === 'stats' ? 'profile' : 'stats')}
+            className="w-full min-h-[54px] px-4 py-3 rounded-2xl bg-teal-50/70 hover:bg-teal-100/70 border border-teal-200/80 flex items-center justify-between gap-3 transition text-left cursor-pointer"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-[#0D9488] text-white flex items-center justify-center shrink-0">
+                <BarChart3 size={17} />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-bold text-[#1C1917]">{t('stats.title')}</span>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-white text-[#0D9488] border border-teal-200">
+                    {t('stats.privateBadge')}
+                  </span>
+                </div>
+                <span className="text-xs text-[#57534E] block">
+                  {t('stats.subtitle')}
+                </span>
+              </div>
+            </div>
+            <ChevronRight size={18} className="text-[#0D9488] shrink-0" />
+          </button>
         </div>
 
         {/* Section Switcher Navigation */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-8 gap-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] p-1.5 text-xs font-semibold">
+        <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-9 gap-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] p-1.5 text-xs font-semibold">
           <button
             type="button"
             onClick={() => setActiveSettingsSection('profile')}
@@ -865,7 +943,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <User size={14} />
-            <span>Profile</span>
+            <span>{t('nav.profile')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveSettingsSection('stats')}
+            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
+              activeSettingsSection === 'stats'
+                ? 'bg-[#0D9488] text-white shadow-2xs font-bold'
+                : 'text-[#78716C] hover:text-[#1C1917]'
+            }`}
+          >
+            <BarChart3 size={14} />
+            <span>{t('nav.analytics')}</span>
           </button>
 
           <button
@@ -878,7 +969,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <Bell size={14} />
-            <span>Notifications</span>
+            <span>{language === 'sw' ? 'Arifa' : 'Alerts'}</span>
           </button>
 
           <button
@@ -891,7 +982,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <Lightbulb size={14} />
-            <span>AI Ideas ({upgradesList.length})</span>
+            <span>Ideas ({upgradesList.length})</span>
           </button>
 
           <button
@@ -904,7 +995,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <Lock size={14} />
-            <span>Privacy</span>
+            <span>{language === 'sw' ? 'Faragha' : 'Privacy'}</span>
           </button>
 
           <button
@@ -917,7 +1008,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <KeyRound size={14} />
-            <span>Password</span>
+            <span>{language === 'sw' ? 'Nenosiri' : 'Password'}</span>
           </button>
 
           <button
@@ -930,7 +1021,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <FileText size={14} />
-            <span>Terms</span>
+            <span>{language === 'sw' ? 'Masharti' : 'Terms'}</span>
           </button>
 
           <button
@@ -956,7 +1047,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             }`}
           >
             <HelpCircle size={14} />
-            <span>Support</span>
+            <span>{t('settings.support')}</span>
           </button>
         </div>
       </div>
@@ -965,6 +1056,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
         isOpen={isDailyRewardModalOpen}
         onClose={() => setIsDailyRewardModalOpen(false)}
       />
+
+      {/* =====================================================================
+          SECTION: PHASE 5 PRIVATE CREATOR STATS (7 & 30 DAYS)
+      ===================================================================== */}
+      {activeSettingsSection === 'stats' && (
+        <CreatorAnalyticsView
+          embeddedInProfile
+          onOpenUpgradeModal={() => setActiveSettingsSection('pro')}
+        />
+      )}
 
       {/* =====================================================================
           SECTION: PUSH NOTIFICATIONS & ALERT SETTINGS
@@ -2154,6 +2255,349 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             )}
           </div>
 
+          {/* Phase 1: Data Saver Mode Card */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div className="flex items-start gap-3">
+                <div
+                  className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 border ${
+                    isDataSaverOn
+                      ? 'bg-teal-50 text-[#0D9488] border-teal-200'
+                      : 'bg-[var(--bg-subtle)] text-[#78716C] border-[var(--border-hairline)]'
+                  }`}
+                >
+                  <Zap size={19} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="font-extrabold text-[#1C1917] text-base">
+                      {t('datasaver.title')}
+                    </h3>
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                        isDataSaverOn
+                          ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
+                          : 'bg-stone-100 text-[#78716C]'
+                      }`}
+                    >
+                      {isDataSaverOn ? t('datasaver.on') : t('datasaver.off')}
+                    </span>
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-extrabold">
+                      {t('datasaver.savedEstimate')}: {formattedSaved}
+                    </span>
+                  </div>
+                  <p className="text-xs text-[#78716C] mt-0.5 max-w-xl leading-relaxed">
+                    {t('datasaver.subtitle')}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                role="switch"
+                aria-checked={isDataSaverOn}
+                onClick={() => {
+                  const next = !isDataSaverOn;
+                  setDataSaverOn(next);
+                  updateUserProfile({ dataSaverEnabled: next }).catch(() => {});
+                }}
+                className={`min-h-[42px] px-4 py-2 rounded-2xl font-extrabold text-xs flex items-center gap-2 transition cursor-pointer shrink-0 ${
+                  isDataSaverOn
+                    ? 'bg-[#0D9488] text-white shadow-2xs'
+                    : 'bg-[var(--bg-subtle)] hover:bg-stone-200/70 text-[#1C1917] border border-[var(--border-hairline)]'
+                }`}
+              >
+                <Zap size={14} className={isDataSaverOn ? 'text-white' : 'text-[#0D9488]'} />
+                <span>{isDataSaverOn ? `${t('datasaver.title')}: ${t('datasaver.on')}` : `${t('datasaver.title')}: ${t('datasaver.off')}`}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Phase 2, Pan-African Languages, Country & Region Picker, Local Money, and Kanga/Kitenge Culture Card */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-5">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-2xl bg-teal-50 text-[#0D9488] border border-teal-200/80 flex items-center justify-center shrink-0">
+                  <Globe size={19} />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-[#1C1917] text-base">
+                    {language === 'sw'
+                      ? 'Lugha za Afrika, Nchi na Utamaduni wa Kanga/Kitenge'
+                      : 'African Languages, Country & Kanga/Kitenge Design'}
+                  </h3>
+                  <p className="text-xs text-[#78716C]">
+                    {language === 'sw'
+                      ? 'Badili kati ya Kiswahili na Kiingereza, chagua nchi yako, sarafu ya TZS/KES/UGX na fremu ya Kanga/Kitenge'
+                      : 'Switch between Swahili & English, pick your country flag, local currency (TZS/KES/UGX) & Kanga/Kitenge frames'}
+                  </p>
+                </div>
+              </div>
+              <span className="px-3 py-1 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200 text-xs font-extrabold">
+                {activeCountryMeta.flag} {language === 'sw' ? activeCountryMeta.greetingSw : activeCountryMeta.greetingEn}
+              </span>
+            </div>
+
+            {/* 1. Primary UI Translation Switch (Swahili & English) + Pan-African Language Option List */}
+            <div className="space-y-2.5">
+              <label className="text-xs font-extrabold text-[#1C1917] block">
+                {language === 'sw'
+                  ? '1. Lugha ya Programu (Kiswahili & Kiingereza + Orodha ya Lugha za Afrika)'
+                  : '1. App Language (Swahili & English + Pan-African Language List)'}
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {PAN_AFRICAN_LANGUAGES.map((langItem) => {
+                  const isSelected = activePanLang === langItem.code || (langItem.code === language && activePanLang === language);
+                  return (
+                    <button
+                      key={langItem.code}
+                      type="button"
+                      onClick={() => {
+                        setPanAfricanLang(langItem.code);
+                        if (langItem.code === 'sw' || langItem.code === 'en') {
+                          setLanguage(langItem.code);
+                          updateUserProfile({
+                            language: langItem.code,
+                            panAfricanLanguage: langItem.code
+                          }).catch(() => {});
+                        } else {
+                          updateUserProfile({
+                            panAfricanLanguage: langItem.code
+                          }).catch(() => {});
+                        }
+                      }}
+                      className={`p-3 rounded-2xl border text-left transition flex flex-col justify-between gap-1 cursor-pointer ${
+                        isSelected
+                          ? 'bg-[#0D9488] text-white border-[#0D9488] shadow-2xs'
+                          : 'bg-[var(--bg-subtle)] text-[#1C1917] border-[var(--border-hairline)] hover:border-teal-300'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1.5">
+                        <span className="text-xs font-extrabold">
+                          {langItem.flag} {langItem.nativeName}
+                        </span>
+                        <span
+                          className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+                            isSelected
+                              ? 'bg-white/20 text-white'
+                              : langItem.fullUiSupport
+                              ? 'bg-emerald-50 text-[#0D9488]'
+                              : 'bg-amber-50 text-amber-800'
+                          }`}
+                        >
+                          {langItem.fullUiSupport
+                            ? language === 'sw'
+                              ? 'Kamili'
+                              : 'Full UI'
+                            : language === 'sw'
+                            ? 'Salamu Tayari'
+                            : 'Regional Ready'}
+                        </span>
+                      </div>
+                      <span
+                        className={`text-[11px] font-medium ${
+                          isSelected ? 'text-teal-50' : 'text-[#78716C]'
+                        }`}
+                      >
+                        “{langItem.greeting}”
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 2. Country & Region Picker with Flags (10 African Countries) */}
+            <div className="space-y-2.5 pt-2 border-t border-[var(--border-hairline)]">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <label className="text-xs font-extrabold text-[#1C1917]">
+                  {language === 'sw'
+                    ? '2. Chagua Nchi na Kanda Yako (Inaonyesha Machapisho ya Nchi Yako Kwanza kwenye Kichupo cha Nyumbani)'
+                    : '2. Country & Region Picker (Prioritizes your country in the Local Feed tab)'}
+                </label>
+                <span className="text-[11px] font-bold text-[#2563EB]">
+                  {activeCountryMeta.flag} {activeCountryMeta.regionLabel}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                {AFRICAN_COUNTRIES.map((country) => {
+                  const selected = country.code === activeCountryCode;
+                  return (
+                    <button
+                      key={country.code}
+                      type="button"
+                      onClick={() => {
+                        setCountryCode(country.code);
+                        updateUserProfile({
+                          countryCode: country.code,
+                          preferredCurrency: country.defaultCurrency
+                        }).catch(() => {});
+                      }}
+                      className={`p-2.5 rounded-2xl border text-left transition flex items-center gap-2 cursor-pointer ${
+                        selected
+                          ? 'bg-[#2563EB] text-white border-[#2563EB] shadow-2xs'
+                          : 'bg-[var(--bg-subtle)] text-[#1C1917] border-[var(--border-hairline)] hover:border-blue-300'
+                      }`}
+                    >
+                      <span className="text-base leading-none shrink-0">{country.flag}</span>
+                      <div className="min-w-0">
+                        <span className="text-xs font-extrabold block truncate">
+                          {language === 'sw' ? country.nameSw : country.nameEn}
+                        </span>
+                        <span
+                          className={`text-[10px] block truncate ${
+                            selected ? 'text-blue-100' : 'text-[#78716C]'
+                          }`}
+                        >
+                          {country.defaultCurrency}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 3. Local Currency (TZS, KES, UGX) + Mobile Money Mention */}
+            <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <span className="text-xs font-extrabold text-[#1C1917] block">
+                  {language === 'sw'
+                    ? '3. Sarafu ya Kienyeji (Inachaguliwa Moja kwa Moja kulingana na Nchi)'
+                    : '3. Local Currency (Auto-chosen by Country: TZS, KES & UGX)'}
+                </span>
+                <span className="text-[11px] text-[#57534E] block">
+                  {language === 'sw'
+                    ? `WaveLink Pro: ${formatLocalPrice(18000, activeCurrency)}/mwezi • Malipo kupitia M-Pesa, Mixx by Yas na Airtel Money`
+                    : `WaveLink Pro: ${formatLocalPrice(18000, activeCurrency)}/mo • Explained for M-Pesa, Mixx by Yas & Airtel Money`}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {(['TZS', 'KES', 'UGX'] as EastAfricanCurrency[]).map((curr) => (
+                  <button
+                    key={curr}
+                    type="button"
+                    onClick={() => {
+                      setCurrency(curr);
+                      updateUserProfile({ preferredCurrency: curr }).catch(() => {});
+                    }}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-extrabold border transition cursor-pointer ${
+                      activeCurrency === curr
+                        ? 'bg-[#0D9488] text-white border-[#0D9488]'
+                        : 'bg-white text-[#1C1917] border-stone-200 hover:border-teal-300'
+                    }`}
+                  >
+                    {curr}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 4. Subtle Kanga & Kitenge Profile Frames & Background Accent */}
+            <div className="space-y-3 pt-2 border-t border-[var(--border-hairline)]">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="text-xs font-extrabold text-[#1C1917]">
+                  {language === 'sw'
+                    ? '4. Fremu ya Wasifu na Mandhari ya Kanga na Kitenge (Hiari)'
+                    : '4. Optional Kanga & Kitenge Profile Frames & Subtle Background'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !isKangaBgEnabled;
+                    updateUserProfile({ kangaBackgroundEnabled: next }).catch(() => {});
+                  }}
+                  className={`px-3 py-1.5 rounded-xl text-[11px] font-extrabold border transition cursor-pointer ${
+                    isKangaBgEnabled
+                      ? 'bg-amber-500 text-white border-amber-500'
+                      : 'bg-[var(--bg-subtle)] text-[#1C1917] border-[var(--border-hairline)]'
+                  }`}
+                >
+                  {isKangaBgEnabled
+                    ? language === 'sw'
+                      ? 'Mandhari ya Kanga: IMEWASHWA ✓'
+                      : 'Subtle Kanga Card Pattern: ON ✓'
+                    : language === 'sw'
+                    ? 'Washa Mandhari ya Kanga'
+                    : 'Enable Subtle Kanga Pattern'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {KANGA_PATTERN_FRAMES.map((frame) => {
+                  const selected = activePatternFrame === frame.id;
+                  return (
+                    <button
+                      key={frame.id}
+                      type="button"
+                      onClick={() => {
+                        updateUserProfile({ patternFrame: frame.id }).catch(() => {});
+                      }}
+                      className={`p-3 rounded-2xl border text-left transition flex items-center justify-between gap-3 cursor-pointer ${
+                        selected
+                          ? 'border-[#0D9488] bg-teal-50/50 ring-2 ring-[#0D9488]/15'
+                          : 'border-[var(--border-hairline)] bg-[var(--bg-subtle)] hover:border-teal-300'
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <span className="text-xs font-extrabold text-[#1C1917] block">
+                          {language === 'sw' ? frame.nameSw : frame.nameEn}
+                        </span>
+                        <span className="text-[11px] text-[#78716C] block">
+                          {language === 'sw' ? frame.descSw : frame.descEn}
+                        </span>
+                      </div>
+                      {selected && <CheckCircle2 size={16} className="text-[#0D9488] shrink-0" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 5. Personal Content Interests */}
+            <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Sparkles size={15} className="text-[#0D9488]" />
+                  <span className="font-extrabold text-[#1C1917] text-xs">
+                    {t('interests.editButton')} ({(userProfile?.interests || []).length}{' '}
+                    {t('interests.selectedCount')})
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+                  {(userProfile?.interests || []).length === 0 ? (
+                    <span className="text-[11px] text-[#78716C]">
+                      {t('interests.pickAtLeastThree')}
+                    </span>
+                  ) : (
+                    (userProfile?.interests || []).map((id) => {
+                      const item = INTEREST_CATALOG.find((c) => c.id === id);
+                      if (!item) return null;
+                      return (
+                        <span
+                          key={id}
+                          className="px-2 py-0.5 rounded-lg bg-white border border-[var(--border-hairline)] text-[11px] font-bold text-[#1C1917]"
+                        >
+                          {item.emoji} {language === 'sw' ? item.labelSw : item.labelEn}
+                        </span>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent('wavelink:open-interest-picker'))}
+                className="py-2 px-4 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white text-xs font-extrabold transition shrink-0 cursor-pointer"
+              >
+                {t('interests.editButton')}
+              </button>
+            </div>
+          </div>
+
+          {/* Phase 6: Friendly Add to Home Screen Hint Card (Especially for iPhone) */}
+          <AddToHomeScreenHintCard />
+
           {/* Battery Saver Mode Card */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
             <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -2366,6 +2810,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
           <span>{inviteToast.message}</span>
         </div>
       )}
+
+      {/* Footer: Empowering African Creators */}
+      <div className="pt-4 pb-2 text-center text-xs font-bold text-[#57534E]">
+        WaveLink • {t('footer.tagline')}
+      </div>
     </div>
   );
 };

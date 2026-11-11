@@ -18,6 +18,10 @@ export const auth = getAuth(app);
 export const CLOUDINARY_CLOUD_NAME = 'monarcking72';
 export const CLOUDINARY_UPLOAD_PRESET = 'monarcking72';
 export const CLOUDINARY_VIDEO_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/video/upload`;
+export const CLOUDINARY_IMAGE_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
+
+/** Maximum allowed Firestore document payload size (~900 KB safety check below Firestore's 1 MB hard limit) */
+export const MAX_FIRESTORE_DOC_BYTES = 900 * 1024;
 
 /**
  * Logs the real Cloudinary / browser video upload error to the console and returns a clear,
@@ -63,7 +67,10 @@ export function formatVideoUploadError(
     rawMessage.startsWith('Videos can be up to') ||
     rawMessage.startsWith('File too big:') ||
     rawMessage.startsWith('This video is ') ||
-    rawMessage.startsWith('Cloudinary upload error:')
+    rawMessage.startsWith('Cloudinary upload error:') ||
+    rawMessage.startsWith('Document size (') ||
+    rawMessage.startsWith('Cannot save raw ') ||
+    rawMessage.startsWith('Blocked:')
   ) {
     return rawMessage;
   }
@@ -437,14 +444,121 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Utility to strip any undefined fields before writing to Firestore
-export function cleanFirestoreData<T extends Record<string, any>>(obj: T): Partial<T> {
-  const result: Record<string, any> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (value !== undefined) {
-      result[key] = value;
+const AVATAR_URL_FIELD_NAMES = new Set([
+  'authorPhotoURL',
+  'photoURL',
+  'senderPhotoURL',
+  'actorAvatar',
+  'viewerPhotoURL',
+  'targetUserAvatar',
+]);
+
+/**
+ * Ensures an avatar URL is a clean HTTP(S) URL and never a base64 data: or blob: URL.
+ */
+export function sanitizeAvatarUrlForFirestore(url: unknown, fallbackSeed = 'waver'): string {
+  if (typeof url === 'string') {
+    const trimmed = url.trim();
+    if (trimmed.startsWith('https://') || trimmed.startsWith('http://')) {
+      return trimmed;
     }
   }
+  return `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(fallbackSeed || 'waver')}`;
+}
+
+function isForbiddenDataOrBlobUrl(val: string): boolean {
+  const trimmed = val.trim().toLowerCase();
+  if (
+    trimmed.startsWith('data:image/') ||
+    trimmed.startsWith('data:video/') ||
+    trimmed.startsWith('data:audio/') ||
+    trimmed.startsWith('data:application/') ||
+    trimmed.startsWith('data:octet-stream') ||
+    trimmed.startsWith('blob:')
+  ) {
+    return true;
+  }
+  // Detect raw unprefixed base64 media payloads (> 16 KB contiguous base64 characters)
+  if (val.length > 16384 && /^[A-Za-z0-9+/=\r\n]+$/.test(val.slice(0, 512))) {
+    return true;
+  }
+  return false;
+}
+
+function inspectValueForRawMedia(value: unknown, fieldPath: string): void {
+  if (typeof value === 'string') {
+    if (isForbiddenDataOrBlobUrl(value)) {
+      throw new Error(
+        `Blocked: Cannot save raw base64, data URL, or blob media in Firestore field "${fieldPath}". Please upload the file to Cloudinary first.`
+      );
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => inspectValueForRawMedia(item, `${fieldPath}[${index}]`));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    // Skip Firestore FieldValue / Timestamp internal objects
+    const proto = Object.getPrototypeOf(value);
+    if (proto && proto !== Object.prototype) {
+      return;
+    }
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      inspectValueForRawMedia(v, fieldPath ? `${fieldPath}.${k}` : k);
+    }
+  }
+}
+
+/**
+ * Computes the approximate UTF-8 byte size of a Firestore document object and blocks
+ * any document exceeding ~900 KB or containing base64 / data URLs / raw media data.
+ */
+export function assertFirestoreDocumentSafe(obj: Record<string, any>, docLabel = 'Firestore document'): number {
+  inspectValueForRawMedia(obj, '');
+
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(obj);
+  } catch {
+    serialized = '';
+  }
+
+  const byteLength =
+    typeof TextEncoder !== 'undefined'
+      ? new TextEncoder().encode(serialized).length
+      : serialized.length;
+
+  if (byteLength > MAX_FIRESTORE_DOC_BYTES) {
+    const sizeKb = Math.round(byteLength / 1024);
+    throw new Error(
+      `Document size (${sizeKb} KB) exceeds the 900 KB safety limit for ${docLabel}. Media files must be uploaded to Cloudinary and only their URLs saved in Firestore.`
+    );
+  }
+
+  return byteLength;
+}
+
+// Utility to strip any undefined fields, sanitize legacy base64 avatar fields, and enforce zero-base64 & <900 KB document safety before writing to Firestore
+export function cleanFirestoreData<T extends Record<string, any>>(obj: T): Partial<T> {
+  const result: Record<string, any> = {};
+  const fallbackSeed =
+    String(obj.authorId || obj.userId || obj.senderId || obj.uid || obj.id || 'waver');
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === undefined) continue;
+
+    if (AVATAR_URL_FIELD_NAMES.has(key) && typeof value === 'string') {
+      if (isForbiddenDataOrBlobUrl(value)) {
+        result[key] = sanitizeAvatarUrlForFirestore('', fallbackSeed);
+        continue;
+      }
+    }
+
+    result[key] = value;
+  }
+
+  assertFirestoreDocumentSafe(result);
   return result as Partial<T>;
 }
 

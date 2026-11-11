@@ -150,32 +150,54 @@ export function getRoyaltyFreeTrackAudioUrl(trackId: string): string {
 
 export const ROYALTY_FREE_LIBRARY: Omit<RoyaltyFreeTrack, 'previewUrl'>[] = [
   {
-    trackId: 'rf_afrobeat_sun',
-    trackName: 'Dar es Salaam Sunset Groove',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Royalty-Free Creator Beats',
-    artworkUrl100: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=200&auto=format&fit=crop&q=80',
-    bpm: 108,
-    mood: 'Upbeat & Sunny',
-    genre: 'Afro-Fusion',
+    trackId: 'rf_bongo_groove',
+    trackName: 'Dar es Salaam Bongo Flava Acoustic',
+    artistName: 'WaveLink East Africa Originals (Royalty-Free)',
+    collectionName: 'Original & Royalty-Free Creator Beats',
+    artworkUrl100: 'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=200&auto=format&fit=crop&q=80',
+    bpm: 102,
+    mood: 'Warm & Smooth',
+    genre: 'Bongo Flava',
     license: 'Royalty-Free (WaveLink Studio Original)'
   },
   {
-    trackId: 'rf_lofi_breeze',
-    trackName: 'Ocean Breeze Lo-Fi',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Chill Study & Vlog Safe',
-    artworkUrl100: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=200&auto=format&fit=crop&q=80',
-    bpm: 84,
-    mood: 'Chill & Aesthetic',
-    genre: 'Lo-Fi Beats',
+    trackId: 'rf_afrobeat_sun',
+    trackName: 'Lagos to Nairobi Afrobeats Groove',
+    artistName: 'WaveLink Pan-African Originals (Royalty-Free)',
+    collectionName: 'Original & Royalty-Free Creator Beats',
+    artworkUrl100: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=200&auto=format&fit=crop&q=80',
+    bpm: 108,
+    mood: 'Upbeat & Sunny',
+    genre: 'Afrobeats',
+    license: 'Royalty-Free (WaveLink Studio Original)'
+  },
+  {
+    trackId: 'rf_synth_wave',
+    trackName: 'Joburg Sunset Amapiano Log Drum',
+    artistName: 'WaveLink Studio Originals (Royalty-Free)',
+    collectionName: 'Original & Royalty-Free Creator Beats',
+    artworkUrl100: 'https://images.unsplash.com/photo-1508700115892-45ecd05ae2ad?w=200&auto=format&fit=crop&q=80',
+    bpm: 113,
+    mood: 'Groovy & Deep',
+    genre: 'Amapiano',
+    license: 'Royalty-Free (WaveLink Studio Original)'
+  },
+  {
+    trackId: 'rf_creator_pop',
+    trackName: 'Nairobi 254 Gengetone Bounce',
+    artistName: 'WaveLink East Africa Originals (Royalty-Free)',
+    collectionName: 'Original & Royalty-Free Creator Beats',
+    artworkUrl100: 'https://images.unsplash.com/photo-1459749411175-04bf5292ceea?w=200&auto=format&fit=crop&q=80',
+    bpm: 118,
+    mood: 'Energetic & Street',
+    genre: 'Gengetone',
     license: 'Royalty-Free (WaveLink Studio Original)'
   },
   {
     trackId: 'rf_comedy_bounce',
-    trackName: 'Quirky Skit & Comedy Pluck',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Comedy & Sketch Sounds',
+    trackName: 'Mtaa Comedy Skit & Marimba Pluck',
+    artistName: 'WaveLink Studio Originals (Royalty-Free)',
+    collectionName: 'Comedy & Sketch Safe Audio',
     artworkUrl100: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=200&auto=format&fit=crop&q=80',
     bpm: 124,
     mood: 'Funny & Playful',
@@ -183,58 +205,36 @@ export const ROYALTY_FREE_LIBRARY: Omit<RoyaltyFreeTrack, 'previewUrl'>[] = [
     license: 'Royalty-Free (WaveLink Studio Original)'
   },
   {
-    trackId: 'rf_creator_pop',
-    trackName: 'Golden Hour Vlog Pop',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Creator Safe Pop',
-    artworkUrl100: 'https://images.unsplash.com/photo-1459749411175-04bf5292ceea?w=200&auto=format&fit=crop&q=80',
-    bpm: 118,
-    mood: 'Bright & Energetic',
-    genre: 'Indie Pop',
-    license: 'Royalty-Free (WaveLink Studio Original)'
-  },
-  {
-    trackId: 'rf_bongo_groove',
-    trackName: 'Zanzibar Acoustic Pluck',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'East Africa Instrumental',
-    artworkUrl100: 'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=200&auto=format&fit=crop&q=80',
-    bpm: 102,
-    mood: 'Warm & Smooth',
+    trackId: 'rf_island_marimba',
+    trackName: 'Zanzibar Spice & Coastal Marimba',
+    artistName: 'WaveLink East Africa Originals (Royalty-Free)',
+    collectionName: 'Coastal & Travel Originals',
+    artworkUrl100: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=200&auto=format&fit=crop&q=80',
+    bpm: 112,
+    mood: 'Happy & Coastal',
     genre: 'Acoustic Groove',
     license: 'Royalty-Free (WaveLink Studio Original)'
   },
   {
+    trackId: 'rf_lofi_breeze',
+    trackName: 'Kilimanjaro Morning Chill Lo-Fi',
+    artistName: 'WaveLink Studio Originals (Royalty-Free)',
+    collectionName: 'Chill Study & Vlog Safe',
+    artworkUrl100: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=200&auto=format&fit=crop&q=80',
+    bpm: 84,
+    mood: 'Calm & Focused',
+    genre: 'Lo-Fi Beats',
+    license: 'Royalty-Free (WaveLink Studio Original)'
+  },
+  {
     trackId: 'rf_cinematic_rise',
-    trackName: 'Storyteller Ambient Horizon',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Cinematic Scores',
+    trackName: 'Serengeti Horizon Inspiration',
+    artistName: 'WaveLink Studio Originals (Royalty-Free)',
+    collectionName: 'Storyteller & Faith Instrumentals',
     artworkUrl100: 'https://images.unsplash.com/photo-1518609878373-06d740f60d8b?w=200&auto=format&fit=crop&q=80',
     bpm: 90,
-    mood: 'Inspiring',
+    mood: 'Inspiring & Uplifting',
     genre: 'Cinematic',
-    license: 'Royalty-Free (WaveLink Studio Original)'
-  },
-  {
-    trackId: 'rf_synth_wave',
-    trackName: 'Neon Night Drive',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Electronic Safe Tracks',
-    artworkUrl100: 'https://images.unsplash.com/photo-1508700115892-45ecd05ae2ad?w=200&auto=format&fit=crop&q=80',
-    bpm: 120,
-    mood: 'Hype & Cyber',
-    genre: 'Synthwave',
-    license: 'Royalty-Free (WaveLink Studio Original)'
-  },
-  {
-    trackId: 'rf_island_marimba',
-    trackName: 'Coco Beach Marimba',
-    artistName: 'WaveLink Studio Originals',
-    collectionName: 'Tropical & Travel',
-    artworkUrl100: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=200&auto=format&fit=crop&q=80',
-    bpm: 112,
-    mood: 'Happy & Tropical',
-    genre: 'Tropical',
     license: 'Royalty-Free (WaveLink Studio Original)'
   }
 ];
@@ -242,8 +242,24 @@ export const ROYALTY_FREE_LIBRARY: Omit<RoyaltyFreeTrack, 'previewUrl'>[] = [
 export function getHydratedRoyaltyFreeTracks(): RoyaltyFreeTrack[] {
   return ROYALTY_FREE_LIBRARY.map((item) => ({
     ...item,
-    previewUrl: getRoyaltyFreeTrackAudioUrl(String(item.trackId))
+    previewUrl: `https://wavelink.app/royalty-free/${item.trackId}.wav`
   }));
+}
+
+/**
+ * Resolves a stored track previewUrl (including compact `https://wavelink.app/royalty-free/<trackId>.wav`
+ * identifiers) into a playable audio source URL in memory without ever storing base64 audio in Firestore.
+ */
+export function resolvePlayableAudioUrl(previewUrl?: string): string {
+  if (!previewUrl) return '';
+  const rfMatch = previewUrl.match(/\/royalty-free\/([a-zA-Z0-9_]+)\.wav/i);
+  if (rfMatch && rfMatch[1]) {
+    return getRoyaltyFreeTrackAudioUrl(rfMatch[1]);
+  }
+  if (previewUrl.startsWith('rf_')) {
+    return getRoyaltyFreeTrackAudioUrl(previewUrl);
+  }
+  return previewUrl;
 }
 
 /**
@@ -256,7 +272,7 @@ export async function playAudioWithVoiceEffect(
 ): Promise<{ stop: () => void }> {
   const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const ctx = new AudioCtx();
-  const res = await fetch(audioUrl);
+  const res = await fetch(resolvePlayableAudioUrl(audioUrl));
   const arrayBuffer = await res.arrayBuffer();
   const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
 

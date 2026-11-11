@@ -1,9 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
+import { useLanguage } from '../context/LanguageContext';
+import { useDataSaver } from '../services/dataSaverService';
+import { useAfricanRegion, KANGA_PATTERN_FRAMES } from '../utils/africanCultureConfig';
 import { ActiveTab } from '../types';
 import { triggerHaptic } from '../utils/haptics';
-import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus, Search } from 'lucide-react';
+import { Waves, Sparkles, Mic, Wifi, WifiOff, BatteryCharging, UserPlus, Search, Globe, Zap } from 'lucide-react';
 import { inviteFriends } from '../utils/share.js';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { CompactPointsDisplay } from './CompactPointsDisplay';
@@ -18,17 +21,18 @@ interface TopHeaderProps {
   hasUnreadNotifications?: boolean;
 }
 
-const TAB_TITLES: Record<ActiveTab, { title: string; subtitle: string }> = {
-  feed: { title: 'WaveLink', subtitle: 'Community social feed' },
-  studio: { title: 'Create', subtitle: 'Share a photo, clip, or story' },
-  videos: { title: 'Reels', subtitle: 'Watch community videos' },
-  announcements: { title: 'Notice Board', subtitle: 'Community events & gatherings' },
-  chat: { title: 'Messages', subtitle: 'Chat with friends' },
-  directory: { title: 'Members', subtitle: 'Community directory' },
-  analytics: { title: 'Analytics', subtitle: 'Post reach & impressions' },
-  monetization: { title: 'Support & Tipping', subtitle: 'Creator economy & membership' },
-  admin: { title: 'Admin Panel', subtitle: 'Community management' },
-  settings: { title: 'Profile', subtitle: 'Account preferences & Pro' }
+const TAB_TITLES: Record<ActiveTab, { title: string; subtitle: string; tKey: string }> = {
+  feed: { title: 'WaveLink', subtitle: 'Community social feed', tKey: 'nav.home' },
+  trending: { title: 'Trending & Challenges', subtitle: 'Fastest growing tags & weekly challenges', tKey: 'nav.trending' },
+  studio: { title: 'Create', subtitle: 'Share a photo, clip, or story', tKey: 'nav.create' },
+  videos: { title: 'Reels', subtitle: 'Watch community videos', tKey: 'nav.reels' },
+  announcements: { title: 'Notice Board', subtitle: 'Community events & gatherings', tKey: 'nav.announcements' },
+  chat: { title: 'Messages', subtitle: 'Chat with friends', tKey: 'nav.chat' },
+  directory: { title: 'Members', subtitle: 'Community directory', tKey: 'nav.members' },
+  analytics: { title: 'Stats', subtitle: 'Post reach & impressions', tKey: 'nav.analytics' },
+  monetization: { title: 'Support & Tipping', subtitle: 'Creator economy & membership', tKey: 'nav.monetization' },
+  admin: { title: 'Admin Panel', subtitle: 'Community management', tKey: 'nav.admin' },
+  settings: { title: 'Profile', subtitle: 'Account preferences & Pro', tKey: 'nav.profile' }
 };
 
 export const TopHeader: React.FC<TopHeaderProps> = ({
@@ -39,10 +43,15 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   onOpenWelink,
   hasUnreadNotifications = false
 }) => {
-  const { currentUser, userProfile, isProEffective, isExemptFromPayments } = useAuth();
+  const { currentUser, userProfile, isProEffective, isExemptFromPayments, updateUserProfile } = useAuth();
   const { isBatterySaver } = useTheme();
+  const { language, setLanguage, t } = useLanguage();
+  const { enabled: isDataSaverOn, formattedSaved } = useDataSaver();
+  const { countryMeta, patternFrame } = useAfricanRegion(userProfile);
+  const activeFrameClass =
+    KANGA_PATTERN_FRAMES.find((f) => f.id === patternFrame)?.cssClass || '';
   const isProUser = isProEffective || isExemptFromPayments;
-  const currentTabInfo = TAB_TITLES[activeTab] || { title: 'WaveLink', subtitle: 'Community' };
+  const currentTabInfo = TAB_TITLES[activeTab] || { title: 'WaveLink', subtitle: 'Community', tKey: 'nav.home' };
 
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
@@ -121,7 +130,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
           className="w-full bg-amber-500/95 text-white px-4 py-1.5 text-xs font-semibold flex items-center justify-center gap-2 shadow-2xs"
         >
           <WifiOff size={13} className="shrink-0 animate-pulse" />
-          <span>You&apos;re offline — check your network connection.</span>
+          <span>{t('header.offlineNotice')}</span>
         </div>
       )}
 
@@ -176,7 +185,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
             <div className="flex flex-col min-w-0 ml-0.5 sm:ml-2">
               <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
                 <h1 className="font-bold text-base sm:text-lg text-[#1C1917] tracking-tight truncate">
-                  {currentTabInfo.title}
+                  {activeTab === 'feed' ? 'WaveLink' : t(currentTabInfo.tKey)}
                 </h1>
                 {isProUser && (
                   <span className="text-[11px] font-semibold text-[#0D9488] bg-[#CCFBF1] px-2 py-0.5 rounded-full shrink-0">
@@ -213,19 +222,32 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   {!isOnline ? (
                     <span className="inline-flex items-center gap-1 font-semibold">
                       <WifiOff size={11} className="shrink-0" />
-                      <span className="hidden xs:inline">Offline</span>
+                      <span className="hidden xs:inline">{t('header.offline')}</span>
                     </span>
                   ) : justReconnected ? (
                     <span className="inline-flex items-center gap-1 font-semibold">
                       <Wifi size={11} className="shrink-0" />
-                      <span className="hidden xs:inline">Back online</span>
+                      <span className="hidden xs:inline">{t('header.backOnline')}</span>
                     </span>
                   ) : (
                     <span className="hidden lg:inline text-[11px] text-[#78716C]">
-                      Online
+                      {t('header.online')}
                     </span>
                   )}
                 </div>
+
+                {isDataSaverOn && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigateTab && onNavigateTab('settings')}
+                    title={`${t('datasaver.title')}: ${formattedSaved}`}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 text-[#0D9488] border border-teal-200/80 text-[11px] font-semibold shrink-0 cursor-pointer"
+                  >
+                    <Zap size={11} className="shrink-0" />
+                    <span className="hidden md:inline">{t('datasaver.badge')} • {formattedSaved}</span>
+                    <span className="md:hidden">{formattedSaved}</span>
+                  </button>
+                )}
 
                 {isBatterySaver && (
                   <button
@@ -298,6 +320,36 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               </>
             )}
 
+            {/* Country Flag & Region Quick Badge */}
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                if (onNavigateTab) onNavigateTab('settings');
+              }}
+              className="min-h-[38px] px-2 py-1.5 rounded-xl bg-amber-50/80 hover:bg-amber-100/80 text-stone-800 border border-amber-200/80 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+              title={`${countryMeta.flag} ${countryMeta.nameEn} • ${countryMeta.defaultCurrency}`}
+            >
+              <span>{countryMeta.flag}</span>
+              <span className="hidden md:inline">{countryMeta.code}</span>
+            </button>
+
+            {/* Phase 2: Quick Language Switch (English / Kiswahili) */}
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                const nextLang = language === 'sw' ? 'en' : 'sw';
+                setLanguage(nextLang);
+                updateUserProfile({ language: nextLang }).catch(() => {});
+              }}
+              className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/80 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+              title={language === 'sw' ? 'Badili Lugha (Kiingereza / Kiswahili)' : 'Switch Language (English / Kiswahili)'}
+            >
+              <Globe size={13} className="text-[#2563EB] shrink-0" />
+              <span>{language === 'sw' ? 'SW' : 'EN'}</span>
+            </button>
+
             {/* Invite Friends Button (WhatsApp / Web Share) */}
             <button
               type="button"
@@ -309,7 +361,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               title="Invite Friends to WaveLink via WhatsApp"
             >
               <UserPlus size={15} className="text-emerald-600 shrink-0" />
-              <span className="hidden sm:inline">Invite Friends</span>
+              <span className="hidden lg:inline">{t('nav.inviteFriends')}</span>
             </button>
 
             {currentUser && (
@@ -331,7 +383,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     triggerHaptic('tab');
                     if (onNavigateTab) onNavigateTab('settings');
                   }}
-                  className="relative w-9 h-9 rounded-full overflow-hidden border border-[var(--border-hairline)] focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0"
+                  className={`relative w-9 h-9 rounded-full overflow-hidden border border-[var(--border-hairline)] focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0 ${activeFrameClass}`}
                   title="View Profile"
                 >
                   <img
@@ -341,7 +393,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                       `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`
                     }
                     alt="Profile"
-                    className="w-full h-full object-cover"
+                    className="w-full h-full rounded-full object-cover"
                   />
                   {hasUnreadNotifications && (
                     <span className="absolute top-0 right-0 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-white" />

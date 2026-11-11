@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { MobileMoneyProvider } from '../types';
+import { MobileMoneyProvider, EastAfricanCurrency } from '../types';
 import {
   initiateMobileMoneyPayment,
   completeSubscription,
@@ -10,6 +10,7 @@ import {
   MOBILE_CARRIERS,
 } from '../services/paymentService';
 import { submitPaymentRequest } from '../services/verificationService';
+import { formatLocalPrice, useAfricanRegion } from '../utils/africanCultureConfig';
 import {
   X,
   CheckCircle2,
@@ -55,6 +56,11 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
   initialTier,
 }) => {
   const { currentUser, userProfile } = useAuth();
+  const { currency, setCurrency } = useAfricanRegion(
+    userProfile?.countryCode,
+    userProfile?.preferredCurrency,
+    userProfile?.panAfricanLanguage
+  );
 
   // Simple 3-step flow: 1 = Enter phone number, 2 = Choose provider, 3 = Confirm (or 4 = Done)
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
@@ -228,6 +234,29 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
           {/* STEP 1: ENTER YOUR PHONE NUMBER */}
           {step === 1 && (
             <form onSubmit={handleStep1Continue} className="space-y-5">
+              {/* Local Currency Switcher (TZS, KES, UGX) */}
+              <div className="flex items-center justify-between gap-2 p-2.5 rounded-2xl bg-[var(--bg-canvas,#FAF7F2)] border border-[var(--border-hairline,#EFECE6)]">
+                <span className="text-[11px] font-bold text-[var(--text-secondary,#78716C)]">
+                  Local Currency (TZS / KES / UGX):
+                </span>
+                <div className="flex items-center gap-1">
+                  {(['TZS', 'KES', 'UGX'] as EastAfricanCurrency[]).map((c) => (
+                    <button
+                      key={c}
+                      type="button"
+                      onClick={() => setCurrency(c)}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold transition cursor-pointer ${
+                        currency === c
+                          ? 'bg-[#0D9488] text-white'
+                          : 'bg-white text-stone-700 border border-stone-200'
+                      }`}
+                    >
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* Plan Selector */}
               <div className="grid grid-cols-2 gap-2.5">
                 {(['monthly', 'harvest'] as const).map((planKey) => {
@@ -248,7 +277,7 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
                         {planKey === 'monthly' ? 'Monthly Pro' : 'Annual Pass'}
                       </div>
                       <div className="text-base font-black text-[var(--accent-primary,#2563EB)] mt-0.5">
-                        {p.priceTZS.toLocaleString()} TZS
+                        {formatLocalPrice(p.priceTZS, currency)}
                       </div>
                       <div className="text-[11px] text-[var(--text-secondary,#78716C)]">
                         {p.period}
@@ -278,7 +307,7 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
                   />
                 </div>
                 <p className="text-xs text-[var(--text-secondary,#78716C)] mt-1.5">
-                  We'll send the AzamPay mobile money prompt to this number for <strong>WaveLink</strong>.
+                  Supported via <strong>M-Pesa</strong>, <strong>Mixx by Yas</strong>, and <strong>Airtel Money</strong> for <strong>WaveLink</strong>.
                 </p>
               </div>
 
@@ -403,7 +432,7 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
                 <div className="pt-2.5 border-t border-[var(--border-hairline,#EFECE6)] flex items-center justify-between text-base">
                   <span className="font-extrabold text-[var(--text-primary,#1C1917)]">Total</span>
                   <span className="font-black text-[var(--accent-primary,#2563EB)]">
-                    {currentPlan.priceTZS.toLocaleString()} TZS
+                    {formatLocalPrice(currentPlan.priceTZS, currency)}
                   </span>
                 </div>
               </div>
@@ -430,7 +459,7 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
                 ) : (
                   <>
                     <ShieldCheck size={18} />
-                    <span>Confirm &amp; Pay {currentPlan.priceTZS.toLocaleString()} TZS</span>
+                    <span>Confirm &amp; Pay {formatLocalPrice(currentPlan.priceTZS, currency)}</span>
                   </>
                 )}
               </button>

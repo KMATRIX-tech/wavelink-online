@@ -8,6 +8,7 @@ import {
   formatPhoneNumber,
   MOBILE_CARRIERS
 } from '../services/paymentService';
+import { formatLocalPrice, useAfricanRegion } from '../utils/africanCultureConfig';
 import {
   X,
   Rocket,
@@ -41,6 +42,11 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
   onSuccess
 }) => {
   const { currentUser, userProfile, isAdmin, isProEffective, isExemptFromPayments } = useAuth();
+  const { currency } = useAfricanRegion(
+    userProfile?.countryCode,
+    userProfile?.preferredCurrency,
+    userProfile?.panAfricanLanguage
+  );
   const [phoneNumber, setPhoneNumber] = useState('');
   const [provider, setProvider] = useState<MobileMoneyProvider>('airtel');
   const [isUpgradeModalOpen, setIsUpgradeModalOpen] = useState(false);
@@ -173,11 +179,11 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
                   Boost Wave Post
                 </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-amber-500 text-white">
-                  2,000 TZS
+                  {formatLocalPrice(2000, currency)}
                 </span>
               </div>
               <p className="text-[11px] text-[#57534E] font-medium">
-                +300% Reach & Top Priority for 48 Hours
+                +300% Reach • M-Pesa, Mixx by Yas &amp; Airtel Money
               </p>
             </div>
           </div>

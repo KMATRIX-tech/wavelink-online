@@ -36,6 +36,7 @@ import { approveVerification, rejectVerification, approvePaymentRequest, rejectP
 import { CrystalBadge } from './CrystalBadge';
 import { SupportDeskView } from './SupportDeskView';
 import { AnnouncementsView } from './AnnouncementsView';
+import { TrendingChallengesView } from './TrendingChallengesView';
 import {
   SUPPORT_BOT_ID,
   SUPPORT_BOT_EMAIL,
@@ -89,7 +90,8 @@ import {
   Sparkles,
   Filter,
   Tag,
-  Trash2
+  Trash2,
+  Trophy
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -115,7 +117,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     currentUser?.email && ADMIN_EMAILS.includes(currentUser.email.trim().toLowerCase())
   );
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'challenges' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>('overview');
   const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(
     Boolean(isOwnerEmailAccount || isAdmin)
   );
@@ -1349,6 +1351,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         </button>
 
         <button
+          onClick={() => setActiveTab('challenges')}
+          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'challenges'
+              ? 'bg-[#2563EB] text-white shadow-xs'
+              : 'text-[#57534E] hover:text-[#1C1917]'
+          }`}
+        >
+          <Trophy size={15} className={activeTab === 'challenges' ? 'text-amber-300' : 'text-amber-600'} />
+          <span>Weekly Challenges</span>
+        </button>
+
+        <button
           onClick={() => setActiveTab('complaints')}
           className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
             activeTab === 'complaints'
@@ -2275,6 +2289,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
       {/* Tab: Admin-Only Updates Group */}
       {activeTab === 'updates_group' && <AnnouncementsView />}
+
+      {/* Tab: Weekly Creator Challenges & Leaderboard */}
+      {activeTab === 'challenges' && <TrendingChallengesView />}
 
       {/* Tab 1: Overview */}
       {activeTab === 'overview' && (

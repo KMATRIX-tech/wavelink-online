@@ -1,4 +1,5 @@
 import { Post } from '../types';
+import { isDataSaverEnabled, isMobileDataOrSlowConnection } from './dataSaverService';
 
 export interface PreloadedMediaInfo {
   width: number;
@@ -19,6 +20,7 @@ const preloadedPostIds = new Set<string>();
 function shouldPreloadInBackground(): boolean {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
   if (!navigator.onLine) return false;
+  if (isDataSaverEnabled() || isMobileDataOrSlowConnection()) return false;
   if (typeof document !== 'undefined' && document.documentElement.getAttribute('data-battery-saver') === 'true') {
     return false;
   }

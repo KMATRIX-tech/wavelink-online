@@ -1,6 +1,35 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
+import { useLanguage } from '../context/LanguageContext';
+import {
+  useDataSaver,
+  getOptimizedImagePreviewUrl,
+  recordDataSavedBytes
+} from '../services/dataSaverService';
+import {
+  getSuggestedHashtagsForInterests,
+  scorePostByInterests,
+  scoreCreatorByInterests
+} from './InterestPickerModal';
+import {
+  AFRICAN_COUNTRIES,
+  PAN_AFRICAN_LANGUAGES,
+  COMMUNITY_REPORT_CATEGORIES,
+  getAfricanCountryMeta,
+  getKangaFrameClass,
+  doesPostMatchCountry,
+  formatLocalPrice,
+  useAfricanRegion
+} from '../utils/africanCultureConfig';
+import {
+  db,
+  handleFirestoreError,
+  OperationType,
+  cleanFirestoreData,
+  sanitizeAvatarUrlForFirestore,
+  formatVideoUploadError,
+  getAuthHeaders
+} from '../firebase';
 import {
   collection,
   query,
@@ -70,7 +99,10 @@ import {
   Mic,
   Flag,
   Ban,
-  Download
+  Download,
+  RotateCcw,
+  Trophy,
+  Globe
 } from 'lucide-react';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { CreatorTipModal } from './CreatorTipModal';
@@ -92,6 +124,7 @@ import {
 import { sanitizeUserText, SUPPORT_BOT_ID } from '../utils/security';
 import {
   compressImage,
+  uploadImageToCloudinary,
   generateVideoThumbnail,
   cloneVideoFileToMemory,
   inspectAndValidateVideoFile,
@@ -100,7 +133,11 @@ import {
   MAX_VIDEO_DURATION_SECONDS,
   MAX_VIDEO_RAW_MB,
 } from '../utils/mediaStorage';
-import { enqueueVideoUploadJob, useVideoUploadQueue } from '../services/videoUploadQueue';
+import {
+  enqueueVideoUploadJob,
+  useVideoUploadQueue,
+  clearFailedVideoAndStudioDrafts,
+} from '../services/videoUploadQueue';
 import { VideoUploadProgressChip, VideoUploadingFeedPostList } from './VideoUploadProgressChip';
 import { downloadPost, sharePost } from '../utils/share.js';
 
@@ -216,6 +253,36 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const activeOrFailedVideoJobs = videoUploadJobs.filter(
     (j) => j.status !== 'completed' && j.status !== 'cancelled'
   );
+  const { t, language, setLanguage } = useLanguage();
+  const {
+    countryCode,
+    countryMeta,
+    currency,
+    panAfricanLang,
+    setCountryCode
+  } = useAfricanRegion(
+    userProfile?.countryCode,
+    userProfile?.preferredCurrency,
+    userProfile?.panAfricanLanguage
+  );
+  const activeCountryCode = userProfile?.countryCode || countryCode;
+  const activeCountryMeta = getAfricanCountryMeta(activeCountryCode);
+  const activeCurrency = userProfile?.preferredCurrency || currency;
+  const activePanLangMeta =
+    PAN_AFRICAN_LANGUAGES.find((l) => l.code === (userProfile?.panAfricanLanguage || panAfricanLang)) ||
+    PAN_AFRICAN_LANGUAGES[0];
+
+  const [feedMode, setFeedMode] = useState<'all' | 'local' | 'following' | 'saved'>('all');
+  const [showCountryPickerBar, setShowCountryPickerBar] = useState(false);
+  const [reportingPost, setReportingPost] = useState<Post | null>(null);
+  const [selectedReportCategory, setSelectedReportCategory] = useState<string>('stolen_content');
+  const [reportExtraNote, setReportExtraNote] = useState('');
+  const [isSubmittingReport, setIsSubmittingReport] = useState(false);
+
+  const { enabled: isDataSaverOn, setEnabled: setDataSaverOn, formattedSaved } = useDataSaver();
+  const [unlockedFullImages, setUnlockedFullImages] = useState<Record<string, boolean>>({});
+  const userInterests = userProfile?.interests || [];
+  const suggestedHashtags = getSuggestedHashtagsForInterests(userInterests);
 
   const [posts, setPosts] = useState<Post[]>([]);
   // Interactive discovery filter from hashtags, mentions, or search
@@ -319,7 +386,28 @@ export const FeedView: React.FC<FeedViewProps> = ({
     try {
       const res = await sharePost(post);
       if (res?.method !== 'cancelled') {
-        showToast('Shared!', 'success');
+        showToast(language === 'sw' ? 'Imeshirikiwa!' : 'Shared!', 'success');
+        // Phase 4: Record verified anti-spam share on the post (max 1 share counted per user per post)
+        if (currentUser && !post.isSponsored && post.id) {
+          const existingSharedBy = Array.isArray(post.sharedBy) ? post.sharedBy : [];
+          if (!existingSharedBy.includes(currentUser.uid)) {
+            const nextSharedBy = [...existingSharedBy, currentUser.uid];
+            const nextSharesCount = Math.max((post.sharesCount || 0) + 1, nextSharedBy.length);
+            updateDoc(doc(db, 'posts', post.id), {
+              sharedBy: arrayUnion(currentUser.uid),
+              sharesCount: nextSharesCount
+            }).catch(() => {});
+            getAuthHeaders()
+              .then((headers) =>
+                fetch('/api/challenges/record-share', {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify({ postId: post.id })
+                })
+              )
+              .catch(() => {});
+          }
+        }
       }
     } catch (err: any) {
       showToast(err?.message || "Couldn't share", 'error');
@@ -355,18 +443,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
       return;
     }
     setIsLoadingSuggested(true);
-    const q = query(collection(db, 'users'), limit(6));
+    const q = query(collection(db, 'users'), limit(12));
     const unsub = onSnapshot(
       q,
       (snap) => {
-        const list: UserProfile[] = [];
+        const candidates: UserProfile[] = [];
         snap.forEach((d) => {
           const u = { ...(d.data() as UserProfile), id: d.id };
-          if (u.id !== currentUser.uid && list.length < 3) {
-            list.push(u);
+          if (u.id !== currentUser.uid) {
+            candidates.push(u);
           }
         });
-        setSuggestedMembers(list);
+        // Phase 3: Rank suggested creators by matching user interests (with plain fallback)
+        const ranked = [...candidates].sort((a, b) => {
+          const scoreB = scoreCreatorByInterests(b, userProfile?.interests || []);
+          const scoreA = scoreCreatorByInterests(a, userProfile?.interests || []);
+          return scoreB - scoreA;
+        });
+        setSuggestedMembers(ranked.slice(0, 3));
         setIsLoadingSuggested(false);
       },
       () => {
@@ -374,7 +468,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       }
     );
     return () => unsub();
-  }, [currentUser?.uid, showWelcomeFlow]);
+  }, [currentUser?.uid, showWelcomeFlow, userProfile?.interests]);
 
   const handleDismissWelcome = () => {
     if (currentUser?.uid) {
@@ -801,30 +895,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
     const safeImageFile = await cloneVideoFileToMemory(file);
     e.target.value = '';
     setInlineMediaFile(safeImageFile);
-    // Show instant objectURL preview immediately so the Share Wave button is enabled without delay
+    // Show instant objectURL preview locally; actual upload to Cloudinary runs when publishing
     const instantPreviewUrl = URL.createObjectURL(safeImageFile);
     setInlineMediaPreview(instantPreviewUrl);
-
-    try {
-      const compressedDataUrl = await compressImage(safeImageFile, 2048, 2048, 0.92);
-      if (
-        compressedDataUrl &&
-        (compressedDataUrl.startsWith('data:image/') || compressedDataUrl.startsWith('http'))
-      ) {
-        setInlineMediaPreview(compressedDataUrl);
-      }
-    } catch (err) {
-      console.warn('Image background compression notice:', err);
-    }
   };
 
-  // Submit inline post with background video compression + resumable Firebase Storage upload
+  // Submit inline post with direct browser-to-Cloudinary unsigned upload (monarcking72 / monarcking72)
   const handleCreatePost = async () => {
     if (!currentUser || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)) return;
 
+    clearFailedVideoAndStudioDrafts();
     const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
+    const safeAuthorPhotoURL = sanitizeAvatarUrlForFirestore(
+      userProfile?.photoURL || currentUser.photoURL,
+      currentUser.uid
+    );
 
-    // Video posts: run compression + resumable upload in the background queue so user can keep browsing
+    // Video posts: upload directly from the browser to Cloudinary with live progress bar,
+    // create the Firestore post only after the upload succeeds, then show it at the top of the feed.
     if (inlineMediaType === 'video' && inlineMediaFile) {
       const clipDuration = Math.max(1, inlineVideoTrimEnd - inlineVideoTrimStart);
       if (clipDuration > maxVideoSeconds + 0.5) {
@@ -845,10 +933,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
         authorEmail: currentUser.email || '',
         authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
         authorUsername: userProfile?.username || `@${emailPrefix}`,
-        authorPhotoURL:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+        authorPhotoURL: safeAuthorPhotoURL,
         content: sanitizeUserText(inlineContent, 2000),
         trimStart: inlineVideoTrimStart,
         trimEnd: inlineVideoTrimEnd,
@@ -863,32 +948,38 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
 
     setIsSubmittingPost(true);
-    setUploadProgress(10);
+    setUploadProgress(5);
     setPostNotice(null);
 
     try {
       const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 
       let finalImageUrl: string | undefined = undefined;
+      let finalWidth: number | undefined = undefined;
+      let finalHeight: number | undefined = undefined;
       let finalMediaType: 'image' | 'video' | undefined = undefined;
 
-      if (inlineMediaType === 'image' && (inlineMediaPreview || inlineMediaFile)) {
-        setUploadProgress(40);
-        if (
+      if (inlineMediaType === 'image' && (inlineMediaFile || inlineMediaPreview)) {
+        if (inlineMediaFile) {
+          const uploaded = await uploadImageToCloudinary(inlineMediaFile, (pct) => {
+            setUploadProgress(Math.max(8, Math.min(92, pct)));
+          });
+          if (!uploaded.secureUrl || !uploaded.secureUrl.startsWith('http')) {
+            throw new Error('Cloudinary photo upload did not return a valid secure_url.');
+          }
+          finalImageUrl = uploaded.secureUrl;
+          finalWidth = uploaded.width;
+          finalHeight = uploaded.height;
+        } else if (
           inlineMediaPreview &&
-          (inlineMediaPreview.startsWith('http://') ||
-            inlineMediaPreview.startsWith('https://') ||
-            (inlineMediaPreview.startsWith('data:image/') && inlineMediaPreview.length <= 840 * 1024))
+          (inlineMediaPreview.startsWith('https://') || inlineMediaPreview.startsWith('http://'))
         ) {
           finalImageUrl = inlineMediaPreview;
-        } else if (inlineMediaFile) {
-          const compressed = await compressImage(inlineMediaFile, 2048, 2048, 0.92);
-          finalImageUrl = compressed || inlineMediaPreview || undefined;
         } else {
-          finalImageUrl = inlineMediaPreview || undefined;
+          throw new Error('Please select a valid photo file to upload to Cloudinary.');
         }
         finalMediaType = 'image';
-        setUploadProgress(88);
+        setUploadProgress(94);
       }
 
       const newPost: Post = {
@@ -897,13 +988,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
         authorEmail: currentUser.email || '',
         authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
         authorUsername: userProfile?.username || `@${emailPrefix}`,
-        authorPhotoURL:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+        authorPhotoURL: safeAuthorPhotoURL,
         content: sanitizeUserText(inlineContent, 2000),
         imageUrl: finalImageUrl,
         mediaType: finalMediaType,
+        videoWidth: finalWidth,
+        videoHeight: finalHeight,
+        countryCode: activeCountryCode,
+        locationTag: `${activeCountryMeta.flag} ${activeCountryMeta.nameEn}`,
         likes: [],
         likesCount: 0,
         reactions: { like: [], heart: [], fire: [] },
@@ -912,15 +1004,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
         createdAt: new Date().toISOString()
       };
 
-      // Optimistically add the new post to the top of the feed immediately
-      setPosts((prev) => [newPost, ...prev.filter((p) => p.id !== postId)]);
-
-      const writePromise = setDoc(doc(db, 'posts', postId), cleanFirestoreData(newPost));
-      const writeTimeout = new Promise<'timeout'>((resolve) =>
-        setTimeout(() => resolve('timeout'), 4500)
-      );
-      await Promise.race([writePromise, writeTimeout]);
+      // Validate < 900 KB & zero base64/data URLs, and create the Firestore document ONLY after upload succeeds
+      const cleanedNewPost = cleanFirestoreData(newPost);
+      await setDoc(doc(db, 'posts', postId), cleanedNewPost);
       setUploadProgress(100);
+
+      // Show the newly created post at the top of the feed after upload + Firestore creation succeed
+      setPosts((prev) => [newPost, ...prev.filter((p) => p.id !== postId)]);
 
       // Reset form
       setInlineContent('');
@@ -930,15 +1020,20 @@ export const FeedView: React.FC<FeedViewProps> = ({
         type: 'success',
         text:
           finalMediaType === 'image'
-            ? 'Photo wave published to the feed!'
+            ? 'Photo wave uploaded to Cloudinary & published to the feed!'
             : 'Wave published to the community feed!'
       });
       setTimeout(() => setPostNotice(null), 4000);
     } catch (err) {
       console.error('Post creation error:', err);
+      const formatted = formatVideoUploadError(err, {
+        fileSize: inlineMediaFile?.size,
+        maxAllowedSeconds: maxVideoSeconds,
+        isProUser: isProTier,
+      });
       setPostNotice({
         type: 'error',
-        text: 'Could not publish wave. Please try a smaller file or check your connection.'
+        text: formatted || 'Could not publish wave. Tap Retry to upload the file again from your browser.'
       });
     } finally {
       setIsSubmittingPost(false);
@@ -1106,12 +1201,39 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   const blockedIds = userProfile?.blockedUserIds || [];
 
-  // Priority sorting: Boosted posts first, then newest (filtering out blocked users)
+  // Priority sorting:
+  // - If feedMode === 'local', show posts from the user's selected country first!
+  // - Boosted posts first, then Phase 3 interest-matched posts for recent waves, with plain chronological fallback
   const sortedPosts = [...posts]
     .filter((p) => !blockedIds.includes(p.authorId))
+    .filter((p) => {
+      if (feedMode === 'following') {
+        return followedIds.includes(p.authorId) || p.authorId === currentUser?.uid;
+      }
+      if (feedMode === 'saved') {
+        return (userProfile?.savedPostIds || []).includes(p.id);
+      }
+      return true;
+    })
     .sort((a, b) => {
+      if (feedMode === 'local') {
+        const aLocal = doesPostMatchCountry(a, activeCountryCode);
+        const bLocal = doesPostMatchCountry(b, activeCountryCode);
+        if (aLocal && !bLocal) return -1;
+        if (!aLocal && bLocal) return 1;
+      }
       if (a.isBoosted && !b.isBoosted) return -1;
       if (!a.isBoosted && b.isBoosted) return 1;
+      if (userInterests.length > 0) {
+        const ageHoursA = (Date.now() - new Date(a.createdAt).getTime()) / (1000 * 60 * 60);
+        const ageHoursB = (Date.now() - new Date(b.createdAt).getTime()) / (1000 * 60 * 60);
+        // Prioritize interest-matching posts published within the last 72 hours; plain chronological fallback otherwise
+        if (ageHoursA <= 72 && ageHoursB <= 72) {
+          const scoreA = scorePostByInterests(a, userInterests);
+          const scoreB = scorePostByInterests(b, userInterests);
+          if (scoreA !== scoreB) return scoreB - scoreA;
+        }
+      }
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
 
@@ -1268,19 +1390,178 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Minimal Calm Friendly Greeting + Non-overlapping WELINK AI button */}
-          <div className="pt-1 pb-1 px-1 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          {/* Feed Mode & Local Country Tab Bar (All Waves | Local Country First | Following | Trending) */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-1.5 shadow-2xs space-y-2">
+            <div className="flex items-center justify-between gap-1.5 flex-wrap">
+              <div className="flex items-center gap-1 flex-1 overflow-x-auto scrollbar-none">
+                <button
+                  type="button"
+                  onClick={() => setFeedMode('all')}
+                  className={`py-2 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
+                    feedMode === 'all'
+                      ? 'bg-[#2563EB] text-white shadow-2xs'
+                      : 'bg-[var(--bg-subtle)] text-[#1C1917] hover:bg-blue-50 hover:text-[#2563EB]'
+                  }`}
+                >
+                  <Waves size={14} />
+                  <span>{t('feed.tabAll')}</span>
+                </button>
+
+                {/* Local Tab: Shows posts from the user's country first */}
+                <button
+                  type="button"
+                  onClick={() => setFeedMode('local')}
+                  className={`py-2 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
+                    feedMode === 'local'
+                      ? 'bg-[#0D9488] text-white shadow-2xs'
+                      : 'bg-[var(--bg-subtle)] text-[#1C1917] hover:bg-teal-50 hover:text-[#0D9488]'
+                  }`}
+                  title={t('feed.localBannerDesc')}
+                >
+                  <span className="text-sm leading-none">{activeCountryMeta.flag}</span>
+                  <span>
+                    {t('feed.tabLocal')} ({activeCountryCode})
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setFeedMode('following')}
+                  className={`py-2 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
+                    feedMode === 'following'
+                      ? 'bg-[#2563EB] text-white shadow-2xs'
+                      : 'bg-[var(--bg-subtle)] text-[#1C1917] hover:bg-blue-50 hover:text-[#2563EB]'
+                  }`}
+                >
+                  <span>{t('feed.tabFollowing')}</span>
+                </button>
+
+                {onNavigateTab && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigateTab('trending')}
+                    className="py-2 px-3 rounded-xl bg-[var(--bg-subtle)] hover:bg-teal-50 text-[#1C1917] hover:text-[#0D9488] font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer"
+                  >
+                    <Trophy size={14} className="text-[#0D9488]" />
+                    <span>{t('nav.trending')}</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowCountryPickerBar((prev) => !prev)}
+                  className="px-2.5 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200/80 text-[11px] font-extrabold flex items-center gap-1 transition cursor-pointer"
+                  title="Pick Country & Region"
+                >
+                  <span>{activeCountryMeta.flag}</span>
+                  <span className="hidden sm:inline">
+                    {language === 'sw' ? activeCountryMeta.nameSw : activeCountryMeta.nameEn}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => window.dispatchEvent(new CustomEvent('wavelink:open-interest-picker'))}
+                  className="px-2.5 py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-[11px] font-extrabold flex items-center gap-1 shrink-0 transition cursor-pointer"
+                  title={t('interests.editButton')}
+                >
+                  <Sparkles size={12} />
+                  <span className="hidden xs:inline">{t('interests.editButton')}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Expandable Country & Region Picker Bar (or when Local Tab is active) */}
+            {(showCountryPickerBar || feedMode === 'local') && (
+              <div className="p-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2 animate-in fade-in">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="text-[11px] font-extrabold text-[#1C1917] flex items-center gap-1.5">
+                    <span>{activeCountryMeta.flag}</span>
+                    <span>
+                      {t('feed.localBannerTitle')}:{' '}
+                      <span className="text-[#0D9488]">
+                        {language === 'sw' ? activeCountryMeta.nameSw : activeCountryMeta.nameEn}
+                      </span>{' '}
+                      ({activeCountryMeta.regionLabel})
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-semibold text-[#57534E]">
+                    {t('feed.localBannerDesc')}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
+                  {AFRICAN_COUNTRIES.map((c) => {
+                    const isSelected = c.code === activeCountryCode;
+                    return (
+                      <button
+                        key={c.code}
+                        type="button"
+                        onClick={() => {
+                          setCountryCode(c.code);
+                          updateUserProfile({
+                            countryCode: c.code,
+                            preferredCurrency: c.defaultCurrency
+                          }).catch(() => {});
+                        }}
+                        className={`px-2.5 py-1.5 rounded-xl text-[11px] font-bold flex items-center gap-1.5 shrink-0 border transition cursor-pointer ${
+                          isSelected
+                            ? 'bg-[#0D9488] text-white border-[#0D9488] shadow-2xs'
+                            : 'bg-white text-[#1C1917] border-stone-200 hover:border-teal-300'
+                        }`}
+                      >
+                        <span>{c.flag}</span>
+                        <span>{language === 'sw' ? c.nameSw : c.nameEn}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Friendly East African Local Greeting (Habari & Karibu) + Optional Subtle Kanga/Kitenge Accent */}
+          <div
+            className={`pt-2 pb-2 px-3 rounded-2xl border border-[var(--border-hairline)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+              userProfile?.kangaBackgroundEnabled
+                ? 'kanga-pattern-subtle bg-[var(--bg-surface)]'
+                : 'bg-[var(--bg-surface)]'
+            }`}
+          >
             <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200/80 text-[10px] font-extrabold">
+                  <span>{activeCountryMeta.flag}</span>
+                  <span>
+                    {language === 'sw' ? activeCountryMeta.greetingSw : activeCountryMeta.greetingEn}
+                  </span>
+                </span>
+                {activePanLangMeta && activePanLangMeta.code !== 'en' && activePanLangMeta.code !== 'sw' && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200/80 text-[10px] font-extrabold">
+                    <span>{activePanLangMeta.flag}</span>
+                    <span>
+                      {activePanLangMeta.nativeName}: {activePanLangMeta.greeting}
+                    </span>
+                  </span>
+                )}
+              </div>
               <h1 className="wavelink-fluid-h1 font-extrabold text-[#1C1917] tracking-tight break-words">
                 {(() => {
                   const hour = new Date().getHours();
-                  const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Friend';
-                  const timeGreeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+                  const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Rafiki';
+                  const timeGreeting =
+                    hour < 12
+                      ? t('feed.greetingMorning')
+                      : hour < 18
+                      ? t('feed.greetingAfternoon')
+                      : t('feed.greetingEvening');
                   return `${timeGreeting}, ${name} 👋`;
                 })()}
               </h1>
-              <p className="text-base sm:text-sm text-[#78716C] mt-0.5 font-medium">
-                Welcome back to your community.
+              <p className="text-base sm:text-sm text-[#57534E] mt-0.5 font-medium">
+                {t('feed.welcomeBack')}
               </p>
             </div>
 
@@ -1293,7 +1574,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   title="Talk Live by Voice with WELINK"
                 >
                   <Mic size={15} className="text-[#0D9488]" />
-                  <span>Live Talk</span>
+                  <span>{t('header.liveTalk')}</span>
                 </button>
                 <button
                   type="button"
@@ -1302,25 +1583,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   title="Open WELINK AI Guide"
                 >
                   <Sparkles size={15} className="text-[#0D9488]" />
-                  <span>WELINK Guide</span>
+                  <span>{t('header.welinkAi')}</span>
                 </button>
               </div>
             )}
           </div>
 
-          {/* Skippable First-Time Welcome Flow */}
+          {/* Skippable First-Time Welcome Flow with Phase 1 Data Saver & Phase 2 Language Switch */}
           {showWelcomeFlow && (
             <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-2xs space-y-4">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
-                    Welcome to WaveLink
+                    {t('welcome.badge')}
                   </span>
                   <h2 className="text-base sm:text-lg font-extrabold text-[#1C1917] mt-1">
-                    Make yourself at home 🌿
+                    {t('welcome.title')}
                   </h2>
                   <p className="text-xs text-[#78716C] mt-0.5">
-                    Say hello to a few neighbors or share your first wave whenever you feel ready.
+                    {t('welcome.subtitle')}
                   </p>
                 </div>
                 <button
@@ -1328,8 +1609,88 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   onClick={handleDismissWelcome}
                   className="px-3 py-1.5 rounded-xl text-xs font-semibold text-[#78716C] hover:text-[#1C1917] hover:bg-[var(--bg-subtle)] transition"
                 >
-                  Skip
+                  {t('welcome.skip')}
                 </button>
+              </div>
+
+              {/* Phase 1 & Phase 2 First-Time Welcome Switches: Data Saver & Swahili/English */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div className="p-3.5 rounded-2xl bg-teal-50/60 border border-teal-200/80 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <Zap size={14} className="text-[#0D9488] shrink-0" />
+                      <span className="text-xs font-extrabold text-[#1C1917]">
+                        {t('datasaver.welcomeTitle')}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-[#57534E] mt-0.5">
+                      {t('datasaver.welcomeDesc')} ({t('datasaver.savedEstimate')}: {formattedSaved})
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={isDataSaverOn}
+                    onClick={() => {
+                      const next = !isDataSaverOn;
+                      setDataSaverOn(next);
+                      updateUserProfile({ dataSaverEnabled: next }).catch(() => {});
+                    }}
+                    className={`w-12 h-7 rounded-full transition-colors p-1 shrink-0 cursor-pointer ${
+                      isDataSaverOn ? 'bg-[#0D9488]' : 'bg-stone-300'
+                    }`}
+                  >
+                    <span
+                      className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
+                        isDataSaverOn ? 'translate-x-5' : 'translate-x-0'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="p-3.5 rounded-2xl bg-blue-50/50 border border-blue-200/80 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <Globe size={14} className="text-[#2563EB] shrink-0" />
+                      <span className="text-xs font-extrabold text-[#1C1917]">
+                        {t('lang.title')}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-[#57534E] mt-0.5">
+                      {t('lang.subtitle')}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLanguage('en');
+                        updateUserProfile({ language: 'en' }).catch(() => {});
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-extrabold transition cursor-pointer ${
+                        language === 'en'
+                          ? 'bg-[#2563EB] text-white'
+                          : 'bg-white text-[#57534E] border border-stone-200'
+                      }`}
+                    >
+                      EN
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLanguage('sw');
+                        updateUserProfile({ language: 'sw' }).catch(() => {});
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-extrabold transition cursor-pointer ${
+                        language === 'sw'
+                          ? 'bg-[#0D9488] text-white'
+                          : 'bg-white text-[#57534E] border border-stone-200'
+                      }`}
+                    >
+                      SW
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {isLoadingSuggested ? (
@@ -1371,7 +1732,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 : 'bg-[#2563EB] text-white hover:bg-[#1D4ED8]'
                             }`}
                           >
-                            {isFollowing ? 'Following' : 'Follow'}
+                            {isFollowing ? t('welcome.following') : t('welcome.follow')}
                           </button>
                         </div>
                       );
@@ -1384,19 +1745,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    setInlineContent('Hello everyone! Happy to be here on WaveLink 👋');
+                    setInlineContent(
+                      language === 'sw'
+                        ? 'Habari zenu wote! Nimefurahi kujiunga na WaveLink 👋'
+                        : 'Hello everyone! Happy to be here on WaveLink 👋'
+                    );
                     handleDismissWelcome();
                   }}
                   className="text-xs font-bold text-[#2563EB] hover:underline"
                 >
-                  Write your first hello post →
+                  {t('welcome.writeFirstWave')}
                 </button>
                 <button
                   type="button"
                   onClick={handleDismissWelcome}
                   className="text-xs text-[#78716C] hover:text-[#1C1917]"
                 >
-                  Done
+                  {t('welcome.done')}
                 </button>
               </div>
             </div>
@@ -1411,16 +1776,16 @@ export const FeedView: React.FC<FeedViewProps> = ({
               <div className="min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-base sm:text-sm font-bold text-[#1C1917]">
-                    Daily Check-In
+                    {t('feed.dailyCheckIn')}
                   </span>
                   <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-50 text-[#D97706] border border-amber-200/80">
-                    {Math.max(1, userProfile?.loginStreak ?? 1)}-day streak
+                    {Math.max(1, userProfile?.loginStreak ?? 1)}d
                   </span>
                 </div>
                 <p className="text-sm sm:text-xs text-[#78716C] break-words">
                   {checkInDoneToday
-                    ? `Checked in for today • ${(userProfile?.wavePoints ?? 10).toLocaleString()} WavePoints`
-                    : `Tap to check in and earn +15 WavePoints • ${(userProfile?.wavePoints ?? 10).toLocaleString()} pts`}
+                    ? `${t('feed.checkedInToday')} • ${(userProfile?.wavePoints ?? 10).toLocaleString()} WavePoints`
+                    : `${t('feed.tapToCheckIn')} • ${(userProfile?.wavePoints ?? 10).toLocaleString()} pts`}
                 </p>
               </div>
             </div>
@@ -1435,7 +1800,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   : 'bg-[#0D9488] hover:bg-teal-700 text-white active:scale-95'
               }`}
             >
-              {checkInDoneToday ? 'Checked In ✓' : 'Check In (+15 pts)'}
+              {checkInDoneToday ? t('feed.checkedInBtn') : t('feed.checkInBtn')}
             </button>
           </div>
 
@@ -1479,10 +1844,33 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 <textarea
                   value={inlineContent}
                   onChange={(e) => setInlineContent(e.target.value)}
-                  placeholder={`What's on your mind today, ${userProfile?.displayName?.split(' ')[0] || 'Friend'}?`}
+                  placeholder={`${t('feed.whatsOnYourMind')}, ${userProfile?.displayName?.split(' ')[0] || 'Friend'}?`}
                   rows={inlineContent || inlineMediaPreview ? 3 : 2}
                   className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-3.5 border border-[#EFECE6] resize-none text-base text-[#1C1917] placeholder-[#A8A29E] focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition"
                 />
+
+                {/* Phase 3: Suggested Hashtags based on picked interests */}
+                {suggestedHashtags.length > 0 && (
+                  <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                    <span className="text-[10px] font-bold text-[#78716C] uppercase tracking-wider">
+                      {t('interests.suggestedHashtags')}:
+                    </span>
+                    {suggestedHashtags.slice(0, 6).map((tag) => (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => {
+                          setInlineContent((prev) =>
+                            prev.includes(tag) ? prev : `${prev.trim() ? `${prev.trim()} ` : ''}${tag} `
+                          );
+                        }}
+                        className="px-2 py-0.5 rounded-lg bg-[#FAF7F2] hover:bg-blue-50 text-[#2563EB] border border-[#EFECE6] text-[11px] font-bold transition cursor-pointer"
+                      >
+                        {tag}
+                      </button>
+                    ))}
+                  </div>
+                )}
 
                 {inlineMediaPreview && (
                   <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] bg-[#0C0A09] flex items-center justify-center">
@@ -1593,11 +1981,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   </div>
                 )}
 
-                {/* Live Firestore Upload Progress Bar */}
+                {/* Live Cloudinary Upload Progress Bar */}
                 {isSubmittingPost && uploadProgress > 0 && (
                   <div className="my-3 p-3 rounded-2xl bg-blue-50/70 border border-blue-200/80">
                     <div className="flex items-center justify-between text-xs font-bold text-[#1C1917] mb-1.5">
-                      <span>Uploading to community feed...</span>
+                      <span>Uploading to Cloudinary & publishing...</span>
                       <span className="font-mono text-[#2563EB]">{uploadProgress}%</span>
                     </div>
                     <div className="w-full h-2 rounded-full bg-blue-100 overflow-hidden">
@@ -1618,20 +2006,36 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         : 'bg-rose-50 border-rose-200 text-rose-900'
                     }`}
                   >
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
                       <CheckCircle2
                         size={15}
-                        className={postNotice.type === 'success' ? 'text-[#0D9488]' : 'text-rose-600'}
+                        className={`shrink-0 ${
+                          postNotice.type === 'success' ? 'text-[#0D9488]' : 'text-rose-600'
+                        }`}
                       />
-                      <span>{postNotice.text}</span>
+                      <span className="break-words">{postNotice.text}</span>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setPostNotice(null)}
-                      className="text-stone-400 hover:text-stone-700 p-1"
-                    >
-                      <X size={14} />
-                    </button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {postNotice.type === 'error' &&
+                        !isSubmittingPost &&
+                        (inlineMediaFile || inlineContent.trim()) && (
+                          <button
+                            type="button"
+                            onClick={handleCreatePost}
+                            className="px-2.5 py-1 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-[11px] flex items-center gap-1 cursor-pointer"
+                          >
+                            <RotateCcw size={12} />
+                            <span>Retry</span>
+                          </button>
+                        )}
+                      <button
+                        type="button"
+                        onClick={() => setPostNotice(null)}
+                        className="text-stone-400 hover:text-stone-700 p-1"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1659,7 +2063,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
                       <ImageIcon size={16} />
-                      <span>Photo</span>
+                      <span>{t('feed.photo')}</span>
                     </button>
 
                     <button
@@ -1671,7 +2075,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
                     >
                       <VideoIcon size={16} />
-                      <span>Video (Up to {maxVideoSeconds}s)</span>
+                      <span>{t('feed.video')} ({maxVideoSeconds}s)</span>
                     </button>
                   </div>
 
@@ -1683,11 +2087,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition"
                   >
                     {isSubmittingPost ? (
-                      <span>Sharing...</span>
+                      <span>{t('feed.sharing')}</span>
                     ) : (
                       <>
                         <Send size={15} />
-                        <span>Share Wave</span>
+                        <span>{t('feed.shareWave')}</span>
                       </>
                     )}
                   </button>
@@ -1982,6 +2386,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         <div>
                           <div className="flex items-center gap-1.5 flex-wrap">
                             <CrystalBadge
+                              userId={post.authorId}
                               email={post.authorEmail}
                               name={post.authorName}
                               isBot={post.authorId === SUPPORT_BOT_ID}
@@ -2074,22 +2479,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           <>
                             <button
                               type="button"
-                              onClick={async () => {
-                                await reportContent({
-                                  targetType: 'post',
-                                  targetId: post.id,
-                                  targetAuthorId: post.authorId,
-                                  targetSummary: post.authorName,
-                                  reason: 'Reported post from community feed'
-                                });
-                                setPostNotice({
-                                  type: 'success',
-                                  text: `Reported wave by ${post.authorName} to platform moderators.`
-                                });
-                                setTimeout(() => setPostNotice(null), 3500);
+                              onClick={() => {
+                                setReportingPost(post);
+                                setSelectedReportCategory('stolen_content');
+                                setReportExtraNote('');
                               }}
-                              className="p-1.5 text-slate-400 hover:text-amber-600 rounded-xl transition"
-                              title="Report Post"
+                              className="p-1.5 text-slate-400 hover:text-amber-600 rounded-xl transition cursor-pointer"
+                              title={language === 'sw' ? 'Ripoti Chapisho' : 'Report Post'}
                             >
                               <Flag size={15} />
                             </button>
@@ -2099,11 +2495,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 await toggleBlockUser(post.authorId);
                                 setPostNotice({
                                   type: 'success',
-                                  text: `Blocked ${post.authorName}. You can manage blocked users in Privacy Settings.`
+                                  text:
+                                    language === 'sw'
+                                      ? `Umemzuia ${post.authorName}. Unaweza kudhibiti watumiaji uliowazuia kwenye Mipangilio ya Faragha.`
+                                      : `Blocked ${post.authorName}. You can manage blocked users in Privacy Settings.`
                                 });
                                 setTimeout(() => setPostNotice(null), 3500);
                               }}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition"
+                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition cursor-pointer"
                               title={`Block ${post.authorName}`}
                             >
                               <Ban size={15} />
@@ -2174,6 +2573,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           Math.max(0, carouselIndices[post.id] || 0)
                         );
                         const currentImgUrl = slides[activeSlideIdx] || post.imageUrl!;
+                        const isFullImageUnlocked = Boolean(unlockedFullImages[post.id]);
+                        const displayImgUrl = getOptimizedImagePreviewUrl(
+                          currentImgUrl,
+                          isDataSaverOn,
+                          isFullImageUnlocked
+                        );
                         const imgDims =
                           preloadedDimensions[currentImgUrl] || getPreloadedMediaInfo(currentImgUrl);
 
@@ -2181,6 +2586,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           <div
                             onClick={(e) => {
                               e.stopPropagation();
+                              if (isDataSaverOn && !isFullImageUnlocked) {
+                                setUnlockedFullImages((prev) => ({ ...prev, [post.id]: true }));
+                                return;
+                              }
                               setLightboxState({
                                 images: slides.length > 0 ? slides : [currentImgUrl],
                                 initialIndex: activeSlideIdx,
@@ -2208,7 +2617,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             {/* Soft blurred, darkened copy of the same photo filling empty side space so there are no black bars */}
                             <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
                               <img
-                                src={currentImgUrl}
+                                src={displayImgUrl}
                                 alt=""
                                 className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
                               />
@@ -2216,11 +2625,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             </div>
 
                             <img
-                              src={currentImgUrl}
+                              src={displayImgUrl}
                               alt="Wave attachment"
                               decoding="async"
                               onLoad={(e) => {
                                 const img = e.currentTarget;
+                                if (isDataSaverOn && !isFullImageUnlocked) {
+                                  recordDataSavedBytes(320 * 1024);
+                                }
                                 if (img.naturalWidth > 0 && img.naturalHeight > 0) {
                                   handleMediaDimensionsReady(currentImgUrl, {
                                     width: img.naturalWidth,
@@ -2243,6 +2655,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 (e.target as HTMLElement).style.display = 'none';
                               }}
                             />
+
+                            {/* Phase 1 Data Saver Small Preview Pill (Tap to load full image) */}
+                            {isDataSaverOn && !isFullImageUnlocked && (
+                              <div className="absolute bottom-3 right-3 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/70 backdrop-blur-xs text-white text-[11px] font-bold border border-white/20 shadow-md pointer-events-none">
+                                <Zap size={12} className="text-teal-300" />
+                                <span>{t('datasaver.tapToLoadFullImage')}</span>
+                              </div>
+                            )}
 
                             {slides.length > 1 && (
                               <>
@@ -2346,7 +2766,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           }`}
                         >
                           <MessageCircle size={16} />
-                          <span className="font-mono tabular-numbers">{post.commentsCount || 0} Replies</span>
+                          <span className="font-mono tabular-numbers">{post.commentsCount || 0} {t('feed.replies')}</span>
                         </button>
 
                         {/* Creator Tip Button */}
@@ -2356,7 +2776,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           title="Tip creator directly via Mobile Money"
                         >
                           <HandCoins size={15} className="text-amber-500" />
-                          <span>Tip {post.tipsCount ? `(${post.tipsCount})` : ''}</span>
+                          <span>{t('feed.tip')} {post.tipsCount ? `(${post.tipsCount})` : ''}</span>
                         </button>
 
                         {/* Save / Bookmark */}
@@ -2381,7 +2801,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           title="Add this post (and more) to your 24-hour Spark"
                         >
                           <Flame size={15} className="text-[#0D9488]" />
-                          <span>Add to Spark</span>
+                          <span>{t('feed.addToSpark')}</span>
                         </button>
                       </div>
 
@@ -2393,7 +2813,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           title="Download post image or text"
                         >
                           <Download size={14} />
-                          <span>Download</span>
+                          <span>{t('feed.download')}</span>
                         </button>
                         <button
                           type="button"
@@ -2402,7 +2822,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           title="Share on WhatsApp or Web Share"
                         >
                           <Share2 size={14} />
-                          <span>Share</span>
+                          <span>{t('feed.share')} {post.sharesCount ? `(${post.sharesCount})` : ''}</span>
                         </button>
                       </div>
                     </div>
@@ -2527,6 +2947,143 @@ export const FeedView: React.FC<FeedViewProps> = ({
             // refresh or keep
           }}
         />
+      )}
+
+      {/* Community-Fitted Safety Report Modal (Stolen Content, Bullying, Scams, Adult Content, Spam) in Swahili & English */}
+      {reportingPost && (
+        <div
+          className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setReportingPost(null)}
+        >
+          <div
+            className="w-full max-w-md bg-white border border-stone-200 rounded-3xl p-5 sm:p-6 shadow-2xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-2xl bg-amber-50 text-amber-600 border border-amber-200">
+                  <Flag size={18} />
+                </div>
+                <div>
+                  <h3 className="text-base font-extrabold text-stone-900">
+                    {language === 'sw' ? 'Ripoti Maudhui kwa Usalama wa Jamii' : 'Report Content for Community Safety'}
+                  </h3>
+                  <p className="text-xs text-stone-500">
+                    {language === 'sw'
+                      ? `Chapisho la ${reportingPost.authorName} litakaguliwa kwa Kiswahili na Kiingereza.`
+                      : `Post by ${reportingPost.authorName} will be reviewed by our moderation team.`}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReportingPost(null)}
+                className="p-1.5 rounded-xl text-stone-400 hover:text-stone-700 hover:bg-stone-100"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {COMMUNITY_REPORT_CATEGORIES.map((cat) => {
+                const isSelected = selectedReportCategory === cat.id;
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    onClick={() => setSelectedReportCategory(cat.id)}
+                    className={`w-full p-3 rounded-2xl border text-left transition flex items-start justify-between gap-2 cursor-pointer ${
+                      isSelected
+                        ? 'bg-amber-50/90 border-amber-400 text-stone-900 shadow-2xs'
+                        : 'bg-stone-50/70 border-stone-200 hover:border-stone-300 text-stone-800'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-extrabold">
+                        {language === 'sw' ? cat.labelSw : cat.labelEn}
+                      </div>
+                      <div className="text-[11px] text-stone-500 mt-0.5">
+                        {language === 'sw' ? cat.descSw : cat.descEn}
+                      </div>
+                    </div>
+                    <div
+                      className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${
+                        isSelected ? 'bg-amber-500 border-amber-500 text-white' : 'border-stone-300 bg-white'
+                      }`}
+                    >
+                      {isSelected && <Check size={12} />}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-stone-700 mb-1">
+                {language === 'sw' ? 'Maelezo ya ziada (Hiari)' : 'Additional details (Optional)'}
+              </label>
+              <textarea
+                rows={2}
+                value={reportExtraNote}
+                onChange={(e) => setReportExtraNote(e.target.value)}
+                placeholder={
+                  language === 'sw'
+                    ? 'Eleza kwa ufupi tatizo uliloliona...'
+                    : 'Briefly describe the issue...'
+                }
+                className="w-full p-2.5 rounded-xl bg-stone-50 border border-stone-200 text-xs text-stone-900 resize-none"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setReportingPost(null)}
+                className="px-4 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-bold cursor-pointer"
+              >
+                {language === 'sw' ? 'Ghairi' : 'Cancel'}
+              </button>
+              <button
+                type="button"
+                disabled={isSubmittingReport}
+                onClick={async () => {
+                  const chosen =
+                    COMMUNITY_REPORT_CATEGORIES.find((c) => c.id === selectedReportCategory) ||
+                    COMMUNITY_REPORT_CATEGORIES[0];
+                  setIsSubmittingReport(true);
+                  try {
+                    await reportContent({
+                      targetType: 'post',
+                      targetId: reportingPost.id,
+                      targetAuthorId: reportingPost.authorId,
+                      targetSummary: reportingPost.authorName,
+                      reason: `${chosen.labelEn} / ${chosen.labelSw}${
+                        reportExtraNote.trim() ? `: ${reportExtraNote.trim()}` : ''
+                      }`
+                    });
+                    setPostNotice({
+                      type: 'success',
+                      text: language === 'sw' ? chosen.moderationNoticeSw : chosen.moderationNoticeEn
+                    });
+                    setTimeout(() => setPostNotice(null), 5000);
+                    setReportingPost(null);
+                  } finally {
+                    setIsSubmittingReport(false);
+                  }
+                }}
+                className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-extrabold cursor-pointer"
+              >
+                {isSubmittingReport
+                  ? language === 'sw'
+                    ? 'Inatuma...'
+                    : 'Submitting...'
+                  : language === 'sw'
+                  ? 'Tuma Ripoti'
+                  : 'Submit Report'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Post Detail Reader Modal with Top Visual Reading Progress Bar */}

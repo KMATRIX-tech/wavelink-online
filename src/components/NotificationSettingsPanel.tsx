@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { useLanguage } from '../context/LanguageContext';
 import { UserNotificationSettings } from '../types';
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
@@ -28,11 +29,14 @@ import {
   Loader2,
   Smartphone,
   ShieldCheck,
-  Send
+  Send,
+  Trophy,
+  MessageCircle
 } from 'lucide-react';
 
 export const NotificationSettingsPanel: React.FC = () => {
   const { currentUser, userProfile, updateUserProfile, showGlobalToast } = useAuth();
+  const { language, t } = useLanguage();
 
   const [settings, setSettings] = useState<UserNotificationSettings>(() => ({
     ...DEFAULT_NOTIFICATION_SETTINGS,
@@ -72,15 +76,24 @@ export const NotificationSettingsPanel: React.FC = () => {
         setDeviceToken(result.token);
         setStatusFeedback({
           type: 'success',
-          text: 'Push notifications are now enabled for this device!'
+          text:
+            language === 'sw'
+              ? 'Arifa za simu zimewashwa kwenye kifaa hiki!'
+              : 'Push notifications are now enabled for this device!'
         });
-        showGlobalToast('Push notifications enabled on this device!');
+        showGlobalToast(
+          language === 'sw'
+            ? 'Arifa zimewashwa kwenye kifaa hiki!'
+            : 'Push notifications enabled on this device!'
+        );
       } else {
         setStatusFeedback({
           type: 'error',
           text:
             result.error ||
-            'Could not enable push notifications. Please check your browser permission settings.'
+            (language === 'sw'
+              ? 'Imeshindikana kuwasha arifa. Tafadhali angalia ruhusa za kivinjari chako.'
+              : 'Could not enable push notifications. Please check your browser permission settings.')
         });
       }
     } finally {
@@ -97,9 +110,16 @@ export const NotificationSettingsPanel: React.FC = () => {
       setDeviceToken(null);
       setStatusFeedback({
         type: 'success',
-        text: 'This device token has been removed and will no longer receive push alerts.'
+        text:
+          language === 'sw'
+            ? 'Kifaa hiki kimeondolewa na hakitapokea tena arifa.'
+            : 'This device token has been removed and will no longer receive push alerts.'
       });
-      showGlobalToast('Push notifications turned off for this device.');
+      showGlobalToast(
+        language === 'sw'
+          ? 'Arifa zimezimwa kwenye kifaa hiki.'
+          : 'Push notifications turned off for this device.'
+      );
     } finally {
       setIsRequestingPermission(false);
     }
@@ -134,35 +154,56 @@ export const NotificationSettingsPanel: React.FC = () => {
         recipientId: `${currentUser.uid}`,
         actorId: 'wavelink_push_test',
         actorName: 'WaveLink Security',
-        type: 'message',
-        title: 'WaveLink Push Test 🔔',
-        body: 'Your push notifications and privacy preview settings are working properly!'
+        type: 'incoming_call',
+        title:
+          language === 'sw'
+            ? 'Simu Inayoingia ya Jaribio 📞'
+            : 'Incoming Call Push Test 📞',
+        body:
+          language === 'sw'
+            ? 'Jaribio la arifa yenye kitufe cha Pokea (Answer) na Kataa (Decline).'
+            : 'Loud notification test with Answer and Decline buttons!'
       });
 
       // Also show a browser notification via Service Worker if granted on this device
       if ('serviceWorker' in navigator && Notification.permission === 'granted' && settings.masterEnabled) {
         const reg = await navigator.serviceWorker.getRegistration('/sw.js');
         if (reg) {
-          const previewBody = settings.showMessagePreviews
-            ? 'Your push notifications and privacy preview settings are working…'
-            : 'Sent you a private message on WaveLink. Tap to view.';
-          await reg.showNotification('WaveLink Push Test 🔔', {
-            body: previewBody,
-            icon: '/pwa-192x192.png',
-            badge: '/pwa-192x192.png',
-            tag: 'wavelink-test'
-          });
+          await reg.showNotification(
+            language === 'sw' ? 'Simu Inayoingia • WaveLink 📞' : 'Incoming WaveLink Call 📞',
+            {
+              body:
+                language === 'sw'
+                  ? 'Gusa Pokea (Answer) au Kataa (Decline).'
+                  : 'Tap Answer to connect or Decline.',
+              icon: '/pwa-192x192.png',
+              badge: '/pwa-192x192.png',
+              tag: 'wavelink-call-test',
+              requireInteraction: true,
+              vibrate: [400, 150, 400, 150, 500],
+              actions: [
+                { action: 'answer_call', title: '📞 Answer' },
+                { action: 'decline_call', title: '✕ Decline' }
+              ]
+            } as any
+          );
         }
       }
 
       setStatusFeedback({
         type: 'success',
-        text: 'Test notification sent! Check your device notification tray and the bell icon.'
+        text:
+          language === 'sw'
+            ? 'Arifa ya jaribio imetumwa! Angalia sehemu ya arifa ya simu yako.'
+            : 'Test notification sent! Check your device notification tray and the bell icon.'
       });
     } catch {
       setStatusFeedback({
         type: 'error',
-        text: 'Could not send test notification right now.'
+        text:
+          language === 'sw'
+            ? 'Imeshindikana kutuma arifa ya jaribio kwa sasa.'
+            : 'Could not send test notification right now.'
       });
     } finally {
       setIsSendingTest(false);
@@ -192,23 +233,23 @@ export const NotificationSettingsPanel: React.FC = () => {
             <div>
               <div className="flex items-center gap-2 flex-wrap">
                 <h3 className="text-base font-extrabold text-stone-900">
-                  Push Notifications on This Device
+                  {t('notif.settings_title')}
                 </h3>
                 {isDeviceSubscribed ? (
                   <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold">
                     <CheckCircle2 size={12} />
-                    <span>Active</span>
+                    <span>{language === 'sw' ? 'Imewashwa' : 'Active'}</span>
                   </span>
                 ) : (
                   <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-stone-100 text-stone-600 text-[11px] font-bold">
-                    <span>Not enabled yet</span>
+                    <span>{language === 'sw' ? 'Bado haijawashwa' : 'Not enabled yet'}</span>
                   </span>
                 )}
               </div>
 
-              {/* Exactly one kind sentence explaining why */}
+              {/* Kind explanation sentence */}
               <p className="text-xs sm:text-sm text-stone-600 mt-1 leading-relaxed">
-                Enable push notifications so you never miss a message, call, or update from your friends.
+                {t('notif.kind_explanation')}
               </p>
             </div>
           </div>
@@ -223,7 +264,7 @@ export const NotificationSettingsPanel: React.FC = () => {
                   className="px-3.5 py-2.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-xs font-bold inline-flex items-center gap-1.5 transition"
                 >
                   {isSendingTest ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                  <span>Send Test Alert</span>
+                  <span>{t('notif.test_btn')}</span>
                 </button>
                 <button
                   type="button"
@@ -232,7 +273,7 @@ export const NotificationSettingsPanel: React.FC = () => {
                   className="px-3.5 py-2.5 rounded-xl bg-stone-100 hover:bg-rose-50 text-stone-700 hover:text-rose-600 border border-stone-200 text-xs font-bold inline-flex items-center gap-1.5 transition"
                 >
                   <BellOff size={14} />
-                  <span>Turn Off on Device</span>
+                  <span>{t('notif.disable_btn')}</span>
                 </button>
               </>
             ) : (
@@ -245,12 +286,12 @@ export const NotificationSettingsPanel: React.FC = () => {
                 {isRequestingPermission ? (
                   <>
                     <Loader2 size={15} className="animate-spin" />
-                    <span>Requesting Permission...</span>
+                    <span>{language === 'sw' ? 'Inaomba ruhusa...' : 'Requesting Permission...'}</span>
                   </>
                 ) : (
                   <>
                     <Bell size={15} />
-                    <span>Enable Push Notifications</span>
+                    <span>{t('notif.enable_btn')}</span>
                   </>
                 )}
               </button>
@@ -290,18 +331,22 @@ export const NotificationSettingsPanel: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <h4 className="text-sm font-extrabold text-stone-900">
-                  Master Notification Switch
+                  {language === 'sw' ? 'Swichi Kuu ya Arifa' : 'Master Notification Switch'}
                 </h4>
                 {isSaving && (
                   <span className="text-[11px] text-blue-600 font-semibold flex items-center gap-1">
                     <Loader2 size={11} className="animate-spin" />
-                    Saving...
+                    {language === 'sw' ? 'Inahifadhi...' : 'Saving...'}
                   </span>
                 )}
               </div>
               <p className="text-xs text-stone-500 mt-0.5">
                 {settings.masterEnabled
-                  ? 'All selected notification categories below are active.'
+                  ? language === 'sw'
+                    ? 'Aina zote za arifa ulizochagua hapa chini zimewashwa.'
+                    : 'All selected notification categories below are active.'
+                  : language === 'sw'
+                  ? 'Arifa zote zimesitishwa kwenye vifaa vyako.'
                   : 'All push notifications are paused across your devices.'}
               </p>
             </div>
@@ -332,9 +377,13 @@ export const NotificationSettingsPanel: React.FC = () => {
         }`}
       >
         <div>
-          <h4 className="text-sm font-extrabold text-stone-900">Notification Categories</h4>
+          <h4 className="text-sm font-extrabold text-stone-900">
+            {language === 'sw' ? 'Aina za Arifa' : 'Notification Categories'}
+          </h4>
           <p className="text-xs text-stone-500 mt-0.5">
-            Choose exactly which updates WaveLink sends from the server to your devices.
+            {language === 'sw'
+              ? 'Chagua ni arifa zipi ungependa kupokea kutoka kwenye seva ya WaveLink.'
+              : 'Choose exactly which updates WaveLink sends from the server to your devices.'}
           </p>
         </div>
 
@@ -342,43 +391,85 @@ export const NotificationSettingsPanel: React.FC = () => {
           {[
             {
               key: 'messages' as const,
-              label: 'Messages',
-              desc: 'Direct messages and group chat replies',
+              label: t('notif.cat_messages'),
+              desc:
+                language === 'sw'
+                  ? 'Ujumbe wa moja kwa moja na soga za vikundi'
+                  : 'Direct messages and group chat messages',
               icon: <MessageSquare size={16} className="text-blue-600" />,
               bg: 'bg-blue-50'
             },
             {
               key: 'calls' as const,
-              label: 'Incoming Calls',
-              desc: 'Real-time voice and video call alerts',
+              label: t('notif.cat_calls'),
+              desc:
+                language === 'sw'
+                  ? 'Arifa kubwa yenye kitufe cha Pokea (Answer) na Kataa (Decline)'
+                  : 'Loud high-priority alert with Answer & Decline action buttons',
               icon: <PhoneCall size={16} className="text-emerald-600" />,
               bg: 'bg-emerald-50'
             },
             {
               key: 'followers' as const,
-              label: 'New Followers',
-              desc: 'When someone starts following your profile',
+              label: t('notif.cat_followers'),
+              desc:
+                language === 'sw'
+                  ? 'Mtu anapoanza kukufuata kwenye WaveLink'
+                  : 'When someone starts following your profile',
               icon: <UserPlus size={16} className="text-purple-600" />,
               bg: 'bg-purple-50'
             },
             {
               key: 'reactions' as const,
-              label: 'Reactions & Replies',
-              desc: 'Likes, hearts, fire reactions, and comments on your posts, Reels & Sparks',
+              label: t('notif.cat_reactions'),
+              desc:
+                language === 'sw'
+                  ? 'Likes, mioyo na moto kwenye machapisho, Reels na Sparks zako'
+                  : 'Likes, hearts, and fire reactions on your posts, Reels & Sparks',
               icon: <Heart size={16} className="text-rose-600" />,
               bg: 'bg-rose-50'
             },
             {
-              key: 'announcements' as const,
-              label: 'Announcements & Events',
-              desc: 'Official Notice Board bulletins, schedules, and community events',
-              icon: <Megaphone size={16} className="text-amber-600" />,
+              key: 'replies' as const,
+              label: t('notif.cat_replies'),
+              desc:
+                language === 'sw'
+                  ? 'Maoni na majibu kwenye machapisho au Sparks zako'
+                  : 'Comments and replies on your posts, Reels, and Sparks',
+              icon: <MessageCircle size={16} className="text-sky-600" />,
+              bg: 'bg-sky-50'
+            },
+            {
+              key: 'challenges' as const,
+              label: t('notif.cat_challenges'),
+              desc:
+                language === 'sw'
+                  ? 'Vikumbusho vya mashindano ya wabunifu ya wiki na matokeo ya washindi'
+                  : 'Weekly creator challenge reminders, deadlines, and leaderboard results',
+              icon: <Trophy size={16} className="text-amber-600" />,
               bg: 'bg-amber-50'
             },
             {
+              key: 'announcements' as const,
+              label:
+                language === 'sw' ? 'Matangazo na Matukio' : 'Announcements & Events',
+              desc:
+                language === 'sw'
+                  ? 'Matangazo rasmi ya jumuiya na ratiba za matukio'
+                  : 'Official Notice Board bulletins, schedules, and community events',
+              icon: <Megaphone size={16} className="text-orange-600" />,
+              bg: 'bg-orange-50'
+            },
+            {
               key: 'payments' as const,
-              label: 'Payment Confirmations & Tips',
-              desc: 'Mobile money creator tips, post boosts, and Pro pass receipts',
+              label:
+                language === 'sw'
+                  ? 'Malipo na Zawadi za Wabunifu'
+                  : 'Payment Confirmations & Tips',
+              desc:
+                language === 'sw'
+                  ? 'Zawadi za pesa za simu, kuongeza ufikiaji na uthibitisho wa Pro'
+                  : 'Mobile money creator tips, post boosts, and Pro pass receipts',
               icon: <Coins size={16} className="text-teal-600" />,
               bg: 'bg-teal-50'
             }

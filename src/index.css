@@ -1,7 +1,7 @@
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 @import "tailwindcss";
 
-/* 4 Calm Light Themes via CSS Variables (Never Dark Mode) */
+/* Calm Light Themes via CSS Variables (Never Dark Mode) */
 :root,
 html[data-theme="classic"] {
   --bg-canvas: #FAF7F2;
@@ -13,6 +13,45 @@ html[data-theme="classic"] {
   --accent-primary: #2563EB;
   --accent-secondary: #0D9488;
   --accent-highlight: #F59E0B;
+}
+
+/* Savanna: warm golden acacia & Serengeti sand with crisp dark typography */
+html[data-theme="savanna"] {
+  --bg-canvas: #FCF9F0;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F4EFE0;
+  --text-primary: #1C1917;
+  --text-secondary: #574C3F;
+  --border-hairline: #E8DEC8;
+  --accent-primary: #B45309;
+  --accent-secondary: #0D9488;
+  --accent-highlight: #D97706;
+}
+
+/* Zanzibar Sea: coastal turquoise & Indian Ocean breeze with clean readable contrast */
+html[data-theme="zanzibar"] {
+  --bg-canvas: #F2FAFC;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #E3F3F7;
+  --text-primary: #0F172A;
+  --text-secondary: #335262;
+  --border-hairline: #CBE6EE;
+  --accent-primary: #0284C7;
+  --accent-secondary: #0D9488;
+  --accent-highlight: #F59E0B;
+}
+
+/* Kilimanjaro Sunrise: crisp alpine morning light & warm terracotta highland tones */
+html[data-theme="kilimanjaro"] {
+  --bg-canvas: #FDF8F4;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F5EBE2;
+  --text-primary: #1C1917;
+  --text-secondary: #5C4940;
+  --border-hairline: #EAD9CB;
+  --accent-primary: #C2410C;
+  --accent-secondary: #2563EB;
+  --accent-highlight: #D97706;
 }
 
 /* Sunset: soft peach, orange and pink */
@@ -52,6 +91,78 @@ html[data-theme="sunrise"] {
   --accent-primary: #D97706;
   --accent-secondary: #0D9488;
   --accent-highlight: #EAB308;
+}
+
+/* Subtle, tasteful East African Kanga & Kitenge geometric textile accents */
+.kanga-pattern-subtle {
+  background-image:
+    radial-gradient(circle at 12px 12px, rgba(217, 119, 6, 0.08) 2px, transparent 2.5px),
+    linear-gradient(45deg, rgba(13, 148, 136, 0.04) 25%, transparent 25%, transparent 75%, rgba(13, 148, 136, 0.04) 75%),
+    linear-gradient(-45deg, rgba(180, 83, 9, 0.04) 25%, transparent 25%, transparent 75%, rgba(180, 83, 9, 0.04) 75%);
+  background-size: 24px 24px;
+}
+
+.kitenge-border-strip {
+  height: 4px;
+  width: 100%;
+  background: repeating-linear-gradient(
+    90deg,
+    #D97706 0px,
+    #D97706 14px,
+    #0D9488 14px,
+    #0D9488 28px,
+    #2563EB 28px,
+    #2563EB 42px,
+    #B45309 42px,
+    #B45309 56px
+  );
+}
+
+/* Kanga & Kitenge Profile Avatar Frames */
+.kanga-avatar-frame--gold {
+  padding: 2.5px;
+  background: conic-gradient(
+    from 0deg,
+    #D97706,
+    #B45309,
+    #F59E0B,
+    #0D9488,
+    #D97706,
+    #C2410C,
+    #F59E0B,
+    #D97706
+  );
+  box-shadow: 0 0 0 2px #FFFBEB, 0 4px 12px rgba(180, 83, 9, 0.22);
+}
+
+.kanga-avatar-frame--teal {
+  padding: 2.5px;
+  background: conic-gradient(
+    from 45deg,
+    #0D9488,
+    #0284C7,
+    #14B8A6,
+    #F59E0B,
+    #0D9488,
+    #2563EB,
+    #0D9488
+  );
+  box-shadow: 0 0 0 2px #F0FDFA, 0 4px 12px rgba(13, 148, 136, 0.22);
+}
+
+.kanga-avatar-frame--savanna {
+  padding: 2.5px;
+  background: conic-gradient(
+    from 90deg,
+    #15803D,
+    #D97706,
+    #B45309,
+    #0D9488,
+    #15803D,
+    #F59E0B,
+    #15803D
+  );
+  box-shadow: 0 0 0 2px #FEFCE8, 0 4px 12px rgba(21, 128, 61, 0.2);
 }
 
 @layer base {

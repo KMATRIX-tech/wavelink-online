@@ -247,30 +247,30 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               <section className="space-y-2">
                 <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-emerald-600" />
-                  1. WaveLink Pro Subscriptions (18,000 TZS / mo)
+                  1. WaveLink Pro Subscriptions (18,000 TZS / KES 900 / UGX 25,000 per mo)
                 </h3>
                 <p>
-                  Pro memberships unlock 100MB video uploads (compared to 0 KB – 4 MB on Free), 1080p WebRTC calling, and ad-free experience. If your Airtel Money or AzamPay wallet was charged multiple times due to a network glitch, or if features failed to activate, we issue a 100% refund within 48 business hours upon verification.
+                  Pro memberships unlock 100MB video uploads (compared to 0 KB – 4 MB on Free), 1080p WebRTC calling, and an ad-free experience. Payments are explained for M-Pesa, Mixx by Yas (Tigo Pesa), and Airtel Money. If your wallet was charged multiple times due to a network glitch, or if features failed to activate, we issue a 100% refund within 48 business hours upon verification.
                 </p>
               </section>
 
               <section className="space-y-2">
                 <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-emerald-600" />
-                  2. Post Boosts (2,000 TZS)
+                  2. Post Boosts (2,000 TZS / KES 100 / UGX 2,800)
                 </h3>
                 <p>
-                  Post boosts take effect immediately upon transaction approval, elevating your post into the featured community spotlight. If an unexpected server outage prevents the boost from delivering impressions, your account receives full replacement boost credits.
+                  Post boosts take effect immediately upon transaction approval via M-Pesa, Mixx by Yas, or Airtel Money, elevating your post into the featured community spotlight. If an unexpected server outage prevents the boost from delivering impressions, your account receives full replacement boost credits.
                 </p>
               </section>
 
               <section className="space-y-2">
                 <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-emerald-600" />
-                  3. Creator Tips
+                  3. Creator Tips (M-Pesa, Mixx by Yas &amp; Airtel Money)
                 </h3>
                 <p>
-                  Tips sent to creators are voluntary tokens of appreciation and are disbursed in near real-time. Once delivered to the creator&apos;s wallet, tips are non-refundable unless verified as unauthorized fraudulent activity.
+                  Tips sent to creators via M-Pesa, Mixx by Yas, or Airtel Money are voluntary tokens of appreciation and are disbursed in near real-time. Once delivered to the creator&apos;s wallet, tips are non-refundable unless verified as unauthorized fraudulent activity.
                 </p>
               </section>
 
@@ -280,7 +280,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({
                   4. How to Request a Refund
                 </h3>
                 <p>
-                  Message our <strong>WaveLink Support</strong> bot in Direct Messages or submit a ticket in the Support Desk with your Mobile Money transaction reference ID. A human administrator will follow up within 24 hours.
+                  Message our <strong>WaveLink Support</strong> bot in Direct Messages or submit a ticket in the Support Desk with your M-Pesa, Mixx by Yas, or Airtel Money transaction reference ID. A human administrator will follow up within 24 hours.
                 </p>
               </section>
             </div>
@@ -321,7 +321,7 @@ export const LegalFooter: React.FC<{ className?: string }> = ({ className = '' }
               <Waves size={14} />
             </div>
             <span className="font-bold text-[#1C1917]">WaveLink</span>
-            <span className="text-[11px] text-[#57534E]">© 2026. Empowering East African Creators.</span>
+            <span className="text-[11px] font-bold text-[#57534E]">• Empowering African Creators</span>
           </div>
 
           <div className="flex items-center gap-4 flex-wrap justify-center font-medium">

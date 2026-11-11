@@ -3,13 +3,11 @@ import { doc, setDoc } from 'firebase/firestore';
 import {
   db,
   cleanFirestoreData,
-  handleFirestoreError,
-  OperationType,
-  formatVideoUploadError
+  formatVideoUploadError,
+  sanitizeAvatarUrlForFirestore
 } from '../firebase';
 import { OnlineSong } from '../types';
 import {
-  compressImage,
   uploadSparkImageToStorage,
   uploadSparkVideoToStorage,
   SparkVideoMetadata,
@@ -93,27 +91,34 @@ class SparkUploadQueueManager {
   }
 
   public enqueue(input: SparkUploadJobInput): string {
+    // Clear any old failed jobs before queuing a new Spark upload
+    this.jobs = this.jobs.filter((j) => j.status !== 'failed');
+
     const now = Date.now();
     const jobId = `sparkjob_${now}_${Math.random().toString(36).substring(2, 7)}`;
     const firstSlide = input.slides[0];
     const totalCount = input.slides.length;
+    const safeAuthorAvatar = sanitizeAvatarUrlForFirestore(input.authorPhotoURL, input.authorId);
 
     const newJob: SparkUploadJob = {
       id: jobId,
       authorId: input.authorId,
       authorName: input.authorName,
-      authorPhotoURL: input.authorPhotoURL,
-      previewThumbUrl: firstSlide?.mediaDataUrl || input.authorPhotoURL,
+      authorPhotoURL: safeAuthorAvatar,
+      previewThumbUrl: firstSlide?.mediaDataUrl || safeAuthorAvatar,
       totalCount,
       completedCount: 0,
       progress: 6,
       status: 'queued',
       statusText:
         totalCount > 1
-          ? `Queued ${totalCount} Sparks for background upload...`
-          : 'Queued Spark for background upload...',
+          ? `Queued ${totalCount} Sparks for Cloudinary upload...`
+          : 'Queued Spark for Cloudinary upload...',
       createdAt: now,
-      input,
+      input: {
+        ...input,
+        authorPhotoURL: safeAuthorAvatar,
+      },
     };
 
     this.jobs = [newJob, ...this.jobs];
@@ -129,10 +134,10 @@ class SparkUploadQueueManager {
 
     this.updateJob(jobId, {
       status: 'queued',
-      progress: 8,
+      progress: 5,
       completedCount: 0,
       error: undefined,
-      statusText: 'Retrying Spark upload in background...',
+      statusText: 'Re-uploading Spark file from browser to Cloudinary...',
     });
 
     void this.processQueue();
@@ -239,28 +244,33 @@ class SparkUploadQueueManager {
           if (input.attachedSong) {
             sparkPayload.songTitle = input.attachedSong.trackName;
             sparkPayload.songArtist = input.attachedSong.artistName;
-            sparkPayload.songAlbumArt = input.attachedSong.artworkUrl100;
-            sparkPayload.songPreviewUrl = input.attachedSong.previewUrl;
+            if (input.attachedSong.artworkUrl100?.startsWith('http')) {
+              sparkPayload.songAlbumArt = input.attachedSong.artworkUrl100;
+            }
+            if (input.attachedSong.previewUrl?.startsWith('http')) {
+              sparkPayload.songPreviewUrl = input.attachedSong.previewUrl;
+            }
           }
 
           if (slide.mediaType === 'image') {
-            let finalImageUrl = slide.mediaDataUrl;
-            if (slide.file && (!finalImageUrl || finalImageUrl.length > 600 * 1024)) {
-              finalImageUrl = await compressImage(slide.file, 1280, 1280, 0.75);
-            }
             const imgUpload = await uploadSparkImageToStorage({
               sparkId,
               userId: input.authorId,
               file: slide.file,
-              dataUrl: finalImageUrl,
+              dataUrl: slide.mediaDataUrl,
               onProgress: (pct) => {
-                updateOverallProgress(i, pct, 'Uploading photo...');
+                updateOverallProgress(i, pct, `Uploading photo (${pct}%)...`);
               },
             });
+            if (!imgUpload.downloadUrl || !imgUpload.downloadUrl.startsWith('http')) {
+              throw new Error('Cloudinary photo upload did not return a valid secure_url.');
+            }
             sparkPayload.mediaUrl = imgUpload.downloadUrl;
             if (imgUpload.storagePath) {
               sparkPayload.storagePath = imgUpload.storagePath;
             }
+            if (imgUpload.width) sparkPayload.videoWidth = imgUpload.width;
+            if (imgUpload.height) sparkPayload.videoHeight = imgUpload.height;
           } else if (slide.mediaType === 'video') {
             if (!slide.file) {
               throw new Error('Video file is missing for Spark upload. Please select the video again.');

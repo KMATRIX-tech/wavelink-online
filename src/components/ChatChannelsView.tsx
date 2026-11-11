@@ -979,7 +979,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     };
   };
 
-  // Handle image or video file upload in chat with tiered size limits (Free: 0 KB - 4 MB, Pro: up to 100 MB)
+  // Handle image or video file upload in chat directly from browser to Cloudinary (monarcking72)
   const handleChatFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -995,10 +995,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     try {
       setChatMediaNotice(null);
       if (isImage) {
-        setChatMediaType('image');
-        const compressed = await compressImage(file, 1024, 1024, 0.75);
-        setChatMediaUrl(compressed);
         e.target.value = '';
+        setChatMediaNotice('Uploading photo to Cloudinary...');
+        const uploadedUrl = await compressImage(file, 1280, 1280, 0.85, (pct) => {
+          setChatMediaNotice(`Uploading photo to Cloudinary (${pct}%)...`);
+        });
+        if (uploadedUrl && uploadedUrl.startsWith('http')) {
+          setChatMediaType('image');
+          setChatMediaUrl(uploadedUrl);
+          setChatMediaNotice(null);
+        } else {
+          setChatMediaNotice('Could not upload photo to Cloudinary. Please try again.');
+        }
       } else {
         const canUploadLarge = Boolean(isProEffective || isAdmin);
         const validation = validateVideoFileSize(file, canUploadLarge);
@@ -1010,18 +1018,24 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
         const safeVideo = await cloneVideoFileToMemory(file);
         e.target.value = '';
-        setChatMediaType('video');
-        // Provide immediate preview via object URL, then upload to server stream for persistence
-        const previewBlobUrl = URL.createObjectURL(safeVideo);
-        setChatMediaUrl(previewBlobUrl);
+        setChatMediaNotice('Uploading video to Cloudinary (0%)...');
         const chatVidId = `chatvid_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        const serverUrl = await uploadVideoChunkedToServer(chatVidId, safeVideo);
-        if (serverUrl) {
-          setChatMediaUrl(serverUrl);
+        const cloudUrl = await uploadVideoChunkedToServer(chatVidId, safeVideo, (pct) => {
+          setChatMediaNotice(`Uploading video to Cloudinary (${pct}%)...`);
+        });
+        if (cloudUrl && cloudUrl.startsWith('http')) {
+          setChatMediaType('video');
+          setChatMediaUrl(cloudUrl);
+          setChatMediaNotice(null);
+        } else {
+          setChatMediaNotice('Could not upload video to Cloudinary. Please try again.');
         }
       }
-    } catch (err) {
-      console.error('Error reading chat media:', err);
+    } catch (err: any) {
+      console.error('Error uploading chat media to Cloudinary:', err);
+      setChatMediaNotice(
+        err instanceof Error ? err.message : 'Could not upload media to Cloudinary. Please try again.'
+      );
     }
   };
 
@@ -1167,19 +1181,25 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           setInputText((prev) => (prev.trim() ? prev : capturedTranscript));
         }
 
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const base64Audio = typeof reader.result === 'string' ? reader.result : '';
-          if (base64Audio) {
-            setChatMediaType('audio');
-            setChatMediaUrl(base64Audio);
-            setVoiceNoteDuration(finalSecs);
-          }
-        };
-        reader.onerror = () => {
-          setChatMediaNotice('Could not process recorded voice note. Please try again.');
-        };
-        reader.readAsDataURL(audioBlob);
+        const voiceNoteId = `voicenote_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        setChatMediaNotice('Uploading voice note to Cloudinary...');
+        uploadVideoChunkedToServer(voiceNoteId, audioBlob, (pct) => {
+          setChatMediaNotice(`Uploading voice note to Cloudinary (${pct}%)...`);
+        })
+          .then((cloudAudioUrl) => {
+            if (cloudAudioUrl && cloudAudioUrl.startsWith('http')) {
+              setChatMediaType('audio');
+              setChatMediaUrl(cloudAudioUrl);
+              setVoiceNoteDuration(finalSecs);
+              setChatMediaNotice(null);
+            } else {
+              setChatMediaNotice('Could not upload recorded voice note to Cloudinary.');
+            }
+          })
+          .catch((err) => {
+            console.error('Voice note Cloudinary upload error:', err);
+            setChatMediaNotice('Could not upload recorded voice note to Cloudinary. Please try again.');
+          });
       };
 
       recorder.start(250);
@@ -1411,6 +1431,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           const timeoutId = setTimeout(() => controller.abort(), 12000);
 
           let botJson: any = null;
+          const activeLang: 'en' | 'sw' =
+            localStorage.getItem('wavelink_language_pref') === 'sw' ? 'sw' : 'en';
           try {
             const resp = await fetch('/api/support-bot/message', {
               method: 'POST',
@@ -1419,6 +1441,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               body: JSON.stringify({
                 message: botPromptText,
                 channelId: pinnedBotChannel,
+                language: activeLang,
                 history: historyForBot,
                 userPaymentStatus: {
                   isPro: Boolean(isProEffective),
@@ -1430,16 +1453,25 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           } catch {
             // Smart conversational fallback if offline or request timed out
             const lowerQ = botPromptText.toLowerCase().trim();
-            let smartFallback = `Hey ${senderDisplayName}! Here is a helpful answer for **"${botPromptText.slice(0, 120)}"**:\n\nI can help you with any general knowledge question, coding, math, writing captions, or WaveLink features (like 24-hour Sparks, Voice Notes, and WaveLink Pro). Could you share a bit more detail or let me know what you'd like to explore?`;
+            let smartFallback =
+              activeLang === 'sw'
+                ? `Hujambo ${senderDisplayName}! Hapa kuna jibu fupi kuhusu **"${botPromptText.slice(0, 120)}"**:\n\nNaweza kukusaidia kwa maswali yoyote ya kawaida, masomo, kuandika maelezo (captions), au jinsi ya kutumia WaveLink (kama Sparks za saa 24, ujumbe wa sauti, na WaveLink Pro). Niambie ungependa nini!`
+                : `Hey ${senderDisplayName}! Here is a helpful answer for **"${botPromptText.slice(0, 120)}"**:\n\nI can help you with any general knowledge question, coding, math, writing captions, or WaveLink features (like 24-hour Sparks, Voice Notes, and WaveLink Pro). Could you share a bit more detail or let me know what you'd like to explore?`;
             if (/^(yo+|hi+|hey+|hello+|sup|mambo|habari|niaje|vipi)[!?. ]*$/i.test(lowerQ)) {
-              smartFallback = `Hey ${senderDisplayName}! 👋 Great to hear from you! Ask me anything—general questions, coding, math, creative writing, or WaveLink tips. What's on your mind?`;
-            } else if (lowerQ.includes('how are you') || lowerQ.includes('how r u')) {
-              smartFallback = `I'm doing great, ${senderDisplayName}! 😊 Ready to answer any question you have. How can I help you today?`;
+              smartFallback =
+                activeLang === 'sw'
+                  ? `Mambo vipi ${senderDisplayName}! 👋 Nafurahi kukusikia! Niulize swali lolote—maswali ya kawaida, masomo, uandishi, au vidokezo vya WaveLink. Nikusaidie na nini leo?`
+                  : `Hey ${senderDisplayName}! 👋 Great to hear from you! Ask me anything—general questions, coding, math, creative writing, or WaveLink tips. What's on your mind?`;
+            } else if (lowerQ.includes('how are you') || lowerQ.includes('how r u') || lowerQ.includes('hali yako')) {
+              smartFallback =
+                activeLang === 'sw'
+                  ? `Niko salama kabisa, ${senderDisplayName}! 😊 Niko tayari kujibu swali lolote ulilo nalo. Nikusaidie vipi leo?`
+                  : `I'm doing great, ${senderDisplayName}! 😊 Ready to answer any question you have. How can I help you today?`;
             }
             botJson = {
               success: true,
               reply: smartFallback,
-              language: 'en',
+              language: activeLang,
               escalate: false
             };
           } finally {
@@ -1449,7 +1481,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           if (!botJson || !botJson.success) {
             setChatMediaNotice(
               botJson?.error ||
-                'WaveLink Support Bot is resting right now. Please try again in a moment.'
+                (activeLang === 'sw'
+                  ? 'WaveLink Support Bot anapumzika kidogo. Tafadhali jaribu tena baada ya muda mfupi.'
+                  : 'WaveLink Support Bot is resting right now. Please try again in a moment.')
             );
           } else {
             const botReplyText = String(botJson.reply || '').trim();
@@ -1651,20 +1685,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
       // Post initial welcome message into group chat
       const welcomeMsgId = `msg_init_${Date.now()}`;
-      await setDoc(doc(db, 'groups', groupId, 'messages', welcomeMsgId), {
-        id: welcomeMsgId,
-        channelId: groupId,
-        senderId: currentUser.uid,
-        senderEmail: currentUser.email || 'system',
-        senderName: userProfile?.displayName || currentUser.displayName || 'Group Admin',
-        senderUsername: '@admin',
-        senderPhotoURL: userProfile?.photoURL || currentUser.photoURL,
-        text: `Welcome to ${newGroupName.trim()}! Wave, chat, and share ideas together. 🎉`,
-        mediaType: 'none',
-        isEdited: false,
-        isDeleted: false,
-        createdAt: new Date().toISOString()
-      });
+      await setDoc(
+        doc(db, 'groups', groupId, 'messages', welcomeMsgId),
+        cleanFirestoreData({
+          id: welcomeMsgId,
+          channelId: groupId,
+          senderId: currentUser.uid,
+          senderEmail: currentUser.email || 'system',
+          senderName: userProfile?.displayName || currentUser.displayName || 'Group Admin',
+          senderUsername: '@admin',
+          senderPhotoURL:
+            userProfile?.photoURL ||
+            currentUser.photoURL ||
+            `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+          text: `Welcome to ${newGroupName.trim()}! Wave, chat, and share ideas together. 🎉`,
+          mediaType: 'none',
+          isEdited: false,
+          isDeleted: false,
+          createdAt: new Date().toISOString()
+        })
+      );
 
       // Reset modal and select newly created group
       setIsCreateGroupOpen(false);
@@ -1797,16 +1837,19 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     }
   };
 
-  // Upload custom group logo from device
+  // Upload custom group logo from device directly to Cloudinary
   const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>, isForEdit = false) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
     try {
-      const compressed = await compressImage(file, 256, 0.8);
-      if (isForEdit) {
-        setEditGroupLogo(compressed);
-      } else {
-        setNewGroupLogo(compressed);
+      const uploadedUrl = await compressImage(file, 512, 512, 0.85);
+      if (uploadedUrl && uploadedUrl.startsWith('http')) {
+        if (isForEdit) {
+          setEditGroupLogo(uploadedUrl);
+        } else {
+          setNewGroupLogo(uploadedUrl);
+        }
       }
     } catch (err) {
       console.error('Logo upload error:', err);

@@ -1,7 +1,12 @@
 import React, { useState } from 'react';
 import { Announcement } from '../types';
 import { useAuth } from '../context/AuthContext';
+import { useLanguage } from '../context/LanguageContext';
 import { CrystalBadge } from './CrystalBadge';
+import {
+  getAfricanCountryMeta,
+  formatEventInViewerLocalTime
+} from '../utils/africanCultureConfig';
 import {
   Calendar,
   Clock,
@@ -29,8 +34,17 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
   isFeedBanner = false
 }) => {
   const { currentUser, isAdmin } = useAuth();
+  const { language, t } = useLanguage();
   const [isCopied, setIsCopied] = useState(false);
   const [isReminderSet, setIsReminderSet] = useState(false);
+  const countryMeta = announcement.countryCode
+    ? getAfricanCountryMeta(announcement.countryCode)
+    : null;
+  const formattedLocalDateTime = formatEventInViewerLocalTime(
+    announcement.eventDate,
+    announcement.eventTime,
+    language === 'sw' ? 'sw' : 'en'
+  );
 
   const isRsvped = Boolean(
     currentUser && announcement.rsvpUserIds?.includes(currentUser.uid)
@@ -75,14 +89,20 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
       <article className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-4 shadow-2xs transition">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 mb-1">
+            <div className="flex items-center gap-2 mb-1 flex-wrap">
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-[#2563EB] border border-blue-200/70">
                 <Pin size={10} className="text-[#2563EB]" />
-                <span>Pinned Notice</span>
+                <span>{language === 'sw' ? 'Tangazo la Jamii' : 'Pinned Notice'}</span>
               </span>
-              {announcement.eventDate && (
-                <span className="text-[11px] text-[#78716C] font-medium truncate">
-                  {announcement.eventDate}
+              {countryMeta && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200/70">
+                  <span>{countryMeta.flag}</span>
+                  <span>{language === 'sw' ? countryMeta.nameSw : countryMeta.nameEn}</span>
+                </span>
+              )}
+              {(announcement.eventDate || announcement.eventTime) && (
+                <span className="text-[11px] text-[#78716C] font-bold truncate">
+                  {formattedLocalDateTime} ({t('events.localTimeLabel')})
                 </span>
               )}
             </div>
@@ -90,7 +110,7 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
               {announcement.title}
             </h3>
             <p className="text-xs text-[#78716C] mt-0.5 line-clamp-2 leading-relaxed">
-              {announcement.content}
+              {announcement.content || announcement.body}
             </p>
           </div>
 
@@ -178,7 +198,7 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
             {announcement.title}
           </h3>
           <p className="text-sm text-[#57534E] mt-1.5 leading-relaxed whitespace-pre-line">
-            {announcement.content}
+            {announcement.content || announcement.body}
           </p>
         </div>
 
@@ -186,22 +206,16 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
           announcement.eventTime ||
           announcement.eventLocation) && (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
-            {announcement.eventDate && (
-              <div className="flex items-center gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917]">
-                <Calendar size={15} className="text-[#2563EB] shrink-0" />
-                <div className="min-w-0">
-                  <div className="text-[10px] uppercase font-bold text-[#78716C]">Date</div>
-                  <div className="truncate font-bold text-xs">{announcement.eventDate}</div>
-                </div>
-              </div>
-            )}
-
-            {announcement.eventTime && (
-              <div className="flex items-center gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917]">
+            {(announcement.eventDate || announcement.eventTime) && (
+              <div className="sm:col-span-2 flex items-center gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917]">
                 <Clock size={15} className="text-[#0D9488] shrink-0" />
                 <div className="min-w-0">
-                  <div className="text-[10px] uppercase font-bold text-[#78716C]">Time</div>
-                  <div className="truncate font-bold text-xs">{announcement.eventTime}</div>
+                  <div className="text-[10px] uppercase font-bold text-[#78716C]">
+                    {t('events.localTimeLabel')}
+                  </div>
+                  <div className="truncate font-bold text-xs">
+                    {formattedLocalDateTime}
+                  </div>
                 </div>
               </div>
             )}
@@ -211,7 +225,10 @@ export const RichEventCard: React.FC<RichEventCardProps> = ({
                 <MapPin size={15} className="text-[#D97706] shrink-0" />
                 <div className="min-w-0">
                   <div className="text-[10px] uppercase font-bold text-[#78716C]">Location</div>
-                  <div className="truncate font-bold text-xs">{announcement.eventLocation}</div>
+                  <div className="truncate font-bold text-xs">
+                    {countryMeta ? `${countryMeta.flag} ` : ''}
+                    {announcement.eventLocation}
+                  </div>
                 </div>
               </div>
             )}

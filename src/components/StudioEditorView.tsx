@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   collection,
-  addDoc,
-  serverTimestamp,
+  doc,
+  setDoc,
   getDocs,
   query,
   orderBy,
@@ -11,16 +11,23 @@ import {
 import {
   db,
   auth,
+  cleanFirestoreData,
+  sanitizeAvatarUrlForFirestore,
+  formatVideoUploadError,
   handleFirestoreError,
   OperationType,
 } from '../firebase';
-import { readFileAsDataUrlSafe } from '../utils/mediaStorage';
-import { enqueueVideoUploadJob, useVideoUploadQueue } from '../services/videoUploadQueue';
+import { uploadImageToCloudinary } from '../utils/mediaStorage';
+import {
+  enqueueVideoUploadJob,
+  clearFailedVideoAndStudioDrafts,
+} from '../services/videoUploadQueue';
 import { SongSelectorModal } from './SongSelectorModal';
-import { OnlineSong } from '../types';
+import { OnlineSong, Post } from '../types';
 import {
   getHydratedRoyaltyFreeTracks,
   playAudioWithVoiceEffect,
+  resolvePlayableAudioUrl,
   VoiceEffectType,
   RoyaltyFreeTrack,
 } from '../utils/creatorStudioAudio';
@@ -422,6 +429,8 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
   const [isHeavyActionLoading, setIsHeavyActionLoading] = useState<string | null>(null);
   const [isPublishing, setIsPublishing] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadStatusText, setUploadStatusText] = useState<string>('Uploading to Cloudinary...');
+  const [canRetryUpload, setCanRetryUpload] = useState<boolean>(false);
   const [publishSuccess, setPublishSuccess] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -432,16 +441,10 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
   const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   const duetVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  // Check for existing draft & fetch real community videos for Reaction/Duet
+  // Clear old failed drafts & fetch real community videos for Reaction/Duet
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STUDIO_DRAFT_STORAGE_KEY);
-      if (raw) {
-        setHasSavedDraft(true);
-      }
-    } catch {
-      // ignore
-    }
+    clearFailedVideoAndStudioDrafts();
+    setHasSavedDraft(false);
 
     const fetchFeedVideosForDuet = async () => {
       try {
@@ -1076,8 +1079,9 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       bgMusicAudioRef.current = new Audio();
     }
     const audio = bgMusicAudioRef.current;
-    if (audio.src !== selectedSong.previewUrl) {
-      audio.src = selectedSong.previewUrl;
+    const playableSongUrl = resolvePlayableAudioUrl(selectedSong.previewUrl);
+    if (audio.src !== playableSongUrl) {
+      audio.src = playableSongUrl;
       audio.currentTime = songStartTime;
     }
     audio.loop = true;
@@ -1613,141 +1617,235 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       }
     }
 
+    // Clear any old failed drafts before starting a fresh upload from the browser
+    clearFailedVideoAndStudioDrafts();
+
     setIsPublishing(true);
-    setUploadProgress(8);
+    setCanRetryUpload(false);
+    setUploadProgress(5);
+    setUploadStatusText('Preparing export for Cloudinary...');
     setErrorMsg(null);
 
     const extractedHashtags = Array.from(
-      new Set((caption.match(/#[a-zA-Z0-9_]+/g) || []).map((t) => t.toLowerCase()))
+      new Set((caption.match(/#[a-zA-Z0-9_]+/g) || []).map((t) => t.replace(/^#/, '').toLowerCase()))
     );
+
+    const safeSongPreviewUrl =
+      selectedSong?.previewUrl && selectedSong.previewUrl.startsWith('http')
+        ? selectedSong.previewUrl
+        : undefined;
+    const safeSongAlbumArt =
+      selectedSong?.artworkUrl100 && selectedSong.artworkUrl100.startsWith('http')
+        ? selectedSong.artworkUrl100
+        : undefined;
 
     const songMetadataPayload = selectedSong
       ? {
-          songId: String(selectedSong.trackId),
           songTitle: selectedSong.trackName,
           songArtist: selectedSong.artistName,
-          songAlbumArt: selectedSong.artworkUrl100,
-          songPreviewUrl: selectedSong.previewUrl,
+          songAlbumArt: safeSongAlbumArt,
+          songPreviewUrl: safeSongPreviewUrl,
           songStartTime: songStartTime ?? 0,
           songVolume: songVolume ?? 85,
         }
       : {};
 
+    const authorName = currentUser.displayName || 'Creator';
+    const authorUsername = `@${authorName.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'creator'}`;
+    const authorPhotoURL = sanitizeAvatarUrlForFirestore(
+      currentUser.photoURL,
+      currentUser.uid
+    );
+
     try {
-      // VIDEO FLOW -> Uses existing Cloudinary queue with live progress bar
+      // VIDEO FLOW -> Direct browser upload to Cloudinary (monarcking72 / monarcking72) with live progress bar
+      // Creates the Firestore post document ONLY after the upload succeeds, then shows it at the top of the feed.
       if (selectedFile && mediaType === 'video') {
-        setUploadProgress(25);
-        let finalCoverDataUrl = customCoverDataUrl || undefined;
-        if (!finalCoverDataUrl && videoPreviewRef.current) {
+        let customCoverHttpUrl: string | undefined = undefined;
+        const hasVisualCoverEdits =
+          Boolean(customCoverDataUrl) ||
+          overlays.length > 0 ||
+          stickers.length > 0 ||
+          filterPreset !== 'none' ||
+          comedyTemplate !== 'none';
+
+        if (hasVisualCoverEdits) {
           try {
-            finalCoverDataUrl = await bakeEditedCanvasDataUrl(videoPreviewRef.current);
-          } catch {
-            // fallback to default thumbnail generation in queue
+            setUploadStatusText('Uploading cover thumbnail to Cloudinary...');
+            const coverDataUrl =
+              customCoverDataUrl ||
+              (videoPreviewRef.current ? await bakeEditedCanvasDataUrl(videoPreviewRef.current) : '');
+            if (coverDataUrl) {
+              const uploadedCover = await uploadImageToCloudinary(coverDataUrl, (pct) => {
+                setUploadProgress(Math.max(5, Math.min(18, Math.round(pct * 0.18))));
+              });
+              if (uploadedCover.secureUrl && uploadedCover.secureUrl.startsWith('http')) {
+                customCoverHttpUrl = uploadedCover.secureUrl;
+              }
+            }
+          } catch (coverErr) {
+            console.warn('Custom cover upload skipped, using Cloudinary video frame thumbnail:', coverErr);
           }
         }
-        setUploadProgress(55);
 
-        const authorName = currentUser.displayName || 'Creator';
-        const authorUsername = `@${authorName.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'creator'}`;
-        const authorPhotoURL =
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/avataaars/svg?seed=${currentUser.uid}`;
-
-        enqueueVideoUploadJob({
-          authorId: currentUser.uid,
-          authorEmail: currentUser.email || '',
-          authorName,
-          authorUsername,
-          authorPhotoURL,
-          file: selectedFile,
-          caption: caption.trim() || 'New Wave Video ✨',
-          trimStart,
-          trimEnd,
-          customThumbnailDataUrl: finalCoverDataUrl,
-          isProUser: isProCreator,
-          aspectRatio,
-          audience,
-          locationTag: locationTag.trim(),
-          allowComments,
-          hashtags: extractedHashtags,
-          songMetadata: songMetadataPayload,
+        await new Promise<void>((resolve, reject) => {
+          enqueueVideoUploadJob({
+            authorId: currentUser.uid,
+            authorEmail: currentUser.email || '',
+            authorName,
+            authorUsername,
+            authorPhotoURL,
+            file: selectedFile,
+            caption: caption.trim() || 'New Wave Video ✨',
+            trimStart,
+            trimEnd,
+            customThumbnailUrl: customCoverHttpUrl,
+            isProUser: isProCreator,
+            aspectRatio,
+            audience,
+            locationTag: locationTag.trim(),
+            allowComments,
+            hashtags: extractedHashtags,
+            songMetadata: songMetadataPayload,
+            onProgress: (pct, statusLabel) => {
+              setUploadProgress(Math.max(5, Math.min(99, pct)));
+              setUploadStatusText(statusLabel || `Uploading to Cloudinary (${pct}%)...`);
+            },
+            onComplete: () => {
+              resolve();
+            },
+            onError: (errMsg) => {
+              reject(new Error(errMsg));
+            },
+          });
         });
 
         setUploadProgress(100);
-        localStorage.removeItem(STUDIO_DRAFT_STORAGE_KEY);
+        setUploadStatusText('Published to WaveLink!');
+        clearFailedVideoAndStudioDrafts();
         setPublishSuccess(true);
         window.setTimeout(() => {
           setPublishSuccess(false);
           if (onNavigateToFeed) onNavigateToFeed();
-        }, 900);
+        }, 500);
         return;
       }
 
-      // IMAGE / CAROUSEL / TEXT POST FLOW
-      let finalMediaUrl = '';
+      // IMAGE / CAROUSEL / TEXT POST FLOW -> Direct browser upload to Cloudinary (monarcking72 / monarcking72)
+      // Never stores base64 or data URLs in Firestore.
+      let finalImageUrl: string | undefined = undefined;
+      let finalWidth: number | undefined = undefined;
+      let finalHeight: number | undefined = undefined;
       const uploadedCarouselUrls: string[] = [];
 
       if (selectedFile && mediaType === 'image') {
-        setUploadProgress(35);
+        setUploadStatusText('Rendering edited photo...');
+        setUploadProgress(12);
         const imgEl = new Image();
         imgEl.crossOrigin = 'anonymous';
         await new Promise<void>((resolve, reject) => {
           imgEl.onload = () => resolve();
-          imgEl.onerror = () => reject(new Error('Image load failed'));
+          imgEl.onerror = () => reject(new Error('Could not load selected image for export.'));
           imgEl.src = previewUrl!;
         });
 
         const bakedDataUrl = await bakeEditedCanvasDataUrl(imgEl);
-        setUploadProgress(65);
-        finalMediaUrl = bakedDataUrl;
-        uploadedCarouselUrls.push(finalMediaUrl);
+        setUploadStatusText('Uploading photo to Cloudinary...');
+        const mainUploaded = await uploadImageToCloudinary(bakedDataUrl, (pct) => {
+          const totalFiles = Math.max(1, carouselFiles.length);
+          const scaled = Math.round(15 + (pct / totalFiles) * 0.75);
+          setUploadProgress(Math.max(15, Math.min(90, scaled)));
+          setUploadStatusText(`Uploading photo to Cloudinary (${pct}%)...`);
+        });
+
+        if (!mainUploaded.secureUrl || !mainUploaded.secureUrl.startsWith('http')) {
+          throw new Error('Cloudinary photo upload did not return a valid secure_url.');
+        }
+
+        finalImageUrl = mainUploaded.secureUrl;
+        finalWidth = mainUploaded.width;
+        finalHeight = mainUploaded.height;
+        uploadedCarouselUrls.push(mainUploaded.secureUrl);
 
         if (carouselFiles.length > 1) {
           for (let i = 1; i < carouselFiles.length; i++) {
-            const extraUrl = await readFileAsDataUrlSafe(carouselFiles[i]);
-            if (extraUrl) uploadedCarouselUrls.push(extraUrl);
+            const extraUploaded = await uploadImageToCloudinary(carouselFiles[i], (pct) => {
+              const basePct = 15 + Math.round(((i + pct / 100) / carouselFiles.length) * 75);
+              setUploadProgress(Math.max(20, Math.min(92, basePct)));
+              setUploadStatusText(
+                `Uploading carousel photo ${i + 1} of ${carouselFiles.length} (${pct}%)...`
+              );
+            });
+            if (extraUploaded.secureUrl && extraUploaded.secureUrl.startsWith('http')) {
+              uploadedCarouselUrls.push(extraUploaded.secureUrl);
+            }
           }
         }
       }
 
-      setUploadProgress(90);
-      await addDoc(collection(db, 'posts'), {
+      setUploadProgress(95);
+      setUploadStatusText('Saving post to feed...');
+
+      const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const postPayload: Post = {
+        id: postId,
         authorId: currentUser.uid,
-        authorName: currentUser.displayName || 'Creator',
-        authorPhotoURL:
-          currentUser.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${currentUser.uid}`,
-        caption: caption.trim() || 'Created with WaveLink Studio ✨',
-        videoUrl: finalMediaUrl,
-        carouselUrls: uploadedCarouselUrls.length > 1 ? uploadedCarouselUrls : [],
-        mediaType: mediaType || 'text',
+        authorEmail: currentUser.email || '',
+        authorName,
+        authorUsername,
+        authorPhotoURL,
+        content: caption.trim() || 'Created with WaveLink Studio ✨',
+        imageUrl: finalImageUrl,
+        imageUrls: uploadedCarouselUrls.length > 1 ? uploadedCarouselUrls : undefined,
+        mediaType: mediaType === 'image' ? 'image' : undefined,
+        videoWidth: finalWidth,
+        videoHeight: finalHeight,
         aspectRatio,
         audience,
-        locationTag: locationTag.trim(),
+        locationTag: locationTag.trim() || undefined,
         allowComments,
-        hashtags: extractedHashtags,
-        filterCss: 'none',
-        duetWithWaveId: duetLayout !== 'none' ? selectedDuetWave.id : null,
-        duetLayout: duetLayout !== 'none' ? duetLayout : null,
-        comedyTemplate: comedyTemplate !== 'none' ? comedyTemplate : null,
-        likesCount: 0,
-        commentsCount: 0,
-        sharesCount: 0,
-        likedBy: [],
+        hashtags: extractedHashtags.length > 0 ? extractedHashtags : undefined,
         ...songMetadataPayload,
-        createdAt: serverTimestamp(),
-      });
+        likes: [],
+        likesCount: 0,
+        reactions: { like: [], heart: [], fire: [] },
+        reactionCounts: { like: 0, heart: 0, fire: 0 },
+        commentsCount: 0,
+        savesCount: 0,
+        createdAt: new Date().toISOString(),
+      };
+
+      const cleanedPost = cleanFirestoreData(postPayload);
+      await setDoc(doc(db, 'posts', postId), cleanedPost);
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('wavelink:video-post-created', { detail: postPayload })
+        );
+      }
 
       setUploadProgress(100);
-      localStorage.removeItem(STUDIO_DRAFT_STORAGE_KEY);
+      setUploadStatusText('Published to WaveLink!');
+      clearFailedVideoAndStudioDrafts();
       setPublishSuccess(true);
       window.setTimeout(() => {
         setPublishSuccess(false);
         if (onNavigateToFeed) onNavigateToFeed();
-      }, 1000);
+      }, 500);
     } catch (err) {
       console.error('Publish error:', err);
-      setErrorMsg('Failed to publish post. Please check your connection and try again.');
-      handleFirestoreError(err, OperationType.CREATE, 'posts');
+      const formatted = formatVideoUploadError(err, {
+        fileSize: selectedFile?.size,
+        maxAllowedSeconds,
+        isProUser: isProCreator,
+      });
+      setErrorMsg(formatted || 'Failed to publish post. Tap Retry Upload to upload the file again.');
+      setCanRetryUpload(true);
+      try {
+        handleFirestoreError(err, OperationType.CREATE, 'posts');
+      } catch {
+        // Handled in UI error banner
+      }
     } finally {
       setIsPublishing(false);
     }
@@ -1890,14 +1988,29 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       {/* Error Message Banner */}
       {errorMsg && (
         <div className="mb-3 p-3.5 rounded-2xl bg-rose-50 border border-rose-200 flex items-center justify-between gap-2 text-xs font-bold text-rose-700">
-          <span>{errorMsg}</span>
-          <button
-            type="button"
-            onClick={() => setErrorMsg(null)}
-            className="min-w-[36px] min-h-[36px] rounded-xl hover:bg-rose-100 flex items-center justify-center cursor-pointer"
-          >
-            <X size={15} />
-          </button>
+          <span className="flex-1">{errorMsg}</span>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {canRetryUpload && !isPublishing && (
+              <button
+                type="button"
+                onClick={handlePublish}
+                className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-xs flex items-center gap-1.5 cursor-pointer"
+              >
+                <RotateCcw size={13} />
+                <span>Retry Upload</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setErrorMsg(null);
+                setCanRetryUpload(false);
+              }}
+              className="min-w-[36px] min-h-[36px] rounded-xl hover:bg-rose-100 flex items-center justify-center cursor-pointer"
+            >
+              <X size={15} />
+            </button>
+          </div>
         </div>
       )}
 
@@ -3884,7 +3997,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
               <div className="flex justify-between text-xs font-extrabold text-[#2563EB]">
                 <span className="flex items-center gap-2">
                   <Loader2 size={15} className="animate-spin" />
-                  <span>Exporting & Uploading to Cloudinary...</span>
+                  <span>{uploadStatusText || 'Uploading to Cloudinary...'}</span>
                 </span>
                 <span>{uploadProgress}%</span>
               </div>
@@ -3907,12 +4020,17 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
             {isPublishing ? (
               <>
                 <Loader2 size={18} className="animate-spin" />
-                <span>Uploading ({uploadProgress}%)...</span>
+                <span>{uploadStatusText || `Uploading (${uploadProgress}%)...`}</span>
               </>
             ) : publishSuccess ? (
               <>
                 <CheckCircle2 size={18} />
                 <span>Published to WaveLink!</span>
+              </>
+            ) : canRetryUpload ? (
+              <>
+                <RotateCcw size={18} />
+                <span>Retry Upload to Cloudinary</span>
               </>
             ) : (
               <>

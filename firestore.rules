@@ -259,6 +259,28 @@ service cloud.firestore {
       match /savedPosts/{savedPostId} {
         allow read, write: if isOwner(userId) || isAdmin();
       }
+
+      // Phase 5: Private Creator Stats subcollection — strictly only the owner of the account can see or update their own stats
+      match /privateStats/{statDocId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Phase 5: Top-level Private Creator Stats collection — strictly only the owner of the account can see their own stats
+    match /creatorStats/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // Phase 4: Weekly Creator Challenges — readable by everyone, created/updated/deleted by Admins
+    match /challenges/{challengeId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Creator Spotlight of the Week — readable by everyone, chosen/updated by Admins
+    match /creatorSpotlights/{spotlightId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
     }
 
     // Top-level private 'Saved Posts' collection: readable and writable only by the authenticated owner or admin
@@ -285,6 +307,8 @@ service cloud.firestore {
           'reactionCounts',
           'commentsCount',
           'savesCount',
+          'sharesCount',
+          'sharedBy',
           'tipsTotalTZS',
           'isBoosted',
           'updatedAt'

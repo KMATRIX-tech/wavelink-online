@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { useLanguage } from '../context/LanguageContext';
+import { useAfricanRegion, KANGA_PATTERN_FRAMES } from '../utils/africanCultureConfig';
 import { CrystalBadge } from './CrystalBadge';
 import { ActiveTab } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -23,7 +25,8 @@ import {
   Flame,
   UserPlus,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Trophy
 } from 'lucide-react';
 import { inviteFriends } from '../utils/share.js';
 
@@ -47,6 +50,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse
 }) => {
   const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, adminCheckFailedReason, signOut } = useAuth();
+  const { t } = useLanguage();
+  const { currency, countryMeta, patternFrame, formatPrice } = useAfricanRegion(userProfile);
+  const activeFrameClass =
+    KANGA_PATTERN_FRAMES.find((f) => f.id === patternFrame)?.cssClass || '';
   const [internalCollapsed, setInternalCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem('wavelink_left_sidebar_collapsed') === 'true';
@@ -76,26 +83,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const isProUser = isProEffective;
 
   const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; badge?: string }[] = [
-    { id: 'feed', label: 'Home Feed', icon: <Rss size={18} /> },
-    { id: 'videos', label: 'Video Reels', icon: <Film size={18} /> },
-    { id: 'studio', label: 'Media Studio', icon: <Wand2 size={18} />, badge: 'Create' },
-    { id: 'announcements', label: 'Notice Board & Events', icon: <CalendarDays size={18} />, badge: 'Events' },
-    { id: 'chat', label: 'Messages', icon: <MessageSquare size={18} /> },
-    { id: 'monetization', label: 'Monetization Hub', icon: <Coins size={18} />, badge: 'TZS' },
-    { id: 'directory', label: 'Members', icon: <Users size={18} /> },
-    { id: 'analytics', label: 'Creator Analytics', icon: <BarChart3 size={18} />, badge: isProUser ? 'Pro' : undefined },
+    { id: 'feed', label: t('nav.home'), icon: <Rss size={18} /> },
+    { id: 'trending', label: t('nav.trending'), icon: <Trophy size={18} />, badge: 'Hot' },
+    { id: 'videos', label: t('nav.reels'), icon: <Film size={18} /> },
+    { id: 'studio', label: t('nav.create'), icon: <Wand2 size={18} />, badge: 'Create' },
+    { id: 'announcements', label: t('nav.announcements'), icon: <CalendarDays size={18} />, badge: 'Events' },
+    { id: 'chat', label: t('nav.chat'), icon: <MessageSquare size={18} /> },
+    { id: 'monetization', label: t('nav.monetization'), icon: <Coins size={18} />, badge: currency },
+    { id: 'directory', label: t('nav.members'), icon: <Users size={18} /> },
+    { id: 'analytics', label: t('nav.analytics'), icon: <BarChart3 size={18} />, badge: 'Private' },
     // Restrict Admin / Moderator Desk to authorized admins (or owner session needing re-verification)
     ...(isAdmin ||
     adminCheckFailedReason === 'owner sign-in not used' ||
     adminCheckFailedReason === 'session needs refresh'
       ? [{
           id: 'admin' as ActiveTab,
-          label: isSuperAdmin || !isSubAdmin ? 'Admin Desk' : 'Moderator Desk',
+          label: isSuperAdmin || !isSubAdmin ? t('nav.admin') : 'Moderator Desk',
           icon: <Shield size={18} />,
           badge: isSuperAdmin || !isSubAdmin ? 'Owner' : 'Mod'
         }]
       : []),
-    { id: 'settings', label: 'Profile & Settings', icon: <Settings size={18} /> },
+    { id: 'settings', label: t('nav.profile'), icon: <Settings size={18} /> },
   ];
 
   const handleSelectTab = (tab: ActiveTab) => {
@@ -138,7 +146,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 Wave<span className="text-[#2563eb]">Link</span>
               </span>
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 -mt-0.5 truncate">
-                Community Platform
+                {countryMeta.flag} Empowering African Creators
               </span>
             </div>
           )}
@@ -304,7 +312,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <Crown size={18} className="text-amber-200" />
             </button>
             <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-[#0F172A] text-white text-xs font-bold whitespace-nowrap shadow-lg translate-y-2">
-              {isProUser ? 'WaveLink Pro Active (VIP)' : 'WaveLink Pro • 18,000 TZS'}
+              {isProUser ? 'WaveLink Pro Active (VIP)' : `WaveLink Pro • ${formatPrice(18000)}`}
             </div>
           </div>
         ) : (
@@ -320,7 +328,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   </div>
                   <div className="min-w-0">
                     <span className="text-xs font-black block tracking-tight">WaveLink Pro</span>
-                    <span className="text-[10px] text-blue-50 block truncate">18,000 TZS • WaveLink</span>
+                    <span className="text-[10px] text-blue-50 block truncate">{formatPrice(18000)} • M-Pesa / Mixx / Airtel</span>
                   </div>
                 </div>
                 <Sparkles size={14} className="text-amber-200 shrink-0 group-hover:rotate-12 transition-transform" />
@@ -397,7 +405,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 }
                 alt="Avatar"
                 className={`w-9 h-9 rounded-full object-cover shrink-0 ${
-                  userProfile?.isPro
+                  activeFrameClass
+                    ? activeFrameClass
+                    : userProfile?.isPro
                     ? 'pro-aura-gold ring-2 ring-amber-400'
                     : 'ring-2 ring-blue-500/20'
                 }`}
@@ -405,11 +415,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="min-w-0 flex-1">
                 <div className="truncate">
                   <CrystalBadge
+                    userId={currentUser?.uid}
                     email={currentUser?.email}
                     name={userProfile?.displayName || currentUser?.displayName || 'Waver'}
                     isPro={userProfile?.isPro}
                     hasBlueStar={isProUser}
                     isSubAdmin={isSubAdmin}
+                    weeklyWinnerUntil={userProfile?.weeklyWinnerUntil}
                     size="sm"
                     showAdminTag={isAdmin}
                   />
@@ -437,6 +449,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <LogOut size={15} />
               </button>
             </div>
+          </div>
+        )}
+        {!collapsedMode && (
+          <div className="pt-2.5 text-center">
+            <p className="text-[11px] font-extrabold tracking-wide text-[#0D9488]">
+              Empowering African Creators
+            </p>
           </div>
         )}
       </div>

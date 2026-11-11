@@ -9,6 +9,7 @@ import {
   MOBILE_CARRIERS
 } from '../services/paymentService';
 import { sendNotification } from '../services/notificationService';
+import { formatLocalPrice, useAfricanRegion } from '../utils/africanCultureConfig';
 import {
   X,
   HandCoins,
@@ -41,6 +42,11 @@ export const CreatorTipModal: React.FC<CreatorTipModalProps> = ({
   onSuccess
 }) => {
   const { currentUser, userProfile, isAdmin, isProEffective, isExemptFromPayments } = useAuth();
+  const { currency } = useAfricanRegion(
+    userProfile?.countryCode,
+    userProfile?.preferredCurrency,
+    userProfile?.panAfricanLanguage
+  );
   const [amountTZS, setAmountTZS] = useState<number>(2000);
   const [customAmount, setCustomAmount] = useState<string>('');
   const [phoneNumber, setPhoneNumber] = useState('');
@@ -174,7 +180,7 @@ export const CreatorTipModal: React.FC<CreatorTipModalProps> = ({
                 Tip {post.authorName}
               </h3>
               <p className="text-[11px] text-[#57534E] font-medium">
-                Direct Mobile Money Creator Tip
+                M-Pesa • Mixx by Yas • Airtel Money ({currency})
               </p>
             </div>
           </div>
@@ -212,7 +218,7 @@ export const CreatorTipModal: React.FC<CreatorTipModalProps> = ({
                             : 'bg-[#FAF7F2] border border-[var(--border-subtle)] text-[#1C1917] hover:bg-stone-100'
                         }`}
                       >
-                        {amt.toLocaleString()} TZS
+                        {formatLocalPrice(amt, currency)}
                       </button>
                     );
                   })}
@@ -231,7 +237,7 @@ export const CreatorTipModal: React.FC<CreatorTipModalProps> = ({
                 <div className="flex items-center justify-between text-[#57534E]">
                   <span>Gross Tip Amount:</span>
                   <span className="font-mono font-bold text-[#1C1917]">
-                    TZS {currentGross.toLocaleString()}
+                    {formatLocalPrice(currentGross, currency)}
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-amber-700">
@@ -240,13 +246,13 @@ export const CreatorTipModal: React.FC<CreatorTipModalProps> = ({
                     <span>{isFeeWaived ? 'Platform Processing Fee (Waived for Admin/Pro):' : 'Platform Processing Fee (10%):'}</span>
                   </span>
                   <span className={`font-mono font-bold ${isFeeWaived ? 'text-emerald-600' : ''}`}>
-                    {isFeeWaived ? '0 TZS (Waived)' : `-TZS ${platformFee.toLocaleString()}`}
+                    {isFeeWaived ? '0 (Waived)' : `-${formatLocalPrice(platformFee, currency)}`}
                   </span>
                 </div>
                 <div className="pt-1.5 border-t border-[var(--border-subtle)] flex items-center justify-between font-bold text-emerald-700">
                   <span>{isFeeWaived ? 'Creator Net Received (100%):' : 'Creator Net Received (90%):'}</span>
                   <span className="font-mono text-sm">
-                    TZS {creatorNetAmount.toLocaleString()}
+                    {formatLocalPrice(creatorNetAmount, currency)}
                   </span>
                 </div>
               </div>
@@ -254,7 +260,7 @@ export const CreatorTipModal: React.FC<CreatorTipModalProps> = ({
               {/* Mobile Phone Input */}
               <div>
                 <label className="block text-xs font-bold text-[#1C1917] mb-1">
-                  Your Airtel Money / Mobile Phone:
+                  Your M-Pesa, Mixx by Yas, or Airtel Money Phone:
                 </label>
                 <div className="relative">
                   <Phone className="absolute left-3.5 top-3 text-[#2563EB]" size={15} />

@@ -7,6 +7,7 @@ import {
   Disc,
   RotateCcw,
 } from 'lucide-react';
+import { resolvePlayableAudioUrl } from '../utils/creatorStudioAudio';
 
 export interface SongPlayerCardProps {
   title: string;
@@ -47,13 +48,14 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
   const manuallyPausedRef = useRef<boolean>(false);
   const startOffset = Math.max(0, Number(startTime) || 0);
   const normalizedVolume = Math.max(0, Math.min(1, (Number(volume) || 85) / 100));
+  const resolvedSrc = resolvePlayableAudioUrl(previewUrl);
 
   const getOrCreateAudio = useCallback((): HTMLAudioElement => {
-    if (!audioRef.current || audioRef.current.src !== previewUrl) {
+    if (!audioRef.current || audioRef.current.src !== resolvedSrc) {
       if (audioRef.current) {
         audioRef.current.pause();
       }
-      const audio = new Audio(previewUrl);
+      const audio = new Audio(resolvedSrc);
       audio.preload = 'metadata';
       audio.volume = normalizedVolume;
       audio.muted = isMuted;
@@ -88,7 +90,7 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
       audioRef.current.volume = normalizedVolume;
     }
     return audioRef.current;
-  }, [previewUrl, normalizedVolume, isMuted, startOffset]);
+  }, [resolvedSrc, normalizedVolume, isMuted, startOffset]);
 
   // Sync volume & mute changes live
   useEffect(() => {

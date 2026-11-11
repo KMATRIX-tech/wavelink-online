@@ -6,8 +6,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { LanguageProvider, useLanguage } from './context/LanguageContext';
 import { db, testConnection } from './firebase';
-import { collection, query, where, onSnapshot, updateDoc, doc } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, updateDoc, doc, getDoc } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
 import { ActiveTab, CallRecipient } from './types';
@@ -20,6 +21,8 @@ import { BannedView } from './components/BannedView';
 import { FeedView } from './components/FeedView';
 import { StudioEditorView } from './components/StudioEditorView';
 import { VideosHubView } from './components/VideosHubView';
+import { TrendingChallengesView } from './components/TrendingChallengesView';
+import { InterestPickerModal, hasUserCompletedOrSkippedInterests } from './components/InterestPickerModal';
 import { AnnouncementsView } from './components/AnnouncementsView';
 import { ChatChannelsView } from './components/ChatChannelsView';
 import { UserDirectoryView } from './components/UserDirectoryView';
@@ -34,6 +37,7 @@ import { SparkUploadQueueBanner } from './components/SparkUploadQueueBanner';
 import { VideoUploadProgressChip } from './components/VideoUploadProgressChip';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { validateFrontendEnvironment } from './utils/envValidation';
+import { setDataSaverPreference } from './services/dataSaverService';
 import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 
@@ -54,6 +58,7 @@ interface AuthenticatedAppProps {
 function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   const { userProfile } = useAuth();
   const { appearanceTheme, setAppearanceTheme } = useTheme();
+  const { setLanguage, language, t } = useLanguage();
 
   // Remember user's session tab from where they left off
   const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
@@ -61,6 +66,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       const saved = localStorage.getItem('wavelink_last_active_tab') as ActiveTab;
       const validTabs: ActiveTab[] = [
         'feed',
+        'trending',
         'studio',
         'videos',
         'monetization',
@@ -97,6 +103,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   const [isWelinkOpen, setIsWelinkOpen] = useState(false);
   const [welinkInitialMode, setWelinkInitialMode] = useState<'chat' | 'image' | 'voice'>('chat');
   const [unreadNotificationIds, setUnreadNotificationIds] = useState<string[]>([]);
+  const [showInterestPicker, setShowInterestPicker] = useState<boolean>(false);
 
   const ringtoneStopRef = useRef<(() => void) | null>(null);
   const handledCallIdsRef = useRef<Set<string>>(new Set());
@@ -128,12 +135,35 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     };
   }, []);
 
-  // Sync user's saved appearanceTheme from Firestore across devices
+  // Sync user's saved appearanceTheme, language, and dataSaverEnabled from Firestore across devices
   useEffect(() => {
     if (userProfile?.appearanceTheme && userProfile.appearanceTheme !== appearanceTheme) {
       setAppearanceTheme(userProfile.appearanceTheme);
     }
   }, [userProfile?.appearanceTheme, appearanceTheme, setAppearanceTheme]);
+
+  useEffect(() => {
+    if (userProfile?.language && (userProfile.language === 'sw' || userProfile.language === 'en') && userProfile.language !== language) {
+      setLanguage(userProfile.language);
+    }
+  }, [userProfile?.language, language, setLanguage]);
+
+  useEffect(() => {
+    if (typeof userProfile?.dataSaverEnabled === 'boolean') {
+      setDataSaverPreference(userProfile.dataSaverEnabled);
+    }
+  }, [userProfile?.dataSaverEnabled]);
+
+  // Phase 3: Show skippable post-signup Interest Picker if the user hasn't picked or skipped yet
+  useEffect(() => {
+    if (!currentUser?.uid || !userProfile) return;
+    if (!hasUserCompletedOrSkippedInterests(currentUser.uid, userProfile)) {
+      const timer = setTimeout(() => {
+        setShowInterestPicker(true);
+      }, 600);
+      return () => clearTimeout(timer);
+    }
+  }, [currentUser?.uid, userProfile]);
 
   // Listen for unread reaction/reply notifications to display a small notification dot
   useEffect(() => {
@@ -222,12 +252,16 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         setActiveTab(tab);
       }
     };
+    const handleOpenInterestPicker = () => {
+      setShowInterestPicker(true);
+    };
     window.addEventListener('wavelink:hashtag', handleGlobalHashtag);
     window.addEventListener('wavelink:navigate-tag', handleGlobalHashtag);
     window.addEventListener('wavelink:mention', handleGlobalMention);
     window.addEventListener('wavelink:navigate-profile', handleGlobalMention);
     window.addEventListener('wavelink:start-chat', handleGlobalChat);
     window.addEventListener('wavelink:navigate-tab', handleGlobalNavigateTab);
+    window.addEventListener('wavelink:open-interest-picker', handleOpenInterestPicker);
     return () => {
       window.removeEventListener('wavelink:hashtag', handleGlobalHashtag);
       window.removeEventListener('wavelink:navigate-tag', handleGlobalHashtag);
@@ -235,6 +269,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       window.removeEventListener('wavelink:navigate-profile', handleGlobalMention);
       window.removeEventListener('wavelink:start-chat', handleGlobalChat);
       window.removeEventListener('wavelink:navigate-tab', handleGlobalNavigateTab);
+      window.removeEventListener('wavelink:open-interest-picker', handleOpenInterestPicker);
     };
   }, []);
 
@@ -600,6 +635,94 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     setIsWelinkOpen(true);
   };
 
+  // Phase 6: Listen for Service Worker push notification Answer / Decline call actions
+  useEffect(() => {
+    if (typeof window === 'undefined' || !currentUser?.uid) return;
+
+    const executeCallActionById = async (action: 'answer' | 'decline', callId?: string, callerId?: string, callerName?: string, callType?: 'video' | 'voice') => {
+      if (!callId) {
+        if (action === 'answer' && incomingCall) {
+          handleAcceptIncomingCall();
+        } else if (action === 'decline' && incomingCall) {
+          handleDeclineIncomingCall();
+        }
+        return;
+      }
+
+      stopIncomingRingtone();
+      handledCallIdsRef.current.add(callId);
+      setIncomingCall(null);
+
+      if (action === 'decline') {
+        updateDoc(doc(db, 'calls', callId), {
+          status: 'declined',
+          endedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }).catch(() => {});
+        return;
+      }
+
+      if (action === 'answer') {
+        try {
+          const callSnap = await getDoc(doc(db, 'calls', callId));
+          const callData = callSnap.exists() ? callSnap.data() : null;
+          setActiveCall({
+            type: (callData?.type || callData?.callType || callType) === 'voice' ? 'voice' : 'video',
+            recipient: {
+              id: callData?.callerId || callData?.caller || callerId || '',
+              name: callData?.callerName || callerName || 'WaveLink Member',
+              photoURL: callData?.callerPhotoURL
+            },
+            isInitiator: false,
+            callId,
+            initialOffer: callData?.offer
+          });
+        } catch {
+          setActiveCall({
+            type: callType === 'voice' ? 'voice' : 'video',
+            recipient: {
+              id: callerId || '',
+              name: callerName || 'WaveLink Member'
+            },
+            isInitiator: false,
+            callId
+          });
+        }
+      }
+    };
+
+    // Check URL query params when opened from push notification action button
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const urlCallAction = params.get('callAction');
+      const urlCallId = params.get('callId') || undefined;
+      if (urlCallAction === 'answer' || urlCallAction === 'decline') {
+        executeCallActionById(urlCallAction, urlCallId);
+        params.delete('callAction');
+        params.delete('callId');
+        const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}${window.location.hash}`;
+        window.history.replaceState({}, '', nextUrl);
+      }
+    } catch {
+      // ignore URL parsing errors
+    }
+
+    const handleSwMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (data && data.type === 'WAVELINK_CALL_NOTIFICATION_ACTION') {
+        const action = data.action === 'decline' ? 'decline' : 'answer';
+        executeCallActionById(action, data.callId, data.callerId, data.callerName, data.callType);
+      }
+    };
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', handleSwMessage);
+      return () => {
+        navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+      };
+    }
+  }, [currentUser?.uid, incomingCall, stopIncomingRingtone]);
+
   if (userProfile?.isBanned) {
     return <BannedView onOpenSupport={() => setActiveTab('settings')} />;
   }
@@ -650,6 +773,18 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
               onStartChat={handleStartChatWithUser}
             />
           )}
+          {activeTab === 'trending' && (
+            <TrendingChallengesView
+              onSelectHashtag={(tag) => {
+                setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
+                setActiveTab('feed');
+              }}
+              onJoinChallengeWithTag={(tag) => {
+                setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
+                setActiveTab('feed');
+              }}
+            />
+          )}
           {activeTab === 'studio' && (
             <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
           )}
@@ -682,6 +817,15 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           )}
         </main>
       </div>
+
+      {/* Phase 3: Skippable Post-Signup Interest Picker Modal */}
+      {showInterestPicker && (
+        <InterestPickerModal
+          isOpen={showInterestPicker}
+          onClose={() => setShowInterestPicker(false)}
+          initialInterests={userProfile?.interests || []}
+        />
+      )}
 
       {/* Non-blocking Background Spark & Video Upload Queue Progress Trackers */}
       <SparkUploadQueueBanner variant="floating" />
@@ -743,7 +887,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                 className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
               >
                 <PhoneOff size={18} />
-                <span>Decline</span>
+                <span>{t('call.decline')}</span>
               </button>
               <button
                 type="button"
@@ -751,7 +895,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                 className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition active:scale-95 animate-pulse cursor-pointer"
               >
                 <PhoneCall size={18} />
-                <span>Accept</span>
+                <span>{t('call.answer')}</span>
               </button>
             </div>
           </div>
@@ -829,11 +973,13 @@ function RootAppContent() {
 export default function App() {
   return (
     <ErrorBoundary>
-      <ThemeProvider>
-        <AuthProvider>
-          <RootAppContent />
-        </AuthProvider>
-      </ThemeProvider>
+      <LanguageProvider>
+        <ThemeProvider>
+          <AuthProvider>
+            <RootAppContent />
+          </AuthProvider>
+        </ThemeProvider>
+      </LanguageProvider>
     </ErrorBoundary>
   );
 }

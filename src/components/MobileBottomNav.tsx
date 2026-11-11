@@ -1,6 +1,7 @@
 import React from 'react';
 import { ActiveTab } from '../types';
 import { useAuth } from '../context/AuthContext';
+import { useLanguage } from '../context/LanguageContext';
 import { triggerHaptic } from '../utils/haptics';
 import {
   Home,
@@ -22,6 +23,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   hasUnreadNotifications = false
 }) => {
   const { userProfile, currentUser } = useAuth();
+  const { t } = useLanguage();
 
   const navItems: {
     id: ActiveTab;
@@ -33,7 +35,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   }[] = [
     {
       id: 'feed',
-      label: 'Home',
+      label: t('nav.home'),
       activeColor: 'text-[#2563EB]',
       showDot: hasUnreadNotifications,
       icon: (active) => (
@@ -46,7 +48,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     },
     {
       id: 'videos',
-      label: 'Reels',
+      label: t('nav.reels'),
       activeColor: 'text-[#F43F5E]',
       icon: (active) => (
         <Film
@@ -58,14 +60,14 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     },
     {
       id: 'studio',
-      label: 'Create',
+      label: t('nav.create'),
       isPrimaryAction: true,
       activeColor: 'text-[#0D9488]',
       icon: () => <Plus size={24} strokeWidth={2.5} className="text-white" />
     },
     {
       id: 'chat',
-      label: 'Chat',
+      label: t('nav.chat'),
       activeColor: 'text-[#0284C7]',
       icon: (active) => (
         <MessageSquare
@@ -77,7 +79,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     },
     {
       id: 'settings',
-      label: 'Profile',
+      label: t('nav.profile'),
       activeColor: 'text-[#D97706]',
       icon: (active) => (
         <div className="relative">

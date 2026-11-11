@@ -89,16 +89,16 @@ export const MOBILE_CARRIERS: Record<MobileMoneyProvider, CarrierInfo> = {
   },
   mpesa: {
     provider: 'mpesa',
-    name: 'Vodacom M-Pesa',
+    name: 'M-Pesa',
     ussdCode: '*150*00#',
     brandColor: '#E11D48',
     bgLight: 'bg-rose-50 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-900',
     logoEmoji: '📱',
-    prefixMatch: ['074', '075', '076', '25574', '25575', '25576']
+    prefixMatch: ['074', '075', '076', '25574', '25575', '25576', '2547', '070', '071', '072']
   },
   tigopesa: {
     provider: 'tigopesa',
-    name: 'Tigo Pesa',
+    name: 'Mixx by Yas (Tigo Pesa)',
     ussdCode: '*150*01#',
     brandColor: '#0284C7',
     bgLight: 'bg-sky-50 dark:bg-sky-950/30 text-sky-600 dark:text-sky-400 border-sky-200 dark:border-sky-900',
@@ -107,7 +107,7 @@ export const MOBILE_CARRIERS: Record<MobileMoneyProvider, CarrierInfo> = {
   },
   azampay: {
     provider: 'azampay',
-    name: 'AzamPay / ClickPesa',
+    name: 'M-Pesa / Mixx by Yas / Airtel Money',
     ussdCode: 'Push Gateway',
     brandColor: '#9333EA',
     bgLight: 'bg-purple-50 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 border-purple-200 dark:border-purple-900',

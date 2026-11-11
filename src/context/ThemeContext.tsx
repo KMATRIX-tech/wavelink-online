@@ -13,6 +13,33 @@ export interface AppearanceThemeOption {
 
 export const APPEARANCE_THEMES: AppearanceThemeOption[] = [
   {
+    id: 'savanna',
+    name: 'Savanna',
+    description: 'Warm golden acacia & Serengeti sand with crisp dark text',
+    previewBg: '#FCF9F0',
+    previewAccent: '#B45309',
+    previewSecondary: '#0D9488',
+    proOnly: false,
+  },
+  {
+    id: 'zanzibar',
+    name: 'Zanzibar Sea',
+    description: 'Coastal turquoise & Indian Ocean breeze with clean readable contrast',
+    previewBg: '#F2FAFC',
+    previewAccent: '#0284C7',
+    previewSecondary: '#0D9488',
+    proOnly: false,
+  },
+  {
+    id: 'kilimanjaro',
+    name: 'Kilimanjaro Sunrise',
+    description: 'Crisp alpine morning light & warm terracotta highland tones',
+    previewBg: '#FDF8F4',
+    previewAccent: '#C2410C',
+    previewSecondary: '#2563EB',
+    proOnly: false,
+  },
+  {
     id: 'classic',
     name: 'Classic',
     description: 'White and warm cream with friendly blue & teal accents',
@@ -81,7 +108,10 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   const [appearanceTheme, setAppearanceThemeState] = useState<AppearanceTheme>(() => {
     const saved = localStorage.getItem(APPEARANCE_STORAGE_KEY) as AppearanceTheme | null;
-    if (saved && ['classic', 'sunset', 'river', 'sunrise'].includes(saved)) {
+    if (
+      saved &&
+      ['classic', 'savanna', 'zanzibar', 'kilimanjaro', 'sunset', 'river', 'sunrise'].includes(saved)
+    ) {
       return saved;
     }
     return 'classic';
@@ -139,7 +169,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   }, [isBatterySaver]);
 
   const setAppearanceTheme = (next: AppearanceTheme) => {
-    if (['classic', 'sunset', 'river', 'sunrise'].includes(next)) {
+    if (['classic', 'savanna', 'zanzibar', 'kilimanjaro', 'sunset', 'river', 'sunrise'].includes(next)) {
       setAppearanceThemeState(next);
     }
   };

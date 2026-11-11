@@ -1144,9 +1144,11 @@ function buildSupportBotFallbackReply(
   userText: string,
   userPaymentStatus: { isPro?: boolean; proPlan?: string; pendingVerification?: boolean },
   escalation: { shouldEscalate: boolean; topic: string },
-  history?: Array<{ role: string; text: string }>
+  history?: Array<{ role: string; text: string }>,
+  preferredLanguage?: 'en' | 'sw'
 ): string {
-  const isSw = detectSwahili(userText);
+  const isSw =
+    preferredLanguage === 'sw' || (!preferredLanguage && detectSwahili(userText));
   const trimmed = userText.trim();
   const q = trimmed.toLowerCase();
 
@@ -1722,6 +1724,7 @@ const CheckoutSchema = z.object({
 const SupportBotMessageSchema = z.object({
   message: z.string().min(1).max(4000),
   channelId: z.string().max(160).optional(),
+  language: z.enum(['en', 'sw']).optional(),
   history: z
     .array(
       z.object({
@@ -2542,7 +2545,9 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
       bucket.count += 1;
     }
 
-    const isSw = detectSwahili(cleanMessage);
+    const preferredLang = parsed.data.language;
+    const isSw =
+      preferredLang === 'sw' || (!preferredLang && detectSwahili(cleanMessage));
     const escalation = analyzeSupportEscalation(cleanMessage);
     const userPaymentStatus = parsed.data.userPaymentStatus || {};
 
@@ -2566,6 +2571,11 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
           : userPaymentStatus.pendingVerification
           ? 'Payment Verification Pending Admin Approval'
           : 'Free Plan'
+      }.
+Preferred Language: ${
+        isSw
+          ? 'Kiswahili (Reply in simple, friendly, everyday Swahili words)'
+          : 'English (Reply in simple, friendly, everyday English words)'
       }.
 Escalation Required: ${
         escalation.shouldEscalate
@@ -2610,7 +2620,8 @@ Escalation Required: ${
         cleanMessage,
         userPaymentStatus,
         escalation,
-        parsed.data.history
+        parsed.data.history,
+        preferredLang
       );
     }
 
@@ -4785,6 +4796,8 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     calls: boolean;
     followers: boolean;
     reactions: boolean;
+    replies: boolean;
+    challenges: boolean;
     announcements: boolean;
     payments: boolean;
     showMessagePreviews: boolean;
@@ -4800,6 +4813,8 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     calls: true,
     followers: true,
     reactions: true,
+    replies: true,
+    challenges: true,
     announcements: true,
     payments: true,
     showMessagePreviews: true,
@@ -4814,6 +4829,8 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     Map<string, { tokenId: string; token: string; platform?: string; updatedAt: string }>
   >();
   const userNotificationSettingsStore = new Map<string, ServerNotificationSettings>();
+  const pushDispatchRateBuckets = new Map<string, { count: number; resetAt: number }>();
+  const antiSpamShareTracker = new Map<string, number>();
 
   function isWithinQuietHours(settings: ServerNotificationSettings): boolean {
     if (!settings.quietHoursEnabled) return false;
@@ -4862,9 +4879,13 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         return { allowed: settings.followers !== false, category: 'followers' };
       case 'post_like':
       case 'post_reaction':
-      case 'post_comment':
       case 'spark_like':
         return { allowed: settings.reactions !== false, category: 'reactions' };
+      case 'post_comment':
+      case 'post_reply':
+        return { allowed: settings.replies !== false, category: 'replies' };
+      case 'challenge_reminder':
+        return { allowed: settings.challenges !== false, category: 'challenges' };
       case 'announcement':
         return { allowed: settings.announcements !== false, category: 'announcements' };
       case 'post_tip':
@@ -4985,6 +5006,8 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       calls: raw.calls !== undefined ? Boolean(raw.calls) : true,
       followers: raw.followers !== undefined ? Boolean(raw.followers) : true,
       reactions: raw.reactions !== undefined ? Boolean(raw.reactions) : true,
+      replies: raw.replies !== undefined ? Boolean(raw.replies) : true,
+      challenges: raw.challenges !== undefined ? Boolean(raw.challenges) : true,
       announcements: raw.announcements !== undefined ? Boolean(raw.announcements) : true,
       payments: raw.payments !== undefined ? Boolean(raw.payments) : true,
       showMessagePreviews:
@@ -5006,6 +5029,21 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       const authUser = await verifyFirebaseIdTokenHeader(req);
       if (!authUser?.uid) {
         return res.status(401).json({ error: 'Authentication required to trigger push notifications' });
+      }
+
+      // Server-side rate limit on push dispatches per actor
+      const nowMs = Date.now();
+      const rateEntry = pushDispatchRateBuckets.get(authUser.uid);
+      if (!rateEntry || nowMs > rateEntry.resetAt) {
+        pushDispatchRateBuckets.set(authUser.uid, { count: 1, resetAt: nowMs + 60_000 });
+      } else if (rateEntry.count >= 25) {
+        return res.status(429).json({
+          sent: false,
+          skippedReason: 'rate_limited',
+          error: 'Push notification rate limit exceeded. Please wait a moment.',
+        });
+      } else {
+        rateEntry.count += 1;
       }
 
       const recipientId = String(req.body?.recipientId || '').trim();
@@ -5121,6 +5159,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
       if (realTokenList.length > 0 && getAdminApps().length > 0) {
         try {
+          const isIncomingCall = type === 'incoming_call' || type === 'call';
           const multicastResult = await getAdminMessaging(getAdminApp()).sendEachForMulticast({
             tokens: realTokenList.map((t) => t.token),
             notification: {
@@ -5134,14 +5173,27 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
               actorId,
               actorName,
               entityId,
+              callId: isIncomingCall ? entityId : '',
               url: '/',
             },
             webpush: {
+              headers: {
+                Urgency: isIncomingCall ? 'high' : 'normal',
+              },
               notification: {
                 title,
                 body,
                 icon: '/pwa-192x192.png',
                 badge: '/pwa-192x192.png',
+                requireInteraction: isIncomingCall,
+                ...(isIncomingCall
+                  ? {
+                      actions: [
+                        { action: 'answer_call', title: '📞 Answer' },
+                        { action: 'decline_call', title: '✕ Decline' },
+                      ],
+                    }
+                  : {}),
               },
               fcmOptions: {
                 link: '/',
@@ -5190,6 +5242,47 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       console.error('[WaveLink Push Dispatch Error]:', err?.message || err);
       return res.status(500).json({ sent: false, error: 'Push dispatch failed' });
     }
+  });
+
+  // Phase 4: Server-enforced Anti-Spam Share Verification for Weekly Creator Challenges
+  app.post('/api/challenges/record-share', async (req, res) => {
+    const authUser = await verifyFirebaseIdTokenHeader(req);
+    if (!authUser?.uid) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    const postId = String(req.body?.postId || '').trim();
+    const authorId = String(req.body?.authorId || '').trim();
+    if (!postId) {
+      return res.status(400).json({ error: 'postId is required' });
+    }
+    if (authorId && authorId === authUser.uid) {
+      return res.json({ counted: false, reason: 'self_share_not_counted_for_leaderboard' });
+    }
+    const dedupeKey = `${authUser.uid}:${postId}`;
+    if (antiSpamShareTracker.has(dedupeKey)) {
+      return res.json({ counted: false, reason: 'already_counted_unique_share' });
+    }
+    antiSpamShareTracker.set(dedupeKey, Date.now());
+    return res.json({ counted: true, postId, sharedBy: authUser.uid });
+  });
+
+  // Phase 5: Server-enforced Private Creator Stats access check (strictly account owner only)
+  app.get('/api/creator-stats/:userId', async (req, res) => {
+    const authUser = await verifyFirebaseIdTokenHeader(req);
+    const targetUserId = String(req.params.userId || '').trim();
+    if (!authUser?.uid) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    if (authUser.uid !== targetUserId) {
+      return res.status(403).json({
+        error: 'Forbidden: Only the owner of this account can view their private creator stats.',
+      });
+    }
+    return res.json({
+      authorized: true,
+      ownerUid: authUser.uid,
+      checkedAt: new Date().toISOString(),
+    });
   });
 
   // ============================================================================

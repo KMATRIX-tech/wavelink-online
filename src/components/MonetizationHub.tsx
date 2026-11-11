@@ -8,7 +8,8 @@ import {
   PaymentTransaction,
   MobileMoneyProvider,
   PointTransaction,
-  PointTransactionCategory
+  PointTransactionCategory,
+  EastAfricanCurrency
 } from '../types';
 import {
   PRO_TIERS,
@@ -21,6 +22,7 @@ import {
   completePostBoost
 } from '../services/paymentService';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
+import { formatLocalPrice, useAfricanRegion } from '../utils/africanCultureConfig';
 import {
   Coins,
   Crown,
@@ -79,6 +81,11 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
     showGlobalToast
   } = useAuth();
   const isProUser = isProEffective;
+  const { currency, setCurrency } = useAfricanRegion(
+    userProfile?.countryCode,
+    userProfile?.preferredCurrency,
+    userProfile?.panAfricanLanguage
+  );
   const [copiedAdminPhone, setCopiedAdminPhone] = useState(false);
   const [hubPromoCode, setHubPromoCode] = useState('');
   const [isRedeemingHubPromo, setIsRedeemingHubPromo] = useState(false);
@@ -666,10 +673,30 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
               Monetization &amp; Growth Hub
             </h2>
             <p className="text-blue-50 text-xs sm:text-sm mt-1 max-w-xl font-medium">
-              Manage WaveLink Pro subscriptions, enable Creator Tipping (10% platform fee), boost post reach for 2,000 TZS, and explore native in-feed affiliate revenue.
+              Manage WaveLink Pro subscriptions in {currency} ({formatLocalPrice(18000, currency)}/mo), enable Creator Tipping (10% platform fee), and boost post reach for {formatLocalPrice(2000, currency)} via M-Pesa, Mixx by Yas &amp; Airtel Money.
             </p>
           </div>
           <div className="flex items-center flex-wrap gap-2">
+            {/* Local Currency Switcher: TZS, KES, UGX */}
+            <div className="flex items-center gap-1 bg-white/15 backdrop-blur-md p-1 rounded-2xl border border-white/25">
+              {(['TZS', 'KES', 'UGX'] as EastAfricanCurrency[]).map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => {
+                    setCurrency(c);
+                    updateUserProfile({ preferredCurrency: c }).catch(() => {});
+                  }}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-extrabold transition cursor-pointer ${
+                    currency === c
+                      ? 'bg-white text-[#2563EB] shadow-2xs'
+                      : 'text-white/90 hover:bg-white/10'
+                  }`}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
             <button
               type="button"
               onClick={() => setActiveSection('history')}
@@ -683,7 +710,7 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
             </button>
             <span className="px-3.5 py-1.5 rounded-2xl bg-white/20 backdrop-blur-md text-white font-mono font-bold text-xs flex items-center gap-1.5 border border-white/30">
               <Zap size={14} className="fill-amber-300 text-amber-300" />
-              <span>Lipa kwa Simu • Airtel Money • Tigo Pesa</span>
+              <span>M-Pesa • Mixx by Yas • Airtel Money</span>
             </span>
           </div>
         </div>
@@ -749,7 +776,7 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
           }`}
         >
           <Rocket size={15} />
-          <span>Post Boosting (2,000 TZS)</span>
+          <span>Post Boosting ({formatLocalPrice(2000, currency)})</span>
         </button>
         <button
           onClick={() => setActiveSection('affiliate')}
@@ -845,14 +872,14 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
                     <div className="mt-4 mb-5 pt-3 border-t border-slate-100">
                       <div className="flex items-baseline gap-1">
                         <span className="text-2xl sm:text-3xl font-black text-[#3B82F6] font-mono">
-                          TZS {tier.priceTZS.toLocaleString()}
+                          {formatLocalPrice(tier.priceTZS, currency)}
                         </span>
                         <span className="text-xs text-slate-400 font-medium">
                           /{tier.billingPeriod.replace('per ', '')}
                         </span>
                       </div>
                       <span className="text-[11px] text-slate-400 font-medium">
-                        ≈ ${tier.priceUSD} USD
+                        M-Pesa • Mixx by Yas • Airtel Money (≈ ${tier.priceUSD} USD)
                       </span>
                     </div>
 

@@ -1,5 +1,30 @@
 export type UserStatus = 'active' | 'warned' | 'banned';
-export type AppearanceTheme = 'classic' | 'sunset' | 'river' | 'sunrise';
+export type AppearanceTheme =
+  | 'classic'
+  | 'savanna'
+  | 'zanzibar'
+  | 'kilimanjaro'
+  | 'sunset'
+  | 'river'
+  | 'sunrise';
+
+export type KangaPatternFrame = 'none' | 'kanga-gold' | 'kitenge-teal' | 'savanna-weave';
+
+export type AfricanCountryCode =
+  | 'TZ'
+  | 'KE'
+  | 'UG'
+  | 'RW'
+  | 'BI'
+  | 'ET'
+  | 'CD'
+  | 'NG'
+  | 'GH'
+  | 'ZA';
+
+export type EastAfricanCurrency = 'TZS' | 'KES' | 'UGX';
+
+export type PanAfricanLanguageCode = 'en' | 'sw' | 'fr' | 'rw' | 'lg' | 'am';
 
 export type ProBorderEffect = 'aura-gold' | 'neon-pulse' | 'cosmic-glow' | 'emerald-ring' | 'none';
 export type ProAccentColor = 'purple' | 'gold' | 'emerald' | 'neon' | 'crimson';
@@ -25,12 +50,16 @@ export interface UserTermsAgreement {
   acceptedAt?: string;
 }
 
+export type AppLanguage = 'en' | 'sw';
+
 export interface UserNotificationSettings {
   masterEnabled: boolean;
   messages: boolean;
   calls: boolean;
   followers: boolean;
   reactions: boolean;
+  replies?: boolean;
+  challenges?: boolean;
   announcements: boolean;
   payments?: boolean;
   showMessagePreviews: boolean;
@@ -70,6 +99,27 @@ export interface UserProfile {
   privacySettings?: UserPrivacySettings;
   notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;
+  // Phase 1: Data Saver preference
+  dataSaverEnabled?: boolean;
+  // Phase 2: Language preference ('en' | 'sw') & Pan-African option
+  language?: AppLanguage;
+  panAfricanLanguage?: PanAfricanLanguageCode;
+  // Country, Region, Currency & Kanga/Kitenge Design Preferences
+  countryCode?: AfricanCountryCode;
+  regionName?: string;
+  preferredCurrency?: EastAfricanCurrency;
+  patternFrame?: KangaPatternFrame;
+  kangaBackgroundEnabled?: boolean;
+  // Phase 3: Selected user interests
+  interests?: string[];
+  interestsCompleted?: boolean;
+  // Phase 4: Weekly Challenge Winner Badge (valid until ISO timestamp)
+  weeklyWinnerUntil?: string;
+  weeklyWinnerChallengeTitle?: string;
+  weeklyWinnerHashtag?: string;
+  // Creator Spotlight of the Week
+  isCreatorSpotlight?: boolean;
+  spotlightNote?: string;
   // Administrative and Security Roles
   role?: 'admin' | 'super_admin' | 'sub_admin' | 'user' | 'bot';
   isBot?: boolean;
@@ -184,6 +234,7 @@ export interface Post {
   songVolume?: number;
   audience?: 'public' | 'followers' | 'close_friends';
   locationTag?: string;
+  countryCode?: AfricanCountryCode;
   allowComments?: boolean;
   hashtags?: string[];
   likes: string[]; // user IDs
@@ -191,8 +242,12 @@ export interface Post {
   reactions?: PostReactions;
   reactionCounts?: PostReactionCounts;
   commentsCount: number;
+  sharesCount?: number;
+  sharedBy?: string[];
   savesCount?: number;
   viewsCount?: number;
+  challengeId?: string;
+  challengeHashtag?: string;
   isEdited?: boolean;
   // Monetization features: Boosting & Tipping
   isBoosted?: boolean;
@@ -317,14 +372,18 @@ export interface Announcement {
   authorUsername?: string;
   authorPhotoURL?: string;
   title: string;
-  content: string;
-  priority: 'normal' | 'urgent';
+  content?: string;
+  body?: string;
+  category?: string;
+  priority?: 'normal' | 'urgent';
   createdAt: string;
   // Rich Community Notice & Event Fields
   type?: 'announcement' | 'event' | 'schedule';
   eventDate?: string;
   eventTime?: string;
+  eventDateTimeIso?: string;
   eventLocation?: string;
+  countryCode?: AfricanCountryCode;
   imageUrl?: string;
   rsvpUserIds?: string[];
   rsvpCount?: number;
@@ -519,6 +578,7 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 
 export type ActiveTab =
   | 'feed'
+  | 'trending'
   | 'studio'
   | 'videos'
   | 'announcements'
@@ -536,6 +596,8 @@ export type NotificationType =
   | 'post_like'
   | 'post_reaction'
   | 'post_comment'
+  | 'post_reply'
+  | 'challenge_reminder'
   | 'post_tip'
   | 'post_boost'
   | 'payment_verified'
@@ -742,3 +804,60 @@ export interface UpgradeFeedbackItem {
   reviewedBy?: string;
   reviewedAt?: string;
 }
+
+export interface CreatorChallenge {
+  id: string;
+  theme: string;
+  themeSw?: string;
+  hashtag: string;
+  description: string;
+  descriptionSw?: string;
+  deadline: string; // ISO date
+  status: 'active' | 'completed';
+  createdBy: string;
+  createdByName?: string;
+  winnerUserId?: string;
+  winnerName?: string;
+  winnerUsername?: string;
+  winnerPhotoURL?: string;
+  winnerAwardedAt?: string;
+  winnerBadgeUntil?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface CreatorPrivateStats {
+  userId: string;
+  views7d: number;
+  views30d: number;
+  likes7d: number;
+  likes30d: number;
+  comments7d: number;
+  comments30d: number;
+  shares7d: number;
+  shares30d: number;
+  followersGained7d: number;
+  followersGained30d: number;
+  updatedAt: string;
+}
+
+export interface CreatorSpotlight {
+  id: string;
+  userId: string;
+  displayName: string;
+  username: string;
+  photoURL?: string;
+  countryCode: AfricanCountryCode;
+  category?: string;
+  categoryLabel: string;
+  headlineEn: string;
+  headlineSw: string;
+  bioEn?: string;
+  bioSw?: string;
+  featuredHashtag?: string;
+  selectedByEmail?: string;
+  chosenByName?: string;
+  updatedAt: string;
+}
+
+

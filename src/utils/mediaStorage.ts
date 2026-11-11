@@ -4,9 +4,10 @@ import {
   formatVideoUploadError,
   CLOUDINARY_CLOUD_NAME,
   CLOUDINARY_UPLOAD_PRESET,
-  CLOUDINARY_VIDEO_UPLOAD_URL
+  CLOUDINARY_VIDEO_UPLOAD_URL,
+  CLOUDINARY_IMAGE_UPLOAD_URL
 } from '../firebase';
-import { collection, doc, setDoc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
+import { collection, doc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
 
 const DB_NAME = 'wavelink_media_db';
 const STORE_NAME = 'videos';
@@ -447,60 +448,112 @@ export async function downscaleSparkVideoTo720p(
 
 /**
  * Fast parallel Firestore subcollection chunk writer (with a strict 4.5s time budget)
- * used ONLY as a cross-device fallback when the Firebase Storage bucket is unreachable in preview.
- * Keeps the main Firestore Spark document strictly lightweight (URL + metadata only, never base64).
+/**
+ * Uploads any image File, Blob, or data:image/... URL directly from the browser to Cloudinary's
+ * unsigned image upload endpoint (`https://api.cloudinary.com/v1_1/monarcking72/image/upload`)
+ * using upload preset `monarcking72` with a live progress callback.
+ * Never returns base64 or data URLs.
  */
-async function writeFastSparkChunksFallback(
-  sparkId: string,
-  file: File | Blob,
-  onProgress?: (pct: number, label?: string) => void
-): Promise<boolean> {
-  try {
-    // Only write Firestore subcollection chunks if clip is <= 8 MB so it finishes in < 4 seconds
-    if (!file || file.size === 0 || file.size > 8 * 1024 * 1024) {
-      return false;
+export function uploadImageToCloudinary(
+  source: File | Blob | string,
+  onProgress?: (percentage: number) => void
+): Promise<{
+  secureUrl: string;
+  width: number;
+  height: number;
+  bytes: number;
+  publicId: string;
+}> {
+  return new Promise((resolve, reject) => {
+    if (!source) {
+      reject(new Error('No image file provided for upload.'));
+      return;
     }
-    const dataUrl = await readFileAsDataUrlSafe(file, 8.5 * 1024 * 1024);
-    if (!dataUrl) return false;
 
-    const FAST_CHUNK_SIZE = 340 * 1024;
-    const totalChunks = Math.ceil(dataUrl.length / FAST_CHUNK_SIZE);
-    if (totalChunks > 28) return false;
-
-    const chunksRef = collection(db, 'sparks', sparkId, 'chunks');
-    const BATCH_CONCURRENCY = 6;
-    const startTime = Date.now();
-
-    for (let i = 0; i < totalChunks; i += BATCH_CONCURRENCY) {
-      if (Date.now() - startTime > 4500) {
-        return false;
-      }
-      const batchPromises: Promise<boolean>[] = [];
-      const batchEnd = Math.min(i + BATCH_CONCURRENCY, totalChunks);
-      for (let j = i; j < batchEnd; j++) {
-        const slice = dataUrl.substring(j * FAST_CHUNK_SIZE, (j + 1) * FAST_CHUNK_SIZE);
-        const chunkId = `chunk_${j.toString().padStart(4, '0')}`;
-        batchPromises.push(
-          writeChunkWithRetry(
-            doc(chunksRef, chunkId),
-            { index: j, total: totalChunks, data: slice },
-            0
-          )
-        );
-      }
-      const results = await Promise.all(batchPromises);
-      if (onProgress) {
-        const pct = Math.min(96, Math.round(35 + (batchEnd / totalChunks) * 60));
-        onProgress(pct, `Uploading Spark (${pct}%)...`);
-      }
-      if (results.some((ok) => !ok)) {
-        return false;
-      }
+    // If already an HTTP/HTTPS URL, return it directly
+    if (typeof source === 'string' && (source.startsWith('https://') || source.startsWith('http://'))) {
+      if (onProgress) onProgress(100);
+      resolve({
+        secureUrl: source,
+        width: 1080,
+        height: 1080,
+        bytes: 0,
+        publicId: 'existing_http_image'
+      });
+      return;
     }
-    return true;
-  } catch {
-    return false;
-  }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', CLOUDINARY_IMAGE_UPLOAD_URL, true);
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+    xhr.upload.onprogress = (event: ProgressEvent) => {
+      if (!onProgress) return;
+      if (event.lengthComputable && event.total > 0) {
+        const pct = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+        onProgress(pct);
+      } else {
+        onProgress(50);
+      }
+    };
+
+    xhr.onload = () => {
+      const status = xhr.status || 0;
+      let parsed: any = null;
+      try {
+        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        parsed = null;
+      }
+
+      if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+        if (onProgress) onProgress(100);
+        resolve({
+          secureUrl: parsed.secure_url,
+          width: typeof parsed.width === 'number' && parsed.width > 0 ? parsed.width : 1080,
+          height: typeof parsed.height === 'number' && parsed.height > 0 ? parsed.height : 1080,
+          bytes: typeof parsed.bytes === 'number' && parsed.bytes > 0 ? parsed.bytes : 0,
+          publicId: String(parsed.public_id || `wavelink_img_${Date.now()}`)
+        });
+        return;
+      }
+
+      const errMsg =
+        parsed?.error?.message ||
+        (status ? `Cloudinary image upload HTTP ${status} error` : 'Cloudinary image upload failed');
+      reject(new Error(`Cloudinary image upload failed: ${errMsg}`));
+    };
+
+    xhr.onerror = () => {
+      reject(
+        new Error(
+          'Network error while uploading image to Cloudinary. Please check your connection and try again.'
+        )
+      );
+    };
+
+    xhr.onabort = () => {
+      reject(new Error('Image upload was cancelled.'));
+    };
+
+    const formData = new FormData();
+    if (typeof source === 'string') {
+      formData.append('file', source);
+    } else if (source instanceof File) {
+      formData.append('file', source);
+    } else {
+      const ext = source.type === 'image/png' ? 'png' : source.type === 'image/webp' ? 'webp' : 'jpg';
+      const namedFile = new File([source], `wavelink_photo_${Date.now()}.${ext}`, {
+        type: source.type || 'image/jpeg',
+        lastModified: Date.now()
+      });
+      formData.append('file', namedFile);
+    }
+    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+
+    if (onProgress) onProgress(5);
+    xhr.send(formData);
+  });
 }
 
 /**
@@ -625,8 +678,9 @@ export async function uploadSparkVideoToStorage(params: {
 }
 
 /**
- * Keeps Spark photos working as they are now using the compressed JPEG DataURL
- * (no Firebase Storage).
+ * Uploads Spark photos and rendered Spark text-card images directly from the browser
+ * to Cloudinary (`https://api.cloudinary.com/v1_1/monarcking72/image/upload`, preset `monarcking72`)
+ * with live upload progress, returning ONLY the HTTPS `secure_url`. Never stores base64 in Firestore.
  */
 export async function uploadSparkImageToStorage(params: {
   sparkId: string;
@@ -634,10 +688,16 @@ export async function uploadSparkImageToStorage(params: {
   file?: File | null;
   dataUrl: string;
   onProgress?: (percentage: number) => void;
-}): Promise<{ downloadUrl: string; storagePath?: string }> {
-  const { dataUrl, onProgress } = params;
-  if (onProgress) onProgress(100);
-  return { downloadUrl: dataUrl };
+}): Promise<{ downloadUrl: string; storagePath?: string; width?: number; height?: number }> {
+  const { file, dataUrl, onProgress } = params;
+  const uploadSource: File | Blob | string = file && file.size > 0 ? file : dataUrl;
+  const uploaded = await uploadImageToCloudinary(uploadSource, onProgress);
+  return {
+    downloadUrl: uploaded.secureUrl,
+    storagePath: uploaded.publicId,
+    width: uploaded.width,
+    height: uploaded.height
+  };
 }
 
 // Track expired Spark IDs already cleaned up in this session so we don't repeat calls
@@ -843,61 +903,61 @@ export async function uploadVideoChunkedToServer(
   file: File | Blob,
   onProgress?: (percentage: number) => void
 ): Promise<string | null> {
-  try {
-    if (!file || file.size === 0 || file.size > PRO_MAX_VIDEO_BYTES) {
-      return null;
-    }
-
-    const SERVER_CHUNK_BYTES = 2 * 1024 * 1024;
-    const totalChunks = Math.max(1, Math.ceil(file.size / SERVER_CHUNK_BYTES));
-    const safeId = entityId.replace(/[^a-zA-Z0-9_-]/g, '');
-    let finalVideoUrl: string | null = null;
-
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-      const start = chunkIndex * SERVER_CHUNK_BYTES;
-      const end = Math.min(start + SERVER_CHUNK_BYTES, file.size);
-      const blobSlice = file.slice(start, end);
-      const sliceBuffer = await blobSlice.arrayBuffer();
-      const dataBase64 = arrayBufferToBase64(sliceBuffer);
-
-      const response = await fetch('/api/media/video-chunk', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoId: safeId,
-          chunkIndex,
-          totalChunks,
-          dataBase64,
-          mimeType: file.type || 'video/mp4',
-          isPro: file.size > FREE_MAX_VIDEO_BYTES,
-          totalFileSize: file.size
-        })
-      });
-
-      if (!response.ok) {
-        return null;
-      }
-
-      const json = await response.json();
-      if (!json?.success) {
-        return null;
-      }
-
-      if (json.videoUrl) {
-        finalVideoUrl = json.videoUrl;
-      }
-
-      if (onProgress) {
-        const pct = Math.min(98, Math.round(15 + ((chunkIndex + 1) / totalChunks) * 82));
-        onProgress(pct);
-      }
-    }
-
-    return finalVideoUrl;
-  } catch (err) {
-    console.warn('Server chunked video upload notice:', err);
-    return null;
+  if (!file || file.size === 0 || file.size > PRO_MAX_VIDEO_BYTES) {
+    throw new Error('Media file is empty or exceeds the 100 MB limit.');
   }
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', CLOUDINARY_VIDEO_UPLOAD_URL, true);
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+    xhr.upload.onprogress = (event: ProgressEvent) => {
+      if (!onProgress) return;
+      const total = event.lengthComputable && event.total > 0 ? event.total : file.size;
+      const pct = Math.max(1, Math.min(99, Math.round((event.loaded / total) * 100)));
+      onProgress(pct);
+    };
+
+    xhr.onload = () => {
+      const status = xhr.status || 0;
+      let parsed: any = null;
+      try {
+        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        parsed = null;
+      }
+      if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+        if (onProgress) onProgress(100);
+        resolve(parsed.secure_url);
+        return;
+      }
+      const errMsg =
+        parsed?.error?.message ||
+        (status ? `Cloudinary HTTP ${status} error` : 'Cloudinary media upload failed');
+      reject(new Error(`Cloudinary upload failed: ${errMsg}`));
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Network error while uploading media to Cloudinary.'));
+    };
+
+    const formData = new FormData();
+    const isAudio = (file.type || '').startsWith('audio/');
+    const defaultExt = isAudio ? 'webm' : 'mp4';
+    const uploadFile =
+      file instanceof File
+        ? file
+        : new File([file], `${entityId}.${defaultExt}`, {
+            type: file.type || (isAudio ? 'audio/webm' : 'video/mp4'),
+            lastModified: Date.now()
+          });
+    formData.append('file', uploadFile);
+    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+
+    if (onProgress) onProgress(5);
+    xhr.send(formData);
+  });
 }
 
 export function readFileAsDataUrlSafe(
@@ -1015,31 +1075,6 @@ export async function getCachedVideo(id: string): Promise<string | null> {
   } catch {
     return null;
   }
-}
-
-const CHUNK_SIZE = 260 * 1024;
-const MAX_CHUNKS = 36;
-
-async function writeChunkWithRetry(
-  chunkDocRef: ReturnType<typeof doc>,
-  payload: { index: number; total: number; data: string },
-  maxRetries = 2
-): Promise<boolean> {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const writePromise = setDoc(chunkDocRef, payload);
-      const timeoutPromise = new Promise<'timeout'>((resolve) =>
-        setTimeout(() => resolve('timeout'), 4500)
-      );
-      const res = await Promise.race([writePromise.then(() => 'ok' as const), timeoutPromise]);
-      if (res === 'ok') return true;
-    } catch (err) {
-      if (attempt === maxRetries) {
-        console.warn('Chunk write retry exhausted:', err);
-      }
-    }
-  }
-  return false;
 }
 
 export interface VideoCompressionOptions {
@@ -1392,7 +1427,9 @@ export async function compressVideoBeforeUpload(
 }
 
 /**
- * Returns a safe thumbnail DataURL or derives a fast JPEG frame URL from a Cloudinary video `secure_url`.
+ * Returns a small, fast HTTP(S) thumbnail URL from Cloudinary (never a base64 data: URL).
+ * If a custom cover image was provided as a data:image/ URL, uploads it to Cloudinary first
+ * and returns its HTTPS secure_url; otherwise derives a small .jpg frame URL from the Cloudinary video URL.
  */
 export async function uploadVideoThumbnailToStorage(
   _userId: string,
@@ -1400,15 +1437,40 @@ export async function uploadVideoThumbnailToStorage(
   thumbnailDataUrl: string,
   cloudinaryVideoUrl?: string
 ): Promise<string> {
-  if (cloudinaryVideoUrl && cloudinaryVideoUrl.includes('res.cloudinary.com/')) {
-    const derivedThumb = cloudinaryVideoUrl.replace(/\.(mp4|webm|mov|ogv|m4v|3gp)$/i, '.jpg');
-    if (derivedThumb !== cloudinaryVideoUrl) {
-      return derivedThumb;
-    }
-  }
-  if (thumbnailDataUrl && thumbnailDataUrl.length < 75000) {
+  if (
+    thumbnailDataUrl &&
+    (thumbnailDataUrl.startsWith('https://') || thumbnailDataUrl.startsWith('http://'))
+  ) {
     return thumbnailDataUrl;
   }
+
+  if (cloudinaryVideoUrl && cloudinaryVideoUrl.includes('res.cloudinary.com/')) {
+    // Derive a small, sharp JPEG thumbnail URL directly from the Cloudinary video asset
+    const withTransform = cloudinaryVideoUrl.replace(
+      '/video/upload/',
+      '/video/upload/so_1.0,w_640,c_limit,q_auto:good/'
+    );
+    const derivedThumb = withTransform.replace(/\.(mp4|webm|mov|ogv|m4v|3gp)$/i, '.jpg');
+    if (derivedThumb !== withTransform && derivedThumb.startsWith('http')) {
+      return derivedThumb;
+    }
+    const simpleDerived = cloudinaryVideoUrl.replace(/\.(mp4|webm|mov|ogv|m4v|3gp)$/i, '.jpg');
+    if (simpleDerived !== cloudinaryVideoUrl && simpleDerived.startsWith('http')) {
+      return simpleDerived;
+    }
+  }
+
+  if (thumbnailDataUrl && thumbnailDataUrl.startsWith('data:image/')) {
+    try {
+      const uploaded = await uploadImageToCloudinary(thumbnailDataUrl);
+      if (uploaded.secureUrl && uploaded.secureUrl.startsWith('http')) {
+        return uploaded.secureUrl;
+      }
+    } catch (err) {
+      console.warn('Could not upload custom video thumbnail to Cloudinary:', err);
+    }
+  }
+
   return '';
 }
 
@@ -1616,9 +1678,7 @@ export function startDirectVideoUploadToCloudinary(params: {
 
           resolve({
             videoUrl: secureUrl,
-            thumbnailUrl:
-              resolvedThumb ||
-              (thumbnailDataUrl && thumbnailDataUrl.length < 75000 ? thumbnailDataUrl : ''),
+            thumbnailUrl: resolvedThumb && resolvedThumb.startsWith('http') ? resolvedThumb : '',
             storagePath: publicId,
             durationSeconds: cloudDuration,
             fileSize: cloudBytes,
@@ -1806,62 +1866,47 @@ export async function resolveVideoUrl(
   return null;
 }
 
+/**
+ * Prepares an image in the browser (preserving original sharpness up to maxWidth/maxHeight)
+ * and uploads it directly from the browser to Cloudinary's unsigned upload API
+ * (`https://api.cloudinary.com/v1_1/monarcking72/image/upload`, preset `monarcking72`),
+ * returning ONLY the HTTPS `secure_url`. Never returns base64 or data URLs.
+ */
 export function compressImage(
   file: File | Blob,
   maxWidth = 2048,
   maxHeight = 2048,
-  quality = 0.92
+  quality = 0.92,
+  onProgress?: (percentage: number) => void
 ): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     if (!file || file.size === 0) {
-      resolve('');
+      reject(new Error('Selected image file is empty.'));
       return;
     }
 
-    let settled = false;
-    const finish = (val: string) => {
-      if (!settled) {
-        settled = true;
-        resolve(val);
-      }
-    };
-
-    // Safety timeout so image preparation can never hang post creation
-    const safetyTimer = setTimeout(() => {
-      try {
-        finish(URL.createObjectURL(file));
-      } catch {
-        finish('');
-      }
-    }, 6000);
-
-    if (file.type === 'image/svg+xml' && file.size <= 300 * 1024) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        clearTimeout(safetyTimer);
-        finish((e.target?.result as string) || '');
-      };
-      reader.onerror = () => {
-        clearTimeout(safetyTimer);
-        finish('');
-      };
-      reader.readAsDataURL(file);
-      return;
-    }
-
+    // Fast path: if original file is a standard web image <= 12 MB and doesn't need resizing,
+    // or if we want to optimize large camera photos in canvas first before uploading to Cloudinary:
     const img = new Image();
     const objectUrl = URL.createObjectURL(file);
 
     img.onload = () => {
-      clearTimeout(safetyTimer);
       URL.revokeObjectURL(objectUrl);
 
       let width = img.naturalWidth || img.width || 1080;
       let height = img.naturalHeight || img.height || 1080;
 
-      // Never upscale beyond original image dimensions; only cap if larger than maxWidth/maxHeight
-      const targetMaxW = Math.max(maxWidth, 2048);
-      const targetMaxH = Math.max(maxHeight, 2048);
+      const targetMaxW = Math.max(maxWidth, 512);
+      const targetMaxH = Math.max(maxHeight, 512);
+      const needsResize = width > targetMaxW || height > targetMaxH || file.size > 8 * 1024 * 1024;
+
+      if (!needsResize) {
+        uploadImageToCloudinary(file, onProgress)
+          .then((res) => resolve(res.secureUrl))
+          .catch((err) => reject(err));
+        return;
+      }
+
       if (width > targetMaxW || height > targetMaxH) {
         if (width > height) {
           height = Math.round((height * targetMaxW) / width);
@@ -1872,95 +1917,39 @@ export function compressImage(
         }
       }
 
-      const renderAtScale = (scale: number, q: number): string => {
-        const w = Math.max(1, Math.round(width * scale));
-        const h = Math.max(1, Math.round(height * scale));
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return '';
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(img, 0, 0, w, h);
-        return canvas.toDataURL('image/jpeg', q);
-      };
-
-      const MAX_SAFE_FIRESTORE_CHARS = 820 * 1024; // High-resolution sharp JPEG within Firestore doc limit
-      const highRes = renderAtScale(1, Math.max(quality, 0.9));
-
-      // Try uploading original image directly to Cloudinary for full-resolution sharp delivery
-      if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET && file.size <= 15 * 1024 * 1024) {
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-        fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
-          method: 'POST',
-          body: formData
-        })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((data) => {
-            if (data && typeof data.secure_url === 'string' && data.secure_url.startsWith('http')) {
-              finish(data.secure_url);
-              return;
-            }
-            let fallback = highRes;
-            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
-              fallback = renderAtScale(1, 0.85);
-            }
-            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
-              fallback = renderAtScale(0.9, 0.78);
-            }
-            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
-              fallback = renderAtScale(0.8, 0.72);
-            }
-            finish(fallback);
-          })
-          .catch(() => {
-            let fallback = highRes;
-            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
-              fallback = renderAtScale(1, 0.85);
-            }
-            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
-              fallback = renderAtScale(0.9, 0.78);
-            }
-            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
-              fallback = renderAtScale(0.8, 0.72);
-            }
-            finish(fallback);
-          });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, width);
+      canvas.height = Math.max(1, height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        uploadImageToCloudinary(file, onProgress)
+          .then((res) => resolve(res.secureUrl))
+          .catch((err) => reject(err));
         return;
       }
 
-      let compressed = highRes;
-      if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
-        compressed = renderAtScale(1, 0.85);
-      }
-      if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
-        compressed = renderAtScale(0.9, 0.78);
-      }
-      if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
-        compressed = renderAtScale(0.8, 0.72);
-      }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-      finish(compressed);
+      canvas.toBlob(
+        (blob) => {
+          const uploadTarget = blob && blob.size > 0 ? blob : file;
+          uploadImageToCloudinary(uploadTarget, onProgress)
+            .then((res) => resolve(res.secureUrl))
+            .catch((err) => reject(err));
+        },
+        'image/jpeg',
+        Math.max(0.75, Math.min(0.95, quality))
+      );
     };
 
     img.onerror = () => {
-      clearTimeout(safetyTimer);
       URL.revokeObjectURL(objectUrl);
-      if (file.size <= 600 * 1024) {
-        const reader = new FileReader();
-        reader.onload = (e) => finish((e.target?.result as string) || '');
-        reader.onerror = () => finish('');
-        reader.readAsDataURL(file);
-      } else {
-        try {
-          finish(URL.createObjectURL(file));
-        } catch {
-          finish('');
-        }
-      }
+      // Still attempt direct Cloudinary upload (e.g. for HEIC/AVIF/SVG supported by Cloudinary)
+      uploadImageToCloudinary(file, onProgress)
+        .then((res) => resolve(res.secureUrl))
+        .catch((err) => reject(err));
     };
 
     img.src = objectUrl;

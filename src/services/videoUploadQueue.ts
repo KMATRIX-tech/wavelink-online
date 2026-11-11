@@ -5,11 +5,11 @@ import {
   cleanFirestoreData,
   handleFirestoreError,
   OperationType,
-  formatVideoUploadError
+  formatVideoUploadError,
+  sanitizeAvatarUrlForFirestore
 } from '../firebase';
 import {
   compressVideoBeforeUpload,
-  generateVideoThumbnail,
   startDirectVideoUploadToCloudinary,
   DirectVideoUploadTaskHandle,
   formatVideoFileSize,
@@ -53,7 +53,9 @@ export interface VideoPostUploadJobInput {
     songStartTime?: number;
     songVolume?: number;
   };
+  onProgress?: (percentage: number, statusText: string) => void;
   onComplete?: (postId: string, createdPost?: Post) => void;
+  onError?: (errorMessage: string, jobId: string) => void;
 }
 
 export type VideoUploadJobStatus =
@@ -97,6 +99,49 @@ export type VideoUploadQueueJob = VideoUploadJob;
 
 type VideoQueueListener = (jobs: VideoUploadJob[]) => void;
 
+const STALE_DRAFT_STORAGE_KEYS = [
+  'wavelink_creator_studio_draft',
+  'wavelink_creator_studio_draft_v1',
+  'wavelink_creator_studio_draft_v2',
+  'wavelink_failed_post_draft',
+  'wavelink_video_upload_drafts',
+  'wavelink_pending_posts'
+];
+
+export function clearFailedVideoAndStudioDrafts(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    for (const key of STALE_DRAFT_STORAGE_KEYS) {
+      localStorage.removeItem(key);
+    }
+    // Also remove any legacy localStorage item that accidentally stored base64 data URLs
+    const keysToInspect: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('wavelink_') && k.includes('draft')) {
+        keysToInspect.push(k);
+      }
+    }
+    for (const k of keysToInspect) {
+      localStorage.removeItem(k);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function sanitizeOptionalHttpUrl(url?: string): string | undefined {
+  if (!url || typeof url !== 'string') return undefined;
+  const trimmed = url.trim();
+  if (trimmed.startsWith('https://') || trimmed.startsWith('http://')) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('data:audio/')) {
+    return 'https://wavelink.app/royalty-free/rf_afrobeat_sun.wav';
+  }
+  return undefined;
+}
+
 class VideoUploadQueueManager {
   private jobs: VideoUploadJob[] = [];
   private listeners: Set<VideoQueueListener> = new Set();
@@ -106,6 +151,10 @@ class VideoUploadQueueManager {
     string,
     { file: File; durationSeconds: number; width: number; height: number; thumbnailUrl: string }
   > = new Map();
+
+  constructor() {
+    clearFailedVideoAndStudioDrafts();
+  }
 
   public getJobs(): VideoUploadJob[] {
     return [...this.jobs];
@@ -135,7 +184,26 @@ class VideoUploadQueueManager {
     this.emit();
   }
 
+  public clearFailedJobs(): void {
+    clearFailedVideoAndStudioDrafts();
+    this.jobs.forEach((j) => {
+      if (j.status === 'failed' || j.status === 'cancelled') {
+        if (j.videoPreviewUrl) {
+          try {
+            URL.revokeObjectURL(j.videoPreviewUrl);
+          } catch {}
+        }
+        this.compressedFilesCache.delete(j.id);
+      }
+    });
+    this.jobs = this.jobs.filter((j) => j.status !== 'failed' && j.status !== 'cancelled');
+    this.emit();
+  }
+
   public enqueue(input: VideoPostUploadJobInput): string {
+    // Clear any old failed drafts before starting a new upload
+    this.clearFailedJobs();
+
     const now = Date.now();
     const postId = input.postId || `post_${now}_${Math.random().toString(36).substring(2, 7)}`;
     const jobId = `vidjob_${now}_${Math.random().toString(36).substring(2, 7)}`;
@@ -148,6 +216,7 @@ class VideoUploadQueueManager {
 
     const normalizedCaption = input.caption ?? input.content ?? '';
     const normalizedThumb = input.customThumbnailUrl || input.customThumbnailDataUrl || '';
+    const safeAuthorAvatar = sanitizeAvatarUrlForFirestore(input.authorPhotoURL, input.authorId);
     const rawFileSize = input.file?.size || 0;
     const initialSizeLabel = formatVideoFileSize(rawFileSize);
     let previewUrl = '';
@@ -162,37 +231,38 @@ class VideoUploadQueueManager {
       authorEmail: input.authorEmail || '',
       authorName: input.authorName || 'Creator',
       authorUsername: input.authorUsername || '@waver',
-      authorPhotoURL: input.authorPhotoURL,
+      authorPhotoURL: safeAuthorAvatar,
       fileName: input.file.name || 'video.mp4',
       fileSize: rawFileSize,
       bytesTransferred: 0,
       formattedFileSize: initialSizeLabel,
-      thumbnailUrl: normalizedThumb,
+      thumbnailUrl: normalizedThumb.startsWith('http') ? normalizedThumb : '',
       videoPreviewUrl: previewUrl,
       isProUser,
       phase: 'preparing',
       progress: 5,
       status: 'preparing',
-      statusText: `Preparing 720p video (${initialSizeLabel})...`,
+      statusText: `Preparing video (${initialSizeLabel})...`,
       durationSeconds: initialDuration,
       createdAt: now,
       input: {
         ...input,
         postId,
+        authorPhotoURL: safeAuthorAvatar,
         isProUser,
         caption: normalizedCaption,
         customThumbnailUrl: normalizedThumb || undefined,
         songTitle: input.songTitle ?? input.songMetadata?.songTitle,
         songArtist: input.songArtist ?? input.songMetadata?.songArtist,
-        songAlbumArt: input.songAlbumArt ?? input.songMetadata?.songAlbumArt,
-        songPreviewUrl: input.songPreviewUrl ?? input.songMetadata?.songPreviewUrl,
+        songAlbumArt: sanitizeOptionalHttpUrl(input.songAlbumArt ?? input.songMetadata?.songAlbumArt),
+        songPreviewUrl: sanitizeOptionalHttpUrl(input.songPreviewUrl ?? input.songMetadata?.songPreviewUrl),
         songAlbumName: input.songAlbumName ?? input.songMetadata?.songAlbumName,
         songStartTime: input.songStartTime ?? input.songMetadata?.songStartTime,
         songVolume: input.songVolume ?? input.songMetadata?.songVolume
       }
     };
 
-    this.jobs = [newJob, ...this.jobs.filter((j) => j.status !== 'cancelled')];
+    this.jobs = [newJob, ...this.jobs.filter((j) => j.status !== 'cancelled' && j.status !== 'failed')];
     this.emit();
 
     void this.runJob(jobId);
@@ -243,23 +313,33 @@ class VideoUploadQueueManager {
     this.emit();
   }
 
+  /**
+   * Re-uploads the video file from the browser to Cloudinary from scratch
+   * instead of resending a failed Firestore document, and clears any stale cache/drafts.
+   */
   public retryJob(jobId: string): void {
     const target = this.jobs.find((j) => j.id === jobId);
     if (!target) return;
 
-    const cached = this.compressedFilesCache.get(jobId);
-    const sizeLabel = formatVideoFileSize(cached?.file.size || target.fileSize);
+    clearFailedVideoAndStudioDrafts();
+    this.compressedFilesCache.delete(jobId);
+
+    const freshPostId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const sizeLabel = formatVideoFileSize(target.input.file?.size || target.fileSize);
 
     this.updateJob(jobId, {
-      status: cached ? 'uploading' : 'preparing',
-      phase: cached ? 'uploading' : 'preparing',
+      postId: freshPostId,
+      input: {
+        ...target.input,
+        postId: freshPostId
+      },
+      status: 'preparing',
+      phase: 'preparing',
       progress: 5,
       bytesTransferred: 0,
       formattedFileSize: sizeLabel,
       error: undefined,
-      statusText: cached
-        ? `Retrying upload (${sizeLabel})...`
-        : `Preparing 720p video (${sizeLabel})...`
+      statusText: `Re-uploading video from browser (${sizeLabel})...`
     });
 
     void this.runJob(jobId);
@@ -289,7 +369,7 @@ class VideoUploadQueueManager {
     try {
       let prepared = this.compressedFilesCache.get(jobId);
 
-      // Step 1: Compress / downscale video to ~720p in browser & generate thumbnail
+      // Step 1: Inspect/trim video in browser (preserving original quality & enforcing 60s Free / 90s Pro limit)
       if (!prepared) {
         const rawSizeLabel = formatVideoFileSize(input.file.size);
         this.updateJob(jobId, {
@@ -297,28 +377,31 @@ class VideoUploadQueueManager {
           status: 'preparing',
           progress: 6,
           formattedFileSize: rawSizeLabel,
-          statusText: `Preparing 720p video (${rawSizeLabel})...`
+          statusText: `Preparing video (${rawSizeLabel})...`
         });
+        if (input.onProgress) {
+          input.onProgress(6, `Preparing video (${rawSizeLabel})...`);
+        }
 
-        const [firstSecThumb, compressed] = await Promise.all([
-          input.customThumbnailUrl
-            ? Promise.resolve(input.customThumbnailUrl)
-            : generateVideoThumbnail(input.file, 1.0),
-          compressVideoBeforeUpload(input.file, {
-            trimStart: input.trimStart,
-            trimEnd: input.trimEnd,
-            isProUser,
-            signal: abortController.signal,
-            onProgress: (pct, label) => {
-              this.updateJob(jobId, {
-                phase: 'preparing',
-                status: 'preparing',
-                progress: Math.max(5, Math.min(100, pct)),
-                statusText: label || `Compressing to 720p (${pct}%)...`
-              });
+        const compressed = await compressVideoBeforeUpload(input.file, {
+          trimStart: input.trimStart,
+          trimEnd: input.trimEnd,
+          isProUser,
+          signal: abortController.signal,
+          onProgress: (pct, label) => {
+            const mapped = Math.max(5, Math.min(20, Math.round(pct * 0.2)));
+            const text = label || `Preparing video (${pct}%)...`;
+            this.updateJob(jobId, {
+              phase: 'preparing',
+              status: 'preparing',
+              progress: pct,
+              statusText: text
+            });
+            if (input.onProgress) {
+              input.onProgress(mapped, text);
             }
-          })
-        ]);
+          }
+        });
 
         if (abortController.signal.aborted) return;
 
@@ -327,7 +410,7 @@ class VideoUploadQueueManager {
           durationSeconds: compressed.durationSeconds,
           width: compressed.width,
           height: compressed.height,
-          thumbnailUrl: firstSecThumb || job.thumbnailUrl
+          thumbnailUrl: input.customThumbnailUrl || input.customThumbnailDataUrl || ''
         };
         this.compressedFilesCache.set(jobId, prepared);
 
@@ -335,12 +418,11 @@ class VideoUploadQueueManager {
         this.updateJob(jobId, {
           fileSize: prepared.file.size,
           formattedFileSize: compressedSizeLabel,
-          thumbnailUrl: prepared.thumbnailUrl,
           durationSeconds: prepared.durationSeconds,
           videoWidth: prepared.width,
           videoHeight: prepared.height,
           progress: 100,
-          statusText: `720p video ready (${compressedSizeLabel}) — starting upload...`
+          statusText: `Video ready (${compressedSizeLabel}) — uploading to Cloudinary...`
         });
       }
 
@@ -356,6 +438,9 @@ class VideoUploadQueueManager {
         formattedFileSize: `0 KB / ${uploadSizeLabel}`,
         statusText: `Uploading 1% • 0 KB / ${uploadSizeLabel}`
       });
+      if (input.onProgress) {
+        input.onProgress(20, `Uploading to Cloudinary (1% • ${uploadSizeLabel})...`);
+      }
 
       const handle = startDirectVideoUploadToCloudinary({
         postId,
@@ -379,6 +464,10 @@ class VideoUploadQueueManager {
             formattedFileSize: `${formatVideoFileSize(transferred)} / ${formatVideoFileSize(total)}`,
             statusText
           });
+          if (input.onProgress) {
+            const overallPct = Math.max(20, Math.min(98, Math.round(20 + pct * 0.78)));
+            input.onProgress(overallPct, statusText);
+          }
         },
         onStateChange: (state) => {
           const current = this.jobs.find((j) => j.id === jobId);
@@ -399,16 +488,17 @@ class VideoUploadQueueManager {
 
       if (
         !uploadResult.videoUrl ||
-        uploadResult.videoUrl.startsWith('data:video/') ||
+        uploadResult.videoUrl.startsWith('data:') ||
+        uploadResult.videoUrl.startsWith('blob:') ||
         !uploadResult.videoUrl.startsWith('http')
       ) {
         throw new Error(
-          'Cloudinary upload did not return a valid secure_url. Never saving base64 video in Firestore.'
+          'Cloudinary upload did not return a valid secure_url. Never saving base64 or raw video data in Firestore.'
         );
       }
 
       // Step 3: Create the post in Firestore ONLY after the Cloudinary upload has finished,
-      // saving only the returned secure_url and basic metadata.
+      // saving only the returned secure_url, small HTTP thumbnail URL, duration, width, and height.
       const extractedHashtags =
         input.hashtags && input.hashtags.length > 0
           ? input.hashtags
@@ -425,11 +515,21 @@ class VideoUploadQueueManager {
         Math.min(maxAllowedSeconds, Math.round(uploadResult.durationSeconds * 10) / 10)
       );
 
-      // Prefer the lightweight Cloudinary .jpg poster URL over large base64 data URLs
+      const finalWidth = uploadResult.width || prepared.width || 720;
+      const finalHeight = uploadResult.height || prepared.height || 1280;
+
+      // Strictly use an HTTPS thumbnail URL (either uploaded custom cover URL or Cloudinary derived .jpg URL)
+      const derivedFallbackThumb = uploadResult.videoUrl
+        .replace('/video/upload/', '/video/upload/so_1.0,w_640,c_limit,q_auto:good/')
+        .replace(/\.[a-zA-Z0-9]+(\?.*)?$/, '.jpg');
       const cloudPosterUrl =
         uploadResult.thumbnailUrl && uploadResult.thumbnailUrl.startsWith('http')
           ? uploadResult.thumbnailUrl
-          : uploadResult.videoUrl.replace(/\.[a-zA-Z0-9]+(\?.*)?$/, '.jpg');
+          : derivedFallbackThumb.startsWith('http')
+          ? derivedFallbackThumb
+          : undefined;
+
+      const safeAuthorPhotoUrl = sanitizeAvatarUrlForFirestore(input.authorPhotoURL, input.authorId);
 
       const postPayload: Post = {
         id: postId,
@@ -437,29 +537,29 @@ class VideoUploadQueueManager {
         authorEmail: input.authorEmail || '',
         authorName: input.authorName || 'Creator',
         authorUsername: input.authorUsername || '@waver',
-        authorPhotoURL: input.authorPhotoURL,
+        authorPhotoURL: safeAuthorPhotoUrl,
         content: (input.caption || '').trim(),
         mediaType: 'video',
         videoUrl: uploadResult.videoUrl,
-        thumbnailUrl: cloudPosterUrl || undefined,
+        thumbnailUrl: cloudPosterUrl,
         storagePath: uploadResult.storagePath,
         duration: roundedDuration,
         videoDurationSeconds: roundedDuration,
-        videoWidth: prepared.width || undefined,
-        videoHeight: prepared.height || undefined,
+        videoWidth: finalWidth,
+        videoHeight: finalHeight,
         videoFileName: prepared.file.name,
         videoTrimStart: input.trimStart ?? 0,
         videoTrimEnd: input.trimEnd ?? roundedDuration,
         hasVideoChunks: false,
-        aspectRatio: input.aspectRatio || '4:5',
+        aspectRatio: input.aspectRatio || '9:16',
         audience: input.audience || 'public',
         locationTag: input.locationTag?.trim() || undefined,
         allowComments: input.allowComments !== undefined ? input.allowComments : true,
         hashtags: extractedHashtags.length > 0 ? extractedHashtags : undefined,
         songTitle: input.songTitle,
         songArtist: input.songArtist,
-        songAlbumArt: input.songAlbumArt,
-        songPreviewUrl: input.songPreviewUrl,
+        songAlbumArt: sanitizeOptionalHttpUrl(input.songAlbumArt),
+        songPreviewUrl: sanitizeOptionalHttpUrl(input.songPreviewUrl),
         songAlbumName: input.songAlbumName,
         songStartTime: input.songStartTime,
         songVolume: input.songVolume,
@@ -472,8 +572,10 @@ class VideoUploadQueueManager {
         createdAt: new Date().toISOString()
       };
 
+      const cleanedPayload = cleanFirestoreData(postPayload);
+
       try {
-        await setDoc(doc(db, 'posts', postId), cleanFirestoreData(postPayload));
+        await setDoc(doc(db, 'posts', postId), cleanedPayload);
       } catch (firestoreErr) {
         console.error('[WaveLink Video Post Firestore Error]', firestoreErr);
         try {
@@ -481,6 +583,8 @@ class VideoUploadQueueManager {
         } catch {}
         throw firestoreErr;
       }
+
+      clearFailedVideoAndStudioDrafts();
 
       // Immediately notify FeedView / VideosHubView so the saved post appears at the top of the feed right away
       if (typeof window !== 'undefined') {
@@ -494,11 +598,16 @@ class VideoUploadQueueManager {
         phase: 'done',
         status: 'completed',
         progress: 100,
+        thumbnailUrl: cloudPosterUrl || '',
         bytesTransferred: prepared.file.size,
         formattedFileSize: uploadSizeLabel,
         createdPost: postPayload,
         statusText: `Published (${uploadSizeLabel})!`
       });
+
+      if (input.onProgress) {
+        input.onProgress(100, `Published (${uploadSizeLabel})!`);
+      }
 
       if (input.onComplete) {
         try {
@@ -512,6 +621,7 @@ class VideoUploadQueueManager {
       }, 4000);
     } catch (error: any) {
       this.activeHandles.delete(jobId);
+      this.compressedFilesCache.delete(jobId);
       const rawMsg = error instanceof Error ? error.message : String(error || '');
       if (rawMsg === 'UPLOAD_CANCELLED') {
         this.jobs = this.jobs.filter((j) => j.id !== jobId);
@@ -529,8 +639,14 @@ class VideoUploadQueueManager {
       this.updateJob(jobId, {
         status: 'failed',
         error: formattedError,
-        statusText: 'Video upload failed — tap Retry'
+        statusText: 'Video upload failed — tap Retry to upload file again'
       });
+
+      if (input.onError) {
+        try {
+          input.onError(formattedError, jobId);
+        } catch {}
+      }
     }
   }
 }
@@ -554,6 +670,7 @@ export function useVideoUploadQueue() {
     resumeJob: (id: string) => videoUploadQueue.resumeJob(id),
     cancelJob: (id: string) => videoUploadQueue.cancelJob(id),
     retryJob: (id: string) => videoUploadQueue.retryJob(id),
-    dismissJob: (id: string) => videoUploadQueue.dismissJob(id)
+    dismissJob: (id: string) => videoUploadQueue.dismissJob(id),
+    clearFailedJobs: () => videoUploadQueue.clearFailedJobs()
   };
 }

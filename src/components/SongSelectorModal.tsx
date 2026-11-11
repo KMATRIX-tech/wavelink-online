@@ -24,14 +24,14 @@ interface SongSelectorModalProps {
 
 const GENRE_FILTERS = [
   'All',
-  'Afro-Fusion',
-  'Lo-Fi Beats',
+  'Bongo Flava',
+  'Amapiano',
+  'Afrobeats',
+  'Gengetone',
   'Comedy Skit',
-  'Indie Pop',
   'Acoustic Groove',
+  'Lo-Fi Beats',
   'Cinematic',
-  'Synthwave',
-  'Tropical',
 ];
 
 export const SongSelectorModal: React.FC<SongSelectorModalProps> = ({

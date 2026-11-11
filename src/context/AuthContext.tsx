@@ -33,12 +33,17 @@ import {
   UserProfile,
   PointTransaction,
   PointTransactionCategory,
+  AfricanCountryCode,
+  EastAfricanCurrency,
+  PanAfricanLanguageCode,
+  KangaPatternFrame,
   PointTransactionType,
   AppearanceTheme,
   UserPrivacySettings,
   UserNotificationSettings,
   UserTermsAgreement,
-  AuditActionType
+  AuditActionType,
+  AppLanguage
 } from '../types';
 import {
   removeCurrentDeviceFcmToken,
@@ -308,6 +313,21 @@ interface AuthContextType {
     privacySettings?: UserPrivacySettings;
     notificationSettings?: UserNotificationSettings;
     termsAgreement?: UserTermsAgreement;
+    dataSaverEnabled?: boolean;
+    language?: AppLanguage;
+    panAfricanLanguage?: PanAfricanLanguageCode;
+    countryCode?: AfricanCountryCode;
+    regionName?: string;
+    preferredCurrency?: EastAfricanCurrency;
+    patternFrame?: KangaPatternFrame;
+    kangaBackgroundEnabled?: boolean;
+    interests?: string[];
+    interestsCompleted?: boolean;
+    weeklyWinnerUntil?: string;
+    weeklyWinnerChallengeTitle?: string;
+    weeklyWinnerHashtag?: string;
+    isCreatorSpotlight?: boolean;
+    spotlightNote?: string;
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
   toggleBlockUser: (targetUserId: string) => Promise<boolean>;
@@ -1320,6 +1340,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     privacySettings?: UserPrivacySettings;
     notificationSettings?: UserNotificationSettings;
     termsAgreement?: UserTermsAgreement;
+    dataSaverEnabled?: boolean;
+    language?: AppLanguage;
+    panAfricanLanguage?: PanAfricanLanguageCode;
+    countryCode?: AfricanCountryCode;
+    regionName?: string;
+    preferredCurrency?: EastAfricanCurrency;
+    patternFrame?: KangaPatternFrame;
+    kangaBackgroundEnabled?: boolean;
+    interests?: string[];
+    interestsCompleted?: boolean;
+    weeklyWinnerUntil?: string;
+    weeklyWinnerChallengeTitle?: string;
+    weeklyWinnerHashtag?: string;
+    isCreatorSpotlight?: boolean;
+    spotlightNote?: string;
   }) => {
     if (!currentUser) return;
     try {
@@ -1353,6 +1388,51 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       if (data.termsAgreement !== undefined) {
         updatePayload.termsAgreement = data.termsAgreement;
+      }
+      if (data.dataSaverEnabled !== undefined) {
+        updatePayload.dataSaverEnabled = Boolean(data.dataSaverEnabled);
+      }
+      if (data.language !== undefined) {
+        updatePayload.language = data.language === 'sw' ? 'sw' : 'en';
+      }
+      if (data.panAfricanLanguage !== undefined) {
+        updatePayload.panAfricanLanguage = data.panAfricanLanguage;
+      }
+      if (data.countryCode !== undefined) {
+        updatePayload.countryCode = data.countryCode;
+      }
+      if (data.regionName !== undefined) {
+        updatePayload.regionName = sanitizeUserText(data.regionName, 60);
+      }
+      if (data.preferredCurrency !== undefined) {
+        updatePayload.preferredCurrency = data.preferredCurrency;
+      }
+      if (data.patternFrame !== undefined) {
+        updatePayload.patternFrame = data.patternFrame;
+      }
+      if (data.kangaBackgroundEnabled !== undefined) {
+        updatePayload.kangaBackgroundEnabled = Boolean(data.kangaBackgroundEnabled);
+      }
+      if (data.interests !== undefined) {
+        updatePayload.interests = Array.isArray(data.interests) ? data.interests.slice(0, 15) : [];
+      }
+      if (data.interestsCompleted !== undefined) {
+        updatePayload.interestsCompleted = Boolean(data.interestsCompleted);
+      }
+      if (data.weeklyWinnerUntil !== undefined) {
+        updatePayload.weeklyWinnerUntil = data.weeklyWinnerUntil;
+      }
+      if (data.weeklyWinnerChallengeTitle !== undefined) {
+        updatePayload.weeklyWinnerChallengeTitle = sanitizeUserText(data.weeklyWinnerChallengeTitle, 120);
+      }
+      if (data.weeklyWinnerHashtag !== undefined) {
+        updatePayload.weeklyWinnerHashtag = sanitizeUserText(data.weeklyWinnerHashtag, 60);
+      }
+      if (data.isCreatorSpotlight !== undefined) {
+        updatePayload.isCreatorSpotlight = Boolean(data.isCreatorSpotlight);
+      }
+      if (data.spotlightNote !== undefined) {
+        updatePayload.spotlightNote = sanitizeUserText(data.spotlightNote, 200);
       }
 
       const sanitized = cleanFirestoreData(updatePayload);

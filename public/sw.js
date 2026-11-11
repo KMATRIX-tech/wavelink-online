@@ -1,4 +1,4 @@
-const CACHE_NAME = 'wavelink-pwa-v3';
+const CACHE_NAME = 'wavelink-pwa-v4';
 const ASSETS_TO_CACHE = [
   '/',
   '/index.html',
@@ -11,22 +11,23 @@ const ASSETS_TO_CACHE = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS_TO_CACHE);
-    }).catch(() => {})
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(ASSETS_TO_CACHE))
+      .catch(() => {})
   );
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
+    caches.keys().then((cacheNames) =>
+      Promise.all(
         cacheNames
           .filter((name) => name !== CACHE_NAME)
           .map((name) => caches.delete(name))
-      );
-    })
+      )
+    )
   );
   self.clients.claim();
 });
@@ -45,7 +46,7 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Network-first for HTML navigation so fresh releases load immediately
+  // Network-first for HTML navigation so fresh releases load immediately with offline fallback
   if (event.request.mode === 'navigate') {
     event.respondWith(
       fetch(event.request)
@@ -74,6 +75,7 @@ self.addEventListener('fetch', (event) => {
 });
 
 // Handle incoming Firebase Cloud Messaging & Web Push notifications
+// Supports messages, followers, reactions, replies, challenge reminders, and loud incoming calls with Answer/Decline buttons
 self.addEventListener('push', (event) => {
   let payload = {};
   if (event.data) {
@@ -91,10 +93,31 @@ self.addEventListener('push', (event) => {
 
   const notif = payload.notification || {};
   const data = payload.data || {};
-  const title = notif.title || data.title || 'WaveLink';
-  const body = notif.body || data.body || 'Tap to open WaveLink.';
+  const notifType = data.type || 'system';
+  const isIncomingCall = notifType === 'incoming_call' || notifType === 'call';
+
+  const title = notif.title || data.title || (isIncomingCall ? 'Incoming WaveLink Call 📞' : 'WaveLink');
+  const body =
+    notif.body ||
+    data.body ||
+    (isIncomingCall ? 'Tap Answer to join the call or Decline.' : 'Tap to open WaveLink.');
   const icon = notif.icon || data.icon || '/pwa-192x192.png';
-  const tag = data.tag || data.type || 'wavelink-notification';
+  const tag = isIncomingCall
+    ? `wavelink-call-${data.entityId || 'active'}`
+    : data.tag || notifType || 'wavelink-notification';
+
+  const actions = isIncomingCall
+    ? [
+        {
+          action: 'answer_call',
+          title: '📞 Answer'
+        },
+        {
+          action: 'decline_call',
+          title: '✕ Decline'
+        }
+      ]
+    : [];
 
   const options = {
     body,
@@ -102,31 +125,48 @@ self.addEventListener('push', (event) => {
     badge: '/pwa-192x192.png',
     tag,
     renotify: true,
-    vibrate: data.type === 'incoming_call' || data.type === 'call' ? [300, 150, 300, 150, 400] : [180, 80, 180],
-    requireInteraction: data.type === 'incoming_call' || data.type === 'call',
+    vibrate: isIncomingCall ? [400, 150, 400, 150, 500, 200, 600] : [180, 80, 180],
+    requireInteraction: isIncomingCall,
+    actions,
     data: {
       url: data.url || '/',
-      type: data.type || 'system',
+      type: notifType,
       entityId: data.entityId || '',
-      actorId: data.actorId || ''
+      actorId: data.actorId || '',
+      actorName: data.actorName || ''
     }
   };
 
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
-// Focus or open WaveLink when a push notification is tapped
+// Handle notification clicks, including Answer / Decline buttons on incoming call notifications
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = (event.notification.data && event.notification.data.url) || '/';
+  const notifData = event.notification.data || {};
+  const action = event.action || 'open';
+  const callAction =
+    action === 'answer_call'
+      ? 'answer'
+      : action === 'decline_call'
+      ? 'decline'
+      : null;
+
+  const targetUrl = callAction
+    ? `/?callAction=${encodeURIComponent(callAction)}&callId=${encodeURIComponent(
+        notifData.entityId || ''
+      )}`
+    : notifData.url || '/';
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
       for (const client of clientList) {
         if ('focus' in client) {
           client.postMessage({
-            type: 'WAVELINK_NOTIFICATION_CLICK',
-            data: event.notification.data || {}
+            type: callAction ? 'WAVELINK_CALL_NOTIFICATION_ACTION' : 'WAVELINK_NOTIFICATION_CLICK',
+            action: callAction || 'open',
+            callId: notifData.entityId || '',
+            data: notifData
           });
           return client.focus();
         }

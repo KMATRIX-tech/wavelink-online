@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { resolveVideoUrl } from '../utils/mediaStorage';
-import { Volume2, VolumeX } from 'lucide-react';
+import {
+  useDataSaver,
+  shouldBlockVideoAutoplay,
+  getOptimizedVideoUrl,
+  getOptimizedImagePreviewUrl
+} from '../services/dataSaverService';
+import { useLanguage } from '../context/LanguageContext';
+import { Volume2, VolumeX, Play, Zap } from 'lucide-react';
 
 export interface VideoPlayerProps {
   postId: string;
@@ -146,14 +153,19 @@ function evaluateFeedVideoPlayers(): void {
     item.entry.setAllowedToLoad(isCurrentOrNext);
   });
 
-  // 4. Enforce single active playing video
+  // 4. Enforce single active playing video (never autoplay on mobile data or when Data Saver is on)
+  const blockAutoplay = shouldBlockVideoAutoplay();
   const nextActiveInstanceId =
-    bestVisibleIndex !== -1 ? entries[bestVisibleIndex].entry.instanceId : null;
+    !blockAutoplay && bestVisibleIndex !== -1 ? entries[bestVisibleIndex].entry.instanceId : null;
 
   activePlayingInstanceId = nextActiveInstanceId;
 
   entries.forEach((item, idx) => {
-    const isTarget = idx === bestVisibleIndex && item.entry.autoPlayOnVisible && !item.entry.userPaused;
+    const isTarget =
+      !blockAutoplay &&
+      idx === bestVisibleIndex &&
+      item.entry.autoPlayOnVisible &&
+      !item.entry.userPaused;
     item.entry.setIsActivePlayTarget(isTarget);
     if (!isTarget) {
       item.entry.forcePause();
@@ -248,10 +260,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [hasError, setHasError] = useState<boolean>(false);
 
+  const { enabled: isDataSaverOn, blockAutoplay } = useDataSaver();
+  const { t } = useLanguage();
+
   // Sound state: remembers the user's sound choice across videos
   const [isMuted, setIsMuted] = useState<boolean>(() =>
     getRememberedSoundMuted(defaultMuted)
   );
+  const [userManuallyStarted, setUserManuallyStarted] = useState<boolean>(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const bgBlurVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -465,7 +481,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         videoUrl.startsWith('http://') ||
         videoUrl.startsWith('blob:'))
     ) {
-      setResolvedSrc(videoUrl);
+      setResolvedSrc(getOptimizedVideoUrl(videoUrl, isDataSaverOn));
       setHasError(false);
       return;
     }
@@ -478,7 +494,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       .then((src) => {
         if (!isMounted) return;
         if (src) {
-          setResolvedSrc(src);
+          setResolvedSrc(getOptimizedVideoUrl(src, isDataSaverOn));
         } else {
           setHasError(true);
         }
@@ -494,7 +510,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [allowedToLoad, postId, videoUrl, hasVideoChunks]);
+  }, [allowedToLoad, postId, videoUrl, hasVideoChunks, isDataSaverOn]);
 
   // Start or pause playback whenever coordinator marks this video as the active play target
   useEffect(() => {
@@ -510,6 +526,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     e.stopPropagation();
     const instanceId = instanceIdRef.current;
     const reg = registeredPlayers.get(instanceId);
+    setUserManuallyStarted(true);
 
     if (!allowedToLoad) {
       userPausedRef.current = false;
@@ -572,13 +589,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   };
 
   // Fallback poster URL using `#t=0.001` fragment when no separate thumbnailUrl exists
-  const effectivePosterSrc =
+  const rawPosterSrc =
     posterUrl ||
     (!allowedToLoad &&
     resolvedSrc &&
     (resolvedSrc.startsWith('https://') || resolvedSrc.startsWith('http://'))
       ? `${resolvedSrc}#t=0.001`
       : undefined);
+  const effectivePosterSrc = rawPosterSrc
+    ? getOptimizedImagePreviewUrl(rawPosterSrc, isDataSaverOn, userManuallyStarted)
+    : undefined;
 
   const showSoftPlaceholder =
     (!isVideoReady && !isPosterLoaded) || (isBuffering && !isPlaying && !isPosterLoaded);
@@ -740,6 +760,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block pointer-events-none"
           />
         )
+      )}
+
+      {/* Data Saver / Mobile Data Tap-to-Play Overlay when autoplay is paused to save data */}
+      {!isPlaying && (blockAutoplay || isDataSaverOn) && (
+        <div className="absolute inset-0 z-[8] flex flex-col items-center justify-center bg-black/25 pointer-events-none">
+          <div className="w-12 h-12 rounded-full bg-black/65 backdrop-blur-xs text-white flex items-center justify-center shadow-lg border border-white/25 mb-2">
+            <Play size={20} className="ml-0.5 fill-white" />
+          </div>
+          <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-black/65 backdrop-blur-xs text-white text-[11px] font-bold border border-white/15">
+            <Zap size={11} className="text-teal-300" />
+            <span>{t('datasaver.videoTapToPlay')}</span>
+          </span>
+        </div>
       )}
 
       {/* Single small speaker icon in the corner to unmute/mute */}
