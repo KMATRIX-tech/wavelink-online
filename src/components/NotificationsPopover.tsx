@@ -73,7 +73,7 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
       collection(db, 'notifications'),
       where('recipientId', '==', currentUser.uid),
       orderBy('createdAt', 'desc'),
-      limit(50)
+      limit(15)
     );
 
     const unsub = onSnapshot(

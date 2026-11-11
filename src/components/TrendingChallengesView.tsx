@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
-import { db, cleanFirestoreData, getAuthHeaders } from '../firebase';
+import { db, cleanFirestoreData, getAuthHeaders, batchCacheUserProfiles, handleFirestoreError, OperationType } from '../firebase';
 import {
   collection,
   query,
   orderBy,
   limit,
-  onSnapshot,
+  getDocs,
+  getDoc,
   doc,
   setDoc,
   updateDoc,
@@ -17,6 +18,7 @@ import { Post, CreatorChallenge, UserProfile, CreatorSpotlight, Announcement, Af
 import { CrystalBadge, registerActiveWeeklyWinner } from './CrystalBadge';
 import { sendNotification } from '../services/notificationService';
 import { INTEREST_CATALOG } from './InterestPickerModal';
+import { QuotaExceededBanner } from './QuotaExceededBanner';
 import {
   AFRICAN_COUNTRIES,
   DEFAULT_CREATOR_SPOTLIGHT,
@@ -40,7 +42,8 @@ import {
   ArrowUpRight,
   Calendar,
   MapPin,
-  Edit3
+  Edit3,
+  RefreshCw
 } from 'lucide-react';
 
 interface TrendingChallengesViewProps {
@@ -190,25 +193,47 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
   const [evLocation, setBpEvLocation] = useState('Dar es Salaam / Online');
   const [evCountry, setBpEvCountry] = useState<AfricanCountryCode>('TZ');
   const [isSavingEvent, setIsSavingEvent] = useState(false);
+  const [isLoadingData, setIsLoadingData] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  useEffect(() => {
-    const qPosts = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(80));
-    const unsubPosts = onSnapshot(
-      qPosts,
-      (snap) => {
+  const loadLeaderboardData = useCallback(async (isRefresh = false) => {
+    if (isRefresh) {
+      setIsRefreshing(true);
+    } else {
+      setIsLoadingData(true);
+    }
+
+    try {
+      // 1. Posts query: bounded to 35 most recent posts
+      const qPosts = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(35));
+      // 2. Challenges query: bounded to 8 challenges
+      const qChallenges = query(collection(db, 'challenges'), orderBy('createdAt', 'desc'), limit(8));
+      // 3. Users query: bounded to 30 active creators
+      const qUsers = query(collection(db, 'users'), limit(30));
+      // 4. Spotlight document
+      const docSpotlightRef = doc(db, 'creatorSpotlights', 'current');
+      // 5. Events query: bounded to 6 announcements
+      const qEvents = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'), limit(6));
+
+      const [postsSnap, challengesSnap, usersSnap, spotlightSnap, eventsSnap] = await Promise.allSettled([
+        getDocs(qPosts),
+        getDocs(qChallenges),
+        getDocs(qUsers),
+        getDoc(docSpotlightRef),
+        getDocs(qEvents)
+      ]);
+
+      if (postsSnap.status === 'fulfilled') {
         const list: Post[] = [];
-        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
+        postsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
         setPosts(list);
-      },
-      () => {}
-    );
+      } else {
+        handleFirestoreError(postsSnap.reason, OperationType.LIST, 'posts');
+      }
 
-    const qChallenges = query(collection(db, 'challenges'), orderBy('createdAt', 'desc'), limit(15));
-    const unsubChallenges = onSnapshot(
-      qChallenges,
-      (snap) => {
+      if (challengesSnap.status === 'fulfilled') {
         const list: CreatorChallenge[] = [];
-        snap.forEach((d) => {
+        challengesSnap.value.forEach((d) => {
           const data = { id: d.id, ...d.data() } as CreatorChallenge;
           list.push(data);
           if (data.winnerUserId && data.winnerBadgeUntil) {
@@ -218,59 +243,50 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
         if (list.length > 0) {
           setChallenges(list);
         }
-      },
-      () => {}
-    );
+      } else {
+        handleFirestoreError(challengesSnap.reason, OperationType.LIST, 'challenges');
+      }
 
-    const qUsers = query(collection(db, 'users'), limit(60));
-    const unsubUsers = onSnapshot(
-      qUsers,
-      (snap) => {
+      if (usersSnap.status === 'fulfilled') {
         const map: Record<string, UserProfile> = {};
-        snap.forEach((d) => {
+        const profileList: UserProfile[] = [];
+        usersSnap.value.forEach((d) => {
           const u = { id: d.id, ...d.data() } as UserProfile;
           map[d.id] = u;
+          profileList.push(u);
           if (u.weeklyWinnerUntil) {
             registerActiveWeeklyWinner(u.id, u.weeklyWinnerUntil);
             if (u.email) registerActiveWeeklyWinner(u.email, u.weeklyWinnerUntil);
           }
         });
         setUsersMap(map);
-      },
-      () => {}
-    );
+        batchCacheUserProfiles(profileList);
+      } else {
+        handleFirestoreError(usersSnap.reason, OperationType.LIST, 'users');
+      }
 
-    const unsubSpotlight = onSnapshot(
-      doc(db, 'creatorSpotlights', 'current'),
-      (snap) => {
-        if (snap.exists()) {
-          setSpotlight({ id: snap.id, ...snap.data() } as CreatorSpotlight);
-        }
-      },
-      () => {}
-    );
+      if (spotlightSnap.status === 'fulfilled' && spotlightSnap.value.exists()) {
+        setSpotlight({ id: spotlightSnap.value.id, ...spotlightSnap.value.data() } as CreatorSpotlight);
+      }
 
-    const qEvents = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'), limit(12));
-    const unsubEvents = onSnapshot(
-      qEvents,
-      (snap) => {
+      if (eventsSnap.status === 'fulfilled') {
         const evs: Announcement[] = [];
-        snap.forEach((d) => {
+        eventsSnap.value.forEach((d) => {
           evs.push({ id: d.id, ...d.data() } as Announcement);
         });
         setCommunityEvents(evs);
-      },
-      () => {}
-    );
-
-    return () => {
-      unsubPosts();
-      unsubChallenges();
-      unsubUsers();
-      unsubSpotlight();
-      unsubEvents();
-    };
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'leaderboardData');
+    } finally {
+      setIsLoadingData(false);
+      setIsRefreshing(false);
+    }
   }, []);
+
+  useEffect(() => {
+    loadLeaderboardData(false);
+  }, [loadLeaderboardData]);
 
   // 1. Hashtags growing fastest today
   const trendingHashtags = useMemo(() => {
@@ -670,6 +686,23 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
 
   return (
     <div className="max-w-5xl mx-auto py-5 px-3 sm:px-6 space-y-6">
+      <QuotaExceededBanner onRetry={() => loadLeaderboardData(true)} />
+
+      <div className="flex items-center justify-between px-1">
+        <span className="text-xs font-bold text-stone-500">
+          {language === 'sw' ? 'Matokeo na Takwimu za Wiki' : 'Weekly Trends & Live Leaderboard'}
+        </span>
+        <button
+          type="button"
+          disabled={isRefreshing || isLoadingData}
+          onClick={() => loadLeaderboardData(true)}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-bold transition active:scale-95 cursor-pointer disabled:opacity-50"
+        >
+          <RefreshCw size={13} className={isRefreshing ? 'animate-spin text-[#0D9488]' : 'text-stone-500'} />
+          <span>{isRefreshing ? (language === 'sw' ? 'Inapakia...' : 'Refreshing...') : (language === 'sw' ? 'Sasisha Data' : 'Refresh Data')}</span>
+        </button>
+      </div>
+
       {/* 0. Creator Spotlight of the Week (Chosen by Admin) + Subtle Kitenge Border */}
       <div className="bg-white border border-stone-200/90 rounded-3xl overflow-hidden shadow-xs">
         <div className="kitenge-border-strip" />

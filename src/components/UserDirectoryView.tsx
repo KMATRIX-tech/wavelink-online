@@ -1,14 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType } from '../firebase';
-import { collection, query, orderBy, onSnapshot, where } from 'firebase/firestore';
+import { db, handleFirestoreError, OperationType, batchCacheUserProfiles, notifyQuotaExceeded, isFirestoreQuotaError } from '../firebase';
+import { collection, query, orderBy, getDocs, where, limit } from 'firebase/firestore';
 import { UserProfile } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { UserDirectorySkeleton } from './PostSkeleton';
-import { Users, Search, MessageSquare, Shield, AlertTriangle, ShieldAlert, Lock, Star, Sparkles, X, UserPlus, Check } from 'lucide-react';
+import { Users, Search, MessageSquare, Shield, AlertTriangle, ShieldAlert, Lock, Star, Sparkles, X, UserPlus, Check, RefreshCw } from 'lucide-react';
 import { isSuperAdminEmail, ADMIN_EMAIL } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { toggleFollowUser } from '../services/notificationService';
+import { QuotaExceededBanner } from './QuotaExceededBanner';
 
 interface UserDirectoryViewProps {
   onStartChat: (userId: string) => void;
@@ -51,44 +52,55 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
     setTimeout(() => setSuccessNotice(null), 3000);
   };
 
-  // Listen to currentUser's follows
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Load currentUser's follows once with limit(50)
   useEffect(() => {
     if (!currentUser) return;
-    const q = query(collection(db, 'follows'), where('followerId', '==', currentUser.uid));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
+    let isMounted = true;
+    const fetchFollows = async () => {
+      try {
+        const q = query(collection(db, 'follows'), where('followerId', '==', currentUser.uid), limit(50));
+        const snap = await getDocs(q);
+        if (!isMounted) return;
         const map: Record<string, boolean> = {};
         snap.forEach((d) => {
           const data = d.data();
           if (data.targetUserId) map[data.targetUserId] = true;
         });
         setFollowingMap(map);
-      },
-      (err) => {
-        console.warn('Follows snapshot notice:', err);
+      } catch (err) {
+        console.warn('Follows fetch notice:', err);
       }
-    );
-    return () => unsub();
+    };
+    fetchFollows();
+    return () => {
+      isMounted = false;
+    };
   }, [currentUser]);
 
+  // Load directory profiles once with limit(25) + in-memory batch caching
+  const loadDirectoryUsers = async (showSpinner = false) => {
+    if (showSpinner) setIsRefreshing(true);
+    else setIsLoading(true);
+    try {
+      const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'), limit(25));
+      const snapshot = await getDocs(q);
+      const list: UserProfile[] = [];
+      snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
+      batchCacheUserProfiles(list);
+      setUsers(list);
+    } catch (err) {
+      console.warn('Directory users fetch notice:', err);
+      if (isFirestoreQuotaError(err)) notifyQuotaExceeded(err);
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  };
+
   useEffect(() => {
-    setIsLoading(true);
-    const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: UserProfile[] = [];
-        snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
-        setUsers(list);
-        setIsLoading(false);
-      },
-      (err) => {
-        console.warn('Directory users snapshot notice:', err);
-        setIsLoading(false);
-      }
-    );
-    return () => unsub();
+    loadDirectoryUsers();
   }, [currentUser?.uid]);
 
   const filteredUsers = users.filter((u) => {
@@ -101,6 +113,8 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
 
   return (
     <div className="max-w-5xl mx-auto py-6 px-3 sm:px-6 space-y-6">
+      <QuotaExceededBanner onRetry={() => loadDirectoryUsers(true)} />
+
       {successNotice && (
         <div className="p-4 rounded-2xl bg-teal-50 border border-teal-300 text-teal-950 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3 animate-in fade-in">
           <span>{successNotice}</span>

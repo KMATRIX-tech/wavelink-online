@@ -5,6 +5,7 @@ import {
   collection,
   query,
   orderBy,
+  limit,
   onSnapshot,
   doc,
   setDoc,
@@ -62,7 +63,7 @@ export const AnnouncementsView: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const q = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'));
+    const q = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'), limit(20));
     const unsub = onSnapshot(
       q,
       (snapshot) => {

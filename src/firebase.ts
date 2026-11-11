@@ -1,8 +1,17 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFirestore, setLogLevel, doc, getDoc } from 'firebase/firestore';
+import {
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  setLogLevel,
+  doc,
+  getDoc
+} from 'firebase/firestore';
 import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
+import type { UserProfile } from './types';
 
 export const firebaseConfig = firebaseAppletConfig;
 
@@ -11,9 +20,138 @@ setLogLevel('silent');
 
 const app = initializeApp(firebaseConfig);
 
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+// Enable Firestore offline persistence so repeat visits read from local IndexedDB cache
+let firestoreDb: ReturnType<typeof getFirestore>;
+try {
+  firestoreDb = initializeFirestore(
+    app,
+    {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager()
+      })
+    },
+    firebaseConfig.firestoreDatabaseId
+  );
+} catch {
+  firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+}
+
+export const db = firestoreDb;
 
 export const auth = getAuth(app);
+
+// ============================================================================
+// IN-MEMORY USER PROFILE CACHE
+// Caches profiles in memory so the same user profile is not re-read for every post
+// ============================================================================
+const userProfileMemoryCache = new Map<string, { profile: UserProfile; timestamp: number }>();
+const pendingProfileFetches = new Map<string, Promise<UserProfile | null>>();
+const PROFILE_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
+
+export function getCachedUserProfile(userId: string): UserProfile | null {
+  if (!userId) return null;
+  const entry = userProfileMemoryCache.get(userId);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > PROFILE_CACHE_TTL_MS) {
+    userProfileMemoryCache.delete(userId);
+    return null;
+  }
+  return entry.profile;
+}
+
+export function setCachedUserProfile(userId: string, profile: UserProfile): void {
+  if (!userId || !profile) return;
+  userProfileMemoryCache.set(userId, { profile, timestamp: Date.now() });
+}
+
+export function batchCacheUserProfiles(profiles: UserProfile[]): void {
+  if (!Array.isArray(profiles)) return;
+  const now = Date.now();
+  profiles.forEach((p) => {
+    if (p && p.id) {
+      userProfileMemoryCache.set(p.id, { profile: p, timestamp: now });
+    }
+  });
+}
+
+export async function fetchUserProfileCached(userId: string): Promise<UserProfile | null> {
+  if (!userId) return null;
+  const cached = getCachedUserProfile(userId);
+  if (cached) return cached;
+
+  // Deduplicate concurrent inflight fetches for the same user profile
+  const pending = pendingProfileFetches.get(userId);
+  if (pending) return pending;
+
+  const fetchPromise = (async () => {
+    try {
+      const snap = await getDoc(doc(db, 'users', userId));
+      if (snap.exists()) {
+        const profile = { id: snap.id, ...snap.data() } as UserProfile;
+        setCachedUserProfile(userId, profile);
+        return profile;
+      }
+      return null;
+    } catch (err) {
+      if (isFirestoreQuotaError(err)) {
+        notifyQuotaExceeded(err);
+      }
+      return null;
+    } finally {
+      pendingProfileFetches.delete(userId);
+    }
+  })();
+
+  pendingProfileFetches.set(userId, fetchPromise);
+  return fetchPromise;
+}
+
+// ============================================================================
+// GLOBAL QUOTA EXCEEDED NOTIFIER
+// Shows friendly banner/notice instead of empty screen when free daily read quota hits
+// ============================================================================
+let isQuotaExceededGlobal = false;
+let quotaErrorMessage = '';
+const quotaListeners = new Set<(isExceeded: boolean, errorMsg: string) => void>();
+
+export function getQuotaExceededState(): { isExceeded: boolean; message: string } {
+  return { isExceeded: isQuotaExceededGlobal, message: quotaErrorMessage };
+}
+
+export function notifyQuotaExceeded(error?: unknown): void {
+  isQuotaExceededGlobal = true;
+  const raw = error instanceof Error ? error.message : String(error || '');
+  quotaErrorMessage =
+    raw ||
+    'Free daily read quota exceeded. Cached content remains available offline and will refresh when the daily quota resets.';
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('wavelink:quota-exceeded', {
+        detail: { isExceeded: true, message: quotaErrorMessage }
+      })
+    );
+  }
+  quotaListeners.forEach((fn) => fn(true, quotaErrorMessage));
+}
+
+export function clearQuotaExceededState(): void {
+  isQuotaExceededGlobal = false;
+  quotaErrorMessage = '';
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('wavelink:quota-exceeded', {
+        detail: { isExceeded: false, message: '' }
+      })
+    );
+  }
+  quotaListeners.forEach((fn) => fn(false, ''));
+}
+
+export function subscribeQuotaState(listener: (isExceeded: boolean, errorMsg: string) => void): () => void {
+  quotaListeners.add(listener);
+  listener(isQuotaExceededGlobal, quotaErrorMessage);
+  return () => quotaListeners.delete(listener);
+}
 
 export const CLOUDINARY_CLOUD_NAME = 'monarcking72';
 export const CLOUDINARY_UPLOAD_PRESET = 'monarcking72';
@@ -437,6 +575,9 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     isFirestoreQuotaError(error) ||
     rawMessage.toLowerCase().includes('client is offline')
   ) {
+    if (isFirestoreQuotaError(error)) {
+      notifyQuotaExceeded(error);
+    }
     return;
   }
 

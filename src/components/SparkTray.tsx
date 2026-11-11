@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { db, handleFirestoreError, OperationType } from '../firebase';
-import { collection, query, orderBy, onSnapshot } from 'firebase/firestore';
+import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
 import { Post, Spark } from '../types';
 import { SparkViewerModal } from './SparkViewerModal';
 import {
@@ -58,9 +58,9 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
     }
   }, [externalPostsToShare]);
 
-  // Real-time listener for sparks + automatic 24-hour expiry & Firebase Storage file cleanup
+  // Real-time listener for sparks + automatic 24-hour expiry & Firebase Storage file cleanup (capped at 30 most recent)
   useEffect(() => {
-    const q = query(collection(db, 'sparks'), orderBy('createdAt', 'desc'));
+    const q = query(collection(db, 'sparks'), orderBy('createdAt', 'desc'), limit(30));
     const unsub = onSnapshot(
       q,
       (snapshot) => {

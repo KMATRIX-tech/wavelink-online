@@ -170,8 +170,8 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
     const fetchTagPosts = async () => {
       setIsLoadingTagPosts(true);
       try {
-        // Fetch recent posts to match hashtag in memory
-        const recentQ = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(50));
+        // Fetch recent posts to match hashtag in memory (bounded to 15)
+        const recentQ = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(15));
         const snap = await getDocs(recentQ);
         const matching: Post[] = [];
         const regex = new RegExp(`#${cleanTag}\\b`, 'i');

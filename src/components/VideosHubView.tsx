@@ -5,6 +5,11 @@ import {
   collection,
   query,
   orderBy,
+  limit,
+  getDocs,
+  startAfter,
+  QueryDocumentSnapshot,
+  DocumentData,
   onSnapshot,
   doc,
   addDoc,
@@ -16,6 +21,7 @@ import { CrystalBadge } from './CrystalBadge';
 import { CreatorTipModal } from './CreatorTipModal';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { VideoUploadProgressChip } from './VideoUploadProgressChip';
+import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { sendNotification } from '../services/notificationService';
 import { sharePost } from '../utils/share.js';
 
@@ -625,29 +631,78 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
     return () => window.removeEventListener(SOUND_PREF_EVENT, handleSoundPref);
   }, []);
 
-  // Real-time listener for video posts
-  useEffect(() => {
-    const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'));
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: Post[] = [];
-        snapshot.forEach((d) => {
-          const data = d.data();
-          if (data.videoUrl || data.hasVideoChunks || data.mediaType === 'video') {
-            list.push({ ...data, id: d.id } as Post);
-          }
-        });
-        setVideoPosts(list);
-        setIsLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'posts');
-      }
-    );
+  const [lastVisibleDoc, setLastVisibleDoc] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [hasMorePosts, setHasMorePosts] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
 
-    return () => unsub();
+  // Load video posts with limit(20) to prevent unbounded collection reads
+  const loadInitialVideoPosts = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(20));
+      const snapshot = await getDocs(q);
+      const list: Post[] = [];
+      snapshot.forEach((d) => {
+        const data = d.data();
+        if (data.videoUrl || data.hasVideoChunks || data.mediaType === 'video') {
+          list.push({ ...data, id: d.id } as Post);
+        }
+      });
+      setVideoPosts(list);
+      if (snapshot.docs.length > 0) {
+        setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1]);
+        setHasMorePosts(snapshot.docs.length >= 20);
+      } else {
+        setHasMorePosts(false);
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, 'posts');
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
+
+  const loadMoreVideoPosts = useCallback(async () => {
+    if (!lastVisibleDoc || isLoadingMore || !hasMorePosts) return;
+    setIsLoadingMore(true);
+    try {
+      const q = query(
+        collection(db, 'posts'),
+        orderBy('createdAt', 'desc'),
+        startAfter(lastVisibleDoc),
+        limit(15)
+      );
+      const snapshot = await getDocs(q);
+      const list: Post[] = [];
+      snapshot.forEach((d) => {
+        const data = d.data();
+        if (data.videoUrl || data.hasVideoChunks || data.mediaType === 'video') {
+          list.push({ ...data, id: d.id } as Post);
+        }
+      });
+      if (list.length > 0) {
+        setVideoPosts((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const newUnique = list.filter((p) => !existingIds.has(p.id));
+          return [...prev, ...newUnique];
+        });
+      }
+      if (snapshot.docs.length > 0) {
+        setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1]);
+        setHasMorePosts(snapshot.docs.length >= 15);
+      } else {
+        setHasMorePosts(false);
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, 'posts');
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [lastVisibleDoc, isLoadingMore, hasMorePosts]);
+
+  useEffect(() => {
+    loadInitialVideoPosts();
+  }, [loadInitialVideoPosts]);
 
   // Immediately insert completed video posts at the top of the Reels pager
   useEffect(() => {
@@ -707,6 +762,9 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
         });
         if (bestIdx !== -1) {
           setActiveIndex((prev) => (prev === bestIdx ? prev : bestIdx));
+          if (bestIdx >= filteredPosts.length - 3 && hasMorePosts && !isLoadingMore) {
+            loadMoreVideoPosts();
+          }
         }
       },
       {
@@ -741,7 +799,8 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
     setIsLoadingComments(true);
     const q = query(
       collection(db, 'posts', activeCommentsPost.id, 'comments'),
-      orderBy('createdAt', 'asc')
+      orderBy('createdAt', 'asc'),
+      limit(30)
     );
     const unsub = onSnapshot(
       q,

@@ -4,6 +4,7 @@ import { db, handleFirestoreError, OperationType, cleanFirestoreData } from '../
 import {
   collection,
   query,
+  where,
   orderBy,
   onSnapshot,
   doc,
@@ -425,7 +426,11 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
   // Load current user's active Sparks
   useEffect(() => {
     if (!isOpen || !currentUser) return;
-    const q = query(collection(db, 'sparks'), orderBy('createdAt', 'asc'));
+    const q = query(
+      collection(db, 'sparks'),
+      where('authorId', '==', currentUser.uid),
+      limit(20)
+    );
     const unsub = onSnapshot(
       q,
       (snap) => {

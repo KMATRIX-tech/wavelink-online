@@ -1,14 +1,18 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders } from '../firebase';
+import { db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders, batchCacheUserProfiles } from '../firebase';
 import {
   collection,
-  onSnapshot,
+  query,
+  limit,
+  getDocs,
+  getDoc,
   doc,
   updateDoc,
   setDoc,
   deleteDoc
 } from 'firebase/firestore';
+import { QuotaExceededBanner } from './QuotaExceededBanner';
 import {
   UserProfile,
   Post,
@@ -91,7 +95,8 @@ import {
   Filter,
   Tag,
   Trash2,
-  Trophy
+  Trophy,
+  RefreshCw
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -477,31 +482,144 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       .catch(() => {});
   }, [isAdmin]);
 
-  // Listen to platform statistics & real data
-  useEffect(() => {
+  const [isLoadingDashboardData, setIsLoadingDashboardData] = useState(false);
+  const [isRefreshingDashboard, setIsRefreshingDashboard] = useState(false);
+
+  // Load platform statistics & data with bounded queries (limit 40)
+  const loadAdminData = useCallback(async (isRefresh = false) => {
     if (!isAdmin) return;
+    if (isRefresh) {
+      setIsRefreshingDashboard(true);
+    } else {
+      setIsLoadingDashboardData(true);
+    }
 
-    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
-      const list: UserProfile[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
-      setUsers(list);
-    });
+    try {
+      const qUsers = query(collection(db, 'users'), limit(50));
+      const qPosts = query(collection(db, 'posts'), limit(40));
+      const qTickets = query(collection(db, 'supportTickets'), limit(40));
+      const qVerif = query(collection(db, 'pending_verifications'), limit(40));
+      const qPayReq = query(collection(db, 'payment_requests'), limit(40));
+      const qDomains = query(collection(db, 'system_domains'), limit(40));
+      const qBotLogs = query(collection(db, 'supportBotLogs'), limit(30));
+      const qDrafts = query(collection(db, 'scheduledBotDrafts'), limit(20));
+      const qReports = query(collection(db, 'contentReports'), limit(40));
+      const qAudit = query(collection(db, 'adminAuditLogs'), limit(40));
+      const qUpgrades = query(collection(db, 'upgrade_feedback'), limit(40));
 
-    const unsubPosts = onSnapshot(collection(db, 'posts'), (snap) => {
-      const list: Post[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
-      setPosts(list);
-    });
+      const [
+        usersSnap,
+        postsSnap,
+        ticketsSnap,
+        verifSnap,
+        payReqSnap,
+        domainsSnap,
+        botLogsSnap,
+        draftsSnap,
+        reportsSnap,
+        auditSnap,
+        upgradesSnap,
+        settingsSnap,
+        payConfigSnap,
+        botConfigSnap
+      ] = await Promise.allSettled([
+        getDocs(qUsers),
+        getDocs(qPosts),
+        getDocs(qTickets),
+        getDocs(qVerif),
+        getDocs(qPayReq),
+        getDocs(qDomains),
+        getDocs(qBotLogs),
+        getDocs(qDrafts),
+        getDocs(qReports),
+        getDocs(qAudit),
+        getDocs(qUpgrades),
+        getDoc(doc(db, 'appSettings', 'global')),
+        getDoc(doc(db, 'paymentConfig', 'global')),
+        getDoc(doc(db, 'supportBotConfig', 'global'))
+      ]);
 
-    const unsubTickets = onSnapshot(collection(db, 'supportTickets'), (snap) => {
-      const list: SupportTicket[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as SupportTicket));
-      setTickets(list);
-    });
+      if (usersSnap.status === 'fulfilled') {
+        const list: UserProfile[] = [];
+        usersSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
+        setUsers(list);
+        batchCacheUserProfiles(list);
+      }
 
-    const unsubSettings = onSnapshot(doc(db, 'appSettings', 'global'), (snap) => {
-      if (snap.exists()) {
-        setAppSettings(snap.data() as AppSettings);
+      if (postsSnap.status === 'fulfilled') {
+        const list: Post[] = [];
+        postsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
+        setPosts(list);
+      }
+
+      if (ticketsSnap.status === 'fulfilled') {
+        const list: SupportTicket[] = [];
+        ticketsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as SupportTicket));
+        setTickets(list);
+      }
+
+      if (verifSnap.status === 'fulfilled') {
+        const list: PendingVerification[] = [];
+        verifSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as PendingVerification));
+        list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+        setVerifications(list);
+      }
+
+      if (payReqSnap.status === 'fulfilled') {
+        const list: PaymentRequest[] = [];
+        payReqSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as PaymentRequest));
+        list.sort((a, b) => {
+          const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return timeB - timeA;
+        });
+        setPaymentRequests(list);
+      }
+
+      if (domainsSnap.status === 'fulfilled') {
+        const list: SystemDomain[] = [];
+        domainsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as SystemDomain));
+        list.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime());
+        setSystemDomains(list);
+      }
+
+      if (botLogsSnap.status === 'fulfilled') {
+        const list: SupportBotLog[] = [];
+        botLogsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as SupportBotLog));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setBotLogs(list);
+      }
+
+      if (draftsSnap.status === 'fulfilled') {
+        const list: ScheduledBotDraft[] = [];
+        draftsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as ScheduledBotDraft));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setScheduledDrafts(list);
+      }
+
+      if (reportsSnap.status === 'fulfilled') {
+        const list: ContentReport[] = [];
+        reportsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as ContentReport));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setContentReports(list);
+      }
+
+      if (auditSnap.status === 'fulfilled') {
+        const list: AdminAuditLog[] = [];
+        auditSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as AdminAuditLog));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setAuditLogs(list);
+      }
+
+      if (upgradesSnap.status === 'fulfilled') {
+        const list: UpgradeFeedbackItem[] = [];
+        upgradesSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as UpgradeFeedbackItem));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setUpgradeFeedbacks(list);
+      }
+
+      if (settingsSnap.status === 'fulfilled' && settingsSnap.value.exists()) {
+        setAppSettings(settingsSnap.value.data() as AppSettings);
       } else {
         setAppSettings({
           id: 'global',
@@ -509,97 +627,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           voiceCallsUnlocked: false
         });
       }
-    });
 
-    const unsubPaymentConfig = onSnapshot(doc(db, 'paymentConfig', 'global'), (snap) => {
-      if (snap.exists()) {
-        setPaymentConfig(snap.data() as PaymentGatewayConfig);
+      if (payConfigSnap.status === 'fulfilled' && payConfigSnap.value.exists()) {
+        setPaymentConfig(payConfigSnap.value.data() as PaymentGatewayConfig);
       }
-    });
 
-    const unsubVerifications = onSnapshot(collection(db, 'pending_verifications'), (snap) => {
-      const list: PendingVerification[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PendingVerification));
-      list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
-      setVerifications(list);
-    });
-
-    const unsubPaymentRequests = onSnapshot(collection(db, 'payment_requests'), (snap) => {
-      const list: PaymentRequest[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PaymentRequest));
-      list.sort((a, b) => {
-        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-        return timeB - timeA;
-      });
-      setPaymentRequests(list);
-    });
-
-    const unsubDomains = onSnapshot(collection(db, 'system_domains'), (snap) => {
-      const list: SystemDomain[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as SystemDomain));
-      list.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime());
-      setSystemDomains(list);
-    });
-
-    const unsubBotConfig = onSnapshot(doc(db, 'supportBotConfig', 'global'), (snap) => {
-      if (snap.exists()) {
-        setBotConfig((prev) => ({ ...prev, ...(snap.data() as SupportBotConfig) }));
+      if (botConfigSnap.status === 'fulfilled' && botConfigSnap.value.exists()) {
+        setBotConfig((prev) => ({ ...prev, ...(botConfigSnap.value.data() as SupportBotConfig) }));
       }
-    });
-
-    const unsubBotLogs = onSnapshot(collection(db, 'supportBotLogs'), (snap) => {
-      const list: SupportBotLog[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as SupportBotLog));
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setBotLogs(list);
-    });
-
-    const unsubScheduledDrafts = onSnapshot(collection(db, 'scheduledBotDrafts'), (snap) => {
-      const list: ScheduledBotDraft[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as ScheduledBotDraft));
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setScheduledDrafts(list);
-    });
-
-    const unsubReports = onSnapshot(collection(db, 'contentReports'), (snap) => {
-      const list: ContentReport[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as ContentReport));
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setContentReports(list);
-    });
-
-    const unsubAuditLogs = onSnapshot(collection(db, 'adminAuditLogs'), (snap) => {
-      const list: AdminAuditLog[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as AdminAuditLog));
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setAuditLogs(list);
-    });
-
-    const unsubUpgrades = onSnapshot(collection(db, 'upgrade_feedback'), (snap) => {
-      const list: UpgradeFeedbackItem[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as UpgradeFeedbackItem));
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setUpgradeFeedbacks(list);
-    });
-
-    return () => {
-      unsubUsers();
-      unsubPosts();
-      unsubTickets();
-      unsubSettings();
-      unsubPaymentConfig();
-      unsubVerifications();
-      unsubPaymentRequests();
-      unsubDomains();
-      unsubBotConfig();
-      unsubBotLogs();
-      unsubScheduledDrafts();
-      unsubReports();
-      unsubAuditLogs();
-      unsubUpgrades();
-    };
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'adminDashboard');
+    } finally {
+      setIsLoadingDashboardData(false);
+      setIsRefreshingDashboard(false);
+    }
   }, [isAdmin]);
+
+  useEffect(() => {
+    loadAdminData(false);
+  }, [loadAdminData]);
 
   if (isCheckingServerAdmin && !isOwnerEmailAccount) {
     return (
@@ -1280,6 +1326,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   return (
     <div className="max-w-7xl mx-auto py-6 px-3 sm:px-6 space-y-6">
+      <QuotaExceededBanner onRetry={() => loadAdminData(true)} />
+
       {/* Admin Title Card */}
       <div className="bg-gradient-to-r from-purple-800 via-indigo-900 to-slate-900 rounded-3xl p-6 sm:p-8 text-white shadow-xl shadow-purple-950/20 flex items-center justify-between flex-wrap gap-4 border border-purple-500/20">
         <div>
@@ -1312,7 +1360,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            disabled={isRefreshingDashboard || isLoadingDashboardData}
+            onClick={() => loadAdminData(true)}
+            className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 border border-white/20 text-white text-xs font-bold transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw size={13} className={isRefreshingDashboard ? 'animate-spin text-purple-300' : ''} />
+            <span>{isRefreshingDashboard ? 'Refreshing...' : 'Refresh Console'}</span>
+          </button>
+
           <CrystalBadge
             email={currentUser?.email}
             name={isSuperAdmin ? 'Platform Owner' : (currentUser?.displayName || 'Moderator')}

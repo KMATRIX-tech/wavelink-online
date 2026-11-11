@@ -1,6 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, cleanFirestoreData } from '../firebase';
+import {
+  db,
+  handleFirestoreError,
+  OperationType,
+  cleanFirestoreData,
+  batchCacheUserProfiles,
+  notifyQuotaExceeded,
+  isFirestoreQuotaError
+} from '../firebase';
 import {
   collection,
   query,
@@ -11,11 +19,14 @@ import {
   updateDoc,
   deleteDoc,
   getDocs,
+  limit,
+  limitToLast,
   arrayUnion,
   arrayRemove,
   serverTimestamp
 } from 'firebase/firestore';
 import { ChannelMessage, UserProfile, CallRecipient, ChatGroup, TypingStatusEntry, ChatChannelMeta } from '../types';
+import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { CrystalBadge } from './CrystalBadge';
 import {
   compressImage,
@@ -62,6 +73,7 @@ import {
   Ban,
   Bot,
   ArrowLeft,
+  History,
   AlertTriangle,
   RefreshCw
 } from 'lucide-react';
@@ -268,11 +280,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showGifPicker, setShowGifPicker] = useState(false);
 
-  // Real data: Groups & Registered Members
   const [groups, setGroups] = useState<ChatGroup[]>([]);
   const [members, setMembers] = useState<UserProfile[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [convoFilter, setConvoFilter] = useState<'all' | 'groups' | 'dms'>('all');
+  const [messageLimit, setMessageLimit] = useState<number>(30);
 
   // Group creation modal state
   const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false);
@@ -396,18 +408,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     };
   }, [activeChannel, showMobileChannels]);
 
-  // 1. Real-time listener for registered users / online members (with dedicated WaveLink Support Bot pinned first)
+  // 1. Load registered users / online members once with limit(30) (with Support Bot pinned first)
   useEffect(() => {
-    const usersCol = collection(db, 'users');
-    const unsub = onSnapshot(
-      usersCol,
-      (snap) => {
+    let isMounted = true;
+    const fetchUsers = async () => {
+      try {
+        const usersCol = query(collection(db, 'users'), limit(30));
+        const snap = await getDocs(usersCol);
+        if (!isMounted) return;
         const otherUsers: UserProfile[] = [];
         snap.forEach((d) => {
           if (d.id !== currentUser?.uid && d.id !== SUPPORT_BOT_ID) {
             otherUsers.push({ id: d.id, ...d.data() } as UserProfile);
           }
         });
+        batchCacheUserProfiles(otherUsers);
         // Sort client-side by createdAt descending so users without createdAt are never excluded
         otherUsers.sort((a, b) => {
           const timeA = a.createdAt ? Date.parse(a.createdAt) || 0 : 0;
@@ -436,21 +451,24 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             return computeDmConversationId(currentUser.uid, firstTarget.id);
           });
         }
-      },
-      (e) => {
-        console.error('[WaveLink Chat] Error loading users directory for chat:', e);
-        setMembers([SUPPORT_BOT_PROFILE]);
+      } catch (e) {
+        if (isMounted) setMembers([SUPPORT_BOT_PROFILE]);
       }
-    );
-    return () => unsub();
+    };
+    fetchUsers();
+    return () => {
+      isMounted = false;
+    };
   }, [currentUser?.uid, initialTargetUserId]);
 
-  // 2. Real-time listener for user-created groups
+  // 2. Load user-created groups once with limit(20)
   useEffect(() => {
-    const groupsCol = collection(db, 'groups');
-    const unsub = onSnapshot(
-      groupsCol,
-      (snapshot) => {
+    let isMounted = true;
+    const fetchGroups = async () => {
+      try {
+        const groupsCol = query(collection(db, 'groups'), limit(20));
+        const snapshot = await getDocs(groupsCol);
+        if (!isMounted) return;
         const list: ChatGroup[] = [];
         snapshot.forEach((d) => {
           list.push({ id: d.id, ...d.data() } as ChatGroup);
@@ -470,13 +488,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             return joinedGroup ? joinedGroup.id : '';
           });
         }
-      },
-      (err) => {
-        console.error('[WaveLink Chat] Error loading groups list:', err);
+      } catch (err) {
+        console.warn('[WaveLink Chat] Groups fetch notice:', err);
       }
-    );
-
-    return () => unsub();
+    };
+    fetchGroups();
+    return () => {
+      isMounted = false;
+    };
   }, [currentUser?.uid]);
 
   // Synthesize any DM participants discovered in `channels` who might not have a document in `users` yet
@@ -1063,8 +1082,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     }
   }, [activeChannelTypingUsers.length]);
 
-  // 3. Real-time onSnapshot message listener for active conversation, ordered by timestamp
-  // Loads messages from BOTH participants instantly without filtering by senderId
+  // Reset message limit to 30 whenever active channel changes
+  useEffect(() => {
+    setMessageLimit(30);
+  }, [activeChannel]);
+
+  // 3. Real-time onSnapshot message listener for active conversation (only open chat)
+  // Loads strictly only the latest 30 messages (with "Load older messages" option)
   useEffect(() => {
     setMessages([]);
     setChatLoadError(null);
@@ -1077,13 +1101,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       ? collection(db, 'channels', activeChannel, 'messages')
       : collection(db, 'groups', activeChannel, 'messages');
 
-    // Primary real-time query ordered by server timestamp; companion query captures any legacy messages that only had createdAt
-    const timestampOrderedQuery = query(messagesCol, orderBy('timestamp', 'asc'));
-    const legacyOrderedQuery = query(messagesCol, orderBy('createdAt', 'asc'));
+    // Query strictly limited to the latest 30 messages (or messageLimit when expanded)
+    const limitedMessagesQuery = query(
+      messagesCol,
+      orderBy('createdAt', 'asc'),
+      limitToLast(messageLimit)
+    );
 
     const mergedDocsMap = new Map<string, ChannelMessage>();
 
-    const publishMergedMessages = (sourceLabel: string) => {
+    const publishMergedMessages = () => {
       const combined: ChannelMessage[] = [];
       mergedDocsMap.forEach((msgData) => {
         // Ensure Support Bot messages stay strictly inside the WaveLink Support DM channel
@@ -1095,7 +1122,6 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         ) {
           return;
         }
-        // IMPORTANT: Never filter by currentUser.uid / senderId — include messages from BOTH participants
         combined.push(msgData);
       });
 
@@ -1105,7 +1131,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       const myCount = combined.filter((m) => m.senderId === currentUser?.uid).length;
       const otherCount = combined.length - myCount;
       console.log(
-        `[WaveLink Chat] Loaded ${combined.length} messages in conversation "${activeChannel}" (${sourceLabel}) — sent by me: ${myCount}, received from other participant(s): ${otherCount}`
+        `[WaveLink Chat] Loaded ${combined.length} messages (limit=${messageLimit}) in "${activeChannel}" — sent: ${myCount}, received: ${otherCount}`
       );
 
       setChatLoadError(null);
@@ -1115,16 +1141,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       }, 80);
     };
 
-    const handleListenerError = (err: any, queryType: string) => {
+    const handleListenerError = (err: any) => {
       console.error(
-        `[WaveLink Chat] Permission or listener error (${queryType}) on conversation "${activeChannel}":`,
-        {
-          code: err?.code,
-          message: err?.message,
-          conversationId: activeChannel,
-          currentUserId: currentUser?.uid
-        }
+        `[WaveLink Chat] Listener error on conversation "${activeChannel}":`,
+        err?.message || err
       );
+      if (isFirestoreQuotaError(err)) {
+        notifyQuotaExceeded(err);
+      }
       const friendlyMsg =
         err?.code === 'permission-denied'
           ? `Permission denied while loading messages for conversation "${activeChannel}". Please verify you are a participant in this conversation.`
@@ -1132,8 +1156,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       setChatLoadError(friendlyMsg);
     };
 
-    const unsubTimestamp = onSnapshot(
-      timestampOrderedQuery,
+    const unsub = onSnapshot(
+      limitedMessagesQuery,
       (snapshot) => {
         snapshot.docChanges().forEach((change) => {
           if (change.type === 'removed') {
@@ -1145,38 +1169,17 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             } as ChannelMessage);
           }
         });
-        publishMergedMessages('timestamp-query');
+        publishMergedMessages();
       },
       (err) => {
-        handleListenerError(err, 'orderBy-timestamp');
-      }
-    );
-
-    const unsubLegacy = onSnapshot(
-      legacyOrderedQuery,
-      (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === 'removed') {
-            mergedDocsMap.delete(change.doc.id);
-          } else {
-            mergedDocsMap.set(change.doc.id, {
-              id: change.doc.id,
-              ...change.doc.data()
-            } as ChannelMessage);
-          }
-        });
-        publishMergedMessages('createdAt-sync');
-      },
-      (err) => {
-        handleListenerError(err, 'orderBy-createdAt');
+        handleListenerError(err);
       }
     );
 
     return () => {
-      unsubTimestamp();
-      unsubLegacy();
+      unsub();
     };
-  }, [activeChannel, isDirectMessage, currentUser?.uid, retryTrigger]);
+  }, [activeChannel, isDirectMessage, currentUser?.uid, messageLimit, retryTrigger]);
 
   // 4. Track & broadcast lastSeen timestamp and per-message readBy receipts in Firestore
   useEffect(() => {
@@ -2994,6 +2997,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             ref={messagesListRef}
             className="wavelink-chat-messages-list flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 bg-[#FAF7F2]"
           >
+            <QuotaExceededBanner compact={true} className="mb-2" />
+
+            {messages.length >= messageLimit && (
+              <div className="w-full flex justify-center py-1">
+                <button
+                  type="button"
+                  onClick={() => setMessageLimit((prev) => prev + 30)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 border border-slate-200/90 text-slate-700 text-xs font-bold transition active:scale-95 shadow-2xs cursor-pointer"
+                >
+                  <History size={13} className="text-teal-600" />
+                  <span>Load older messages (30 more)</span>
+                </button>
+              </div>
+            )}
+
             {messages.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-center p-6 text-[#57534E]">
                 <div className="p-4 rounded-3xl bg-blue-50 text-[#2563EB] border border-blue-200/60 mb-3">

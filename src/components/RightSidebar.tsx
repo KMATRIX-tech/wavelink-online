@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db } from '../firebase';
-import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
+import { db, batchCacheUserProfiles } from '../firebase';
+import { collection, query, orderBy, limit, getDocs } from 'firebase/firestore';
 import { ActiveTab, UserProfile } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { LegalModal, LegalDocType } from './LegalModals';
@@ -69,21 +69,26 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
   };
 
   useEffect(() => {
-    const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'), limit(12));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
+    let isMounted = true;
+    const fetchOnlineMembers = async () => {
+      try {
+        const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'), limit(12));
+        const snap = await getDocs(q);
+        if (!isMounted) return;
         const list: UserProfile[] = [];
         snap.forEach((d) => {
           list.push({ id: d.id, ...d.data() } as UserProfile);
         });
         setOnlineMembers(list);
-      },
-      (err) => {
-        console.warn('Online members snapshot notice:', err);
+        batchCacheUserProfiles(list);
+      } catch (err) {
+        console.warn('Online members fetch notice:', err);
       }
-    );
-    return () => unsub();
+    };
+    fetchOnlineMembers();
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   return (

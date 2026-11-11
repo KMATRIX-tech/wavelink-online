@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { db } from '../firebase';
-import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { db, batchCacheUserProfiles, handleFirestoreError, OperationType } from '../firebase';
+import { collection, query, orderBy, limit, getDocs } from 'firebase/firestore';
 import { UserProfile, Post, ActiveTab } from '../types';
 import { useAuth } from '../context/AuthContext';
 import {
@@ -63,37 +63,56 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Fetch users & posts for instant live search
-  useEffect(() => {
-    const usersQ = query(collection(db, 'users'), limit(100));
-    const unsubUsers = onSnapshot(usersQ, (snap) => {
-      const list: UserProfile[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
-      setAllUsers(list);
-    });
+  const hasFetchedSearchData = useRef(false);
+  const [isSearchingData, setIsSearchingData] = useState(false);
 
-    const postsQ = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(150));
-    const unsubPosts = onSnapshot(postsQ, (snap) => {
-      const list: Post[] = [];
-      const tagSet = new Set<string>(DEFAULT_TRENDING_TAGS);
-      snap.forEach((d) => {
-        const post = { id: d.id, ...d.data() } as Post;
-        list.push(post);
-        // Extract hashtags from content
-        const matches = post.content?.match(/#[a-zA-Z0-9_]+/g);
-        if (matches) {
-          matches.forEach((t) => tagSet.add(t));
-        }
-      });
-      setAllPosts(list);
-      setAllHashtags(Array.from(tagSet));
-    });
+  // Lazy fetch users & posts only when search bar is opened, bounded to 25 each
+  const fetchSearchIndex = useCallback(async () => {
+    if (hasFetchedSearchData.current) return;
+    hasFetchedSearchData.current = true;
+    setIsSearchingData(true);
+    try {
+      const usersQ = query(collection(db, 'users'), limit(25));
+      const postsQ = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(25));
 
-    return () => {
-      unsubUsers();
-      unsubPosts();
-    };
+      const [usersSnap, postsSnap] = await Promise.allSettled([
+        getDocs(usersQ),
+        getDocs(postsQ)
+      ]);
+
+      if (usersSnap.status === 'fulfilled') {
+        const list: UserProfile[] = [];
+        usersSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
+        setAllUsers(list);
+        batchCacheUserProfiles(list);
+      }
+
+      if (postsSnap.status === 'fulfilled') {
+        const list: Post[] = [];
+        const tagSet = new Set<string>(DEFAULT_TRENDING_TAGS);
+        postsSnap.value.forEach((d) => {
+          const post = { id: d.id, ...d.data() } as Post;
+          list.push(post);
+          const matches = post.content?.match(/#[a-zA-Z0-9_]+/g);
+          if (matches) {
+            matches.forEach((t) => tagSet.add(t));
+          }
+        });
+        setAllPosts(list);
+        setAllHashtags(Array.from(tagSet));
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'searchIndex');
+    } finally {
+      setIsSearchingData(false);
+    }
   }, []);
+
+  useEffect(() => {
+    if (isOpen || searchTerm.trim().length > 0) {
+      fetchSearchIndex();
+    }
+  }, [isOpen, searchTerm, fetchSearchIndex]);
 
   // Keyboard shortcut listener (Cmd/Ctrl+K or '/' opens search, 'Escape' closes)
   useEffect(() => {

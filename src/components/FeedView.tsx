@@ -28,13 +28,18 @@ import {
   cleanFirestoreData,
   sanitizeAvatarUrlForFirestore,
   formatVideoUploadError,
-  getAuthHeaders
+  getAuthHeaders,
+  batchCacheUserProfiles,
+  notifyQuotaExceeded,
+  isFirestoreQuotaError
 } from '../firebase';
 import {
   collection,
   query,
   orderBy,
   onSnapshot,
+  getDocs,
+  startAfter,
   doc,
   setDoc,
   deleteDoc,
@@ -42,9 +47,12 @@ import {
   updateDoc,
   limit,
   arrayUnion,
-  arrayRemove
+  arrayRemove,
+  type QueryDocumentSnapshot,
+  type DocumentData
 } from 'firebase/firestore';
 import { Post, PostComment, Announcement, ReactionType, UserProfile } from '../types';
+import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { CrystalBadge } from './CrystalBadge';
 import { VideoPlayer } from './VideoPlayer';
 import { PostBody } from './PostBody';
@@ -102,7 +110,8 @@ import {
   Download,
   RotateCcw,
   Trophy,
-  Globe
+  Globe,
+  RefreshCw
 } from 'lucide-react';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { CreatorTipModal } from './CreatorTipModal';
@@ -431,22 +440,32 @@ export const FeedView: React.FC<FeedViewProps> = ({
     return localStorage.getItem(`wavelink_checkin_${currentUser?.uid}_${today}`) === '1';
   });
 
+  // Feed Pagination & Refresh State (10 posts at a time + startAfter)
+  const [lastVisibleDoc, setLastVisibleDoc] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [hasMorePosts, setHasMorePosts] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const loadMoreTriggerRef = useRef<HTMLDivElement | null>(null);
+
   useEffect(() => {
     if (userProfile?.followingIds) {
       setFollowedIds(userProfile.followingIds);
     }
   }, [userProfile?.followingIds]);
 
+  // Suggested community members: load once with limit(8) and batch cache profiles
   useEffect(() => {
     if (!currentUser?.uid || !showWelcomeFlow) {
       setIsLoadingSuggested(false);
       return;
     }
-    setIsLoadingSuggested(true);
-    const q = query(collection(db, 'users'), limit(12));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
+    let isMounted = true;
+    const fetchSuggested = async () => {
+      setIsLoadingSuggested(true);
+      try {
+        const q = query(collection(db, 'users'), limit(8));
+        const snap = await getDocs(q);
+        if (!isMounted) return;
         const candidates: UserProfile[] = [];
         snap.forEach((d) => {
           const u = { ...(d.data() as UserProfile), id: d.id };
@@ -454,20 +473,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
             candidates.push(u);
           }
         });
-        // Phase 3: Rank suggested creators by matching user interests (with plain fallback)
+        batchCacheUserProfiles(candidates);
         const ranked = [...candidates].sort((a, b) => {
           const scoreB = scoreCreatorByInterests(b, userProfile?.interests || []);
           const scoreA = scoreCreatorByInterests(a, userProfile?.interests || []);
           return scoreB - scoreA;
         });
         setSuggestedMembers(ranked.slice(0, 3));
-        setIsLoadingSuggested(false);
-      },
-      () => {
-        setIsLoadingSuggested(false);
+      } catch (err) {
+        if (isFirestoreQuotaError(err)) notifyQuotaExceeded(err);
+      } finally {
+        if (isMounted) setIsLoadingSuggested(false);
       }
-    );
-    return () => unsub();
+    };
+    fetchSuggested();
+    return () => {
+      isMounted = false;
+    };
   }, [currentUser?.uid, showWelcomeFlow, userProfile?.interests]);
 
   const handleDismissWelcome = () => {
@@ -516,25 +538,71 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Real-time listener for posts + immediate event when a video upload completes
-  useEffect(() => {
-    setIsLoading(true);
-    const postsQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'));
-    const unsub = onSnapshot(
-      postsQuery,
-      (snapshot) => {
-        const docs: Post[] = [];
-        snapshot.forEach((docSnap) => {
-          docs.push({ id: docSnap.id, ...docSnap.data() } as Post);
-        });
-        setPosts(docs);
-        setIsLoading(false);
-      },
-      (error) => {
-        console.warn('Feed posts listener notice:', error);
-        setIsLoading(false);
+  // Primary Feed Loader: 10 posts at a time using getDocs (loaded once on mount/refresh)
+  const loadInitialPosts = async (showRefreshSpinner = false) => {
+    if (showRefreshSpinner) setIsRefreshing(true);
+    else setIsLoading(true);
+    try {
+      const postsQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(10));
+      const snapshot = await getDocs(postsQuery);
+      const docs: Post[] = [];
+      snapshot.forEach((docSnap) => {
+        docs.push({ id: docSnap.id, ...docSnap.data() } as Post);
+      });
+      setPosts(docs);
+      setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1] || null);
+      setHasMorePosts(snapshot.docs.length === 10);
+    } catch (error) {
+      console.warn('Feed posts fetch notice:', error);
+      if (isFirestoreQuotaError(error)) {
+        notifyQuotaExceeded(error);
       }
-    );
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  };
+
+  // Load more posts: fetches next 10 posts using startAfter(lastVisibleDoc)
+  const loadMorePosts = async () => {
+    if (isLoadingMore || !hasMorePosts || !lastVisibleDoc) return;
+    setIsLoadingMore(true);
+    try {
+      const nextQuery = query(
+        collection(db, 'posts'),
+        orderBy('createdAt', 'desc'),
+        startAfter(lastVisibleDoc),
+        limit(10)
+      );
+      const snapshot = await getDocs(nextQuery);
+      if (!snapshot.empty) {
+        const newDocs: Post[] = [];
+        snapshot.forEach((docSnap) => {
+          newDocs.push({ id: docSnap.id, ...docSnap.data() } as Post);
+        });
+        setPosts((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const uniqueNew = newDocs.filter((p) => !existingIds.has(p.id));
+          return [...prev, ...uniqueNew];
+        });
+        setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1] || null);
+        setHasMorePosts(snapshot.docs.length === 10);
+      } else {
+        setHasMorePosts(false);
+      }
+    } catch (error) {
+      console.warn('Load more posts notice:', error);
+      if (isFirestoreQuotaError(error)) {
+        notifyQuotaExceeded(error);
+      }
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  // Initial load on mount
+  useEffect(() => {
+    loadInitialPosts();
 
     const handleVideoPostCreated = (ev: Event) => {
       const created = (ev as CustomEvent<Post>)?.detail;
@@ -545,18 +613,37 @@ export const FeedView: React.FC<FeedViewProps> = ({
     window.addEventListener('wavelink:video-post-created', handleVideoPostCreated);
 
     return () => {
-      unsub();
       window.removeEventListener('wavelink:video-post-created', handleVideoPostCreated);
     };
   }, [currentUser?.uid]);
 
-  // Fetch announcements for pinned banner and right sidebar
+  // Infinite scroll observer: trigger loadMorePosts when user scrolls near the end
   useEffect(() => {
+    const trigger = loadMoreTriggerRef.current;
+    if (!trigger) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMorePosts && !isLoadingMore && !isLoading) {
+          loadMorePosts();
+        }
+      },
+      { rootMargin: '300px' }
+    );
+
+    observer.observe(trigger);
+    return () => observer.disconnect();
+  }, [hasMorePosts, isLoadingMore, isLoading, lastVisibleDoc]);
+
+  // Fetch announcements for pinned banner and right sidebar: load once with limit(5)
+  useEffect(() => {
+    let isMounted = true;
     setIsLoadingAnnouncements(true);
-    const q = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
+    const fetchAnnouncements = async () => {
+      try {
+        const q = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'), limit(5));
+        const snap = await getDocs(q);
+        if (!isMounted) return;
         let latest: Announcement | null = null;
         let pinned: Announcement | null = null;
         snap.forEach((d) => {
@@ -566,14 +653,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
         });
         setLatestAnnouncement(latest);
         setPinnedAnnouncement(pinned);
-        setIsLoadingAnnouncements(false);
-      },
-      (err) => {
-        console.warn('Announcements listener notice:', err);
-        setIsLoadingAnnouncements(false);
+      } catch (err) {
+        console.warn('Announcements fetch notice:', err);
+        if (isFirestoreQuotaError(err)) notifyQuotaExceeded(err);
+      } finally {
+        if (isMounted) setIsLoadingAnnouncements(false);
       }
-    );
-    return () => unsub();
+    };
+    fetchAnnouncements();
+    return () => {
+      isMounted = false;
+    };
   }, [currentUser?.uid]);
 
   // RSVP toggle for announcement card
@@ -591,45 +681,28 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Toggle comments expander
-  const toggleComments = (postId: string) => {
-    setExpandedComments((prev) => {
-      const next = !prev[postId];
-      if (next && commentsMap[postId] === undefined) {
-        setLoadingCommentsMap((lm) => ({ ...lm, [postId]: true }));
-      }
-      return { ...prev, [postId]: next };
-    });
-  };
+  // Toggle comments expander: loads comments once on demand with limit(30)
+  const toggleComments = async (postId: string) => {
+    const willOpen = !expandedComments[postId];
+    setExpandedComments((prev) => ({ ...prev, [postId]: willOpen }));
 
-  useEffect(() => {
-    const unsubscribers: (() => void)[] = [];
-
-    Object.keys(expandedComments).forEach((postId) => {
-      if (expandedComments[postId]) {
+    if (willOpen && commentsMap[postId] === undefined) {
+      setLoadingCommentsMap((lm) => ({ ...lm, [postId]: true }));
+      try {
         const commentsRef = collection(db, 'posts', postId, 'comments');
-        const q = query(commentsRef, orderBy('createdAt', 'asc'));
-        const unsub = onSnapshot(
-          q,
-          (snap) => {
-            const list: PostComment[] = [];
-            snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PostComment));
-            setCommentsMap((prev) => ({ ...prev, [postId]: list }));
-            setLoadingCommentsMap((prev) => ({ ...prev, [postId]: false }));
-          },
-          (err) => {
-            console.error('Comments error:', err);
-            setLoadingCommentsMap((prev) => ({ ...prev, [postId]: false }));
-          }
-        );
-        unsubscribers.push(unsub);
+        const q = query(commentsRef, orderBy('createdAt', 'asc'), limit(30));
+        const snap = await getDocs(q);
+        const list: PostComment[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PostComment));
+        setCommentsMap((prev) => ({ ...prev, [postId]: list }));
+      } catch (err) {
+        console.warn('Comments fetch notice:', err);
+        if (isFirestoreQuotaError(err)) notifyQuotaExceeded(err);
+      } finally {
+        setLoadingCommentsMap((lm) => ({ ...lm, [postId]: false }));
       }
-    });
-
-    return () => {
-      unsubscribers.forEach((u) => u());
-    };
-  }, [expandedComments]);
+    }
+  };
 
   // Helper to resolve current reaction arrays & counts (with backwards-compatibility for existing post.likes)
   const getReactionData = (rawPost: Post) => {
@@ -2145,6 +2218,34 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
           {/* Posts Stream: Show active/failed uploading video post cards at the top of the feed */}
           <div className="space-y-5">
+            {/* Friendly Quota Exceeded Notice (Graceful cached offline mode) */}
+            <QuotaExceededBanner onRetry={() => loadInitialPosts(true)} />
+
+            {/* Quick Refresh bar */}
+            <div className="flex items-center justify-between pb-1 px-1">
+              <span className="text-xs font-bold text-stone-600">
+                {language === 'sw' ? 'Machapisho ya Hivi Karibuni' : 'Recent Waves'}
+              </span>
+              <button
+                type="button"
+                onClick={() => loadInitialPosts(true)}
+                disabled={isRefreshing || isLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition active:scale-95 cursor-pointer disabled:opacity-50"
+                title={language === 'sw' ? 'Onyesha upya mlisho' : 'Refresh feed'}
+              >
+                <RefreshCw size={12} className={isRefreshing ? 'animate-spin text-teal-600' : ''} />
+                <span>
+                  {isRefreshing
+                    ? language === 'sw'
+                      ? 'Inaonyesha...'
+                      : 'Refreshing...'
+                    : language === 'sw'
+                    ? 'Onyesha Upya'
+                    : 'Refresh'}
+                </span>
+              </button>
+            </div>
+
             <VideoUploadingFeedPostList />
             {isLoading ? (
               <PostSkeleton count={4} />
@@ -2907,6 +3008,36 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 );
               })
             )}
+
+            {/* Pagination Load More trigger & status */}
+            <div ref={loadMoreTriggerRef} className="py-6 flex flex-col items-center justify-center gap-2">
+              {isLoadingMore && (
+                <div className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+                  <RefreshCw size={14} className="animate-spin text-teal-600" />
+                  <span>
+                    {language === 'sw'
+                      ? 'Inapakia machapisho 10 zaidi...'
+                      : 'Loading 10 more waves...'}
+                  </span>
+                </div>
+              )}
+              {!hasMorePosts && posts.length > 0 && (
+                <div className="text-center py-2 text-xs text-stone-400 font-medium">
+                  {language === 'sw'
+                    ? 'Umeona machapisho yote ya hivi karibuni ✨'
+                    : 'You are all caught up ✨'}
+                </div>
+              )}
+              {hasMorePosts && !isLoadingMore && (
+                <button
+                  type="button"
+                  onClick={loadMorePosts}
+                  className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition active:scale-95 cursor-pointer"
+                >
+                  {language === 'sw' ? 'Pakia Zaidi (10 Zaidi)' : 'Load More (10 more)'}
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Legal Footer for Privacy, Terms & Refund policies */}

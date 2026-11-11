@@ -8,7 +8,7 @@ import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LanguageProvider, useLanguage } from './context/LanguageContext';
 import { db, testConnection } from './firebase';
-import { collection, query, where, onSnapshot, updateDoc, doc, getDoc } from 'firebase/firestore';
+import { collection, query, where, limit, onSnapshot, updateDoc, doc, getDoc } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
 import { ActiveTab, CallRecipient } from './types';
@@ -173,7 +173,9 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     }
     const q = query(
       collection(db, 'notifications'),
-      where('recipientId', '==', currentUser.uid)
+      where('recipientId', '==', currentUser.uid),
+      where('read', '==', false),
+      limit(20)
     );
     const unsub = onSnapshot(
       q,
@@ -456,11 +458,13 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
     const qByReceiverId = query(
       collection(db, 'calls'),
-      where('receiverId', '==', currentUser.uid)
+      where('receiverId', '==', currentUser.uid),
+      limit(5)
     );
     const qByReceiver = query(
       collection(db, 'calls'),
-      where('receiver', '==', currentUser.uid)
+      where('receiver', '==', currentUser.uid),
+      limit(5)
     );
 
     let docsByReceiverId: Array<{ id: string; data: () => any }> = [];
