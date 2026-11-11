@@ -39,20 +39,12 @@ import { useAuth } from '../context/AuthContext';
 import {
   Waves,
   Mail,
-  Lock,
-  User,
-  AtSign,
-  ArrowRight,
-  Sparkles,
   AlertCircle,
   Eye,
   EyeOff,
-  UserPlus,
-  LogIn,
   ShieldCheck,
   KeyRound,
   CheckCircle2,
-  UserCheck,
   X
 } from 'lucide-react';
 
@@ -1045,6 +1037,131 @@ export const AuthPage: React.FC = () => {
     }
   };
 
+  const [authStep, setAuthStep] = useState<'landing' | 'email' | 'password'>('landing');
+  const [isStepTransitioning, setIsStepTransitioning] = useState(false);
+  const [activeLegalNotice, setActiveLegalNotice] = useState<'terms' | 'privacy' | null>(null);
+  const stepTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const emailFieldRef = useRef<HTMLInputElement | null>(null);
+  const passwordFieldRef = useRef<HTMLInputElement | null>(null);
+
+  const transitionToStep = useCallback((nextStep: 'landing' | 'email' | 'password') => {
+    setError(null);
+    setStatusMessage(null);
+    setVerificationErrorCode(null);
+    if (stepTimeoutRef.current) {
+      clearTimeout(stepTimeoutRef.current);
+    }
+    setIsStepTransitioning(true);
+    stepTimeoutRef.current = setTimeout(() => {
+      setAuthStep(nextStep);
+      requestAnimationFrame(() => {
+        setIsStepTransitioning(false);
+        if (nextStep === 'email') {
+          setTimeout(() => emailFieldRef.current?.focus(), 60);
+        } else if (nextStep === 'password') {
+          setTimeout(() => passwordFieldRef.current?.focus(), 60);
+        }
+      });
+    }, 170);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (stepTimeoutRef.current) {
+        clearTimeout(stepTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  /**
+   * Direct Google Sign-In from the circular Google provider button on the minimalist landing screen
+   */
+  const handleGoogleSignIn = async () => {
+    if (isLoading) return;
+    setError(null);
+    setStatusMessage(null);
+    setIsLoading(true);
+
+    try {
+      const googleProvider = new GoogleAuthProvider();
+      googleProvider.setCustomParameters({ prompt: 'select_account' });
+      const res = await signInWithPopup(auth, googleProvider);
+      const fbUser = res.user;
+
+      const userRef = doc(db, 'users', fbUser.uid);
+      const userSnap = await getDoc(userRef).catch(() => null);
+      const existingData = userSnap && userSnap.exists() ? userSnap.data() : null;
+
+      const cleanEmail = (fbUser.email || '').trim().toLowerCase();
+      const fallbackHandle =
+        (cleanEmail.split('@')[0] || 'waver').replace(/[^a-z0-9_.-]/g, '') || 'waver';
+      const resolvedUsername =
+        existingData?.username || `@${fallbackHandle}`;
+      const resolvedDisplayName =
+        existingData?.displayName || fbUser.displayName || fallbackHandle;
+      const isOwnerAccount = cleanEmail === 'keylanmbilinyi5@gmail.com';
+
+      await setDoc(
+        userRef,
+        cleanFirestoreData({
+          id: fbUser.uid,
+          email: cleanEmail,
+          username: resolvedUsername,
+          displayName: resolvedDisplayName,
+          avatar: existingData?.avatar || fbUser.photoURL || '',
+          emailVerified: true,
+          isContactVerified: true,
+          ...(isOwnerAccount ? { role: 'admin', isOwner: true } : {}),
+          updatedAt: new Date().toISOString()
+        }),
+        { merge: true }
+      ).catch(() => {});
+
+      await completeVerifiedAuthSession(resolvedDisplayName, resolvedUsername);
+      if (isOwnerAccount) {
+        await refreshAdminVerification().catch(() => {});
+      }
+    } catch (err) {
+      await logFailureOnServerOnly('google_direct_signin', err);
+      setError(GENERIC_USER_AUTH_ERROR);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  /**
+   * Step 2 -> Step 3 handler: Validates email (or username/email) before fading to the password step
+   */
+  const handleEmailStepContinue = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+
+    if (authMode === 'signup') {
+      const cleanEmail = emailInput.trim().toLowerCase();
+      if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+        setError('Please enter a valid email address to continue.');
+        return;
+      }
+      if (!usernameInput.trim()) {
+        const suggested = cleanEmail.split('@')[0].replace(/[^a-z0-9_.-]/g, '');
+        if (suggested) setUsernameInput(suggested);
+      }
+      transitionToStep('password');
+      return;
+    }
+
+    const identifier = (emailInput || usernameInput).trim();
+    if (!identifier) {
+      setError('Please enter your email address or username to continue.');
+      return;
+    }
+    setUsernameInput(identifier);
+    if (identifier.includes('@') && !identifier.startsWith('@')) {
+      setEmailInput(identifier.toLowerCase());
+    }
+    transitionToStep('password');
+  };
+
   /**
    * Hidden Owner Sign-In Handler:
    * 1. Requires Owner Access Code input
@@ -1159,650 +1276,695 @@ export const AuthPage: React.FC = () => {
   };
 
   return (
-    <div className="min-h-[100dvh] w-full max-w-full relative flex items-center justify-center p-3.5 sm:p-8 overflow-x-hidden overflow-y-auto animate-aurora-bg text-[#0F172A] safe-area-top safe-area-bottom">
-      {/* Moving Colorful Floating Orbs */}
-      <div className="absolute top-[-10%] left-[-8%] w-[520px] max-w-[90vw] h-[520px] max-h-[90vw] rounded-full bg-gradient-to-br from-blue-500/45 via-cyan-400/40 to-teal-300/35 blur-[95px] pointer-events-none animate-orb-1" />
-      <div className="absolute bottom-[-12%] right-[-8%] w-[580px] max-w-[90vw] h-[580px] max-h-[90vw] rounded-full bg-gradient-to-tr from-emerald-400/45 via-teal-400/35 to-cyan-500/40 blur-[105px] pointer-events-none animate-orb-2" />
-      <div className="absolute top-[15%] right-[8%] w-[460px] max-w-[85vw] h-[460px] max-h-[85vw] rounded-full bg-gradient-to-bl from-pink-500/40 via-rose-400/35 to-amber-300/40 blur-[95px] pointer-events-none animate-orb-3" />
-      <div className="absolute bottom-[12%] left-[10%] w-[440px] max-w-[85vw] h-[440px] max-h-[85vw] rounded-full bg-gradient-to-tr from-violet-500/40 via-fuchsia-400/35 to-amber-400/35 blur-[95px] pointer-events-none animate-orb-4" />
+    <div className="min-h-[100dvh] w-full bg-white text-[#0F172A] flex flex-col justify-between items-center px-6 py-8 sm:py-12 overflow-x-hidden overflow-y-auto safe-area-top safe-area-bottom">
+      {/* Top balanced spacer */}
+      <div className="w-full max-w-[380px] h-2" aria-hidden="true" />
 
-      {/* Animated Moving Colour Waves at the Bottom */}
-      <div className="absolute inset-x-0 bottom-0 h-48 pointer-events-none overflow-hidden opacity-75">
-        <svg
-          className="absolute bottom-0 left-[-10%] w-[120%] h-40 animate-wave-slow"
-          viewBox="0 0 1440 320"
-          preserveAspectRatio="none"
-        >
-          <defs>
-            <linearGradient id="waveGrad1" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stopColor="#2563EB" stopOpacity="0.35" />
-              <stop offset="33%" stopColor="#06B6D4" stopOpacity="0.35" />
-              <stop offset="66%" stopColor="#10B981" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="#EC4899" stopOpacity="0.35" />
-            </linearGradient>
-          </defs>
-          <path
-            fill="url(#waveGrad1)"
-            d="M0,160L60,170.7C120,181,240,203,360,192C480,181,600,139,720,138.7C840,139,960,181,1080,197.3C1200,213,1320,203,1380,197.3L1440,192L1440,320L1380,320C1320,320,1200,320,1080,320C960,320,840,320,720,320C600,320,480,320,360,320C240,320,120,320,60,320L0,320Z"
-          />
-        </svg>
-        <svg
-          className="absolute bottom-0 left-[-10%] w-[120%] h-32 animate-wave-fast"
-          viewBox="0 0 1440 320"
-          preserveAspectRatio="none"
-        >
-          <defs>
-            <linearGradient id="waveGrad2" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stopColor="#8B5CF6" stopOpacity="0.3" />
-              <stop offset="50%" stopColor="#F59E0B" stopOpacity="0.3" />
-              <stop offset="100%" stopColor="#10B981" stopOpacity="0.35" />
-            </linearGradient>
-          </defs>
-          <path
-            fill="url(#waveGrad2)"
-            d="M0,224L60,208C120,192,240,160,360,165.3C480,171,600,213,720,229.3C840,245,960,235,1080,208C1200,181,1320,139,1380,117.3L1440,96L1440,320L1380,320C1320,320,1200,320,1080,320C960,320,840,320,720,320C600,320,480,320,360,320C240,320,120,320,60,320L0,320Z"
-          />
-        </svg>
-      </div>
-
-      {/* Main Welcoming Onboarding Container */}
-      <div className="relative w-full max-w-lg z-10">
-        {/* Brand Header — Tapping the WaveLink Logo 5 times opens Hidden Owner Sign-In */}
-        <div className="text-center mb-7">
+      {/* Centered Authentication Content */}
+      <main className="w-full max-w-[360px] mx-auto my-auto flex flex-col items-center">
+        {/* Centered Branding — Tapping the WaveLink Logo 5 times opens Hidden Owner Sign-In */}
+        <div className="flex flex-col items-center text-center mb-8">
           <button
             type="button"
             onClick={handleLogoTap}
-            aria-label="WaveLink Logo"
-            className="inline-flex items-center justify-center p-4 rounded-3xl animate-moving-btn shadow-xl shadow-blue-500/30 mb-3.5 ring-4 ring-white/90 select-none cursor-pointer focus:outline-none active:scale-95 transition-transform"
+            aria-label="WaveLink"
+            className="w-12 h-12 rounded-2xl bg-[#0F172A] text-white flex items-center justify-center shadow-xs hover:bg-slate-800 active:scale-95 transition-all duration-200 mb-4 cursor-pointer focus:outline-none"
           >
-            <Waves className="w-8 h-8 text-white animate-bounce" style={{ animationDuration: '3s' }} />
+            <Waves className="w-6 h-6 text-white" />
           </button>
-          <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-[#0F172A]">
-            Welcome to <span className="animate-moving-text">WaveLink</span>
+          <h1 className="text-2xl sm:text-[26px] font-semibold tracking-tight text-[#0F172A]">
+            {authMode === 'existing'
+              ? 'Link your account'
+              : authStep === 'landing'
+              ? 'Welcome to WaveLink'
+              : authStep === 'email'
+              ? authMode === 'signup'
+                ? 'Create your account'
+                : 'Enter your email'
+              : authMode === 'signup'
+              ? 'Set your password'
+              : 'Enter your password'}
           </h1>
-          <p className="mt-2 text-sm text-slate-700 font-medium max-w-md mx-auto leading-relaxed">
-            A vibrant, colourful community to connect with friends, share stories &amp; reels, and support creators across East Africa.
+          <p className="mt-1.5 text-sm text-slate-500 font-normal leading-relaxed">
+            {authMode === 'existing'
+              ? 'Verify once to attach a username and password to your account'
+              : authStep === 'landing'
+              ? 'Sign in or create an account to continue'
+              : authStep === 'email'
+              ? authMode === 'signup'
+                ? 'Enter the email address you want to use on WaveLink'
+                : 'Use your email address or username to continue'
+              : authMode === 'signup'
+              ? 'Choose a strong password and verify your email'
+              : 'Enter your password to sign in to WaveLink'}
           </p>
-
-          {/* Colourful Onboarding Feature Highlights */}
-          <div className="mt-4 flex items-center justify-center gap-2 flex-wrap text-xs font-bold">
-            <span className="px-3.5 py-1.5 rounded-full bg-white/90 backdrop-blur-md border border-blue-200 text-blue-700 shadow-sm flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-blue-500 animate-ping" style={{ animationDuration: '2.5s' }} />
-              Live Community Feed
-            </span>
-            <span className="px-3.5 py-1.5 rounded-full bg-white/90 backdrop-blur-md border border-emerald-200 text-emerald-700 shadow-sm flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" style={{ animationDuration: '3s' }} />
-              HD Reels &amp; Calling
-            </span>
-            <span className="px-3.5 py-1.5 rounded-full bg-white/90 backdrop-blur-md border border-pink-200 text-pink-700 shadow-sm flex items-center gap-1.5">
-              <Sparkles size={12} className="text-amber-500" />
-              Creator Mobile Wallet
-            </span>
-          </div>
         </div>
 
-        {/* Moving Rainbow Border Wrapper around the Crisp White Card */}
-        <div className="p-[3px] rounded-[28px] animate-vibrant-ribbon shadow-[0_20px_60px_-12px_rgba(37,99,235,0.28)]">
-          <div className="bg-white/95 backdrop-blur-xl rounded-[25px] p-5 sm:p-8">
-            {/* Mode Switcher Tabs: Sign In vs Create Account */}
-            <div className="grid grid-cols-2 p-1.5 bg-slate-100/90 rounded-2xl border border-slate-200/80 mb-3 gap-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('signin');
-                  setError(null);
-                  setStatusMessage(null);
-                  setVerificationErrorCode(null);
-                }}
-                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-black flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer ${
-                  authMode === 'signin'
-                    ? 'bg-slate-900 text-white shadow-md shadow-slate-900/25 scale-[1.01]'
-                    : 'text-slate-700 hover:text-slate-950 hover:bg-slate-200/60'
-                }`}
-              >
-                <LogIn size={15} />
-                <span>Sign In</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('signup');
-                  setError(null);
-                  setStatusMessage(null);
-                  setVerificationErrorCode(null);
-                  setExistingAccountDetected(false);
-                }}
-                className={`min-h-[44px] py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-black flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer ${
-                  authMode === 'signup'
-                    ? 'bg-slate-900 text-white shadow-md shadow-slate-900/25 scale-[1.01]'
-                    : 'text-slate-700 hover:text-slate-950 hover:bg-slate-200/60'
-                }`}
-              >
-                <UserPlus size={15} />
-                <span>Create Account</span>
-              </button>
-            </div>
-
-            {/* "I already have an account" button for existing users who first signed up with Google */}
-            <div className="mb-5">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('existing');
-                  setError(null);
-                  setStatusMessage(null);
-                  setVerificationErrorCode(null);
-                }}
-                className={`w-full min-h-[40px] py-2 px-3.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-2 border transition-all ${
-                  authMode === 'existing'
-                    ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
-                    : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
-                }`}
-              >
-                <UserCheck size={14} />
-                <span>I already have an account (First signed up with Google)</span>
-              </button>
-            </div>
-
-            <div className="mb-5 text-center">
-              <h2 className="text-lg font-extrabold text-[#0F172A] flex items-center justify-center gap-2">
-                <Sparkles size={17} className="text-pink-500 animate-spin" style={{ animationDuration: '6s' }} />
-                <span className="animate-moving-text">
-                  {authMode === 'existing'
-                    ? 'Keep Your Existing Account & Data'
-                    : authMode === 'signup'
-                    ? 'Create Your Verified Account'
-                    : 'Sign In with Username & Password'}
+        {/* Feedback Alerts */}
+        {error && (
+          <div className="w-full mb-5 px-4 py-3 rounded-2xl bg-rose-50/90 border border-rose-200/80 text-rose-700 text-xs flex items-start gap-2.5 transition-opacity duration-200">
+            <AlertCircle size={15} className="text-rose-500 shrink-0 mt-0.5" />
+            <div className="flex-1 space-y-1">
+              <span className="block font-medium leading-relaxed">{error}</span>
+              {verificationErrorCode && (
+                <span className="block text-[11px] font-mono text-rose-600/90">
+                  {verificationErrorCode}
                 </span>
-              </h2>
-              <p className="text-xs text-slate-500 mt-1 font-medium">
-                {authMode === 'existing'
-                  ? 'Verify once with Google or an email link, then choose your username and password while keeping all your data'
-                  : authMode === 'signup'
-                  ? 'Choose a username and password (8–24 characters), then verify your email'
-                  : 'Enter your username and password to jump right into the feed'}
-              </p>
+              )}
             </div>
+          </div>
+        )}
 
-            {/* Feedback messages */}
-            {error && (
-              <div className="mb-4 p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-start gap-2.5 animate-in fade-in">
-                <AlertCircle size={16} className="text-rose-500 shrink-0 mt-0.5" />
-                <div className="flex-1 font-medium space-y-1">
-                  <span className="block">{error}</span>
-                  {verificationErrorCode && (
-                    <span className="block text-[11px] font-mono text-rose-600/90">
-                      {verificationErrorCode}
+        {statusMessage && !error && (
+          <div className="w-full mb-5 px-4 py-3 rounded-2xl bg-slate-50 border border-slate-200 text-slate-700 text-xs flex items-center gap-2.5 transition-opacity duration-200">
+            <CheckCircle2 size={15} className="text-slate-900 shrink-0" />
+            <span className="font-medium leading-relaxed">{statusMessage}</span>
+          </div>
+        )}
+
+        {/* Step Container with Smooth Fade Transitions */}
+        <div
+          className={`w-full transition-all duration-200 ease-out ${
+            isStepTransitioning
+              ? 'opacity-0 translate-y-1 pointer-events-none'
+              : 'opacity-100 translate-y-0'
+          }`}
+        >
+          {authMode === 'existing' ? (
+            /* =====================================================================
+               "I ALREADY HAVE AN ACCOUNT" FLOW (Existing Google-Linked Users)
+               ===================================================================== */
+            <div className="w-full space-y-4">
+              {!existingVerifiedUid ? (
+                <div className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-4">
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    Verify your existing account once using Google or an email link so we can attach your username and password to your original profile.
+                  </p>
+
+                  <button
+                    type="button"
+                    disabled={isVerifyingExisting}
+                    onClick={handleVerifyExistingWithGoogle}
+                    className="w-full h-12 px-5 rounded-full bg-white hover:bg-slate-50 text-[#0F172A] border border-slate-200 font-medium text-sm flex items-center justify-center gap-3 shadow-2xs transition-all duration-200 disabled:opacity-50 cursor-pointer"
+                  >
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                      <path
+                        fill="#4285F4"
+                        d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.42l4.03-3.15z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
+                      />
+                    </svg>
+                    <span>
+                      {isVerifyingExisting ? 'Verifying...' : 'Verify with Google'}
                     </span>
-                  )}
-                </div>
-              </div>
-            )}
+                  </button>
 
-            {statusMessage && !error && (
-              <div className="mb-4 p-3.5 rounded-2xl bg-blue-50 border border-blue-200 text-blue-700 text-xs flex items-center gap-2.5 animate-in fade-in font-medium">
-                <CheckCircle2 size={16} className="text-blue-600 shrink-0" />
-                <span>{statusMessage}</span>
-              </div>
-            )}
+                  <div className="flex items-center gap-3 py-1">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-xs text-slate-400">or</span>
+                    <div className="h-px flex-1 bg-slate-200" />
+                  </div>
 
-            {authMode === 'existing' ? (
-              /* =====================================================================
-                 "I ALREADY HAVE AN ACCOUNT" FLOW (Existing Google-Linked Users)
-                 Step 1: Verify once via Google or Email Link
-                 Step 2: Choose username & password on the same UID, keeping all data
-                 ===================================================================== */
-              <div className="space-y-4">
-                {!existingVerifiedUid ? (
-                  <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-4">
-                    <div className="text-xs text-slate-700 font-semibold leading-relaxed">
-                      Step 1: Verify your existing account once using Google or an email link so we attach your new username and password to your original account.
-                    </div>
-
+                  <div className="space-y-2.5">
+                    <input
+                      type="email"
+                      value={emailInput}
+                      onChange={(e) => setEmailInput(e.target.value)}
+                      placeholder="Existing email address"
+                      className="w-full h-11 px-4 rounded-full bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-slate-900 text-sm transition-colors"
+                    />
                     <button
                       type="button"
-                      disabled={isVerifyingExisting}
-                      onClick={handleVerifyExistingWithGoogle}
-                      className="w-full min-h-[46px] py-2.5 px-4 rounded-2xl bg-white hover:bg-slate-50 text-[#0F172A] border border-slate-300 font-extrabold text-xs sm:text-sm flex items-center justify-center gap-3 shadow-sm transition disabled:opacity-50"
+                      disabled={isVerifyingExisting || resendCooldownSeconds > 0}
+                      onClick={handleVerifyExistingWithEmailLink}
+                      className="w-full h-11 px-5 rounded-full bg-[#0F172A] hover:bg-slate-800 text-white font-medium text-sm disabled:opacity-50 transition-all duration-200 cursor-pointer"
                     >
-                      <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
-                        <path
-                          fill="#4285F4"
-                          d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
-                        />
-                        <path
-                          fill="#34A853"
-                          d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"
-                        />
-                        <path
-                          fill="#FBBC05"
-                          d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.42l4.03-3.15z"
-                        />
-                        <path
-                          fill="#EA4335"
-                          d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
-                        />
-                      </svg>
-                      <span>
-                        {isVerifyingExisting ? 'Verifying...' : 'Verify Existing Account with Google'}
-                      </span>
+                      {isVerifyingExisting
+                        ? 'Sending link...'
+                        : resendCooldownSeconds > 0
+                        ? `Resend in ${resendCooldownSeconds}s`
+                        : existingEmailLinkSent
+                        ? 'Resend verification link'
+                        : 'Send verification link'}
                     </button>
-
-                    <div className="relative flex py-1 items-center">
-                      <div className="flex-grow border-t border-slate-200" />
-                      <span className="flex-shrink mx-3 text-[11px] font-bold text-slate-400 uppercase">
-                        or verify via email link
-                      </span>
-                      <div className="flex-grow border-t border-slate-200" />
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="block text-xs font-bold text-[#0F172A]">
-                        Existing Account Email
-                      </label>
-                      <div className="relative">
-                        <Mail className="absolute left-3.5 top-3.5 text-blue-500" size={16} />
-                        <input
-                          type="email"
-                          value={emailInput}
-                          onChange={(e) => setEmailInput(e.target.value)}
-                          placeholder="Enter your existing email address"
-                          className="w-full min-h-[42px] pl-10 pr-28 py-2 rounded-xl bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-blue-500 text-xs sm:text-sm"
-                        />
-                        <button
-                          type="button"
-                          disabled={isVerifyingExisting || resendCooldownSeconds > 0}
-                          onClick={handleVerifyExistingWithEmailLink}
-                          className="absolute right-1.5 top-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] disabled:opacity-50 transition"
-                        >
-                          {isVerifyingExisting
-                            ? 'Sending...'
-                            : resendCooldownSeconds > 0
-                            ? `Resend (${resendCooldownSeconds}s)`
-                            : existingEmailLinkSent
-                            ? 'Resend Link'
-                            : 'Send Link'}
-                        </button>
-                      </div>
-                      {existingEmailLinkSent && (
-                        <p className="text-[11px] text-blue-700 font-semibold pt-1">
-                          Verification link sent. Open the link in your email to continue setting your username and password.
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <form onSubmit={handleCompleteExistingAccountSetup} className="space-y-4" noValidate>
-                    <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 font-bold">
-                        <CheckCircle2 size={15} className="text-emerald-600 shrink-0" />
-                        <span>Verified: {existingVerifiedEmail || auth.currentUser?.email}</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          setExistingVerifiedUid(null);
-                          setExistingVerifiedEmail('');
-                          await fbSignOut(auth).catch(() => {});
-                        }}
-                        className="text-[11px] font-extrabold underline text-emerald-700 hover:text-emerald-900"
-                      >
-                        Switch
-                      </button>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
-                        Display Name
-                      </label>
-                      <div className="relative">
-                        <User className="absolute left-3.5 top-3.5 text-emerald-500" size={16} />
-                        <input
-                          type="text"
-                          value={displayName}
-                          onChange={(e) => setDisplayName(e.target.value)}
-                          placeholder="Your display name"
-                          className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#10B981] text-base sm:text-sm transition"
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
-                        Choose Your Username
-                      </label>
-                      <div className="relative">
-                        <AtSign className="absolute left-3.5 top-3.5 text-purple-500" size={16} />
-                        <input
-                          type="text"
-                          required
-                          value={usernameInput}
-                          onChange={(e) => setUsernameInput(e.target.value)}
-                          placeholder="e.g. keylan_tz"
-                          className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-purple-500 text-base sm:text-sm transition"
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label className="block text-xs font-bold text-[#0F172A]">
-                          Choose Your Password
-                        </label>
-                        <span className="text-[10px] text-pink-600 font-semibold">
-                          8–24 chars, at least 1 letter &amp; 1 number
-                        </span>
-                      </div>
-                      <div className="relative">
-                        <Lock className="absolute left-3.5 top-3.5 text-pink-500" size={16} />
-                        <input
-                          type={showPassword ? 'text' : 'password'}
-                          required
-                          value={password}
-                          onChange={(e) => setPassword(e.target.value)}
-                          placeholder="8–24 characters with letters & numbers"
-                          minLength={8}
-                          maxLength={24}
-                          className="w-full min-h-[44px] pl-10 pr-10 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-pink-500 text-base sm:text-sm transition"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowPassword(!showPassword)}
-                          className="min-w-[44px] min-h-[44px] absolute right-0 top-0 flex items-center justify-center text-slate-400 hover:text-pink-600 transition"
-                        >
-                          {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                        </button>
-                      </div>
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={isLoading}
-                      className="w-full min-h-[48px] mt-3 py-3.5 px-5 rounded-2xl font-black text-sm text-white flex items-center justify-center gap-2 bg-slate-900 hover:bg-black active:scale-[0.99] transition shadow-lg shadow-slate-900/25 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none cursor-pointer"
-                    >
-                      {isLoading ? (
-                        <div className="flex items-center gap-2">
-                          <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                          <span className="text-white font-black text-sm">Saving...</span>
-                        </div>
-                      ) : (
-                        <>
-                          <span className="text-white font-black tracking-wide text-sm">
-                            Save Username &amp; Password &amp; Sign In
-                          </span>
-                          <ArrowRight size={16} className="text-white shrink-0" />
-                        </>
-                      )}
-                    </button>
-                  </form>
-                )}
-              </div>
-            ) : (
-              /* Normal User Form: Username & Password + Firebase Built-In Email Verification */
-              <form onSubmit={handleSubmit} className="space-y-4" noValidate>
-                {authMode === 'signup' && (
-                  <div>
-                    <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
-                      Full Name / Display Name
-                    </label>
-                    <div className="relative">
-                      <User className="absolute left-3.5 top-3.5 text-emerald-500" size={16} />
-                      <input
-                        type="text"
-                        required
-                        value={displayName}
-                        onChange={(e) => setDisplayName(e.target.value)}
-                        placeholder="e.g. Amina Nyerere"
-                        className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/25 text-base sm:text-sm transition"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <div>
-                  <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
-                    {authMode === 'signup' ? 'Username' : 'Username (or Email)'}
-                  </label>
-                  <div className="relative">
-                    <AtSign className="absolute left-3.5 top-3.5 text-purple-500" size={16} />
-                    <input
-                      type="text"
-                      required
-                      value={usernameInput}
-                      onChange={(e) => setUsernameInput(e.target.value)}
-                      placeholder={authMode === 'signup' ? 'e.g. amina_tz' : 'e.g. amina_tz or name@domain.com'}
-                      className="w-full min-h-[44px] pl-10 pr-4 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-500/25 text-base sm:text-sm transition"
-                    />
                   </div>
                 </div>
-
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-bold text-[#0F172A]">
-                      Password
-                    </label>
-                    <span className="text-[10px] text-pink-600 font-semibold">
-                      8–24 chars, at least 1 letter &amp; 1 number
+              ) : (
+                <form onSubmit={handleCompleteExistingAccountSetup} className="space-y-3.5" noValidate>
+                  <div className="px-4 py-2.5 rounded-full bg-slate-50 border border-slate-200 text-slate-700 text-xs flex items-center justify-between gap-2">
+                    <span className="truncate font-medium">
+                      {existingVerifiedEmail || auth.currentUser?.email}
                     </span>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setExistingVerifiedUid(null);
+                        setExistingVerifiedEmail('');
+                        await fbSignOut(auth).catch(() => {});
+                      }}
+                      className="text-xs font-medium underline text-slate-600 hover:text-slate-900 shrink-0 cursor-pointer"
+                    >
+                      Change
+                    </button>
                   </div>
+
+                  <input
+                    type="text"
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    placeholder="Display name"
+                    className="w-full h-12 px-4 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-slate-900 text-sm transition-all"
+                  />
+
+                  <input
+                    type="text"
+                    required
+                    value={usernameInput}
+                    onChange={(e) => setUsernameInput(e.target.value)}
+                    placeholder="Username (e.g. keylan_tz)"
+                    className="w-full h-12 px-4 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-slate-900 text-sm transition-all"
+                  />
+
                   <div className="relative">
-                    <Lock className="absolute left-3.5 top-3.5 text-pink-500" size={16} />
                     <input
                       type={showPassword ? 'text' : 'password'}
                       required
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      placeholder="8–24 characters with letters & numbers"
+                      placeholder="Password (8–24 chars, letters & numbers)"
                       minLength={8}
                       maxLength={24}
-                      className="w-full min-h-[44px] pl-10 pr-10 py-2.5 rounded-2xl bg-slate-50/90 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-pink-500 focus:ring-2 focus:ring-pink-500/25 text-base sm:text-sm transition"
+                      className="w-full h-12 pl-4 pr-11 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-slate-900 text-sm transition-all"
                     />
                     <button
                       type="button"
                       onClick={() => setShowPassword(!showPassword)}
-                      className="min-w-[44px] min-h-[44px] absolute right-0 top-0 flex items-center justify-center text-slate-400 hover:text-pink-600 transition"
-                      title={showPassword ? 'Hide password' : 'Show password'}
+                      className="w-11 h-12 absolute right-0.5 top-0 flex items-center justify-center text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
                     >
                       {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                     </button>
                   </div>
-                </div>
 
-                {/* Email Verification Section for Normal Users (Phone option disabled & hidden) */}
-                {authMode === 'signup' && (
-                  <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/90 space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-extrabold text-[#0F172A] flex items-center gap-1.5">
-                        <Mail size={14} className="text-blue-600" />
-                        <span>Email Verification</span>
-                      </span>
-                      {isEmailVerified && (
-                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] font-extrabold">
-                          <CheckCircle2 size={12} className="text-emerald-600" />
-                          <span>Email verified</span>
-                        </span>
-                      )}
-                    </div>
+                  <button
+                    type="submit"
+                    disabled={isLoading}
+                    className="w-full h-12 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium flex items-center justify-center gap-2 transition-all duration-200 disabled:opacity-50 cursor-pointer"
+                  >
+                    {isLoading ? 'Saving...' : 'Save and continue'}
+                  </button>
+                </form>
+              )}
 
-                    <div className="relative">
-                      <Mail className="absolute left-3.5 top-3.5 text-blue-500" size={16} />
-                      <input
-                        type="email"
-                        required
-                        value={emailInput}
-                        onChange={(e) => {
-                          setEmailInput(e.target.value);
-                          setIsEmailVerified(false);
-                          setVerificationLinkSent(false);
-                          setVerificationNotice(null);
-                          setVerificationErrorCode(null);
-                        }}
-                        placeholder="name@domain.com"
-                        className="w-full min-h-[42px] pl-10 pr-28 py-2 rounded-xl bg-white border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:border-blue-500 text-xs sm:text-sm"
-                      />
-                      {!verificationLinkSent && !isEmailVerified && (
-                        <button
-                          type="button"
-                          disabled={isSendingVerification || isEmailVerified}
-                          onClick={handleSendEmailVerificationLink}
-                          className="absolute right-1.5 top-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] disabled:opacity-50 transition"
-                        >
-                          {isSendingVerification ? 'Sending...' : 'Verify'}
-                        </button>
-                      )}
-                      {verificationLinkSent && !isEmailVerified && (
-                        <button
-                          type="button"
-                          disabled={isSendingVerification || resendCooldownSeconds > 0}
-                          onClick={handleSendEmailVerificationLink}
-                          className="absolute right-1.5 top-1.5 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] disabled:opacity-50 transition"
-                        >
-                          {isSendingVerification
-                            ? 'Sending...'
-                            : resendCooldownSeconds > 0
-                            ? `Resend (${resendCooldownSeconds}s)`
-                            : 'Resend'}
-                        </button>
-                      )}
-                    </div>
-
-                    {verificationErrorCode && !isEmailVerified && (
-                      <p className="text-[11px] font-mono text-rose-600 px-1">
-                        {verificationErrorCode}
-                      </p>
-                    )}
-
-                    {verificationLinkSent && !isEmailVerified && (
-                      <div className="space-y-2 pt-1">
-                        <p className="text-[11px] text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-2.5 py-2 font-semibold">
-                          {verificationNotice ||
-                            'Verification link sent. Check your inbox and spam folder.'}
-                        </p>
-                        <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
-                          <span>
-                            Click the link in your email, then return here to finish sign-up.
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => checkFirebaseEmailVerified()}
-                            className="shrink-0 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-bold text-[11px] transition"
-                          >
-                            I&apos;ve Verified
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {isEmailVerified && (
-                      <div className="flex items-center gap-1.5 text-emerald-700 text-xs font-bold">
-                        <CheckCircle2 size={15} className="text-emerald-600 shrink-0" />
-                        <span>Email verified</span>
-                      </div>
-                    )}
-
-                    {existingAccountDetected && (
-                      <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 space-y-3 animate-in fade-in">
-                        <div className="flex items-center gap-2 font-black text-sm text-amber-950">
-                          <AlertCircle size={18} className="text-amber-600 shrink-0" />
-                          <span>This email already has an account</span>
-                        </div>
-                        <p className="text-xs text-amber-800 leading-relaxed font-medium">
-                          An account with this email already exists on WaveLink (including Google sign-in). You can sign in directly or link a username &amp; password to that existing account, keeping all its data.
-                        </p>
-                        <div className="flex flex-col sm:flex-row gap-2 pt-1">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setAuthMode('signin');
-                              setUsernameInput(emailInput.trim().toLowerCase());
-                              setExistingAccountDetected(false);
-                              setError(null);
-                            }}
-                            className="flex-1 py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-black text-white font-black text-xs shadow-md transition flex items-center justify-center gap-1.5 cursor-pointer"
-                          >
-                            <span>Sign In</span>
-                            <ArrowRight size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setExistingAccountDetected(false);
-                              handleStartExistingAccountLink(emailInput.trim().toLowerCase());
-                            }}
-                            className="flex-1 py-2.5 px-4 rounded-xl bg-white border border-amber-300 hover:bg-amber-100 text-amber-950 font-black text-xs transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
-                          >
-                            <span>Link to Existing Account</span>
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
+              <div className="pt-2 text-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    transitionToStep('landing');
+                  }}
+                  className="text-xs font-medium text-slate-500 hover:text-[#0F172A] transition-colors cursor-pointer"
+                >
+                  Back to sign in
+                </button>
+              </div>
+            </div>
+          ) : authStep === 'landing' ? (
+            /* =====================================================================
+               STEP 1: MINIMALIST LANDING VIEW
+               Circular smooth social provider buttons (Google & Email),
+               subtle 'or' divider, and full-width rounded pill button for email continuation
+               ===================================================================== */
+            <div className="w-full flex flex-col items-center">
+              {/* Circular Smooth Social Provider Buttons for Google and Email */}
+              <div className="flex items-center justify-center gap-4 w-full">
+                <button
+                  type="button"
+                  disabled={isLoading}
+                  onClick={handleGoogleSignIn}
+                  aria-label="Continue with Google"
+                  title="Continue with Google"
+                  className="w-14 h-14 rounded-full bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50/80 active:scale-95 shadow-2xs hover:shadow-xs transition-all duration-200 flex items-center justify-center cursor-pointer disabled:opacity-50"
+                >
+                  <svg className="w-5 h-5" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="#4285F4"
+                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.42l4.03-3.15z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
+                    />
+                  </svg>
+                </button>
 
                 <button
-                  type="submit"
-                  disabled={isLoading || (authMode === 'signup' && !isEmailVerified)}
-                  className="w-full min-h-[48px] mt-3 py-3.5 px-5 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer shadow-lg active:scale-[0.99] disabled:cursor-not-allowed bg-slate-900 hover:bg-black text-white shadow-slate-900/25 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none border border-transparent disabled:border-slate-300"
+                  type="button"
+                  disabled={isLoading}
+                  onClick={() => transitionToStep('email')}
+                  aria-label="Continue with Email"
+                  title="Continue with Email"
+                  className="w-14 h-14 rounded-full bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50/80 active:scale-95 shadow-2xs hover:shadow-xs transition-all duration-200 flex items-center justify-center text-[#0F172A] cursor-pointer disabled:opacity-50"
                 >
-                  {isLoading ? (
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                      <span className="text-white font-black text-sm">Please wait...</span>
-                    </div>
+                  <Mail className="w-5 h-5 stroke-[1.8]" />
+                </button>
+              </div>
+
+              {/* Subtle 'or' Divider */}
+              <div className="flex items-center w-full gap-3.5 my-6">
+                <div className="h-px flex-1 bg-slate-200/80" />
+                <span className="text-xs font-normal text-slate-400 lowercase select-none">
+                  or
+                </span>
+                <div className="h-px flex-1 bg-slate-200/80" />
+              </div>
+
+              {/* Full-Width Rounded Pill Button for Email Continuation */}
+              <button
+                type="button"
+                disabled={isLoading}
+                onClick={() => transitionToStep('email')}
+                className="w-full h-12 px-6 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium tracking-tight flex items-center justify-center gap-2 shadow-2xs transition-all duration-200 cursor-pointer disabled:opacity-50"
+              >
+                <span>Continue with email</span>
+              </button>
+
+              {/* Subtle Secondary Account Actions */}
+              <div className="mt-6 flex flex-col items-center gap-2 text-xs text-slate-500">
+                <div>
+                  {authMode === 'signup' ? (
+                    <>
+                      Already have an account?{' '}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthMode('signin');
+                          transitionToStep('email');
+                        }}
+                        className="text-[#0F172A] font-medium hover:underline cursor-pointer"
+                      >
+                        Sign in
+                      </button>
+                    </>
                   ) : (
                     <>
-                      <span className="text-white font-black tracking-wide text-sm">
-                        {authMode === 'signup' ? 'Create WaveLink Account' : 'Sign In to WaveLink'}
-                      </span>
-                      <ArrowRight size={16} className="text-white shrink-0" />
+                      New to WaveLink?{' '}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthMode('signup');
+                          transitionToStep('email');
+                        }}
+                        className="text-[#0F172A] font-medium hover:underline cursor-pointer"
+                      >
+                        Create account
+                      </button>
                     </>
                   )}
-                </button>
-              </form>
-            )}
+                </div>
 
-            {/* Toggle between modes */}
-            <div className="mt-5 text-center space-y-2">
-              {authMode === 'signin' ? (
-                <p className="text-xs text-slate-600 font-medium">
-                  Don&apos;t have an account yet?{' '}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode('signup');
-                      setError(null);
-                      setStatusMessage(null);
-                    }}
-                    className="animate-moving-text font-extrabold underline transition"
-                  >
-                    Sign Up Here
-                  </button>
-                </p>
-              ) : (
-                <p className="text-xs text-slate-600 font-medium">
-                  Already registered with username &amp; password?{' '}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode('signin');
-                      setError(null);
-                      setStatusMessage(null);
-                    }}
-                    className="animate-moving-text font-extrabold underline transition"
-                  >
-                    Sign In Here
-                  </button>
-                </p>
-              )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('existing');
+                    setError(null);
+                    setStatusMessage(null);
+                  }}
+                  className="text-[11px] text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
+                >
+                  First signed up with Google? Link username &amp; password
+                </button>
+              </div>
             </div>
+          ) : authStep === 'email' ? (
+            /* =====================================================================
+               STEP 2: EMAIL INPUT STEP
+               ===================================================================== */
+            <form onSubmit={handleEmailStepContinue} className="w-full space-y-4" noValidate>
+              {/* Clean Mode Switcher Pills */}
+              <div className="grid grid-cols-2 p-1 rounded-full bg-slate-100/90 border border-slate-200/70 mb-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setError(null);
+                    setStatusMessage(null);
+                  }}
+                  className={`h-9 rounded-full text-xs font-medium transition-all duration-200 cursor-pointer ${
+                    authMode === 'signin'
+                      ? 'bg-white text-[#0F172A] shadow-2xs'
+                      : 'text-slate-500 hover:text-[#0F172A]'
+                  }`}
+                >
+                  Sign in
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signup');
+                    setError(null);
+                    setStatusMessage(null);
+                    setExistingAccountDetected(false);
+                  }}
+                  className={`h-9 rounded-full text-xs font-medium transition-all duration-200 cursor-pointer ${
+                    authMode === 'signup'
+                      ? 'bg-white text-[#0F172A] shadow-2xs'
+                      : 'text-slate-500 hover:text-[#0F172A]'
+                  }`}
+                >
+                  Create account
+                </button>
+              </div>
+
+              <div>
+                <label className="sr-only">
+                  {authMode === 'signup' ? 'Email address' : 'Email address or username'}
+                </label>
+                <input
+                  ref={emailFieldRef}
+                  type={authMode === 'signup' ? 'email' : 'text'}
+                  required
+                  value={authMode === 'signup' ? emailInput : emailInput || usernameInput}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (authMode === 'signup') {
+                      setEmailInput(val);
+                      setIsEmailVerified(false);
+                      setVerificationLinkSent(false);
+                      setVerificationNotice(null);
+                      setVerificationErrorCode(null);
+                    } else {
+                      setEmailInput(val);
+                      setUsernameInput(val);
+                    }
+                  }}
+                  placeholder={
+                    authMode === 'signup'
+                      ? 'name@example.com'
+                      : 'Email address or username'
+                  }
+                  autoComplete="email"
+                  className="w-full h-12 px-5 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#0F172A] text-sm transition-all duration-200"
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full h-12 px-6 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium tracking-tight flex items-center justify-center gap-2 shadow-2xs transition-all duration-200 cursor-pointer"
+              >
+                <span>Continue</span>
+              </button>
+
+              <div className="pt-2 flex items-center justify-center">
+                <button
+                  type="button"
+                  onClick={() => transitionToStep('landing')}
+                  className="text-xs font-medium text-slate-500 hover:text-[#0F172A] transition-colors cursor-pointer"
+                >
+                  Back to all options
+                </button>
+              </div>
+            </form>
+          ) : (
+            /* =====================================================================
+               STEP 3: PASSWORD INPUT STEP
+               ===================================================================== */
+            <form onSubmit={handleSubmit} className="w-full space-y-3.5" noValidate>
+              {/* Entered Email / Identifier Pill with Edit Action */}
+              <div className="w-full h-10 px-4 rounded-full bg-slate-50 border border-slate-200/80 flex items-center justify-between gap-2 text-xs text-slate-700">
+                <span className="truncate font-medium">
+                  {authMode === 'signup'
+                    ? emailInput
+                    : emailInput || usernameInput}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => transitionToStep('email')}
+                  className="text-slate-500 hover:text-[#0F172A] font-medium underline underline-offset-2 shrink-0 cursor-pointer"
+                >
+                  Edit
+                </button>
+              </div>
+
+              {authMode === 'signup' && (
+                <>
+                  <input
+                    type="text"
+                    required
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    placeholder="Full name"
+                    className="w-full h-12 px-5 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#0F172A] text-sm transition-all duration-200"
+                  />
+
+                  <input
+                    type="text"
+                    required
+                    value={usernameInput}
+                    onChange={(e) => setUsernameInput(e.target.value)}
+                    placeholder="Username (e.g. amina_tz)"
+                    className="w-full h-12 px-5 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#0F172A] text-sm transition-all duration-200"
+                  />
+                </>
+              )}
+
+              {/* Password Field */}
+              <div>
+                <div className="relative">
+                  <input
+                    ref={passwordFieldRef}
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder={
+                      authMode === 'signup'
+                        ? 'Password (8–24 chars, letters & numbers)'
+                        : 'Password'
+                    }
+                    minLength={8}
+                    maxLength={24}
+                    autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
+                    className="w-full h-12 pl-5 pr-11 rounded-full bg-slate-50/70 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-[#0F172A] text-sm transition-all duration-200"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="w-11 h-12 absolute right-0.5 top-0 flex items-center justify-center text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
+                    title={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+
+              {/* Built-In Email Verification Control for Sign-Up */}
+              {authMode === 'signup' && (
+                <div className="p-3.5 rounded-2xl bg-slate-50/80 border border-slate-200/80 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-slate-700">
+                      Verify your email to complete sign-up
+                    </span>
+                    {isEmailVerified ? (
+                      <span className="inline-flex items-center gap-1 text-emerald-700 text-xs font-medium">
+                        <CheckCircle2 size={14} className="text-emerald-600" />
+                        <span>Verified</span>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={
+                          isSendingVerification ||
+                          (verificationLinkSent && resendCooldownSeconds > 0)
+                        }
+                        onClick={handleSendEmailVerificationLink}
+                        className="px-3.5 py-1.5 rounded-full bg-[#0F172A] hover:bg-slate-800 text-white text-xs font-medium disabled:opacity-50 transition-all cursor-pointer"
+                      >
+                        {isSendingVerification
+                          ? 'Sending...'
+                          : verificationLinkSent
+                          ? resendCooldownSeconds > 0
+                            ? `Resend (${resendCooldownSeconds}s)`
+                            : 'Resend link'
+                          : 'Send verification link'}
+                      </button>
+                    )}
+                  </div>
+
+                  {verificationLinkSent && !isEmailVerified && (
+                    <div className="flex items-center justify-between gap-2 pt-1 text-[11px] text-slate-600">
+                      <span>
+                        {verificationNotice ||
+                          'Open the verification link in your inbox, then tap confirm.'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => checkFirebaseEmailVerified()}
+                        className="shrink-0 px-3 py-1 rounded-full bg-white border border-slate-300 hover:border-slate-900 text-[#0F172A] font-medium text-[11px] transition-colors cursor-pointer"
+                      >
+                        I&apos;ve verified
+                      </button>
+                    </div>
+                  )}
+
+                  {existingAccountDetected && (
+                    <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 space-y-2 text-xs">
+                      <p className="font-medium">
+                        An account with this email already exists.
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthMode('signin');
+                            setUsernameInput(emailInput.trim().toLowerCase());
+                            setExistingAccountDetected(false);
+                            setError(null);
+                          }}
+                          className="px-3 py-1.5 rounded-full bg-[#0F172A] text-white text-xs font-medium cursor-pointer"
+                        >
+                          Sign in instead
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExistingAccountDetected(false);
+                            handleStartExistingAccountLink(emailInput.trim().toLowerCase());
+                          }}
+                          className="px-3 py-1.5 rounded-full bg-white border border-amber-300 text-amber-900 text-xs font-medium cursor-pointer"
+                        >
+                          Link Google account
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Full-Width Rounded Pill Submit Button */}
+              <button
+                type="submit"
+                disabled={isLoading || (authMode === 'signup' && !isEmailVerified)}
+                className="w-full h-12 px-6 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium tracking-tight flex items-center justify-center gap-2 shadow-2xs transition-all duration-200 cursor-pointer disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed"
+              >
+                {isLoading ? (
+                  <div className="flex items-center gap-2">
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    <span>Please wait...</span>
+                  </div>
+                ) : (
+                  <span>
+                    {authMode === 'signup' ? 'Create account' : 'Sign in'}
+                  </span>
+                )}
+              </button>
+
+              <div className="pt-2 flex items-center justify-between text-xs text-slate-500 px-1">
+                <button
+                  type="button"
+                  onClick={() => transitionToStep('email')}
+                  className="hover:text-[#0F172A] transition-colors cursor-pointer"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode(authMode === 'signup' ? 'signin' : 'signup');
+                    setError(null);
+                    setStatusMessage(null);
+                  }}
+                  className="hover:text-[#0F172A] transition-colors cursor-pointer"
+                >
+                  {authMode === 'signup' ? 'Sign in instead' : 'Create an account'}
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      </main>
+
+      {/* Clean Compact Terms Text at the Bottom */}
+      <footer className="w-full max-w-[320px] mx-auto pt-8 text-center">
+        <p className="text-[11px] leading-relaxed text-slate-400 font-normal">
+          By continuing, you agree to WaveLink&apos;s{' '}
+          <button
+            type="button"
+            onClick={() => setActiveLegalNotice('terms')}
+            className="underline underline-offset-2 text-slate-500 hover:text-[#0F172A] transition-colors cursor-pointer"
+          >
+            Terms of Service
+          </button>{' '}
+          and acknowledge that you have read our{' '}
+          <button
+            type="button"
+            onClick={() => setActiveLegalNotice('privacy')}
+            className="underline underline-offset-2 text-slate-500 hover:text-[#0F172A] transition-colors cursor-pointer"
+          >
+            Privacy Policy
+          </button>
+          .
+        </p>
+      </footer>
+
+      {/* Compact Legal Sheet Modal (Terms / Privacy) */}
+      {activeLegalNotice && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs transition-opacity duration-200"
+          onClick={() => setActiveLegalNotice(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-3xl bg-white border border-slate-200 shadow-xl p-6 text-[#0F172A]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-[#0F172A]">
+                {activeLegalNotice === 'terms' ? 'Terms of Service' : 'Privacy Policy'}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setActiveLegalNotice(null)}
+                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 transition-colors cursor-pointer"
+                aria-label="Close"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              {activeLegalNotice === 'terms'
+                ? 'By using WaveLink, you agree to share respectful, authentic content, respect creator intellectual property, and follow community guidelines across feeds, reels, and creator monetization features.'
+                : 'WaveLink protects your account credentials with Firebase Authentication and only stores the profile, post, and creator studio information needed to deliver your social experience.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => setActiveLegalNotice(null)}
+              className="mt-5 w-full h-10 rounded-full bg-[#0F172A] text-white text-xs font-medium hover:bg-slate-800 transition-colors cursor-pointer"
+            >
+              Done
+            </button>
           </div>
         </div>
-
-        {/* Footer credits */}
-        <p className="text-center text-xs text-slate-600 mt-6 font-bold">
-          WaveLink © 2026 • Empowering East African Creators
-        </p>
-      </div>
+      )}
 
       {/* Hidden Owner Sign-In Modal (Opened only after tapping WaveLink logo 5 times) */}
       {showOwnerModal && (
@@ -1810,7 +1972,7 @@ export const AuthPage: React.FC = () => {
           role="dialog"
           aria-modal="true"
           aria-labelledby="owner-signin-title"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-md animate-in fade-in"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in"
         >
           <div className="w-full max-w-md rounded-3xl bg-white border border-slate-200 shadow-2xl p-6 sm:p-7 text-[#0F172A] relative">
             <button
@@ -1833,10 +1995,10 @@ export const AuthPage: React.FC = () => {
                 <ShieldCheck size={22} />
               </div>
               <div>
-                <h3 id="owner-signin-title" className="text-base sm:text-lg font-extrabold text-[#0F172A]">
+                <h3 id="owner-signin-title" className="text-base sm:text-lg font-bold text-[#0F172A]">
                   Owner Sign-In
                 </h3>
-                <p className="text-xs text-slate-500 font-medium">
+                <p className="text-xs text-slate-500">
                   Enter owner access code and sign in with your existing Google account
                 </p>
               </div>
@@ -1851,7 +2013,7 @@ export const AuthPage: React.FC = () => {
 
             <form onSubmit={handleOwnerSignInSubmit} className="space-y-4">
               <div>
-                <label className="block text-xs font-bold text-[#0F172A] mb-1.5">
+                <label className="block text-xs font-semibold text-[#0F172A] mb-1.5">
                   Owner Access Code
                 </label>
                 <div className="relative">
@@ -1864,7 +2026,7 @@ export const AuthPage: React.FC = () => {
                     onChange={(e) => setOwnerAccessCode(e.target.value)}
                     placeholder="Enter access code"
                     autoComplete="off"
-                    className="w-full min-h-[44px] pl-10 pr-10 py-2.5 rounded-2xl bg-slate-50 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-slate-900 text-sm transition disabled:opacity-50"
+                    className="w-full min-h-[44px] pl-10 pr-10 py-2.5 rounded-full bg-slate-50 border border-slate-200 text-[#0F172A] placeholder-slate-400 focus:outline-none focus:bg-white focus:border-slate-900 text-sm transition disabled:opacity-50"
                   />
                   <button
                     type="button"
@@ -1880,7 +2042,7 @@ export const AuthPage: React.FC = () => {
               <button
                 type="submit"
                 disabled={ownerLockedOut || isOwnerSubmitting || !ownerAccessCode.trim()}
-                className="w-full min-h-[48px] py-3 px-4 rounded-2xl bg-slate-900 hover:bg-slate-800 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-3 transition shadow-md disabled:opacity-50"
+                className="w-full min-h-[48px] py-3 px-5 rounded-full bg-slate-900 hover:bg-slate-800 text-white font-medium text-xs sm:text-sm flex items-center justify-center gap-3 transition shadow-sm disabled:opacity-50 cursor-pointer"
               >
                 {isOwnerSubmitting ? (
                   <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -1913,4 +2075,5 @@ export const AuthPage: React.FC = () => {
     </div>
   );
 };
+
 

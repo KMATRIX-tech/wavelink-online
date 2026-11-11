@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { auth, db } from '../firebase';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { auth } from '../firebase';
 
 const ADMIN_EMAILS = ['keylanmbilinyi5@gmail.com'];
 
@@ -9,54 +8,22 @@ interface AdminGuardProps {
 }
 
 export default function AdminGuard({ children }: AdminGuardProps) {
-  const [loading, setLoading] = useState(true);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const initialUser = auth.currentUser;
+  const initialIsOwner = Boolean(
+    initialUser?.email && ADMIN_EMAILS.includes(initialUser.email.trim().toLowerCase())
+  );
+
+  const [loading, setLoading] = useState(!initialUser);
+  const [isAdmin, setIsAdmin] = useState(initialIsOwner);
 
   useEffect(() => {
-    const unsubscribe = auth.onAuthStateChanged(async (user) => {
-      if (!user) {
+    const unsubscribe = auth.onAuthStateChanged((user) => {
+      if (!user || !user.email) {
         setIsAdmin(false);
-        setLoading(false);
-        return;
-      }
-
-      const isOwnerEmail = Boolean(
-        user.email && ADMIN_EMAILS.includes(user.email.trim().toLowerCase())
-      );
-
-      if (isOwnerEmail) {
-        // Auto-provision admin status in Firestore for keylanmbilinyi5@gmail.com
-        try {
-          await setDoc(
-            doc(db, 'users', user.uid),
-            {
-              email: user.email,
-              role: 'admin',
-              isOwner: true
-            },
-            { merge: true }
-          );
-        } catch (err) {
-          console.warn('Could not write admin role automatically:', err);
-        }
-        setIsAdmin(true);
       } else {
-        // Check Firestore for standard users
-        try {
-          const userDocSnap = await getDoc(doc(db, 'users', user.uid));
-          const userData = userDocSnap.exists() ? userDocSnap.data() : null;
-          setIsAdmin(
-            userData?.role === 'admin' ||
-              userData?.role === 'super_admin' ||
-              userData?.role === 'sub_admin' ||
-              userData?.isSubAdmin === true ||
-              userData?.isOwner === true
-          );
-        } catch {
-          setIsAdmin(false);
-        }
+        const isOwner = ADMIN_EMAILS.includes(user.email.trim().toLowerCase());
+        setIsAdmin(isOwner);
       }
-
       setLoading(false);
     });
 
@@ -64,12 +31,16 @@ export default function AdminGuard({ children }: AdminGuardProps) {
   }, []);
 
   if (loading) {
-    return <div className="p-5 text-center">Checking Clearance...</div>;
+    return (
+      <div className="text-center p-[60px] text-slate-900 dark:text-white">
+        <h2 className="text-lg font-bold">Verifying Admin Desk clearance...</h2>
+      </div>
+    );
   }
 
   if (!isAdmin) {
     return (
-      <div className="text-center p-10">
+      <div className="text-center p-10 text-slate-900 dark:text-white">
         <h2 className="text-xl font-bold mb-2">403 Forbidden</h2>
         <p className="mb-4">Access restricted to platform administrator.</p>
         <button

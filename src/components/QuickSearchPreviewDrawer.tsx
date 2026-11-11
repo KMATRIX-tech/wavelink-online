@@ -571,11 +571,17 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
 
                 {/* Media Preview */}
                 {item.post.imageUrl && (
-                  <div className="rounded-2xl overflow-hidden border border-slate-200/80 shadow-xs max-h-72 bg-slate-900">
+                  <div className="relative rounded-2xl overflow-hidden border border-slate-200/80 shadow-xs max-h-72 bg-[#0C0A09] flex items-center justify-center">
+                    <img
+                      src={item.post.imageUrl}
+                      alt=""
+                      aria-hidden="true"
+                      className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
+                    />
                     <img
                       src={item.post.imageUrl}
                       alt="Post visual"
-                      className="w-full h-full object-cover max-h-72"
+                      className="relative z-10 w-full h-auto max-h-72 object-contain"
                     />
                   </div>
                 )}

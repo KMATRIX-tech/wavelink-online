@@ -118,14 +118,14 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
   onToggleSave,
   onOpenTip
 }) => {
-  const [isLandscape, setIsLandscape] = useState<boolean>(() => {
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(() => {
     if (post.videoWidth && post.videoHeight && post.videoWidth > 0 && post.videoHeight > 0) {
-      return post.videoWidth > post.videoHeight * 1.02;
+      return { width: post.videoWidth, height: post.videoHeight };
     }
-    return false;
+    return null;
   });
 
-  // Use the raw videoUrl directly without adding extra Cloudinary transformations so free credits are saved
+  // Use the raw videoUrl directly without adding extra Cloudinary transformations so original quality is preserved
   const [resolvedSrc, setResolvedSrc] = useState<string | null>(() => {
     if (
       post.videoUrl &&
@@ -267,7 +267,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
     const vid = mainVideoRef.current;
     if (!vid) return;
     if (vid.videoWidth > 0 && vid.videoHeight > 0) {
-      setIsLandscape(vid.videoWidth > vid.videoHeight * 1.02);
+      setNaturalSize({ width: vid.videoWidth, height: vid.videoHeight });
     }
     setIsVideoReady(true);
     setIsBuffering(false);
@@ -276,8 +276,17 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
     }
   };
 
-  const posterUrl = post.thumbnailUrl || post.imageUrl || undefined;
+  // Load original sharp image file first before falling back to thumbnail
+  const sharpImageUrl = post.imageUrl || post.thumbnailUrl || undefined;
   const preloadMode = isActive || shouldPreloadNext ? 'auto' : 'metadata';
+
+  // Never upscale beyond the media's real resolution
+  const mediaConstrainStyle: React.CSSProperties | undefined = naturalSize
+    ? {
+        maxWidth: `min(100%, ${naturalSize.width}px)`,
+        maxHeight: `min(100%, ${naturalSize.height}px)`
+      }
+    : undefined;
 
   return (
     <div
@@ -285,7 +294,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
       className="relative w-full h-full bg-[#0C0A09] overflow-hidden flex items-center justify-center cursor-pointer select-none"
     >
       {/* Soft loading placeholder while buffering */}
-      {!isVideoReady && !posterUrl && (
+      {!isVideoReady && !sharpImageUrl && (
         <div
           aria-hidden="true"
           className="absolute inset-0 z-[1] bg-gradient-to-b from-stone-900 via-stone-800 to-stone-950 animate-pulse pointer-events-none"
@@ -302,243 +311,252 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
         </div>
       )}
 
-      {/* Poster fallback when video is not mounted or still initializing */}
-      {posterUrl && (!shouldMountVideo || !isVideoReady) && (
-        <img
-          src={posterUrl}
-          alt={post.content || 'Reel preview'}
-          decoding="async"
-          className={`absolute inset-0 w-full h-full pointer-events-none ${
-            isLandscape ? 'object-contain z-[2]' : 'object-cover z-[1]'
-          }`}
-        />
-      )}
-
-      {/* Landscape blurred backdrop when only poster is shown */}
-      {isLandscape && posterUrl && (!shouldMountVideo || !isVideoReady) && (
-        <img
-          src={posterUrl}
-          alt=""
-          aria-hidden="true"
-          className="absolute inset-0 z-[1] w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-75 pointer-events-none"
-        />
-      )}
-
-      {/* Mounted Video Elements (kept to at most 3 reels: previous, current, next) */}
-      {shouldMountVideo && resolvedSrc && (
-        <>
-          {/* For landscape videos: softly blurred copy of the same video filling the background */}
-          {isLandscape && (
-            <video
-              ref={bgBlurVideoRef}
-              src={resolvedSrc}
-              poster={posterUrl}
-              muted
-              playsInline
-              webkit-playsinline="true"
-              loop
-              preload={preloadMode}
-              aria-hidden="true"
-              className="absolute inset-0 z-[1] w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-75 pointer-events-none"
-            />
-          )}
-
-          {/* Primary Reel Video: Portrait fills with object-cover; Landscape stays uncropped & centered with object-contain */}
+      {/* Full-bleed soft blurred, darkened copy of the same video or photo filling empty sides so there are no black bars */}
+      {shouldMountVideo && resolvedSrc ? (
+        <div aria-hidden="true" className="absolute inset-0 z-[1] overflow-hidden pointer-events-none">
           <video
-            ref={mainVideoRef}
+            ref={bgBlurVideoRef}
             src={resolvedSrc}
-            poster={posterUrl}
+            poster={sharpImageUrl}
+            muted
             playsInline
             webkit-playsinline="true"
             loop
-            muted={isMuted}
             preload={preloadMode}
-            onLoadedMetadata={handleLoadedMetadata}
-            onCanPlay={() => {
-              setIsVideoReady(true);
-              setIsBuffering(false);
-            }}
-            onWaiting={() => setIsBuffering(true)}
-            onPlaying={() => {
-              setIsVideoReady(true);
-              setIsBuffering(false);
-            }}
-            onTimeUpdate={() => {
-              if (
-                isLandscape &&
-                bgBlurVideoRef.current &&
-                mainVideoRef.current &&
-                Math.abs(bgBlurVideoRef.current.currentTime - mainVideoRef.current.currentTime) > 0.4
-              ) {
-                bgBlurVideoRef.current.currentTime = mainVideoRef.current.currentTime;
-              }
-            }}
-            className={`relative z-[2] w-full h-full pointer-events-none ${
-              isLandscape ? 'object-contain' : 'object-cover'
-            }`}
+            className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
           />
-        </>
+          <div className="absolute inset-0 bg-black/35" />
+        </div>
+      ) : (
+        sharpImageUrl && (
+          <div aria-hidden="true" className="absolute inset-0 z-[1] overflow-hidden pointer-events-none">
+            <img
+              src={sharpImageUrl}
+              alt=""
+              className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+            />
+            <div className="absolute inset-0 bg-black/35" />
+          </div>
+        )
       )}
 
-      {/* Small Speaker Button to Unmute / Mute (Top-Right below filter bar) */}
-      <button
-        type="button"
-        onClick={onToggleSound}
-        aria-label={isMuted ? 'Unmute reel' : 'Mute reel'}
-        title={isMuted ? 'Unmute' : 'Mute'}
-        className="absolute top-16 right-3.5 sm:right-5 z-25 min-w-[44px] min-h-[44px] flex items-center justify-center cursor-pointer"
-      >
-        <span className="w-9 h-9 rounded-2xl bg-black/50 hover:bg-black/70 backdrop-blur-md border border-white/20 text-white flex items-center justify-center shadow-md transition active:scale-95">
-          {isMuted ? <VolumeX size={16} /> : <Volume2 size={16} className="text-[#10B981]" />}
-        </span>
-      </button>
+      {/* Centered Reel Stage + Right-Side Action Buttons */}
+      <div className="relative z-10 w-full h-full flex items-center justify-center">
+        {/* Reel Column: Full-screen on phones, 420–480px wide & full height on wide screens */}
+        <div className="relative w-full sm:w-[456px] sm:min-w-[420px] sm:max-w-[480px] h-full flex items-center justify-center overflow-hidden sm:shadow-[0_0_48px_rgba(0,0,0,0.55)]">
+          {/* Sharp Image / Poster when video is not mounted or still initializing */}
+          {sharpImageUrl && (!shouldMountVideo || !isVideoReady || !resolvedSrc) && (
+            <img
+              src={sharpImageUrl}
+              alt={post.content || 'Reel preview'}
+              decoding="async"
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                if (img.naturalWidth > 0 && img.naturalHeight > 0 && !naturalSize) {
+                  setNaturalSize({ width: img.naturalWidth, height: img.naturalHeight });
+                }
+              }}
+              style={mediaConstrainStyle}
+              className="relative z-[2] w-full h-full object-contain pointer-events-none"
+            />
+          )}
 
-      {/* Bottom Soft Gradient Scrim so Author Info & Caption are always readable */}
-      <div
-        aria-hidden="true"
-        className="absolute inset-x-0 bottom-0 h-64 z-10 bg-gradient-to-t from-black/90 via-black/50 to-transparent pointer-events-none"
-      />
+          {/* Primary Reel Video: True aspect ratio with object-contain, never stretched, never cropped, never upscaled beyond real resolution */}
+          {shouldMountVideo && resolvedSrc && (
+            <video
+              ref={mainVideoRef}
+              src={resolvedSrc}
+              poster={sharpImageUrl}
+              playsInline
+              webkit-playsinline="true"
+              loop
+              muted={isMuted}
+              preload={preloadMode}
+              onLoadedMetadata={handleLoadedMetadata}
+              onCanPlay={() => {
+                setIsVideoReady(true);
+                setIsBuffering(false);
+              }}
+              onWaiting={() => setIsBuffering(true)}
+              onPlaying={() => {
+                setIsVideoReady(true);
+                setIsBuffering(false);
+              }}
+              onTimeUpdate={() => {
+                if (
+                  bgBlurVideoRef.current &&
+                  mainVideoRef.current &&
+                  Math.abs(bgBlurVideoRef.current.currentTime - mainVideoRef.current.currentTime) > 0.4
+                ) {
+                  bgBlurVideoRef.current.currentTime = mainVideoRef.current.currentTime;
+                }
+              }}
+              style={mediaConstrainStyle}
+              className="relative z-[2] w-full h-full object-contain pointer-events-none"
+            />
+          )}
 
-      {/* Bottom-Left: Author Avatar, Name, Caption & Attached Song */}
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="absolute left-3.5 sm:left-6 right-20 bottom-4 sm:bottom-6 z-20 flex flex-col gap-2 text-white pointer-events-auto"
-      >
-        <div className="flex items-center gap-2.5">
-          <img
-            src={
-              post.authorPhotoURL ||
-              `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`
-            }
-            alt={post.authorName}
-            referrerPolicy="no-referrer"
-            className="w-10 h-10 rounded-2xl object-cover ring-2 ring-white/85 shadow-md shrink-0 bg-stone-800"
-          />
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="font-extrabold text-sm sm:text-base text-white drop-shadow-xs truncate">
-                {post.authorName}
-              </span>
-              <CrystalBadge email={post.authorEmail} name="" size="sm" />
-            </div>
-            <span className="text-[11px] font-mono text-white/80 block truncate">
-              {post.authorUsername || '@waver'}
+          {/* Small Speaker Button to Unmute / Mute (Top-Right of Reel) */}
+          <button
+            type="button"
+            onClick={onToggleSound}
+            aria-label={isMuted ? 'Unmute reel' : 'Mute reel'}
+            title={isMuted ? 'Unmute' : 'Mute'}
+            className="absolute top-16 right-3.5 sm:right-4 z-25 min-w-[44px] min-h-[44px] flex items-center justify-center cursor-pointer"
+          >
+            <span className="w-9 h-9 rounded-2xl bg-black/50 hover:bg-black/70 backdrop-blur-md border border-white/20 text-white flex items-center justify-center shadow-md transition active:scale-95">
+              {isMuted ? <VolumeX size={16} /> : <Volume2 size={16} className="text-[#10B981]" />}
             </span>
+          </button>
+
+          {/* Bottom Soft Gradient Scrim so Author Info & Caption are always readable */}
+          <div
+            aria-hidden="true"
+            className="absolute inset-x-0 bottom-0 h-64 z-10 bg-gradient-to-t from-black/90 via-black/50 to-transparent pointer-events-none"
+          />
+
+          {/* Bottom of Video: Creator Avatar, Name, Caption & Attached Song */}
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="absolute left-3.5 sm:left-4 right-20 sm:right-4 bottom-4 sm:bottom-6 z-20 flex flex-col gap-2 text-white pointer-events-auto"
+          >
+            <div className="flex items-center gap-2.5">
+              <img
+                src={
+                  post.authorPhotoURL ||
+                  `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`
+                }
+                alt={post.authorName}
+                referrerPolicy="no-referrer"
+                className="w-10 h-10 rounded-2xl object-cover ring-2 ring-white/85 shadow-md shrink-0 bg-stone-800"
+              />
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="font-extrabold text-sm sm:text-base text-white drop-shadow-xs truncate">
+                    {post.authorName}
+                  </span>
+                  <CrystalBadge email={post.authorEmail} name="" size="sm" />
+                </div>
+                <span className="text-[11px] font-mono text-white/80 block truncate">
+                  {post.authorUsername || '@waver'}
+                </span>
+              </div>
+            </div>
+
+            {post.content && (
+              <p className="text-xs sm:text-sm text-white/95 leading-snug line-clamp-3 break-words drop-shadow-xs">
+                {post.content}
+              </p>
+            )}
+
+            {post.songTitle && (
+              <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-white/90 truncate max-w-xs">
+                <Music size={12} className="text-[#10B981] shrink-0" />
+                <span className="truncate">
+                  {post.songTitle}
+                  {post.songArtist ? ` · ${post.songArtist}` : ''}
+                </span>
+              </div>
+            )}
           </div>
         </div>
 
-        {post.content && (
-          <p className="text-xs sm:text-sm text-white/95 leading-snug line-clamp-3 break-words drop-shadow-xs">
-            {post.content}
-          </p>
-        )}
-
-        {post.songTitle && (
-          <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-white/90 truncate max-w-xs">
-            <Music size={12} className="text-[#10B981] shrink-0" />
-            <span className="truncate">
-              {post.songTitle}
-              {post.songArtist ? ` · ${post.songArtist}` : ''}
+        {/* Right Side Vertical Action Stack (Beside the reel on wide screens, over right edge on mobile) */}
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute right-3 bottom-4 sm:static sm:ml-3.5 sm:self-end sm:mb-6 z-20 flex flex-col items-center gap-3 pointer-events-auto"
+        >
+          {/* 1. Like */}
+          <button
+            type="button"
+            onClick={() => onToggleLike(post)}
+            aria-label="Like reel"
+            className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
+          >
+            <span
+              className={`w-11 h-11 rounded-2xl flex items-center justify-center border transition active:scale-90 shadow-md ${
+                isLiked
+                  ? 'bg-[#F43F5E] border-[#F43F5E] text-white shadow-[#F43F5E]/30'
+                  : 'bg-black/45 hover:bg-black/65 backdrop-blur-md border-white/25 text-white'
+              }`}
+            >
+              <Heart size={20} className={isLiked ? 'fill-white' : ''} />
             </span>
-          </div>
-        )}
-      </div>
+            <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
+              {post.likesCount || 0}
+            </span>
+          </button>
 
-      {/* Right Side Vertical Action Stack (WaveLink Rounded Squircle Icons & Colors) */}
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="absolute right-3 sm:right-5 bottom-4 sm:bottom-6 z-20 flex flex-col items-center gap-3 pointer-events-auto"
-      >
-        {/* 1. Like */}
-        <button
-          type="button"
-          onClick={() => onToggleLike(post)}
-          aria-label="Like reel"
-          className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
-        >
-          <span
-            className={`w-11 h-11 rounded-2xl flex items-center justify-center border transition active:scale-90 shadow-md ${
-              isLiked
-                ? 'bg-[#F43F5E] border-[#F43F5E] text-white shadow-[#F43F5E]/30'
-                : 'bg-black/45 hover:bg-black/65 backdrop-blur-md border-white/25 text-white'
-            }`}
+          {/* 2. Comment (Opens Bottom Sheet over Reel) */}
+          <button
+            type="button"
+            onClick={() => onOpenComments(post)}
+            aria-label="Open comments"
+            className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
           >
-            <Heart size={20} className={isLiked ? 'fill-white' : ''} />
-          </span>
-          <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-            {post.likesCount || 0}
-          </span>
-        </button>
+            <span className="w-11 h-11 rounded-2xl bg-black/45 hover:bg-[#2563EB] backdrop-blur-md border border-white/25 text-white flex items-center justify-center transition active:scale-90 shadow-md">
+              <MessageCircle size={20} />
+            </span>
+            <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
+              {post.commentsCount || 0}
+            </span>
+          </button>
 
-        {/* 2. Comment (Opens Bottom Sheet over Reel) */}
-        <button
-          type="button"
-          onClick={() => onOpenComments(post)}
-          aria-label="Open comments"
-          className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
-        >
-          <span className="w-11 h-11 rounded-2xl bg-black/45 hover:bg-[#2563EB] backdrop-blur-md border border-white/25 text-white flex items-center justify-center transition active:scale-90 shadow-md">
-            <MessageCircle size={20} />
-          </span>
-          <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-            {post.commentsCount || 0}
-          </span>
-        </button>
-
-        {/* 3. Share */}
-        <button
-          type="button"
-          onClick={() => onShare(post)}
-          aria-label="Share reel"
-          className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
-        >
-          <span
-            className={`w-11 h-11 rounded-2xl flex items-center justify-center border transition active:scale-90 shadow-md ${
-              isCopied
-                ? 'bg-[#10B981] border-[#10B981] text-white'
-                : 'bg-black/45 hover:bg-[#0284C7] backdrop-blur-md border-white/25 text-white'
-            }`}
+          {/* 3. Share */}
+          <button
+            type="button"
+            onClick={() => onShare(post)}
+            aria-label="Share reel"
+            className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
           >
-            {isCopied ? <Check size={19} /> : <Share2 size={19} />}
-          </span>
-          <span className="text-[10px] font-bold text-white drop-shadow-xs">
-            {isCopied ? 'Copied' : 'Share'}
-          </span>
-        </button>
+            <span
+              className={`w-11 h-11 rounded-2xl flex items-center justify-center border transition active:scale-90 shadow-md ${
+                isCopied
+                  ? 'bg-[#10B981] border-[#10B981] text-white'
+                  : 'bg-black/45 hover:bg-[#0284C7] backdrop-blur-md border-white/25 text-white'
+              }`}
+            >
+              {isCopied ? <Check size={19} /> : <Share2 size={19} />}
+            </span>
+            <span className="text-[10px] font-bold text-white drop-shadow-xs">
+              {isCopied ? 'Copied' : 'Share'}
+            </span>
+          </button>
 
-        {/* 4. Save */}
-        <button
-          type="button"
-          onClick={() => onToggleSave(post.id)}
-          aria-label={isSaved ? 'Remove from saved' : 'Save reel'}
-          className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
-        >
-          <span
-            className={`w-11 h-11 rounded-2xl flex items-center justify-center border transition active:scale-90 shadow-md ${
-              isSaved
-                ? 'bg-[#2563EB] border-[#2563EB] text-white shadow-[#2563EB]/30'
-                : 'bg-black/45 hover:bg-black/65 backdrop-blur-md border-white/25 text-white'
-            }`}
+          {/* 4. Save */}
+          <button
+            type="button"
+            onClick={() => onToggleSave(post.id)}
+            aria-label={isSaved ? 'Remove from saved' : 'Save reel'}
+            className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
           >
-            <Bookmark size={19} className={isSaved ? 'fill-white' : ''} />
-          </span>
-          <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-            {post.savesCount || 0}
-          </span>
-        </button>
+            <span
+              className={`w-11 h-11 rounded-2xl flex items-center justify-center border transition active:scale-90 shadow-md ${
+                isSaved
+                  ? 'bg-[#2563EB] border-[#2563EB] text-white shadow-[#2563EB]/30'
+                  : 'bg-black/45 hover:bg-black/65 backdrop-blur-md border-white/25 text-white'
+              }`}
+            >
+              <Bookmark size={19} className={isSaved ? 'fill-white' : ''} />
+            </span>
+            <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
+              {post.savesCount || 0}
+            </span>
+          </button>
 
-        {/* 5. Tip Creator */}
-        <button
-          type="button"
-          onClick={() => onOpenTip(post)}
-          aria-label={`Tip ${post.authorName}`}
-          className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
-        >
-          <span className="w-11 h-11 rounded-2xl bg-gradient-to-tr from-[#0D9488] to-[#2563EB] hover:opacity-95 border border-white/35 text-white flex items-center justify-center transition active:scale-90 shadow-md shadow-[#0D9488]/30">
-            <HandCoins size={19} />
-          </span>
-          <span className="text-[10px] font-extrabold text-white drop-shadow-xs">Tip</span>
-        </button>
+          {/* 5. Tip Creator */}
+          <button
+            type="button"
+            onClick={() => onOpenTip(post)}
+            aria-label={`Tip ${post.authorName}`}
+            className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
+          >
+            <span className="w-11 h-11 rounded-2xl bg-gradient-to-tr from-[#0D9488] to-[#2563EB] hover:opacity-95 border border-white/35 text-white flex items-center justify-center transition active:scale-90 shadow-md shadow-[#0D9488]/30">
+              <HandCoins size={19} />
+            </span>
+            <span className="text-[10px] font-extrabold text-white drop-shadow-xs">Tip</span>
+          </button>
+        </div>
       </div>
     </div>
   );

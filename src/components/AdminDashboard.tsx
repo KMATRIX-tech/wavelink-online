@@ -110,9 +110,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     adminCheckFailedReason
   } = useAuth();
 
+  const ADMIN_EMAILS = ['keylanmbilinyi5@gmail.com'];
+  const isOwnerEmailAccount = Boolean(
+    currentUser?.email && ADMIN_EMAILS.includes(currentUser.email.trim().toLowerCase())
+  );
+
   const [activeTab, setActiveTab] = useState<'overview' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>('overview');
-  const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(false);
-  const [isCheckingServerAdmin, setIsCheckingServerAdmin] = useState<boolean>(true);
+  const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(
+    Boolean(isOwnerEmailAccount || isAdmin)
+  );
+  const [isCheckingServerAdmin, setIsCheckingServerAdmin] = useState<boolean>(false);
   const [failedCheckReason, setFailedCheckReason] = useState<string | null>(null);
 
   // Re-verify owner access state on the 403 screen
@@ -121,11 +128,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [showReverifyCodeText, setShowReverifyCodeText] = useState<boolean>(false);
   const [isReverifyingOwner, setIsReverifyingOwner] = useState<boolean>(false);
   const [reverifyError, setReverifyError] = useState<string | null>(null);
-
-  const ADMIN_EMAILS = ['keylanmbilinyi5@gmail.com'];
-  const isOwnerEmailAccount = Boolean(
-    currentUser?.email && ADMIN_EMAILS.includes(currentUser.email.trim().toLowerCase())
-  );
 
   const verifyAdminSessionWithServer = async (forceTokenRefresh = false) => {
     if (!currentUser) {
@@ -139,19 +141,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setServerAdminVerified(true);
       setFailedCheckReason(null);
       setIsCheckingServerAdmin(false);
-      try {
-        await setDoc(
-          doc(db, 'users', currentUser.uid),
-          {
-            email: currentUser.email,
-            role: 'admin',
-            isOwner: true
-          },
-          { merge: true }
-        );
-      } catch (err) {
-        console.warn('Could not write admin role automatically:', err);
-      }
+      setDoc(
+        doc(db, 'users', currentUser.uid),
+        {
+          email: currentUser.email,
+          role: 'admin',
+          isOwner: true
+        },
+        { merge: true }
+      ).catch(() => {});
       return;
     }
 
@@ -601,7 +599,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     };
   }, [isAdmin]);
 
-  if (isCheckingServerAdmin) {
+  if (isCheckingServerAdmin && !isOwnerEmailAccount) {
     return (
       <div className="min-h-[80vh] flex items-center justify-center p-4">
         <div className="w-full max-w-sm bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-8 text-center shadow-lg">

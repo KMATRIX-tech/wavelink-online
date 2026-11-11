@@ -394,9 +394,22 @@ export interface FirestoreErrorInfo {
   };
 }
 
-export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+export function isFirestoreQuotaError(error: unknown): boolean {
+  if (!error) return false;
+  const code = String((error as { code?: unknown })?.code || '').toLowerCase();
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    code === 'resource-exhausted' ||
+    msg.includes('quota limit exceeded') ||
+    msg.includes('quota exceeded') ||
+    msg.includes('resource-exhausted')
+  );
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): void {
+  const rawMessage = error instanceof Error ? error.message : String(error);
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: rawMessage,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
@@ -411,7 +424,16 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     operationType,
     path
   };
-  console.warn('Firestore Operation Notice:', JSON.stringify(errInfo));
+
+  // Do not crash onSnapshot listeners when daily free-tier read quota is exhausted or client is offline
+  if (
+    isFirestoreQuotaError(error) ||
+    rawMessage.toLowerCase().includes('client is offline')
+  ) {
+    return;
+  }
+
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
   throw new Error(JSON.stringify(errInfo));
 }
 

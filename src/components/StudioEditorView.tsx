@@ -1940,20 +1940,39 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
                 />
               ) : previewUrl ? (
                 mediaType === 'video' ? (
-                  <video
-                    src={previewUrl}
-                    muted
-                    playsInline
-                    autoPlay
-                    loop
-                    className="absolute inset-0 w-full h-full object-cover opacity-85"
-                  />
+                  <>
+                    <video
+                      src={previewUrl}
+                      muted
+                      playsInline
+                      autoPlay
+                      loop
+                      aria-hidden="true"
+                      className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
+                    />
+                    <video
+                      src={previewUrl}
+                      muted
+                      playsInline
+                      autoPlay
+                      loop
+                      className="absolute inset-0 z-10 w-full h-full object-contain opacity-95"
+                    />
+                  </>
                 ) : (
-                  <img
-                    src={previewUrl}
-                    alt="Selected"
-                    className="absolute inset-0 w-full h-full object-cover opacity-85"
-                  />
+                  <>
+                    <img
+                      src={previewUrl}
+                      alt=""
+                      aria-hidden="true"
+                      className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
+                    />
+                    <img
+                      src={previewUrl}
+                      alt="Selected"
+                      className="absolute inset-0 z-10 w-full h-full object-contain opacity-95"
+                    />
+                  </>
                 )
               ) : (
                 <div className="absolute inset-0 bg-gradient-to-b from-stone-800 via-stone-900 to-black flex flex-col items-center justify-center p-6 text-center">
@@ -3918,24 +3937,45 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
               <X size={18} />
             </button>
           </div>
-          <div className="relative w-full max-w-sm aspect-[9/16] rounded-3xl overflow-hidden bg-stone-900 border border-white/20">
+          <div className="relative w-full max-w-[450px] aspect-[9/16] rounded-3xl overflow-hidden bg-stone-950 border border-white/20 flex items-center justify-center">
             {previewUrl &&
               (mediaType === 'video' ? (
-                <video
-                  src={previewUrl}
-                  autoPlay
-                  loop
-                  playsInline
-                  style={{ filter: getCombinedFilterStyle() }}
-                  className="w-full h-full object-cover"
-                />
+                <>
+                  <video
+                    src={previewUrl}
+                    autoPlay
+                    loop
+                    muted
+                    playsInline
+                    aria-hidden="true"
+                    style={{ filter: getCombinedFilterStyle() }}
+                    className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
+                  />
+                  <video
+                    src={previewUrl}
+                    autoPlay
+                    loop
+                    playsInline
+                    style={{ filter: getCombinedFilterStyle() }}
+                    className="relative z-10 w-full h-full object-contain"
+                  />
+                </>
               ) : (
-                <img
-                  src={previewUrl}
-                  alt="Full preview"
-                  style={{ filter: getCombinedFilterStyle() }}
-                  className="w-full h-full object-cover"
-                />
+                <>
+                  <img
+                    src={previewUrl}
+                    alt=""
+                    aria-hidden="true"
+                    style={{ filter: getCombinedFilterStyle() }}
+                    className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
+                  />
+                  <img
+                    src={previewUrl}
+                    alt="Full preview"
+                    style={{ filter: getCombinedFilterStyle() }}
+                    className="relative z-10 w-full h-full object-contain"
+                  />
+                </>
               ))}
           </div>
         </div>

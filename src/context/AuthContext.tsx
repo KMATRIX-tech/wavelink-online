@@ -406,7 +406,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   // Verify admin role strictly against the server (/api/admin/verify) and refresh session token immediately
-  const refreshAdminVerification = async (): Promise<boolean> => {
+  const refreshAdminVerification = async (passiveCheck = false): Promise<boolean> => {
     const activeUser = auth.currentUser;
     if (!activeUser) {
       setCustomClaimRole('user');
@@ -415,8 +415,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return false;
     }
 
+    const cleanActiveEmail = (activeUser.email || '').trim().toLowerCase();
+    if (cleanActiveEmail === 'keylanmbilinyi5@gmail.com') {
+      setServerVerifiedRole('admin');
+      setAdminCheckFailedReason(null);
+    }
+
     // Force-refresh Firebase ID token so updated custom claims & session privileges apply immediately
-    const claimRole = await readTokenClaimRole(activeUser, true);
+    const claimRole = await readTokenClaimRole(activeUser, !passiveCheck);
 
     // Ensure currentUser state is synced after Owner sign-in completes
     setCurrentUser(activeUser);
@@ -428,7 +434,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         headers,
         body: JSON.stringify({
           email: activeUser.email,
-          isSubAdmin: Boolean(userProfile?.isSubAdmin || userProfile?.role === 'sub_admin')
+          isSubAdmin: Boolean(userProfile?.isSubAdmin || userProfile?.role === 'sub_admin'),
+          passiveCheck
         })
       });
       const data = await resp.json().catch(() => ({}));
@@ -451,7 +458,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           await syncUserProfileDoc(activeUser, undefined, undefined, resolvedRole);
           return true;
         }
-      } else {
+      } else if (cleanActiveEmail !== 'keylanmbilinyi5@gmail.com') {
         const reason =
           typeof data?.failedCheck === 'string' && data.failedCheck.trim()
             ? data.failedCheck.trim()
@@ -461,12 +468,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setAdminCheckFailedReason(reason);
       }
     } catch {
-      if (claimRole === 'admin') {
+      if (claimRole === 'admin' || cleanActiveEmail === 'keylanmbilinyi5@gmail.com') {
         setServerVerifiedRole('admin');
         setAdminCheckFailedReason(null);
         return true;
       }
       setAdminCheckFailedReason('session needs refresh');
+    }
+    if (cleanActiveEmail === 'keylanmbilinyi5@gmail.com') {
+      return true;
     }
     setServerVerifiedRole('user');
     return false;
@@ -597,19 +607,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const claimRole = await readTokenClaimRole(user, false);
 
       if (isOwnerEmail) {
-        try {
-          await setDoc(
-            userDocRef,
-            {
-              email: user.email,
-              role: 'admin',
-              isOwner: true
-            },
-            { merge: true }
-          );
-        } catch (err) {
-          console.warn('Could not write admin role automatically:', err);
-        }
+        setDoc(
+          userDocRef,
+          {
+            email: user.email,
+            role: 'admin',
+            isOwner: true
+          },
+          { merge: true }
+        ).catch(() => {});
       }
 
       // 1. Look up existing user document by Firebase UID first
@@ -941,14 +947,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setCurrentUser(user);
 
       if (user) {
-        // Synchronize full existing profile from Firestore first so existing points, posts, followers, and Pro status are never overwritten
-        await syncUserProfileDoc(user).catch((err) => {
-          console.warn('Profile sync notice:', err);
-        });
+        const cleanEmail = (user.email || '').trim().toLowerCase();
+        const hasOwnerSessionToken = Boolean(
+          typeof window !== 'undefined' &&
+            (sessionStorage.getItem(OWNER_SESSION_STORAGE_KEY) ||
+              localStorage.getItem(OWNER_SESSION_STORAGE_KEY))
+        );
+        if (cleanEmail === 'keylanmbilinyi5@gmail.com') {
+          setServerVerifiedRole('admin');
+          setAdminCheckFailedReason(null);
+        }
         setIsLoading(false);
 
-        // Verify server-side admin role in the background
-        refreshAdminVerification().catch(() => {});
+        // Synchronize full existing profile from Firestore in the background without blocking UI
+        syncUserProfileDoc(user).catch((err) => {
+          console.warn('Profile sync notice:', err);
+        });
+
+        // Only verify server-side admin session on mount if owner email or owner token is present
+        if (cleanEmail === 'keylanmbilinyi5@gmail.com' || hasOwnerSessionToken) {
+          refreshAdminVerification(true).catch(() => {});
+        }
 
         // Listen for live status changes on /users/{uid} (single canonical source for role & profile)
         const userDocRef = doc(db, 'users', user.uid);

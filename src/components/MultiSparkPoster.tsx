@@ -1156,14 +1156,22 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
                             src={activeSlide.mediaDataUrl}
                             controls
                             playsInline
-                            className="w-full h-auto max-h-60 object-contain"
+                            className="relative z-10 w-full h-auto max-h-60 object-contain"
                           />
                         ) : (
-                          <img
-                            src={activeSlide.mediaDataUrl}
-                            alt="Slide preview"
-                            className="w-full h-auto max-h-60 object-contain"
-                          />
+                          <>
+                            <img
+                              src={activeSlide.mediaDataUrl}
+                              alt=""
+                              aria-hidden="true"
+                              className="absolute inset-0 w-full h-full object-cover scale-110 blur-xl opacity-55 brightness-50 pointer-events-none"
+                            />
+                            <img
+                              src={activeSlide.mediaDataUrl}
+                              alt="Slide preview"
+                              className="relative z-10 w-full h-auto max-h-60 object-contain"
+                            />
+                          </>
                         )}
                         {activeSlide.mediaType === 'video' && activeSlide.videoDurationSeconds && (
                           <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-full bg-black/75 text-white text-[10px] font-mono font-bold flex items-center gap-1.5">
@@ -1452,19 +1460,36 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
                       key={spark.id}
                       className="rounded-2xl border border-[#EFECE6] bg-[#FAF7F2] overflow-hidden flex flex-col justify-between"
                     >
-                      <div className="relative h-36 bg-stone-900">
+                      <div className="relative h-36 bg-stone-950 overflow-hidden flex items-center justify-center">
                         <img
-                          src={spark.mediaUrl}
-                          alt={spark.caption || `Spark ${idx + 1}`}
-                          className="w-full h-full object-cover"
+                          src={spark.thumbnailUrl || spark.mediaUrl}
+                          alt=""
+                          aria-hidden="true"
+                          className="absolute inset-0 w-full h-full object-cover scale-110 blur-xl opacity-55 brightness-50 pointer-events-none"
                         />
-                        <span className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-stone-900/80 text-white text-[10px] font-bold">
+                        {spark.mediaType === 'video' ? (
+                          <video
+                            src={spark.mediaUrl}
+                            poster={spark.thumbnailUrl}
+                            muted
+                            playsInline
+                            preload="metadata"
+                            className="relative z-10 w-full h-full object-contain pointer-events-none"
+                          />
+                        ) : (
+                          <img
+                            src={spark.mediaUrl}
+                            alt={spark.caption || `Spark ${idx + 1}`}
+                            className="relative z-10 w-full h-full object-contain pointer-events-none"
+                          />
+                        )}
+                        <span className="absolute top-2 left-2 z-20 px-2 py-0.5 rounded-md bg-stone-900/80 text-white text-[10px] font-bold">
                           Post #{idx + 1}
                         </span>
                         <button
                           type="button"
                           onClick={() => handleDeleteExistingSpark(spark.id)}
-                          className="absolute top-2 right-2 p-1.5 rounded-full bg-rose-600 text-white hover:bg-rose-700"
+                          className="absolute top-2 right-2 z-20 p-1.5 rounded-full bg-rose-600 text-white hover:bg-rose-700"
                           title="Delete this Spark post"
                         >
                           <Trash2 size={12} />

@@ -806,8 +806,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
     setInlineMediaPreview(instantPreviewUrl);
 
     try {
-      const compressedDataUrl = await compressImage(safeImageFile, 1280, 1280, 0.82);
-      if (compressedDataUrl && compressedDataUrl.startsWith('data:image/')) {
+      const compressedDataUrl = await compressImage(safeImageFile, 2048, 2048, 0.92);
+      if (
+        compressedDataUrl &&
+        (compressedDataUrl.startsWith('data:image/') || compressedDataUrl.startsWith('http'))
+      ) {
         setInlineMediaPreview(compressedDataUrl);
       }
     } catch (err) {
@@ -873,12 +876,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
         setUploadProgress(40);
         if (
           inlineMediaPreview &&
-          inlineMediaPreview.startsWith('data:image/') &&
-          inlineMediaPreview.length <= 460 * 1024
+          (inlineMediaPreview.startsWith('http://') ||
+            inlineMediaPreview.startsWith('https://') ||
+            (inlineMediaPreview.startsWith('data:image/') && inlineMediaPreview.length <= 840 * 1024))
         ) {
           finalImageUrl = inlineMediaPreview;
         } else if (inlineMediaFile) {
-          const compressed = await compressImage(inlineMediaFile, 1280, 1280, 0.8);
+          const compressed = await compressImage(inlineMediaFile, 2048, 2048, 0.92);
           finalImageUrl = compressed || inlineMediaPreview || undefined;
         } else {
           finalImageUrl = inlineMediaPreview || undefined;
@@ -1481,11 +1485,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 />
 
                 {inlineMediaPreview && (
-                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] bg-[#1C1917]">
+                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] bg-[#0C0A09] flex items-center justify-center">
                     {inlineMediaType === 'video' ? (
-                      <video src={inlineMediaPreview} controls className="w-full h-auto max-h-72 object-contain" />
+                      <video src={inlineMediaPreview} controls className="relative z-10 w-full h-auto max-h-72 object-contain" />
                     ) : (
-                      <img src={inlineMediaPreview} alt="Preview" className="w-full h-auto max-h-72 object-cover" />
+                      <>
+                        <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
+                          <img
+                            src={inlineMediaPreview}
+                            alt=""
+                            className="w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50"
+                          />
+                          <div className="absolute inset-0 bg-black/30" />
+                        </div>
+                        <img
+                          src={inlineMediaPreview}
+                          alt="Preview"
+                          className="relative z-10 w-full h-auto max-h-72 object-contain"
+                        />
+                      </>
                     )}
                     <button
                       type="button"
@@ -1806,39 +1824,68 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         textClassName="text-slate-700"
                       />
 
-                      {/* Image (with preloaded aspect ratio reservation to prevent layout shift) */}
-                      {post.imageUrl && (
-                        <div
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setLightboxState({
-                              images: [post.imageUrl!],
-                              initialIndex: 0,
-                              caption: post.content,
-                              authorName: post.authorName,
-                              authorUsername: post.authorUsername,
-                              authorPhotoURL: post.authorPhotoURL
-                            });
-                          }}
-                          className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 min-h-[180px] bg-slate-50 flex items-center justify-center cursor-zoom-in group relative"
-                          style={
-                            (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))
-                              ? {
-                                  aspectRatio: String(
-                                    (preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl))!.aspectRatio
-                                  ),
+                      {/* Image (with true aspect ratio, object-fit contain, and blurred darkened background copy) */}
+                      {post.imageUrl && (() => {
+                        const sponsoredDims =
+                          preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl);
+                        return (
+                          <div
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setLightboxState({
+                                images: [post.imageUrl!],
+                                initialIndex: 0,
+                                caption: post.content,
+                                authorName: post.authorName,
+                                authorUsername: post.authorUsername,
+                                authorPhotoURL: post.authorPhotoURL
+                              });
+                            }}
+                            className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 min-h-[180px] bg-[#0C0A09] flex items-center justify-center cursor-zoom-in group relative"
+                            style={
+                              sponsoredDims
+                                ? {
+                                    aspectRatio: String(sponsoredDims.aspectRatio),
+                                  }
+                                : undefined
+                            }
+                          >
+                            <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
+                              <img
+                                src={post.imageUrl}
+                                alt=""
+                                className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+                              />
+                              <div className="absolute inset-0 bg-black/30" />
+                            </div>
+                            <img
+                              src={post.imageUrl}
+                              alt="Sponsored item"
+                              decoding="async"
+                              onLoad={(e) => {
+                                const img = e.currentTarget;
+                                if (img.naturalWidth > 0 && img.naturalHeight > 0 && post.imageUrl) {
+                                  handleMediaDimensionsReady(post.imageUrl, {
+                                    width: img.naturalWidth,
+                                    height: img.naturalHeight,
+                                    aspectRatio: img.naturalWidth / img.naturalHeight,
+                                    loadedAt: Date.now()
+                                  });
                                 }
-                              : undefined
-                          }
-                        >
-                          <img
-                            src={post.imageUrl}
-                            alt="Sponsored item"
-                            decoding="async"
-                            className="w-full h-auto max-h-96 object-cover transition-transform duration-300 group-hover:scale-[1.01]"
-                          />
-                        </div>
-                      )}
+                              }}
+                              style={
+                                sponsoredDims && sponsoredDims.width > 0 && sponsoredDims.height > 0
+                                  ? {
+                                      maxWidth: `min(100%, ${sponsoredDims.width}px)`,
+                                      maxHeight: `min(24rem, ${sponsoredDims.height}px)`
+                                    }
+                                  : undefined
+                              }
+                              className="relative z-10 w-full h-full max-h-96 object-contain transition-transform duration-300 group-hover:scale-[1.01]"
+                            />
+                          </div>
+                        );
+                      })()}
 
                       {/* Smart Contextual Affiliate Shop Box */}
                       {post.affiliateProductTitle && (
@@ -2102,7 +2149,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           postId={post.id}
                           videoUrl={post.videoUrl}
                           hasVideoChunks={post.hasVideoChunks}
-                          thumbnailUrl={post.thumbnailUrl || post.imageUrl}
+                          thumbnailUrl={post.imageUrl || post.thumbnailUrl}
                           duration={post.duration ?? post.videoDurationSeconds}
                           videoWidth={post.videoWidth}
                           videoHeight={post.videoHeight}
@@ -2127,6 +2174,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           Math.max(0, carouselIndices[post.id] || 0)
                         );
                         const currentImgUrl = slides[activeSlideIdx] || post.imageUrl!;
+                        const imgDims =
+                          preloadedDimensions[currentImgUrl] || getPreloadedMediaInfo(currentImgUrl);
 
                         return (
                           <div
@@ -2141,7 +2190,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 authorPhotoURL: post.authorPhotoURL
                               });
                             }}
-                            className="relative rounded-2xl overflow-hidden mb-3 border border-slate-200/80 max-h-[480px] min-h-[200px] bg-[#F8FAFC] flex items-center justify-center group cursor-zoom-in"
+                            className="relative rounded-2xl overflow-hidden mb-3 border border-slate-200/80 max-h-[540px] min-h-[200px] bg-[#0C0A09] flex items-center justify-center group cursor-zoom-in"
                             style={
                               post.aspectRatio === '1:1'
                                 ? { aspectRatio: '1 / 1' }
@@ -2149,22 +2198,47 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 ? { aspectRatio: '4 / 5' }
                                 : post.aspectRatio === '9:16'
                                 ? { aspectRatio: '9 / 16' }
-                                : (preloadedDimensions[currentImgUrl] ||
-                                    getPreloadedMediaInfo(currentImgUrl))
+                                : imgDims
                                 ? {
-                                    aspectRatio: String(
-                                      (preloadedDimensions[currentImgUrl] ||
-                                        getPreloadedMediaInfo(currentImgUrl))!.aspectRatio
-                                    ),
+                                    aspectRatio: String(imgDims.aspectRatio),
                                   }
                                 : undefined
                             }
                           >
+                            {/* Soft blurred, darkened copy of the same photo filling empty side space so there are no black bars */}
+                            <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
+                              <img
+                                src={currentImgUrl}
+                                alt=""
+                                className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+                              />
+                              <div className="absolute inset-0 bg-black/30" />
+                            </div>
+
                             <img
                               src={currentImgUrl}
                               alt="Wave attachment"
                               decoding="async"
-                              className="w-full h-full max-h-[480px] object-cover transition-transform duration-300 group-hover:scale-[1.01]"
+                              onLoad={(e) => {
+                                const img = e.currentTarget;
+                                if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                                  handleMediaDimensionsReady(currentImgUrl, {
+                                    width: img.naturalWidth,
+                                    height: img.naturalHeight,
+                                    aspectRatio: img.naturalWidth / img.naturalHeight,
+                                    loadedAt: Date.now()
+                                  });
+                                }
+                              }}
+                              style={
+                                imgDims && imgDims.width > 0 && imgDims.height > 0
+                                  ? {
+                                      maxWidth: `min(100%, ${imgDims.width}px)`,
+                                      maxHeight: `min(540px, ${imgDims.height}px)`
+                                    }
+                                  : undefined
+                              }
+                              className="relative z-10 w-full h-full max-h-[540px] object-contain transition-transform duration-300 group-hover:scale-[1.01]"
                               onError={(e) => {
                                 (e.target as HTMLElement).style.display = 'none';
                               }}

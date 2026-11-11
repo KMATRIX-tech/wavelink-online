@@ -219,6 +219,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     parseInitialAspectRatio(postId, videoWidth, videoHeight, aspectRatio)
   );
 
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(() =>
+    videoWidth && videoHeight && videoWidth > 0 && videoHeight > 0
+      ? { width: videoWidth, height: videoHeight }
+      : null
+  );
+
   // First-frame poster image for off-screen videos and instant preview
   const [posterUrl, setPosterUrl] = useState<string | undefined>(
     () => thumbnailUrl || firstFramePosterCache.get(postId)
@@ -248,6 +254,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   );
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const bgBlurVideoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const userPausedRef = useRef<boolean>(false);
 
@@ -263,6 +270,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       const r = videoWidth / videoHeight;
       videoAspectRatioCache.set(postId, r);
       setNaturalRatio(r);
+      setNaturalSize({ width: videoWidth, height: videoHeight });
     }
   }, [postId, videoWidth, videoHeight]);
 
@@ -292,13 +300,15 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (!vid.videoWidth || !vid.videoHeight) return;
       try {
         const canvas = document.createElement('canvas');
-        const scale = Math.min(1, 640 / Math.max(vid.videoWidth, vid.videoHeight));
+        const scale = Math.min(1, 1280 / Math.max(vid.videoWidth, vid.videoHeight));
         canvas.width = Math.max(1, Math.round(vid.videoWidth * scale));
         canvas.height = Math.max(1, Math.round(vid.videoHeight * scale));
         const ctx = canvas.getContext('2d');
         if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
           if (dataUrl && dataUrl.startsWith('data:image/') && dataUrl.length > 512) {
             firstFramePosterCache.set(postId, dataUrl);
             setPosterUrl(dataUrl);
@@ -315,6 +325,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const pauseVideo = useCallback(() => {
     if (videoRef.current && !videoRef.current.paused) {
       videoRef.current.pause();
+    }
+    if (bgBlurVideoRef.current && !bgBlurVideoRef.current.paused) {
+      bgBlurVideoRef.current.pause();
     }
     setIsPlaying(false);
     setIsBuffering(false);
@@ -338,6 +351,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         .then(() => {
           setIsPlaying(true);
           setIsBuffering(false);
+          if (bgBlurVideoRef.current) {
+            bgBlurVideoRef.current.currentTime = vid.currentTime;
+            bgBlurVideoRef.current.play().catch(() => {});
+          }
         })
         .catch(() => {
           // Phones block autoplay with sound — always fall back to muted autoplay so a tap is never required
@@ -349,6 +366,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               .then(() => {
                 setIsPlaying(true);
                 setIsBuffering(false);
+                if (bgBlurVideoRef.current) {
+                  bgBlurVideoRef.current.play().catch(() => {});
+                }
               })
               .catch(() => {
                 setIsBuffering(false);
@@ -536,6 +556,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       const exactRatio = vid.videoWidth / vid.videoHeight;
       videoAspectRatioCache.set(postId, exactRatio);
       setNaturalRatio(exactRatio);
+      setNaturalSize({ width: vid.videoWidth, height: vid.videoHeight });
     }
     setIsVideoReady(true);
     setIsBuffering(false);
@@ -562,6 +583,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const showSoftPlaceholder =
     (!isVideoReady && !isPosterLoaded) || (isBuffering && !isPlaying && !isPosterLoaded);
 
+  const mediaMaxResolutionStyle: React.CSSProperties | undefined = naturalSize
+    ? {
+        maxWidth: `min(100%, ${naturalSize.width}px)`,
+        maxHeight: `min(80dvh, ${naturalSize.height}px)`
+      }
+    : undefined;
+
   return (
     <div
       ref={containerRef}
@@ -570,7 +598,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         aspectRatio: naturalRatio ? String(naturalRatio) : undefined,
         maxHeight: '80dvh',
       }}
-      className={`relative w-full max-h-[80dvh] rounded-2xl overflow-hidden bg-stone-100 dark:bg-slate-900 select-none cursor-pointer ${
+      className={`relative w-full max-h-[80dvh] rounded-2xl overflow-hidden bg-[#0C0A09] flex items-center justify-center select-none cursor-pointer ${
         !naturalRatio ? 'min-h-[220px]' : ''
       } ${className}`}
     >
@@ -592,8 +620,37 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         </div>
       )}
 
+      {/* Soft blurred, darkened copy of the same video or poster filling empty sides so there are no black bars */}
+      {allowedToLoad && resolvedSrc && !hasError ? (
+        <div aria-hidden="true" className="absolute inset-0 z-[1] overflow-hidden pointer-events-none">
+          <video
+            ref={bgBlurVideoRef}
+            src={resolvedSrc}
+            poster={posterUrl}
+            muted
+            playsInline
+            webkit-playsinline="true"
+            loop
+            preload={isActivePlayTarget ? 'auto' : 'metadata'}
+            className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+          />
+          <div className="absolute inset-0 bg-black/30" />
+        </div>
+      ) : (
+        posterUrl && (
+          <div aria-hidden="true" className="absolute inset-0 z-[1] overflow-hidden pointer-events-none">
+            <img
+              src={posterUrl}
+              alt=""
+              className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+            />
+            <div className="absolute inset-0 bg-black/30" />
+          </div>
+        )
+      )}
+
       {/* First-frame poster image for off-screen videos & instant display before playback */}
-      { posterUrl && (!isPlaying || !isVideoReady || !allowedToLoad) && (
+      {posterUrl && (!isPlaying || !isVideoReady || !allowedToLoad) && (
         <img
           src={posterUrl}
           alt="Video preview"
@@ -602,13 +659,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           onLoad={(e) => {
             setIsPosterLoaded(true);
             const img = e.currentTarget;
-            if (!videoAspectRatioCache.has(postId) && img.naturalWidth > 0 && img.naturalHeight > 0) {
-              const r = img.naturalWidth / img.naturalHeight;
-              videoAspectRatioCache.set(postId, r);
-              setNaturalRatio(r);
+            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+              if (!naturalSize) {
+                setNaturalSize({ width: img.naturalWidth, height: img.naturalHeight });
+              }
+              if (!videoAspectRatioCache.has(postId)) {
+                const r = img.naturalWidth / img.naturalHeight;
+                videoAspectRatioCache.set(postId, r);
+                setNaturalRatio(r);
+              }
             }
           }}
-          className="w-full h-full max-h-[80dvh] object-cover block pointer-events-none"
+          style={mediaMaxResolutionStyle}
+          className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block pointer-events-none"
         />
       )}
 
@@ -633,11 +696,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           }}
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
+          onTimeUpdate={() => {
+            if (
+              bgBlurVideoRef.current &&
+              videoRef.current &&
+              Math.abs(bgBlurVideoRef.current.currentTime - videoRef.current.currentTime) > 0.4
+            ) {
+              bgBlurVideoRef.current.currentTime = videoRef.current.currentTime;
+            }
+          }}
           onError={() => {
             setHasError(true);
             setIsBuffering(false);
           }}
-          className="w-full h-full max-h-[80dvh] object-cover block"
+          style={mediaMaxResolutionStyle}
+          className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block"
         />
       ) : (
         /* If off-screen and no separate thumbnail image exists yet, render lightweight metadata poster frame */
@@ -655,6 +728,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 const exactRatio = vid.videoWidth / vid.videoHeight;
                 videoAspectRatioCache.set(postId, exactRatio);
                 setNaturalRatio(exactRatio);
+                setNaturalSize({ width: vid.videoWidth, height: vid.videoHeight });
               }
               setIsPosterLoaded(true);
             }}
@@ -662,7 +736,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               captureFirstFramePosterIfNeeded(e.currentTarget);
               setIsPosterLoaded(true);
             }}
-            className="w-full h-full max-h-[80dvh] object-cover block pointer-events-none"
+            style={mediaMaxResolutionStyle}
+            className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block pointer-events-none"
           />
         )
       )}

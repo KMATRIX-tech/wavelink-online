@@ -434,24 +434,14 @@ export async function downscaleSparkVideoTo720p(
   meta: SparkVideoMetadata,
   onProgress?: (pct: number) => void
 ): Promise<{ file: File; width: number; height: number }> {
-  const dims = compute720pDimensions(meta.width, meta.height);
-
-  // Fast path: any video within the 80 MB Spark cap uses proportional 720p display metadata
-  // immediately without blocking the upload for 25–30s of real-time browser canvas playback.
-  if (file.size <= SPARK_MAX_FILE_BYTES) {
-    if (onProgress) onProgress(100);
-    return {
-      file,
-      width: dims.width,
-      height: dims.height
-    };
-  }
+  const nativeWidth = Math.max(2, meta.width || 1080);
+  const nativeHeight = Math.max(2, meta.height || 1920);
 
   if (onProgress) onProgress(100);
   return {
     file,
-    width: dims.width,
-    height: dims.height
+    width: nativeWidth,
+    height: nativeHeight
   };
 }
 
@@ -1133,27 +1123,22 @@ export async function compressVideoBeforeUpload(
   const effectiveEnd = Math.min(rawEnd, rawStart + maxAllowedSeconds);
   const effectiveDuration = Math.max(0.5, Math.round((effectiveEnd - rawStart) * 10) / 10);
 
-  const dims = compute720pDimensions(meta.width, meta.height);
-  const hasWebCodecs = await checkWebCodecsH264Support(dims.width, dims.height);
+  const nativeWidth = Math.max(2, meta.width || 1080);
+  const nativeHeight = Math.max(2, meta.height || 1920);
+  const hasWebCodecs = await checkWebCodecsH264Support(nativeWidth, nativeHeight);
 
   const needsTrimming = rawStart > 0.25 || effectiveEnd < meta.durationSeconds - 0.35;
-  const estimatedBitrate = (file.size * 8) / Math.max(1, meta.durationSeconds);
 
-  // Fast path: if the video does not need trimming, is already <= 720p (or <= 14 MB),
-  // and has a reasonable bitrate, skip slow real-time canvas re-recording so upload starts right away
-  const isAlreadyCompact720p =
-    !needsTrimming &&
-    ((!dims.needsDownscale && estimatedBitrate <= TARGET_VIDEO_BITRATE_BPS * 1.6) ||
-      file.size <= 14 * 1024 * 1024);
-
-  if (isAlreadyCompact720p) {
+  // Always preserve original video quality and resolution without extra scaling or heavy compression
+  // unless the user explicitly trims the clip start/end.
+  if (!needsTrimming) {
     const steps = [35, 70, 100];
     for (const pct of steps) {
       if (signal?.aborted) throw new Error('UPLOAD_CANCELLED');
       if (onProgress) {
-        onProgress(pct, `Prepared 720p video (${formatVideoFileSize(file.size)}) — ${pct}%`);
+        onProgress(pct, `Prepared original quality video (${formatVideoFileSize(file.size)}) — ${pct}%`);
       }
-      await new Promise((r) => setTimeout(r, 40));
+      await new Promise((r) => setTimeout(r, 35));
     }
     const validMime = file.type && file.type.startsWith('video/') ? file.type : 'video/mp4';
     const normalizedFile =
@@ -1167,13 +1152,13 @@ export async function compressVideoBeforeUpload(
     return {
       file: normalizedFile,
       durationSeconds: effectiveDuration,
-      width: dims.width,
-      height: dims.height,
-      engine: hasWebCodecs ? 'webcodecs' : 'passthrough'
+      width: nativeWidth,
+      height: nativeHeight,
+      engine: 'passthrough'
     };
   }
 
-  // Browser 720p Downscale & Compression Path (Canvas + MediaRecorder)
+  // User-requested clip trimming path (preserves original resolution & high bitrate)
   const mimeCandidates = [
     'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
     'video/mp4;codecs=avc1',
@@ -1222,7 +1207,7 @@ export async function compressVideoBeforeUpload(
         resolve(outFile);
       };
 
-      // Strict time budget (max 12 seconds) so compression never blocks uploading
+      // Strict time budget (max 12 seconds) so trimming never blocks uploading
       const maxTranscodeMs = Math.min(12000, Math.max(4500, Math.round(effectiveDuration * 450)));
       const guardTimer = setTimeout(() => finish(null), maxTranscodeMs);
 
@@ -1241,8 +1226,8 @@ export async function compressVideoBeforeUpload(
         if (settled) return;
         try {
           const canvas = document.createElement('canvas');
-          canvas.width = dims.width;
-          canvas.height = dims.height;
+          canvas.width = nativeWidth;
+          canvas.height = nativeHeight;
           const ctx = canvas.getContext('2d');
           if (!ctx || typeof (canvas as any).captureStream !== 'function') {
             clearTimeout(guardTimer);
@@ -1270,7 +1255,7 @@ export async function compressVideoBeforeUpload(
           const chunks: BlobPart[] = [];
           recorder = new MediaRecorder(canvasStream, {
             mimeType: supportedMime,
-            videoBitsPerSecond: TARGET_VIDEO_BITRATE_BPS,
+            videoBitsPerSecond: 5_000_000,
             audioBitsPerSecond: TARGET_AUDIO_BITRATE_BPS
           });
 
@@ -1289,10 +1274,10 @@ export async function compressVideoBeforeUpload(
             const outType = supportedMime.includes('webm') ? 'video/webm' : 'video/mp4';
             const outExt = outType === 'video/webm' ? 'webm' : 'mp4';
             const outBlob = new Blob(chunks, { type: outType });
-            if (outBlob.size > 2048 && (needsTrimming || outBlob.size < file.size)) {
+            if (outBlob.size > 2048) {
               const baseName = (file.name || 'video').replace(/\.[^/.]+$/, '');
               finish(
-                new File([outBlob], `${baseName}_720p.${outExt}`, {
+                new File([outBlob], `${baseName}_trimmed.${outExt}`, {
                   type: outType,
                   lastModified: Date.now()
                 })
@@ -1307,12 +1292,12 @@ export async function compressVideoBeforeUpload(
             finish(null);
           };
 
-          video.playbackRate = needsTrimming ? 1.0 : Math.min(2.5, Math.max(1.25, effectiveDuration / 6));
+          video.playbackRate = 1.0;
 
           const renderLoop = () => {
             if (settled) return;
             if (video.currentTime >= effectiveEnd || video.ended) {
-              if (onProgress) onProgress(96, 'Finalizing 720p video...');
+              if (onProgress) onProgress(96, 'Finalizing video...');
               try {
                 if (recorder && recorder.state !== 'inactive') recorder.stop();
               } catch {
@@ -1324,7 +1309,7 @@ export async function compressVideoBeforeUpload(
             const elapsed = Math.max(0, video.currentTime - rawStart);
             const pct = Math.max(12, Math.min(95, Math.round(12 + (elapsed / effectiveDuration) * 83)));
             if (onProgress) {
-              onProgress(pct, `Compressing to 720p (${pct}%)...`);
+              onProgress(pct, `Preparing trimmed clip (${pct}%)...`);
             }
             rafId = requestAnimationFrame(renderLoop);
           };
@@ -1371,19 +1356,19 @@ export async function compressVideoBeforeUpload(
 
     if (transcodeResult) {
       if (onProgress) {
-        onProgress(100, `Compressed to 720p (${formatVideoFileSize(transcodeResult.size)})`);
+        onProgress(100, `Prepared video (${formatVideoFileSize(transcodeResult.size)})`);
       }
       return {
         file: transcodeResult,
         durationSeconds: effectiveDuration,
-        width: dims.width,
-        height: dims.height,
+        width: nativeWidth,
+        height: nativeHeight,
         engine: hasWebCodecs ? 'webcodecs' : 'passthrough'
       };
     }
   }
 
-  // Safe passthrough with 720p metadata if real-time transcoding is skipped or unsupported
+  // Safe passthrough with native metadata if real-time trimming is skipped or unsupported
   if (onProgress) {
     onProgress(100, `Prepared video (${formatVideoFileSize(file.size)})`);
   }
@@ -1400,8 +1385,8 @@ export async function compressVideoBeforeUpload(
   return {
     file: normalizedFile,
     durationSeconds: effectiveDuration,
-    width: dims.width,
-    height: dims.height,
+    width: nativeWidth,
+    height: nativeHeight,
     engine: 'passthrough'
   };
 }
@@ -1782,7 +1767,7 @@ export async function resolveVideoUrl(
     return local;
   }
 
-  // 2. If directVideoUrl is a persistent HTTP/HTTPS or server URL, return it immediately
+  // 2. If directVideoUrl is a persistent HTTP/HTTPS or server URL, return it immediately without extra Firestore reads
   const isPersistentRemoteUrl =
     directVideoUrl &&
     (directVideoUrl.startsWith('http://') ||
@@ -1790,12 +1775,12 @@ export async function resolveVideoUrl(
       directVideoUrl.startsWith('/api/media/video/') ||
       directVideoUrl.startsWith('data:video/'));
 
-  if (isPersistentRemoteUrl && !hasVideoChunks) {
+  if (isPersistentRemoteUrl) {
     return directVideoUrl!;
   }
 
-  // 3. Reassemble Firestore subcollection video chunks if available
-  if (hasVideoChunks || !isPersistentRemoteUrl) {
+  // 3. Reassemble Firestore subcollection video chunks only when explicitly flagged as chunked
+  if (hasVideoChunks || directVideoUrl === 'chunked') {
     try {
       const chunksRef = collection(db, collectionName, entityId, 'chunks');
       const q = query(chunksRef, orderBy('index', 'asc'));
@@ -1811,8 +1796,8 @@ export async function resolveVideoUrl(
           return assembled;
         }
       }
-    } catch (err) {
-      console.error(`Failed loading video chunks from ${collectionName}:`, err);
+    } catch {
+      // Fallback to directVideoUrl when offline or daily read quota is reached
     }
   }
 
@@ -1823,9 +1808,9 @@ export async function resolveVideoUrl(
 
 export function compressImage(
   file: File | Blob,
-  maxWidth = 1280,
-  maxHeight = 1280,
-  quality = 0.8
+  maxWidth = 2048,
+  maxHeight = 2048,
+  quality = 0.92
 ): Promise<string> {
   return new Promise((resolve) => {
     if (!file || file.size === 0) {
@@ -1841,14 +1826,14 @@ export function compressImage(
       }
     };
 
-    // Safety timeout so image compression can never hang post creation
+    // Safety timeout so image preparation can never hang post creation
     const safetyTimer = setTimeout(() => {
       try {
         finish(URL.createObjectURL(file));
       } catch {
         finish('');
       }
-    }, 4500);
+    }, 6000);
 
     if (file.type === 'image/svg+xml' && file.size <= 300 * 1024) {
       const reader = new FileReader();
@@ -1871,16 +1856,19 @@ export function compressImage(
       clearTimeout(safetyTimer);
       URL.revokeObjectURL(objectUrl);
 
-      let width = img.width || 800;
-      let height = img.height || 800;
+      let width = img.naturalWidth || img.width || 1080;
+      let height = img.naturalHeight || img.height || 1080;
 
-      if (width > maxWidth || height > maxHeight) {
+      // Never upscale beyond original image dimensions; only cap if larger than maxWidth/maxHeight
+      const targetMaxW = Math.max(maxWidth, 2048);
+      const targetMaxH = Math.max(maxHeight, 2048);
+      if (width > targetMaxW || height > targetMaxH) {
         if (width > height) {
-          height = Math.round((height * maxWidth) / width);
-          width = maxWidth;
+          height = Math.round((height * targetMaxW) / width);
+          width = targetMaxW;
         } else {
-          width = Math.round((width * maxHeight) / height);
-          height = maxHeight;
+          width = Math.round((width * targetMaxH) / height);
+          height = targetMaxH;
         }
       }
 
@@ -1898,17 +1886,61 @@ export function compressImage(
         return canvas.toDataURL('image/jpeg', q);
       };
 
-      const MAX_SAFE_FIRESTORE_CHARS = 450 * 1024; // ~330 KB binary, well under 1 MB Firestore doc limit
-      let compressed = renderAtScale(1, quality);
+      const MAX_SAFE_FIRESTORE_CHARS = 820 * 1024; // High-resolution sharp JPEG within Firestore doc limit
+      const highRes = renderAtScale(1, Math.max(quality, 0.9));
 
+      // Try uploading original image directly to Cloudinary for full-resolution sharp delivery
+      if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET && file.size <= 15 * 1024 * 1024) {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+        fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+          method: 'POST',
+          body: formData
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            if (data && typeof data.secure_url === 'string' && data.secure_url.startsWith('http')) {
+              finish(data.secure_url);
+              return;
+            }
+            let fallback = highRes;
+            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
+              fallback = renderAtScale(1, 0.85);
+            }
+            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
+              fallback = renderAtScale(0.9, 0.78);
+            }
+            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
+              fallback = renderAtScale(0.8, 0.72);
+            }
+            finish(fallback);
+          })
+          .catch(() => {
+            let fallback = highRes;
+            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
+              fallback = renderAtScale(1, 0.85);
+            }
+            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
+              fallback = renderAtScale(0.9, 0.78);
+            }
+            if (fallback.length > MAX_SAFE_FIRESTORE_CHARS) {
+              fallback = renderAtScale(0.8, 0.72);
+            }
+            finish(fallback);
+          });
+        return;
+      }
+
+      let compressed = highRes;
       if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
-        compressed = renderAtScale(1, 0.62);
+        compressed = renderAtScale(1, 0.85);
       }
       if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
-        compressed = renderAtScale(0.78, 0.52);
+        compressed = renderAtScale(0.9, 0.78);
       }
       if (compressed.length > MAX_SAFE_FIRESTORE_CHARS) {
-        compressed = renderAtScale(0.6, 0.42);
+        compressed = renderAtScale(0.8, 0.72);
       }
 
       finish(compressed);
@@ -1917,7 +1949,7 @@ export function compressImage(
     img.onerror = () => {
       clearTimeout(safetyTimer);
       URL.revokeObjectURL(objectUrl);
-      if (file.size <= 320 * 1024) {
+      if (file.size <= 600 * 1024) {
         const reader = new FileReader();
         reader.onload = (e) => finish((e.target?.result as string) || '');
         reader.onerror = () => finish('');
@@ -1936,7 +1968,7 @@ export function compressImage(
 }
 
 /**
- * Generates a JPEG thumbnail image from the first second (`captureTimeSeconds = 1.0`) of the video.
+ * Generates a sharp JPEG poster image from the first second (`captureTimeSeconds = 1.0`) of the video.
  */
 export function generateVideoThumbnail(
   file: File | Blob,
@@ -1968,14 +2000,18 @@ export function generateVideoThumbnail(
 
     video.onseeked = () => {
       try {
-        const dims = compute720pDimensions(video.videoWidth || 640, video.videoHeight || 360);
+        const rawW = video.videoWidth || 1080;
+        const rawH = video.videoHeight || 1920;
+        const scale = Math.min(1, 1280 / Math.max(rawW, rawH));
         const canvas = document.createElement('canvas');
-        canvas.width = Math.min(640, dims.width);
-        canvas.height = Math.max(1, Math.round((canvas.width * dims.height) / dims.width));
+        canvas.width = Math.max(1, Math.round(rawW * scale));
+        canvas.height = Math.max(1, Math.round(rawH * scale));
         const ctx = canvas.getContext('2d');
         if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const thumb = canvas.toDataURL('image/jpeg', 0.75);
+          const thumb = canvas.toDataURL('image/jpeg', 0.9);
           finish(thumb);
           return;
         }

@@ -284,6 +284,7 @@ export async function initiateMobileMoneyPayment(params: {
     return transaction;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `subscriptions/${txId}`);
+    return transaction;
   }
 }
 

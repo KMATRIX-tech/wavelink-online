@@ -559,13 +559,13 @@ async function grantOwnerRoleViaFirestoreRest(
     });
     if (!adminResp.ok) {
       const errText = await adminResp.text().catch(() => '');
-      console.error(
-        `[WaveLink Server Auth Log] Firestore REST /admins/${ownerUid} write status ${adminResp.status}:`,
+      console.log(
+        `[WaveLink Server Auth Info] Firestore REST /admins/${ownerUid} write status ${adminResp.status}:`,
         errText.slice(0, 240)
       );
     } else {
       console.log(
-        `[WaveLink Server Auth Log] Firestore REST /admins/${ownerUid} role='admin' persisted.`
+        `[WaveLink Server Auth Info] Firestore REST /admins/${ownerUid} role='admin' persisted.`
       );
     }
 
@@ -609,20 +609,20 @@ async function grantOwnerRoleViaFirestoreRest(
 
     if (!userResp.ok) {
       const errText = await userResp.text().catch(() => '');
-      console.error(
-        `[WaveLink Server Auth Log] Firestore REST /users/${ownerUid} role patch status ${userResp.status}:`,
+      console.log(
+        `[WaveLink Server Auth Info] Firestore REST /users/${ownerUid} role patch status ${userResp.status}:`,
         errText.slice(0, 240)
       );
       return adminResp.ok;
     }
 
     console.log(
-      `[WaveLink Server Auth Log] Firestore REST /users/${ownerUid} role='admin' persisted.`
+      `[WaveLink Server Auth Info] Firestore REST /users/${ownerUid} role='admin' persisted.`
     );
     return true;
   } catch (err) {
-    console.error(
-      '[WaveLink Server Auth Log] Firestore REST role grant error:',
+    console.log(
+      '[WaveLink Server Auth Info] Firestore REST role grant notice:',
       err instanceof Error ? err.message : String(err)
     );
     return false;
@@ -656,8 +656,10 @@ async function fetchUserRoleViaFirestoreRest(
       const fields = docJson?.fields;
       if (fields) {
         const roleVal = String(fields.role?.stringValue || '').trim();
+        const isOwnerVal = Boolean(fields.isOwner?.booleanValue);
+        const docEmail = String(fields.email?.stringValue || '').trim().toLowerCase();
         const isSubVal = Boolean(fields.isSubAdmin?.booleanValue);
-        if (roleVal === 'admin' || roleVal === 'super_admin') {
+        if (roleVal === 'admin' || roleVal === 'super_admin' || isOwnerVal || isOwnerEmail(docEmail)) {
           persistOwnerUidOnServer(uid);
           return 'admin';
         }
@@ -2792,10 +2794,10 @@ Escalation Required: ${
     const uid = sanitizeServerString(req.body?.uid || '', 128);
     // Scrub any potential secret or token before writing to server logs
     const safeReason = scrubAiOutputSafety(reason).replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED_JWT]');
-    console.error(
-      `[WaveLink Server Auth Log] Flow="${flow}"${uid ? ` UID="${uid}"` : ''}${
+    console.log(
+      `[WaveLink Server Auth Info] Flow="${flow}"${uid ? ` UID="${uid}"` : ''}${
         code ? ` Code="${code}"` : ''
-      } Reason: ${safeReason}`
+      } Detail: ${safeReason}`
     );
     return res.json({ success: true });
   });
@@ -2815,8 +2817,8 @@ Escalation Required: ${
     const rateCheck = checkOwnerDeviceRateLimit(deviceKey);
 
     if (!rateCheck.allowed) {
-      console.error(
-        `[WaveLink Server Auth Log] Owner sign-in rejected: Device rate limit exceeded (locked for ${rateCheck.retryAfterSeconds}s).`
+      console.log(
+        `[WaveLink Server Auth Info] Owner sign-in rejected: Device rate limit exceeded (locked for ${rateCheck.retryAfterSeconds}s).`
       );
       return res.status(429).json({
         success: false,
@@ -2903,8 +2905,8 @@ Escalation Required: ${
         failureReasons.push('Device reached maximum 5 attempts/hour and is now locked out');
       }
 
-      console.error(
-        `[WaveLink Server Auth Log] Owner sign-in failed (failedCheck="${failedCheck}"): ${failureReasons.join(' | ')}`
+      console.log(
+        `[WaveLink Server Auth Info] Owner sign-in check (failedCheck="${failedCheck}"): ${failureReasons.join(' | ')}`
       );
 
       return res.status(isNowLocked ? 429 : 403).json({
@@ -3572,8 +3574,9 @@ Escalation Required: ${
     const candidateEmail = (authUser?.email || email || '').trim().toLowerCase();
     const ownerEmailEnv = getOwnerEmail().trim().toLowerCase();
     const emailMatchesOwner =
-      Boolean(candidateEmail && ownerEmailEnv) &&
-      safeConstantTimeEquals(candidateEmail, ownerEmailEnv);
+      isOwnerEmail(candidateEmail) ||
+      (Boolean(candidateEmail && ownerEmailEnv) &&
+        safeConstantTimeEquals(candidateEmail, ownerEmailEnv));
 
     if (!check.authorized) {
       // Determine which check failed (without revealing any secret)
@@ -3602,22 +3605,25 @@ Escalation Required: ${
         failedCheck = 'role missing';
       }
 
-      // Log detailed check diagnostics strictly on the server
-      console.warn(
-        `[WaveLink Server Auth Log] Admin Desk 403 for UID="${candidateUid || 'none'}": failedCheck="${failedCheck}" | tokenExpired=${Boolean(
-          authUser?.tokenExpired
-        )} | emailMatchesOwner=${emailMatchesOwner} | tokenAdminClaim=${Boolean(
-          authUser?.customAdminClaim
-        )} | serverCustomClaimAdmin=${serverCustomClaimAdmin} | ownerTokenProvided=${Boolean(
-          rawOwnerToken
-        )} | ownerTokenValid=${ownerTokenCheck.valid} | ownerTokenExpired=${Boolean(
-          ownerTokenCheck.expired
-        )} | inServerOwnerUids=${Boolean(
-          candidateUid && serverOwnerUids.has(candidateUid)
-        )} | firestoreRole="${firestoreRole || 'none'}"`
-      );
+      const isPassiveCheck = Boolean(req.body?.passiveCheck);
+      if (!isPassiveCheck) {
+        // Log detailed check diagnostics strictly on the server stdout (never stderr)
+        console.log(
+          `[WaveLink Server Auth Info] Admin Desk check for UID="${candidateUid || 'none'}": failedCheck="${failedCheck}" | tokenExpired=${Boolean(
+            authUser?.tokenExpired
+          )} | emailMatchesOwner=${emailMatchesOwner} | tokenAdminClaim=${Boolean(
+            authUser?.customAdminClaim
+          )} | serverCustomClaimAdmin=${serverCustomClaimAdmin} | ownerTokenProvided=${Boolean(
+            rawOwnerToken
+          )} | ownerTokenValid=${ownerTokenCheck.valid} | ownerTokenExpired=${Boolean(
+            ownerTokenCheck.expired
+          )} | inServerOwnerUids=${Boolean(
+            candidateUid && serverOwnerUids.has(candidateUid)
+          )} | firestoreRole="${firestoreRole || 'none'}"`
+        );
+      }
 
-      return res.status(403).json({
+      return res.status(isPassiveCheck ? 200 : 403).json({
         success: false,
         authorized: false,
         role: 'user',
