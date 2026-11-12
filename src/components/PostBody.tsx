@@ -33,6 +33,7 @@ import {
   limit
 } from 'firebase/firestore';
 import { CrystalBadge } from './CrystalBadge';
+import { Avatar } from './Avatar';
 import { UserProfile } from '../types';
 import { toggleFollowUser } from '../services/notificationService';
 
@@ -1138,10 +1139,10 @@ export const PostBody: React.FC<PostBodyProps> = ({
                 onClick={(e) => handleHashtag(e, token.tag)}
                 title={`Explore waves tagged with #${token.tag}`}
                 aria-label={`Explore hashtag #${token.tag}`}
-                className="wavelink-tag-link inline-flex items-center gap-0.5 font-bold text-[#2563EB] hover:text-[#1D4ED8] bg-blue-50/90 hover:bg-blue-100 border border-blue-200/70 hover:border-blue-300 px-1.5 py-0.5 rounded-md transition-all active:scale-95 cursor-pointer align-baseline select-text underline-offset-2 hover:underline focus:outline-none focus:ring-1 focus:ring-blue-400 group/tag"
+                className="wavelink-tag-link wavelink-glass-chip inline-flex items-center gap-0.5 font-bold text-[#2563EB] dark:text-sky-300 px-2.5 py-0.5 rounded-full text-xs transition-transform active:scale-95 cursor-pointer align-baseline select-text focus:outline-none focus:ring-1 focus:ring-blue-400 group/tag mr-1 my-0.5"
               >
-                <Hash aria-hidden="true" size={11} className="text-[#3B82F6] group-hover/tag:text-[#1D4ED8] shrink-0 transition-colors" />
-                <span>#{token.tag}</span>
+                <Hash aria-hidden="true" size={11} className="text-[#3B82F6] dark:text-sky-300 shrink-0 transition-colors" />
+                <span>{token.tag}</span>
               </a>
             );
           }
@@ -1156,10 +1157,10 @@ export const PostBody: React.FC<PostBodyProps> = ({
                 onClick={(e) => handleMention(e, token.username)}
                 title={`View @${token.username}'s profile & waves`}
                 aria-label={`View @${token.username} profile and waves`}
-                className="wavelink-mention-link inline-flex items-center gap-0.5 font-bold text-[#0F766E] hover:text-[#0D9488] bg-teal-50/90 hover:bg-teal-100 border border-teal-200/60 hover:border-teal-300 px-1.5 py-0.5 rounded-md transition-all active:scale-95 cursor-pointer align-baseline select-text underline-offset-2 hover:underline focus:outline-none focus:ring-1 focus:ring-teal-400 group/mention"
+                className="wavelink-mention-link wavelink-glass-chip inline-flex items-center gap-0.5 font-bold text-[#0F766E] dark:text-teal-300 px-2.5 py-0.5 rounded-full text-xs transition-transform active:scale-95 cursor-pointer align-baseline select-text focus:outline-none focus:ring-1 focus:ring-teal-400 group/mention mr-1 my-0.5"
               >
-                <AtSign aria-hidden="true" size={11} className="text-[#0D9488] group-hover/mention:text-[#0F766E] shrink-0 transition-colors" />
-                <span>@{token.username}</span>
+                <AtSign aria-hidden="true" size={11} className="text-[#0D9488] dark:text-teal-300 shrink-0 transition-colors" />
+                <span>{token.username}</span>
               </a>
             );
           }
@@ -1350,13 +1351,19 @@ export const PostBody: React.FC<PostBodyProps> = ({
             ) : profileModal.user ? (
               <div className="space-y-4">
                 <div className="flex items-center gap-3.5">
-                  <img
+                  <Avatar
+                    uid={profileModal.user.id}
                     src={
                       profileModal.user.photoURL ||
                       `https://api.dicebear.com/7.x/shapes/svg?seed=${profileModal.user.id}`
                     }
                     alt={profileModal.user.displayName || profileModal.username}
-                    className="w-14 h-14 rounded-2xl object-cover ring-2 ring-teal-500/30 shadow-xs"
+                    fallbackName={profileModal.user.displayName || profileModal.username}
+                    size={56}
+                    showStatus={true}
+                    onlyWhenVisible={false}
+                    targetProfile={profileModal.user}
+                    className="ring-2 ring-teal-500/30 rounded-full shadow-xs"
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5 flex-wrap">

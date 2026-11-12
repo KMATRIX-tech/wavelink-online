@@ -169,23 +169,37 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ variant = 's
 };
 
 /**
- * Friendly, dismissible Add to Home Screen Hint Card (especially helpful for iPhone users)
+ * Friendly, dismissible Add to Home Screen Hint Strip (shows once a week, never on top of content on phones)
  */
-export const AddToHomeScreenHintCard: React.FC<{ compact?: boolean }> = ({ compact = false }) => {
+export const AddToHomeScreenHintCard: React.FC<{ compact?: boolean }> = ({ compact = true }) => {
   const { canInstall, isInstalled, isIOS, triggerInstall } = usePWAInstall();
   const [dismissed, setDismissed] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
-    return localStorage.getItem('wavelink_a2hs_hint_dismissed') === '1';
+    try {
+      const untilStr = localStorage.getItem('wavelink_a2hs_dismissed_until');
+      if (untilStr) {
+        const until = parseInt(untilStr, 10);
+        if (Number.isFinite(until) && Date.now() < until) {
+          return true;
+        }
+      }
+      return localStorage.getItem('wavelink_a2hs_hint_dismissed') === '1';
+    } catch {
+      return false;
+    }
   });
   const [showDetails, setShowDetails] = useState(false);
 
-  if (isInstalled || (dismissed && compact)) {
+  if (isInstalled || dismissed) {
     return null;
   }
 
   const handleDismiss = () => {
     setDismissed(true);
     try {
+      // Dismiss for 7 days (shows only once a week, never above feed after dismissal)
+      const oneWeekFromNow = Date.now() + 7 * 24 * 60 * 60 * 1000;
+      localStorage.setItem('wavelink_a2hs_dismissed_until', String(oneWeekFromNow));
       localStorage.setItem('wavelink_a2hs_hint_dismissed', '1');
     } catch {
       // ignore
@@ -193,87 +207,69 @@ export const AddToHomeScreenHintCard: React.FC<{ compact?: boolean }> = ({ compa
   };
 
   return (
-    <div className="rounded-2xl bg-gradient-to-r from-blue-50 via-indigo-50/70 to-teal-50 border border-blue-200/80 p-4 shadow-2xs">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-start gap-3">
-          <div className="p-2.5 rounded-2xl bg-blue-600 text-white shadow-xs shrink-0 mt-0.5">
-            <Smartphone size={18} />
-          </div>
-          <div className="space-y-1">
-            <div className="flex items-center gap-2 flex-wrap">
-              <h4 className="text-xs sm:text-sm font-extrabold text-slate-900">
-                {isIOS
-                  ? 'Using an iPhone? Add WaveLink to your Home Screen'
-                  : 'Install WaveLink on your Home Screen'}
-              </h4>
-              <span className="px-2 py-0.5 rounded-md bg-blue-100 text-blue-700 text-[10px] font-bold">
-                Web App
-              </span>
-            </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              {isIOS
-                ? 'On iPhone, tap the Share button in Safari and choose "Add to Home Screen" so WaveLink opens full-screen and can deliver instant push notifications.'
-                : 'Add WaveLink to your Home Screen for one-tap launch, smooth full-screen browsing, and reliable background push notifications.'}
-            </p>
-
-            {showDetails && isIOS && (
-              <div className="mt-2.5 p-3 rounded-xl bg-white/90 border border-blue-200/70 space-y-2 text-xs text-slate-700">
-                <div className="flex items-center gap-2">
-                  <Share size={14} className="text-blue-600 shrink-0" />
-                  <span>
-                    <strong>Step 1:</strong> Tap the <strong>Share</strong> button in Safari&apos;s toolbar.
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <PlusSquare size={14} className="text-emerald-600 shrink-0" />
-                  <span>
-                    <strong>Step 2:</strong> Tap <strong>Add to Home Screen</strong>, then tap <strong>Add</strong>.
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Sparkles size={14} className="text-amber-500 shrink-0" />
-                  <span>
-                    <strong>Step 3:</strong> Open WaveLink from your Home Screen to enable push alerts!
-                  </span>
-                </div>
-              </div>
-            )}
-
-            <div className="pt-1.5 flex items-center gap-2 flex-wrap">
-              {canInstall ? (
-                <button
-                  type="button"
-                  onClick={() => triggerInstall()}
-                  className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-2xs transition active:scale-95"
-                >
-                  <Download size={13} />
-                  <span>Add to Home Screen</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setShowDetails((prev) => !prev)}
-                  className="px-3 py-1.5 rounded-xl bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 text-xs font-bold inline-flex items-center gap-1.5 transition"
-                >
-                  <Share size={13} />
-                  <span>{showDetails ? 'Hide iPhone Steps' : 'See How on iPhone / Mobile'}</span>
-                </button>
-              )}
-            </div>
-          </div>
+    <aside
+      aria-label="Install app notice"
+      className="w-full max-w-full rounded-xl bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200/80 dark:border-blue-800/60 px-3 py-1.5 shadow-2xs flex flex-col gap-1.5 transition-all animate-in fade-in"
+    >
+      <div className="flex items-center justify-between gap-2.5 text-xs">
+        <div className="flex items-center gap-2 min-w-0">
+          <Smartphone size={14} className="text-[#2563EB] shrink-0" />
+          <span className="font-semibold text-slate-800 dark:text-slate-200 truncate">
+            {isIOS
+              ? 'Add WaveLink to iPhone Home Screen for instant launch & alerts'
+              : 'Install WaveLink on your Home Screen'}
+          </span>
         </div>
 
-        {compact && (
+        <div className="flex items-center gap-1.5 shrink-0">
+          {canInstall ? (
+            <button
+              type="button"
+              onClick={() => triggerInstall()}
+              className="px-2.5 py-1 rounded-lg bg-[#2563EB] hover:bg-blue-700 text-white font-bold text-[11px] inline-flex items-center gap-1 transition cursor-pointer"
+            >
+              <Download size={11} />
+              <span>Install</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowDetails((p) => !p)}
+              className="px-2 py-0.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-blue-50 text-[#2563EB] border border-blue-200/80 text-[11px] font-bold inline-flex items-center gap-1 transition cursor-pointer"
+            >
+              <Share size={11} />
+              <span>{showDetails ? 'Hide' : 'Steps'}</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={handleDismiss}
-            className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-white/60 transition shrink-0"
-            title="Dismiss hint"
+            className="p-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition shrink-0 cursor-pointer"
+            title="Dismiss for 1 week"
+            aria-label="Dismiss banner"
           >
-            <X size={15} />
+            <X size={14} />
           </button>
-        )}
+        </div>
       </div>
-    </div>
+
+      {showDetails && (
+        <div className="pt-1 pb-0.5 border-t border-blue-200/50 text-[11px] text-slate-600 dark:text-slate-300 flex items-center gap-3 flex-wrap">
+          {isIOS ? (
+            <>
+              <span>1. Tap Safari <strong>Share</strong> <Share size={11} className="inline text-[#2563EB]" /></span>
+              <span>2. Choose <strong>Add to Home Screen</strong> <PlusSquare size={11} className="inline text-emerald-600" /></span>
+              <span>3. Open full-screen from your Home Screen</span>
+            </>
+          ) : (
+            <>
+              <span>1. Open browser menu (<strong>⋮</strong>)</span>
+              <span>2. Tap <strong>Install app</strong> or <strong>Add to Home screen</strong></span>
+            </>
+          )}
+        </div>
+      )}
+    </aside>
   );
 };

@@ -7,7 +7,17 @@ import {
   getOptimizedImagePreviewUrl
 } from '../services/dataSaverService';
 import { useLanguage } from '../context/LanguageContext';
-import { Volume2, VolumeX, Play, Zap } from 'lucide-react';
+import {
+  Volume2,
+  VolumeX,
+  Play,
+  Pause,
+  RotateCcw,
+  Zap,
+  Sparkles,
+  MoreHorizontal
+} from 'lucide-react';
+import { Avatar } from './Avatar';
 
 export interface VideoPlayerProps {
   postId: string;
@@ -21,10 +31,20 @@ export interface VideoPlayerProps {
   className?: string;
   autoPlayOnVisible?: boolean;
   defaultMuted?: boolean;
+  // Optional glass overlays inside the floating media frame
+  authorName?: string;
+  authorPhotoURL?: string;
+  authorId?: string;
+  onAuthorClick?: () => void;
+  onOpenMoreMenu?: (e: React.MouseEvent) => void;
+  onOpenAiInfo?: (e: React.MouseEvent) => void;
+  showGlassOverlays?: boolean;
+  showStatus?: boolean;
 }
 
 const SOUND_PREF_STORAGE_KEY = 'wavelink_feed_video_sound_pref';
 const SOUND_PREF_EVENT = 'wavelink:video-sound-pref';
+export const EXCLUSIVE_AUDIO_EVENT = 'wavelink:exclusive-audio-play';
 
 // Cache natural aspect ratios and captured first-frame posters across scroll mounts
 const videoAspectRatioCache = new Map<string, number>();
@@ -75,9 +95,9 @@ let coordinatorRafId: number | null = null;
 
 /**
  * Coordinates all feed video players so that:
- * 1. Strictly ONLY ONE video plays at a time (the one most in view >= 55% or manually tapped).
- * 2. To save mobile data, ONLY the video currently in view and the immediate next one in DOM order
- *    load their video stream; all other videos display their first-frame poster image.
+ * 1. Strictly ONLY ONE video plays at a time (the one > 60% on screen or manually tapped).
+ * 2. Off-screen videos are lazy-loaded (only the video in view and immediate next one load metadata/stream;
+ *    all other off-screen videos show their thumbnail first).
  */
 function scheduleCoordinatorEvaluation(): void {
   if (typeof window === 'undefined') return;
@@ -108,7 +128,7 @@ function evaluateFeedVideoPlayers(): void {
 
   const viewportCenter = (window.innerHeight || 800) / 2;
 
-  // 1. Find the best visible candidate where most of the video is in view (ratio >= 0.55)
+  // 1. Find the best visible candidate where more than 60% of the video is on screen (ratio >= 0.6)
   let bestVisibleIndex = -1;
   let bestRatio = 0;
   let bestDistanceToCenter = Infinity;
@@ -119,7 +139,7 @@ function evaluateFeedVideoPlayers(): void {
     const center = rect.top + rect.height / 2;
     const dist = Math.abs(center - viewportCenter);
 
-    if (entry.isIntersecting && entry.intersectionRatio >= 0.55) {
+    if (entry.isIntersecting && entry.intersectionRatio >= 0.6) {
       if (
         entry.intersectionRatio > bestRatio + 0.05 ||
         (Math.abs(entry.intersectionRatio - bestRatio) <= 0.05 && dist < bestDistanceToCenter)
@@ -131,7 +151,7 @@ function evaluateFeedVideoPlayers(): void {
     }
   });
 
-  // 2. If no video is >= 55% visible yet, find the one closest to the viewport (at or below top) for loading
+  // 2. If no video is >= 60% visible yet, find the one closest to the viewport center for metadata preloading
   let primaryLoadIndex = bestVisibleIndex;
   if (primaryLoadIndex === -1) {
     let minDistance = Infinity;
@@ -146,14 +166,14 @@ function evaluateFeedVideoPlayers(): void {
     });
   }
 
-  // 3. Only load the video that is in view (`primaryLoadIndex`) and the next one (`primaryLoadIndex + 1`)
+  // 3. Lazy-load off-screen videos: only allow the current visible video and immediate next one to load
   entries.forEach((item, idx) => {
     const isCurrentOrNext =
       primaryLoadIndex !== -1 && (idx === primaryLoadIndex || idx === primaryLoadIndex + 1);
     item.entry.setAllowedToLoad(isCurrentOrNext);
   });
 
-  // 4. Enforce single active playing video (never autoplay on mobile data or when Data Saver is on)
+  // 4. Enforce single active playing video
   const blockAutoplay = shouldBlockVideoAutoplay();
   const nextActiveInstanceId =
     !blockAutoplay && bestVisibleIndex !== -1 ? entries[bestVisibleIndex].entry.instanceId : null;
@@ -210,23 +230,39 @@ function parseInitialAspectRatio(
   return null;
 }
 
+function formatCompactTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const totalSecs = Math.floor(seconds);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+}
+
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   postId,
   videoUrl,
   hasVideoChunks,
   thumbnailUrl,
+  duration: initialDuration,
   videoWidth,
   videoHeight,
   aspectRatio,
   className = '',
   autoPlayOnVisible = true,
   defaultMuted = true,
+  authorName,
+  authorPhotoURL,
+  authorId,
+  onAuthorClick,
+  onOpenMoreMenu,
+  onOpenAiInfo,
+  showGlassOverlays = false,
+  showStatus = true
 }) => {
   const instanceIdRef = useRef<string>(
     `vp_${postId}_${Math.random().toString(36).substring(2, 8)}`
   );
 
-  // Real aspect ratio of the video so portrait videos are tall and landscape videos are wide
   const [naturalRatio, setNaturalRatio] = useState<number | null>(() =>
     parseInitialAspectRatio(postId, videoWidth, videoHeight, aspectRatio)
   );
@@ -237,13 +273,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       : null
   );
 
-  // First-frame poster image for off-screen videos and instant preview
   const [posterUrl, setPosterUrl] = useState<string | undefined>(
     () => thumbnailUrl || firstFramePosterCache.get(postId)
   );
   const [isPosterLoaded, setIsPosterLoaded] = useState<boolean>(false);
 
-  // Only true for the video in view and the next one in the feed
   const [allowedToLoad, setAllowedToLoad] = useState<boolean>(false);
   const [isActivePlayTarget, setIsActivePlayTarget] = useState<boolean>(false);
 
@@ -258,12 +292,18 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [isVideoReady, setIsVideoReady] = useState<boolean>(false);
   const [isBuffering, setIsBuffering] = useState<boolean>(false);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [hasEnded, setHasEnded] = useState<boolean>(false);
   const [hasError, setHasError] = useState<boolean>(false);
+  const [currentTime, setCurrentTime] = useState<number>(0);
+  const [videoDuration, setVideoDuration] = useState<number>(initialDuration || 0);
+
+  // Floating glass controls visibility: fade out after 2.5 seconds of playback, show on tap
+  const [controlsVisible, setControlsVisible] = useState<boolean>(true);
+  const controlsFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const { enabled: isDataSaverOn, blockAutoplay } = useDataSaver();
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
 
-  // Sound state: remembers the user's sound choice across videos
   const [isMuted, setIsMuted] = useState<boolean>(() =>
     getRememberedSoundMuted(defaultMuted)
   );
@@ -273,6 +313,31 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const bgBlurVideoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const userPausedRef = useRef<boolean>(false);
+
+  const scheduleControlsFadeOut = useCallback(() => {
+    if (controlsFadeTimerRef.current) {
+      clearTimeout(controlsFadeTimerRef.current);
+      controlsFadeTimerRef.current = null;
+    }
+    controlsFadeTimerRef.current = setTimeout(() => {
+      if (videoRef.current && !videoRef.current.paused && !videoRef.current.ended) {
+        setControlsVisible(false);
+      }
+    }, 2500);
+  }, []);
+
+  const revealControlsWithTimer = useCallback(() => {
+    setControlsVisible(true);
+    scheduleControlsFadeOut();
+  }, [scheduleControlsFadeOut]);
+
+  useEffect(() => {
+    return () => {
+      if (controlsFadeTimerRef.current) {
+        clearTimeout(controlsFadeTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (thumbnailUrl && thumbnailUrl !== posterUrl) {
@@ -290,7 +355,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, [postId, videoWidth, videoHeight]);
 
-  // Listen for sound preference changes from any video in the feed
+  // Listen for sound preference changes & exclusive audio coordinator events
   useEffect(() => {
     const handleSoundPrefChange = (e: Event) => {
       const customEvent = e as CustomEvent<{ muted: boolean }>;
@@ -303,13 +368,25 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }
     };
 
+    const handleExclusiveAudio = (e: Event) => {
+      const custom = e as CustomEvent<{ sourceId?: string }>;
+      if (custom.detail?.sourceId && custom.detail.sourceId !== instanceIdRef.current) {
+        // Another post started playing audio; mute or pause this video's audio so only 1 post plays audio at a time
+        if (videoRef.current && !videoRef.current.muted) {
+          videoRef.current.muted = true;
+          setIsMuted(true);
+        }
+      }
+    };
+
     window.addEventListener(SOUND_PREF_EVENT, handleSoundPrefChange);
+    window.addEventListener(EXCLUSIVE_AUDIO_EVENT, handleExclusiveAudio);
     return () => {
       window.removeEventListener(SOUND_PREF_EVENT, handleSoundPrefChange);
+      window.removeEventListener(EXCLUSIVE_AUDIO_EVENT, handleExclusiveAudio);
     };
   }, []);
 
-  // Capture the first frame as poster image if this video didn't have a saved thumbnailUrl
   const captureFirstFramePosterIfNeeded = useCallback(
     (vid: HTMLVideoElement) => {
       if (posterUrl || firstFramePosterCache.has(postId)) return;
@@ -324,20 +401,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           ctx.imageSmoothingEnabled = true;
           ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
           if (dataUrl && dataUrl.startsWith('data:image/') && dataUrl.length > 512) {
             firstFramePosterCache.set(postId, dataUrl);
             setPosterUrl(dataUrl);
           }
         }
       } catch {
-        // Cross-origin canvas taint if CORS not set on bucket; <video poster> fallback still works
+        // Cross-origin canvas fallback
       }
     },
     [postId, posterUrl]
   );
 
-  // Pause helper
   const pauseVideo = useCallback(() => {
     if (videoRef.current && !videoRef.current.paused) {
       videoRef.current.pause();
@@ -347,54 +423,76 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
     setIsPlaying(false);
     setIsBuffering(false);
+    setControlsVisible(true);
   }, []);
 
-  // Play helper: starts muted with playsInline so mobile browsers never block autoplay,
-  // while respecting the user's remembered sound preference whenever allowed by the browser
-  const playVideo = useCallback(() => {
-    const vid = videoRef.current;
-    if (!vid) return;
+  const playVideo = useCallback(
+    (fromReplay = false) => {
+      const vid = videoRef.current;
+      if (!vid) return;
 
-    const preferredMuted = getRememberedSoundMuted(true);
-    // On mobile browsers, unmuted autoplay is only permitted after the user has interacted in this session
-    const shouldTryUnmuted = !preferredMuted && hasUserSelectedUnmuteInSession;
-    vid.muted = !shouldTryUnmuted;
-    setIsMuted(vid.muted);
+      if (fromReplay || vid.ended || hasEnded) {
+        try {
+          vid.currentTime = 0;
+          setCurrentTime(0);
+        } catch {
+          // ignore
+        }
+        setHasEnded(false);
+      }
 
-    const playPromise = vid.play();
-    if (playPromise !== undefined) {
-      playPromise
-        .then(() => {
-          setIsPlaying(true);
-          setIsBuffering(false);
-          if (bgBlurVideoRef.current) {
-            bgBlurVideoRef.current.currentTime = vid.currentTime;
-            bgBlurVideoRef.current.play().catch(() => {});
-          }
-        })
-        .catch(() => {
-          // Phones block autoplay with sound — always fall back to muted autoplay so a tap is never required
-          if (videoRef.current) {
-            videoRef.current.muted = true;
-            setIsMuted(true);
-            videoRef.current
-              .play()
-              .then(() => {
-                setIsPlaying(true);
-                setIsBuffering(false);
-                if (bgBlurVideoRef.current) {
-                  bgBlurVideoRef.current.play().catch(() => {});
-                }
-              })
-              .catch(() => {
-                setIsBuffering(false);
-              });
-          }
-        });
-    }
-  }, []);
+      const preferredMuted = getRememberedSoundMuted(true);
+      const shouldTryUnmuted = !preferredMuted && hasUserSelectedUnmuteInSession;
+      vid.muted = !shouldTryUnmuted;
+      setIsMuted(vid.muted);
 
-  // Register with the feed video coordinator and observe viewport visibility
+      if (!vid.muted) {
+        window.dispatchEvent(
+          new CustomEvent(EXCLUSIVE_AUDIO_EVENT, {
+            detail: { sourceId: instanceIdRef.current }
+          })
+        );
+      }
+
+      const playPromise = vid.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            setIsPlaying(true);
+            setHasEnded(false);
+            setIsBuffering(false);
+            scheduleControlsFadeOut();
+            if (bgBlurVideoRef.current) {
+              bgBlurVideoRef.current.currentTime = vid.currentTime;
+              bgBlurVideoRef.current.play().catch(() => {});
+            }
+          })
+          .catch(() => {
+            if (videoRef.current) {
+              videoRef.current.muted = true;
+              setIsMuted(true);
+              videoRef.current
+                .play()
+                .then(() => {
+                  setIsPlaying(true);
+                  setHasEnded(false);
+                  setIsBuffering(false);
+                  scheduleControlsFadeOut();
+                  if (bgBlurVideoRef.current) {
+                    bgBlurVideoRef.current.play().catch(() => {});
+                  }
+                })
+                .catch(() => {
+                  setIsBuffering(false);
+                });
+            }
+          });
+      }
+    },
+    [hasEnded, scheduleControlsFadeOut]
+  );
+
+  // Register with the feed video coordinator and observe >60% viewport visibility
   useEffect(() => {
     const instanceId = instanceIdRef.current;
     const entry: RegisteredPlayerEntry = {
@@ -436,8 +534,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         reg.isIntersecting = obsEntry.isIntersecting;
         reg.intersectionRatio = obsEntry.intersectionRatio;
 
-        // Reset manual pause when the video scrolls out of view
-        if (!obsEntry.isIntersecting || obsEntry.intersectionRatio < 0.2) {
+        // Pause when scrolled away (< 0.25 visible)
+        if (!obsEntry.isIntersecting || obsEntry.intersectionRatio < 0.25) {
           userPausedRef.current = false;
           reg.userPaused = false;
           pauseVideo();
@@ -446,7 +544,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         scheduleCoordinatorEvaluation();
       },
       {
-        threshold: [0, 0.2, 0.4, 0.55, 0.7, 0.85],
+        threshold: [0, 0.25, 0.45, 0.6, 0.75, 0.9],
         rootMargin: '0px',
       }
     );
@@ -514,15 +612,61 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   // Start or pause playback whenever coordinator marks this video as the active play target
   useEffect(() => {
-    if (isActivePlayTarget && allowedToLoad && resolvedSrc && !userPausedRef.current) {
-      playVideo();
+    if (isActivePlayTarget && allowedToLoad && resolvedSrc && !userPausedRef.current && !hasEnded) {
+      playVideo(false);
     } else if (!isActivePlayTarget) {
       pauseVideo();
     }
-  }, [isActivePlayTarget, allowedToLoad, resolvedSrc, playVideo, pauseVideo]);
+  }, [isActivePlayTarget, allowedToLoad, resolvedSrc, hasEnded, playVideo, pauseVideo]);
 
-  // Single tap on the video pauses or resumes it
-  const handleVideoTap = (e: React.MouseEvent) => {
+  // Tap on video surface: if controls are hidden, reveal them and start 2.5s fade timer;
+  // if controls are visible, toggle play/pause (or replay if ended)
+  const handleVideoSurfaceTap = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const instanceId = instanceIdRef.current;
+    const reg = registeredPlayers.get(instanceId);
+    setUserManuallyStarted(true);
+
+    if (!controlsVisible && isPlaying && !hasEnded) {
+      revealControlsWithTimer();
+      return;
+    }
+
+    if (!allowedToLoad) {
+      userPausedRef.current = false;
+      if (reg) reg.userPaused = false;
+      notifyManualPlay(instanceId);
+      revealControlsWithTimer();
+      return;
+    }
+
+    const vid = videoRef.current;
+    if (!vid) return;
+
+    if (hasEnded || vid.ended) {
+      userPausedRef.current = false;
+      if (reg) reg.userPaused = false;
+      notifyManualPlay(instanceId);
+      playVideo(true);
+      revealControlsWithTimer();
+      return;
+    }
+
+    if (vid.paused) {
+      userPausedRef.current = false;
+      if (reg) reg.userPaused = false;
+      notifyManualPlay(instanceId);
+      playVideo(false);
+      revealControlsWithTimer();
+    } else {
+      userPausedRef.current = true;
+      if (reg) reg.userPaused = true;
+      pauseVideo();
+      setControlsVisible(true);
+    }
+  };
+
+  const handleTogglePlayPauseButton = (e: React.MouseEvent) => {
     e.stopPropagation();
     const instanceId = instanceIdRef.current;
     const reg = registeredPlayers.get(instanceId);
@@ -532,30 +676,61 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       userPausedRef.current = false;
       if (reg) reg.userPaused = false;
       notifyManualPlay(instanceId);
+      revealControlsWithTimer();
       return;
     }
 
     const vid = videoRef.current;
     if (!vid) return;
 
+    if (hasEnded || vid.ended) {
+      userPausedRef.current = false;
+      if (reg) reg.userPaused = false;
+      notifyManualPlay(instanceId);
+      playVideo(true);
+      revealControlsWithTimer();
+      return;
+    }
+
     if (vid.paused) {
       userPausedRef.current = false;
       if (reg) reg.userPaused = false;
       notifyManualPlay(instanceId);
-      playVideo();
+      playVideo(false);
+      revealControlsWithTimer();
     } else {
       userPausedRef.current = true;
       if (reg) reg.userPaused = true;
       pauseVideo();
+      setControlsVisible(true);
     }
   };
 
-  // Small corner speaker button: unmutes/mutes and remembers the choice for the next videos
+  const handleReplayClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const instanceId = instanceIdRef.current;
+    const reg = registeredPlayers.get(instanceId);
+    userPausedRef.current = false;
+    if (reg) reg.userPaused = false;
+    notifyManualPlay(instanceId);
+    playVideo(true);
+    revealControlsWithTimer();
+  };
+
   const handleToggleSound = (e: React.MouseEvent) => {
     e.stopPropagation();
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
     setRememberedSoundMuted(nextMuted);
+    revealControlsWithTimer();
+
+    if (!nextMuted) {
+      window.dispatchEvent(
+        new CustomEvent(EXCLUSIVE_AUDIO_EVENT, {
+          detail: { sourceId: instanceIdRef.current }
+        })
+      );
+    }
 
     if (videoRef.current) {
       videoRef.current.muted = nextMuted;
@@ -566,6 +741,29 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  const handleSeekBarClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    const vid = videoRef.current;
+    if (!vid) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+    const total = vid.duration && Number.isFinite(vid.duration) ? vid.duration : videoDuration || 30;
+    const targetTime = ratio * total;
+    try {
+      vid.currentTime = targetTime;
+      setCurrentTime(targetTime);
+      if (bgBlurVideoRef.current) {
+        bgBlurVideoRef.current.currentTime = targetTime;
+      }
+      if (hasEnded && targetTime < total - 0.3) {
+        setHasEnded(false);
+      }
+    } catch {
+      // ignore seek errors
+    }
+    revealControlsWithTimer();
+  };
+
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     if (!vid) return;
@@ -574,6 +772,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       videoAspectRatioCache.set(postId, exactRatio);
       setNaturalRatio(exactRatio);
       setNaturalSize({ width: vid.videoWidth, height: vid.videoHeight });
+    }
+    if (vid.duration && Number.isFinite(vid.duration) && vid.duration > 0) {
+      setVideoDuration(vid.duration);
     }
     setIsVideoReady(true);
     setIsBuffering(false);
@@ -588,7 +789,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     setIsBuffering(false);
   };
 
-  // Fallback poster URL using `#t=0.001` fragment when no separate thumbnailUrl exists
   const rawPosterSrc =
     posterUrl ||
     (!allowedToLoad &&
@@ -606,27 +806,89 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const mediaMaxResolutionStyle: React.CSSProperties | undefined = naturalSize
     ? {
         maxWidth: `min(100%, ${naturalSize.width}px)`,
-        maxHeight: `min(80dvh, ${naturalSize.height}px)`
+        maxHeight: `min(78dvh, ${naturalSize.height}px)`
       }
     : undefined;
+
+  const effectiveDuration =
+    videoDuration > 0
+      ? videoDuration
+      : initialDuration && initialDuration > 0
+      ? initialDuration
+      : 0;
+  const progressPercent =
+    effectiveDuration > 0
+      ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100))
+      : 0;
 
   return (
     <div
       ref={containerRef}
-      onClick={handleVideoTap}
+      onClick={handleVideoSurfaceTap}
       style={{
         aspectRatio: naturalRatio ? String(naturalRatio) : undefined,
-        maxHeight: '80dvh',
+        maxHeight: '78dvh',
       }}
-      className={`relative w-full max-h-[80dvh] rounded-2xl overflow-hidden bg-[#0C0A09] flex items-center justify-center select-none cursor-pointer ${
-        !naturalRatio ? 'min-h-[220px]' : ''
+      className={`wavelink-glass-media-frame relative w-full max-h-[78dvh] rounded-[28px] overflow-hidden bg-[#090D16] flex items-center justify-center select-none cursor-pointer ${
+        !naturalRatio ? 'min-h-[240px]' : ''
       } ${className}`}
     >
+      {/* Top-Left & Top-Right Glass Overlays inside the floating media frame */}
+      {showGlassOverlays && (
+        <div
+          className="absolute top-3 left-3 right-3 z-20 flex items-center justify-between gap-2 pointer-events-none"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {authorName && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onAuthorClick?.();
+              }}
+              className="wavelink-glass-overlay-pill pointer-events-auto min-h-[42px] pl-1.5 pr-3.5 py-1 rounded-full flex items-center gap-2 text-white shadow-md transition-transform active:scale-96 cursor-pointer max-w-[74%]"
+              title={authorName}
+            >
+              <Avatar
+                uid={authorId}
+                src={
+                  authorPhotoURL ||
+                  `https://api.dicebear.com/7.x/shapes/svg?seed=${authorId || authorName}`
+                }
+                alt={authorName}
+                fallbackName={authorName}
+                size={28}
+                showStatus={showStatus}
+                className="shrink-0"
+              />
+              <span className="text-xs sm:text-sm font-bold tracking-tight text-white truncate drop-shadow-xs">
+                {authorName}
+              </span>
+            </button>
+          )}
+
+          {onOpenMoreMenu && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenMoreMenu(e);
+              }}
+              aria-label="More options"
+              title="More options"
+              className="wavelink-glass-overlay-pill pointer-events-auto min-w-[44px] min-h-[44px] w-10 h-10 rounded-full flex items-center justify-center text-white shadow-md transition-transform active:scale-96 cursor-pointer ml-auto"
+            >
+              <MoreHorizontal size={18} />
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Soft Loading Placeholder while the video buffers */}
       {showSoftPlaceholder && (
         <div
           aria-hidden="true"
-          className="absolute inset-0 z-[2] bg-gradient-to-br from-stone-200/80 via-stone-100/70 to-stone-200/80 dark:from-slate-800/80 dark:via-slate-900/70 dark:to-slate-800/80 animate-pulse pointer-events-none"
+          className="absolute inset-0 z-[2] bg-gradient-to-br from-slate-800/80 via-slate-900/70 to-slate-800/80 animate-pulse pointer-events-none"
         />
       )}
 
@@ -634,13 +896,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       {isBuffering && (isPosterLoaded || isVideoReady) && (
         <div
           aria-hidden="true"
-          className="absolute top-0 inset-x-0 h-1 z-[4] bg-white/40 overflow-hidden pointer-events-none"
+          className="absolute top-0 inset-x-0 h-1 z-[4] bg-white/30 overflow-hidden pointer-events-none"
         >
-          <div className="w-1/2 h-full bg-white/80 animate-pulse rounded-full" />
+          <div className="w-1/2 h-full bg-white/85 animate-pulse rounded-full" />
         </div>
       )}
 
-      {/* Soft blurred, darkened copy of the same video or poster filling empty sides so there are no black bars */}
+      {/* Soft blurred background copy of the same video or poster filling empty sides */}
       {allowedToLoad && resolvedSrc && !hasError ? (
         <div aria-hidden="true" className="absolute inset-0 z-[1] overflow-hidden pointer-events-none">
           <video
@@ -650,9 +912,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             muted
             playsInline
             webkit-playsinline="true"
-            loop
-            preload={isActivePlayTarget ? 'auto' : 'metadata'}
-            className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+            preload="metadata"
+            className="w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50"
           />
           <div className="absolute inset-0 bg-black/30" />
         </div>
@@ -662,7 +923,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             <img
               src={posterUrl}
               alt=""
-              className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+              referrerPolicy="no-referrer"
+              className="w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50"
             />
             <div className="absolute inset-0 bg-black/30" />
           </div>
@@ -673,9 +935,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       {posterUrl && (!isPlaying || !isVideoReady || !allowedToLoad) && (
         <img
           src={posterUrl}
-          alt="Video preview"
+          alt="Video thumbnail preview"
           loading="lazy"
           decoding="async"
+          referrerPolicy="no-referrer"
           onLoad={(e) => {
             setIsPosterLoaded(true);
             const img = e.currentTarget;
@@ -691,11 +954,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             }
           }}
           style={mediaMaxResolutionStyle}
-          className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block pointer-events-none"
+          className="relative z-[2] w-full h-full max-h-[78dvh] object-contain block pointer-events-none"
         />
       )}
 
-      {/* Only mount & load the video stream when this video is in view or is the next one */}
+      {/* Only mount & load the video stream when this video is in view or is the immediate next one */}
       {allowedToLoad && resolvedSrc && !hasError ? (
         <video
           ref={videoRef}
@@ -703,8 +966,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           poster={posterUrl}
           playsInline
           webkit-playsinline="true"
-          preload={isActivePlayTarget ? 'auto' : 'metadata'}
-          loop
+          preload="metadata"
           muted={isMuted}
           onLoadedMetadata={handleLoadedMetadata}
           onLoadedData={handleLoadedData}
@@ -712,17 +974,41 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           onWaiting={() => setIsBuffering(true)}
           onPlaying={() => {
             setIsPlaying(true);
+            setHasEnded(false);
             setIsBuffering(false);
+            scheduleControlsFadeOut();
           }}
-          onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
+          onPlay={() => {
+            setIsPlaying(true);
+            setHasEnded(false);
+          }}
+          onPause={() => {
+            setIsPlaying(false);
+          }}
+          onEnded={() => {
+            setIsPlaying(false);
+            setHasEnded(true);
+            setControlsVisible(true);
+            if (bgBlurVideoRef.current) {
+              bgBlurVideoRef.current.pause();
+            }
+          }}
           onTimeUpdate={() => {
-            if (
-              bgBlurVideoRef.current &&
-              videoRef.current &&
-              Math.abs(bgBlurVideoRef.current.currentTime - videoRef.current.currentTime) > 0.4
-            ) {
-              bgBlurVideoRef.current.currentTime = videoRef.current.currentTime;
+            if (videoRef.current) {
+              setCurrentTime(videoRef.current.currentTime);
+              if (
+                videoRef.current.duration &&
+                Number.isFinite(videoRef.current.duration) &&
+                videoRef.current.duration > 0
+              ) {
+                setVideoDuration(videoRef.current.duration);
+              }
+              if (
+                bgBlurVideoRef.current &&
+                Math.abs(bgBlurVideoRef.current.currentTime - videoRef.current.currentTime) > 0.4
+              ) {
+                bgBlurVideoRef.current.currentTime = videoRef.current.currentTime;
+              }
             }
           }}
           onError={() => {
@@ -730,10 +1016,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             setIsBuffering(false);
           }}
           style={mediaMaxResolutionStyle}
-          className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block"
+          className="relative z-[2] w-full h-full max-h-[78dvh] object-contain block"
         />
       ) : (
-        /* If off-screen and no separate thumbnail image exists yet, render lightweight metadata poster frame */
         !posterUrl &&
         effectivePosterSrc && (
           <video
@@ -757,36 +1042,128 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               setIsPosterLoaded(true);
             }}
             style={mediaMaxResolutionStyle}
-            className="relative z-[2] w-full h-full max-h-[80dvh] object-contain block pointer-events-none"
+            className="relative z-[2] w-full h-full max-h-[78dvh] object-contain block pointer-events-none"
           />
         )
       )}
 
+      {/* Center Replay Glass Pill when video ends */}
+      {hasEnded && (
+        <div className="absolute inset-0 z-[12] flex items-center justify-center bg-black/35 pointer-events-none">
+          <button
+            type="button"
+            onClick={handleReplayClick}
+            className="wavelink-glass-overlay-pill pointer-events-auto min-h-[48px] px-5 py-2.5 rounded-full text-white font-extrabold text-sm flex items-center gap-2 shadow-xl transition-transform active:scale-96 cursor-pointer"
+          >
+            <RotateCcw size={17} />
+            <span>{language === 'sw' ? 'Cheza Tena' : 'Replay'}</span>
+          </button>
+        </div>
+      )}
+
       {/* Data Saver / Mobile Data Tap-to-Play Overlay when autoplay is paused to save data */}
-      {!isPlaying && (blockAutoplay || isDataSaverOn) && (
+      {!isPlaying && !hasEnded && (blockAutoplay || isDataSaverOn) && (
         <div className="absolute inset-0 z-[8] flex flex-col items-center justify-center bg-black/25 pointer-events-none">
-          <div className="w-12 h-12 rounded-full bg-black/65 backdrop-blur-xs text-white flex items-center justify-center shadow-lg border border-white/25 mb-2">
-            <Play size={20} className="ml-0.5 fill-white" />
+          <div className="wavelink-glass-overlay-pill w-13 h-13 rounded-full text-white flex items-center justify-center shadow-lg mb-2">
+            <Play size={22} className="ml-0.5 fill-white" />
           </div>
-          <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-black/65 backdrop-blur-xs text-white text-[11px] font-bold border border-white/15">
-            <Zap size={11} className="text-teal-300" />
+          <span className="wavelink-glass-overlay-pill inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full text-white text-xs font-bold">
+            <Zap size={12} className="text-teal-300" />
             <span>{t('datasaver.videoTapToPlay')}</span>
           </span>
         </div>
       )}
 
-      {/* Single small speaker icon in the corner to unmute/mute */}
-      <button
-        type="button"
-        onClick={handleToggleSound}
-        aria-label={isMuted ? 'Unmute video' : 'Mute video'}
-        title={isMuted ? 'Unmute' : 'Mute'}
-        className="absolute bottom-2 right-2 z-10 min-w-[44px] min-h-[44px] flex items-center justify-center"
+      {/* Bottom-Left "AI info" Glass Pill (with slow 6-8s gentle float) */}
+      {showGlassOverlays && onOpenAiInfo && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenAiInfo(e);
+          }}
+          aria-label="Open WELINK AI info summary"
+          className={`wavelink-glass-overlay-pill wavelink-float-gentle absolute left-3 z-20 min-h-[38px] px-3.5 py-1.5 rounded-full text-white text-xs font-extrabold flex items-center gap-1.5 shadow-lg transition-all duration-300 active:scale-96 cursor-pointer ${
+            controlsVisible || !isPlaying || hasEnded ? 'bottom-16' : 'bottom-3.5'
+          }`}
+        >
+          <Sparkles size={13} className="text-amber-300 shrink-0" />
+          <span>AI info</span>
+        </button>
+      )}
+
+      {/* Floating Glass Control Bar inside the video (Play/Pause, Thin Progress Bar, Mute/Unmute, Replay when ended)
+          Fades out after 2.5 seconds of playback; shows on tap */}
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className={`wavelink-glass-video-controls absolute left-3 right-3 bottom-3 z-20 rounded-full px-2.5 py-1.5 flex items-center gap-2.5 text-white transition-all duration-300 ${
+          controlsVisible || !isPlaying || hasEnded
+            ? 'opacity-100 translate-y-0 pointer-events-auto'
+            : 'opacity-0 translate-y-1.5 pointer-events-none'
+        }`}
       >
-        <span className="w-8 h-8 rounded-full bg-black/55 hover:bg-black/75 backdrop-blur-xs text-white flex items-center justify-center shadow-sm transition active:scale-95">
+        {/* Play / Pause / Replay Button */}
+        <button
+          type="button"
+          onClick={handleTogglePlayPauseButton}
+          aria-label={hasEnded ? 'Replay video' : isPlaying ? 'Pause video' : 'Play video'}
+          className="min-w-[38px] min-h-[38px] w-9 h-9 rounded-full bg-white/18 hover:bg-white/28 flex items-center justify-center text-white shrink-0 transition-transform active:scale-95 cursor-pointer"
+        >
+          {hasEnded ? (
+            <RotateCcw size={15} />
+          ) : isPlaying ? (
+            <Pause size={15} className="fill-white" />
+          ) : (
+            <Play size={15} className="ml-0.5 fill-white" />
+          )}
+        </button>
+
+        {/* Thin Interactive Progress Bar */}
+        <div
+          onClick={handleSeekBarClick}
+          role="slider"
+          aria-label="Video progress"
+          aria-valuemin={0}
+          aria-valuemax={Math.round(effectiveDuration || 100)}
+          aria-valuenow={Math.round(currentTime)}
+          className="flex-1 h-6 flex items-center cursor-pointer group/seek"
+        >
+          <div className="w-full h-1.5 group-hover/seek:h-2 rounded-full bg-white/28 overflow-hidden transition-all relative">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-[#60A5FA] via-[#2DD4BF] to-[#FFFFFF] transition-all duration-150"
+              style={{ width: `${hasEnded ? 100 : progressPercent}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Compact Time or Replay Label */}
+        {hasEnded ? (
+          <button
+            type="button"
+            onClick={handleReplayClick}
+            className="px-2.5 py-1 rounded-full bg-white/20 hover:bg-white/30 text-[11px] font-extrabold text-white shrink-0 transition-transform active:scale-95 cursor-pointer"
+          >
+            {language === 'sw' ? 'Rudia' : 'Replay'}
+          </button>
+        ) : (
+          effectiveDuration > 0 && (
+            <span className="text-[11px] font-mono font-semibold text-white/90 tabular-nums shrink-0">
+              {formatCompactTime(currentTime)}
+            </span>
+          )
+        )}
+
+        {/* Mute / Unmute Button */}
+        <button
+          type="button"
+          onClick={handleToggleSound}
+          aria-label={isMuted ? 'Unmute video' : 'Mute video'}
+          title={isMuted ? 'Unmute' : 'Mute'}
+          className="min-w-[38px] min-h-[38px] w-9 h-9 rounded-full bg-white/18 hover:bg-white/28 flex items-center justify-center text-white shrink-0 transition-transform active:scale-95 cursor-pointer"
+        >
           {isMuted ? <VolumeX size={15} /> : <Volume2 size={15} />}
-        </span>
-      </button>
+        </button>
+      </div>
     </div>
   );
 };

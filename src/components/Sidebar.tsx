@@ -26,9 +26,14 @@ import {
   UserPlus,
   ChevronLeft,
   ChevronRight,
-  Trophy
+  Trophy,
+  Bell,
+  Palette
 } from 'lucide-react';
+import { useSimpleMode } from '../context/SimpleModeContext';
+import { useTheme, APPEARANCE_THEMES } from '../context/ThemeContext';
 import { inviteFriends } from '../utils/share.js';
+import { Avatar } from './Avatar';
 
 interface SidebarProps {
   activeTab: ActiveTab;
@@ -50,7 +55,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse
 }) => {
   const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, adminCheckFailedReason, signOut } = useAuth();
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
+  const { isSimpleMode } = useSimpleMode();
+  const { appearanceTheme, setAppearanceTheme } = useTheme();
   const { currency, countryMeta, patternFrame, formatPrice } = useAfricanRegion(userProfile);
   const activeFrameClass =
     KANGA_PATTERN_FRAMES.find((f) => f.id === patternFrame)?.cssClass || '';
@@ -82,29 +89,37 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const isProUser = isProEffective;
 
-  const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; badge?: string }[] = [
-    { id: 'feed', label: t('nav.home'), icon: <Rss size={18} /> },
-    { id: 'trending', label: t('nav.trending'), icon: <Trophy size={18} />, badge: 'Hot' },
-    { id: 'videos', label: t('nav.reels'), icon: <Film size={18} /> },
-    { id: 'studio', label: t('nav.create'), icon: <Wand2 size={18} />, badge: 'Create' },
-    { id: 'announcements', label: t('nav.announcements'), icon: <CalendarDays size={18} />, badge: 'Events' },
-    { id: 'chat', label: t('nav.chat'), icon: <MessageSquare size={18} /> },
-    { id: 'monetization', label: t('nav.monetization'), icon: <Coins size={18} />, badge: currency },
-    { id: 'directory', label: t('nav.members'), icon: <Users size={18} /> },
-    { id: 'analytics', label: t('nav.analytics'), icon: <BarChart3 size={18} />, badge: 'Private' },
-    // Restrict Admin / Moderator Desk to authorized admins (or owner session needing re-verification)
-    ...(isAdmin ||
-    adminCheckFailedReason === 'owner sign-in not used' ||
-    adminCheckFailedReason === 'session needs refresh'
-      ? [{
-          id: 'admin' as ActiveTab,
-          label: isSuperAdmin || !isSubAdmin ? t('nav.admin') : 'Moderator Desk',
-          icon: <Shield size={18} />,
-          badge: isSuperAdmin || !isSubAdmin ? 'Owner' : 'Mod'
-        }]
-      : []),
-    { id: 'settings', label: t('nav.profile'), icon: <Settings size={18} /> },
-  ];
+  // In Simple Mode, keep only Home, Messages, Notifications, Profile with larger text
+  const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; badge?: string }[] = isSimpleMode
+    ? [
+        { id: 'feed', label: t('nav.home'), icon: <Rss size={22} /> },
+        { id: 'chat', label: language === 'sw' ? 'Ujumbe (Chat)' : 'Messages', icon: <MessageSquare size={22} /> },
+        { id: 'announcements', label: language === 'sw' ? 'Taarifa' : 'Notifications', icon: <Bell size={22} /> },
+        { id: 'settings', label: t('nav.profile'), icon: <Settings size={22} /> },
+      ]
+    : [
+        { id: 'feed', label: t('nav.home'), icon: <Rss size={18} /> },
+        { id: 'trending', label: t('nav.trending'), icon: <Trophy size={18} />, badge: 'Hot' },
+        { id: 'videos', label: t('nav.reels'), icon: <Film size={18} /> },
+        { id: 'studio', label: t('nav.create'), icon: <Wand2 size={18} />, badge: 'Create' },
+        { id: 'announcements', label: t('nav.announcements'), icon: <CalendarDays size={18} />, badge: 'Events' },
+        { id: 'chat', label: t('nav.chat'), icon: <MessageSquare size={18} /> },
+        { id: 'monetization', label: t('nav.monetization'), icon: <Coins size={18} />, badge: currency },
+        { id: 'directory', label: t('nav.members'), icon: <Users size={18} /> },
+        { id: 'analytics', label: t('nav.analytics'), icon: <BarChart3 size={18} />, badge: 'Private' },
+        // Restrict Admin / Moderator Desk to authorized admins (or owner session needing re-verification)
+        ...(isAdmin ||
+        adminCheckFailedReason === 'owner sign-in not used' ||
+        adminCheckFailedReason === 'session needs refresh'
+          ? [{
+              id: 'admin' as ActiveTab,
+              label: isSuperAdmin || !isSubAdmin ? t('nav.admin') : 'Moderator Desk',
+              icon: <Shield size={18} />,
+              badge: isSuperAdmin || !isSubAdmin ? 'Owner' : 'Mod'
+            }]
+          : []),
+        { id: 'settings', label: t('nav.profile'), icon: <Settings size={18} /> },
+      ];
 
   const handleSelectTab = (tab: ActiveTab) => {
     setActiveTab(tab);
@@ -112,22 +127,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const renderSidebarContent = (collapsedMode: boolean) => (
-    <div className="relative flex flex-col h-full bg-[#ffffff] border-r border-slate-200/90 select-none shadow-[2px_0_16px_-4px_rgba(15,23,42,0.04)] transition-all duration-300 ease-in-out">
+    <div className="relative flex flex-col h-full bg-[var(--bg-surface)] text-[var(--text-primary)] border-r border-[var(--border-hairline)] select-none shadow-[2px_0_16px_-4px_rgba(15,23,42,0.04)] transition-all duration-300 ease-in-out">
       {/* Desktop Edge Collapse / Expand Toggle Button */}
       <button
         type="button"
         onClick={handleToggleCollapse}
         aria-label={collapsedMode ? 'Expand left sidebar' : 'Collapse left sidebar'}
         title={collapsedMode ? 'Expand navigation sidebar' : 'Collapse navigation sidebar'}
-        className="hidden lg:flex items-center justify-center w-7 h-7 rounded-full bg-white border border-slate-200 text-slate-600 hover:text-[#2563eb] hover:border-blue-300 shadow-md absolute -right-3.5 top-5 z-40 transition-transform active:scale-95 cursor-pointer"
+        className="hidden lg:flex items-center justify-center w-7 h-7 rounded-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] hover:border-[var(--accent-primary)] shadow-md absolute -right-3.5 top-5 z-40 transition-transform active:scale-95 cursor-pointer"
       >
         {collapsedMode ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
       </button>
 
       {/* Brand Header */}
       <div
-        className={`border-b border-slate-100 bg-[#f8fafc]/60 flex items-center ${
-          collapsedMode ? 'justify-center px-2 py-4' : 'justify-between px-5 py-4'
+        className={`border-b border-[var(--border-hairline)] bg-[var(--bg-subtle)]/60 flex items-center ${
+          collapsedMode ? 'justify-center px-2 py-4' : 'justify-between px-4 py-4'
         }`}
       >
         <div
@@ -137,16 +152,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
             collapsedMode ? 'justify-center' : 'gap-3'
           }`}
         >
-          <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-[#2563eb] to-[#10B981] text-white shadow-sm shadow-blue-600/20 group-hover:scale-105 transition-transform shrink-0">
-            <Waves size={21} />
+          <div
+            className="p-2.5 rounded-2xl text-white shadow-sm group-hover:scale-105 transition-transform shrink-0"
+            style={{
+              background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+            }}
+          >
+            <Waves size={20} />
           </div>
           {!collapsedMode && (
             <div className="flex flex-col min-w-0">
-              <span className="font-extrabold text-xl tracking-tight text-[#1e293b] truncate">
-                Wave<span className="text-[#2563eb]">Link</span>
+              <span className="font-extrabold text-lg tracking-tight text-[var(--text-primary)] truncate">
+                Wave<span style={{ color: 'var(--accent-primary)' }}>Link</span>
               </span>
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 -mt-0.5 truncate">
-                {countryMeta.flag} Empowering African Creators
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-secondary)] -mt-0.5 truncate">
+                {countryMeta.flag} African Creators
               </span>
             </div>
           )}
@@ -155,7 +175,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {isOpenMobile && (
           <button
             onClick={onCloseMobile}
-            className="p-1.5 text-[#1e293b] hover:text-[#2563eb] rounded-xl lg:hidden"
+            className="p-1.5 text-[var(--text-primary)] hover:text-[var(--accent-primary)] rounded-xl lg:hidden"
           >
             <X size={18} />
           </button>
@@ -164,13 +184,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* Navigation List */}
       <div
-        className={`flex-1 overflow-y-auto overflow-x-hidden py-4 space-y-1 bg-[#ffffff] ${
-          collapsedMode ? 'px-2' : 'px-3.5'
+        className={`flex-1 overflow-y-auto overflow-x-hidden py-3.5 space-y-1 bg-[var(--bg-surface)] ${
+          collapsedMode ? 'px-2' : 'px-3'
         }`}
       >
         {!collapsedMode && (
-          <div className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 px-3 py-1 mb-1">
-            Platform Navigation
+          <div className="text-[10px] font-extrabold uppercase tracking-wider text-[var(--text-secondary)] px-3 py-1 mb-1">
+            Navigation
           </div>
         )}
 
@@ -184,18 +204,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 onClick={() => handleSelectTab(item.id)}
                 title={item.label}
                 aria-label={item.label}
-                className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold transition-all duration-150 ${
+                style={
+                  isActive
+                    ? {
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }
+                    : undefined
+                }
+                className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold transition-all duration-150 cursor-pointer ${
                   collapsedMode
                     ? 'justify-center px-0 py-2.5'
                     : 'justify-between px-3.5 py-2.5'
                 } ${
                   isActive
-                    ? 'bg-[#2563eb] text-white shadow-sm shadow-blue-600/25'
-                    : 'text-[#1e293b] hover:bg-[#f8fafc] hover:text-[#2563eb]'
+                    ? 'text-white shadow-sm'
+                    : 'text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--accent-primary)]'
                 }`}
               >
                 <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3 min-w-0'}`}>
-                  <span className={`shrink-0 ${isActive ? 'text-white' : 'text-[#1e293b]'}`}>
+                  <span className={`shrink-0 ${isActive ? 'text-white' : 'text-[var(--text-primary)]'}`}>
                     {item.icon}
                   </span>
                   {!collapsedMode && <span className="truncate">{item.label}</span>}
@@ -207,8 +235,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       isActive
                         ? 'bg-white/25 text-white'
                         : isItemAdmin && isAdmin
-                        ? 'bg-emerald-100 text-emerald-700'
-                        : 'bg-[#f8fafc] text-[#2563eb] border border-blue-200/70'
+                        ? 'bg-emerald-500/15 text-emerald-600'
+                        : 'bg-[var(--bg-subtle)] text-[var(--accent-primary)] border border-[var(--border-hairline)]'
                     }`}
                   >
                     {item.badge}
@@ -218,7 +246,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
               {/* Clean Hover Tooltip when Collapsed */}
               {collapsedMode && (
-                <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-[#0F172A] text-white text-xs font-bold whitespace-nowrap shadow-lg flex items-center gap-1.5 -translate-y-9">
+                <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg flex items-center gap-1.5 -translate-y-9">
                   <span>{item.label}</span>
                   {item.badge && (
                     <span className="px-1.5 py-0.2 rounded-md bg-blue-500/30 text-blue-200 text-[10px] uppercase">
@@ -231,7 +259,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           );
         })}
 
-        {onOpenWelink && (
+        {!isSimpleMode && onOpenWelink && (
           <div className="relative group/nav">
             <button
               type="button"
@@ -241,124 +269,186 @@ export const Sidebar: React.FC<SidebarProps> = ({
               }}
               title="WELINK AI Guide"
               aria-label="WELINK AI Guide"
-              className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold text-[#1e293b] hover:bg-blue-50/80 hover:text-[#2563eb] transition-all duration-150 mt-1 border border-blue-100 bg-[#f8fafc] ${
+              className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold text-[var(--text-primary)] hover:border-[var(--accent-primary)] transition-all duration-150 mt-1 border border-[var(--border-hairline)] bg-[var(--bg-subtle)] cursor-pointer ${
                 collapsedMode ? 'justify-center px-0 py-2.5' : 'justify-between px-3.5 py-2.5'
               }`}
             >
               <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3'}`}>
-                <span className="text-[#2563eb] shrink-0">
+                <span className="text-[var(--accent-primary)] shrink-0">
                   <Waves size={18} />
                 </span>
-                {!collapsedMode && <span>WELINK AI Guide</span>}
+                {!collapsedMode && <span>WELINK AI</span>}
               </div>
               {!collapsedMode && (
-                <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider bg-gradient-to-r from-[#2563eb] to-[#10B981] text-white">
-                  Pro AI
+                <span
+                  className="text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider text-white"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  AI
                 </span>
               )}
             </button>
             {collapsedMode && (
-              <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-[#0F172A] text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
+              <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
                 WELINK AI Guide
               </div>
             )}
           </div>
         )}
 
-        {/* Invite Friends via WhatsApp */}
+        {!isSimpleMode && (
+          /* Invite Friends via WhatsApp */
+          <div className="relative group/nav">
+            <button
+              type="button"
+              onClick={() => {
+                onCloseMobile();
+                inviteFriends();
+              }}
+              title="Invite Friends via WhatsApp"
+              aria-label="Invite Friends via WhatsApp"
+              className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold text-emerald-700 dark:text-emerald-400 hover:border-emerald-400 transition-all duration-150 mt-1 border border-emerald-500/30 bg-emerald-500/10 cursor-pointer ${
+                collapsedMode ? 'justify-center px-0 py-2.5' : 'justify-between px-3.5 py-2.5'
+              }`}
+            >
+              <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3'}`}>
+                <span className="text-emerald-500 shrink-0">
+                  <UserPlus size={18} />
+                </span>
+                {!collapsedMode && <span>Invite Friends</span>}
+              </div>
+              {!collapsedMode && (
+                <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider bg-emerald-600 text-white">
+                  Share
+                </span>
+              )}
+            </button>
+            {collapsedMode && (
+              <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
+                Invite Friends (WhatsApp)
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Theme / Appearance Quick Shortcut */}
         <div className="relative group/nav">
           <button
             type="button"
             onClick={() => {
-              onCloseMobile();
-              inviteFriends();
+              const available = APPEARANCE_THEMES.filter((th) => !th.proOnly || isProUser);
+              const idx = available.findIndex((th) => th.id === appearanceTheme);
+              const nextTheme = available[(idx + 1) % available.length] || APPEARANCE_THEMES[0];
+              setAppearanceTheme(nextTheme.id);
             }}
-            title="Invite Friends via WhatsApp"
-            aria-label="Invite Friends via WhatsApp"
-            className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold text-emerald-800 hover:bg-emerald-50 transition-all duration-150 mt-1 border border-emerald-200/80 bg-emerald-50/50 ${
+            title={
+              language === 'sw'
+                ? 'Badilisha Mandhari / Rangi'
+                : 'Switch Theme / Appearance'
+            }
+            aria-label="Switch Theme / Appearance"
+            className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold text-[var(--text-primary)] hover:border-[var(--accent-primary)] transition-all duration-150 mt-1 border border-[var(--border-hairline)] bg-[var(--bg-subtle)] cursor-pointer ${
               collapsedMode ? 'justify-center px-0 py-2.5' : 'justify-between px-3.5 py-2.5'
             }`}
           >
-            <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3'}`}>
-              <span className="text-emerald-600 shrink-0">
-                <UserPlus size={18} />
+            <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3 min-w-0'}`}>
+              <span className="text-[var(--accent-primary)] shrink-0">
+                <Palette size={18} />
               </span>
-              {!collapsedMode && <span>Invite Friends</span>}
+              {!collapsedMode && (
+                <span className="truncate">
+                  {language === 'sw' ? 'Mandhari' : 'Theme'}
+                </span>
+              )}
             </div>
             {!collapsedMode && (
-              <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider bg-emerald-600 text-white">
-                WhatsApp
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border-hairline)] truncate max-w-[92px]">
+                {APPEARANCE_THEMES.find((th) => th.id === appearanceTheme)?.emoji || '🌊'}{' '}
+                {APPEARANCE_THEMES.find((th) => th.id === appearanceTheme)?.name.split(' ')[0] || 'Ocean'}
               </span>
             )}
           </button>
           {collapsedMode && (
-            <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-[#0F172A] text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
-              Invite Friends (WhatsApp)
+            <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
+              Theme / Appearance
             </div>
           )}
         </div>
       </div>
 
-      {/* WaveLink Pro Shortcut / Upgrade Button */}
-      <div className={collapsedMode ? 'px-2 mb-2' : 'px-3.5 mb-2'}>
-        {collapsedMode ? (
-          <div className="relative group/nav flex justify-center">
-            <button
-              onClick={() => handleSelectTab('monetization')}
-              title={isProUser ? 'WaveLink Pro Active (VIP)' : 'Upgrade to WaveLink Pro'}
-              aria-label={isProUser ? 'WaveLink Pro Active (VIP)' : 'Upgrade to WaveLink Pro'}
-              className="w-11 h-11 rounded-2xl bg-gradient-to-r from-[#2563eb] to-[#10B981] hover:opacity-95 text-white shadow-sm shadow-blue-600/20 active:scale-95 transition flex items-center justify-center"
-            >
-              <Crown size={18} className="text-amber-200" />
-            </button>
-            <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-[#0F172A] text-white text-xs font-bold whitespace-nowrap shadow-lg translate-y-2">
-              {isProUser ? 'WaveLink Pro Active (VIP)' : `WaveLink Pro • ${formatPrice(18000)}`}
-            </div>
-          </div>
-        ) : (
-          <>
-            {!isProUser ? (
+      {/* WaveLink Pro Shortcut / Upgrade Button (Hidden in Simple Mode) */}
+      {!isSimpleMode && (
+        <div className={collapsedMode ? 'px-2 mb-2' : 'px-3 mb-2'}>
+          {collapsedMode ? (
+            <div className="relative group/nav flex justify-center">
               <button
                 onClick={() => handleSelectTab('monetization')}
-                className="w-full p-3 rounded-2xl bg-gradient-to-r from-[#2563eb] to-[#10B981] hover:opacity-95 text-white shadow-sm shadow-blue-600/20 active:scale-95 transition flex items-center justify-between gap-2 group"
+                title={isProUser ? 'WaveLink Pro Active (VIP)' : 'Upgrade to WaveLink Pro'}
+                aria-label={isProUser ? 'WaveLink Pro Active (VIP)' : 'Upgrade to WaveLink Pro'}
+                style={{
+                  background:
+                    'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                }}
+                className="w-11 h-11 rounded-2xl hover:opacity-95 text-white shadow-sm active:scale-95 transition flex items-center justify-center cursor-pointer"
               >
-                <div className="flex items-center gap-2 text-left min-w-0">
-                  <div className="p-1.5 rounded-xl bg-white/20">
-                    <Crown size={15} className="text-amber-200" />
-                  </div>
-                  <div className="min-w-0">
-                    <span className="text-xs font-black block tracking-tight">WaveLink Pro</span>
-                    <span className="text-[10px] text-blue-50 block truncate">{formatPrice(18000)} • M-Pesa / Mixx / Airtel</span>
-                  </div>
-                </div>
-                <Sparkles size={14} className="text-amber-200 shrink-0 group-hover:rotate-12 transition-transform" />
+                <Crown size={18} className="text-amber-200" />
               </button>
-            ) : (
-              <div className="p-2.5 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-center justify-between text-xs">
-                <span className="text-[11px] font-bold text-emerald-800 flex items-center gap-1.5">
-                  <Crown size={13} className="text-amber-500" />
-                  <span>WaveLink Pro Active</span>
-                </span>
-                <span className="text-[10px] text-emerald-700 font-bold bg-emerald-100 px-2 py-0.5 rounded-full">VIP</span>
+              <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg translate-y-2">
+                {isProUser ? 'WaveLink Pro Active (VIP)' : `WaveLink Pro • ${formatPrice(18000)}`}
               </div>
-            )}
-
-            {/* Adsterra Sidebar Sponsored Banner (Free Users Only - hidden if Pro, Blue Star, or Admin) */}
-            <AdsterraAdBanner
-              variant="sidebar"
-              onOpenUpgradeModal={() => handleSelectTab('monetization')}
-            />
-
-            {/* PWA Install Button */}
-            <div className="pt-2">
-              <PWAInstallButton variant="full" />
             </div>
-          </>
-        )}
-      </div>
+          ) : (
+            <>
+              {!isProUser ? (
+                <button
+                  onClick={() => handleSelectTab('monetization')}
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                  className="w-full p-3 rounded-2xl hover:opacity-95 text-white shadow-sm active:scale-95 transition flex items-center justify-between gap-2 group cursor-pointer"
+                >
+                  <div className="flex items-center gap-2 text-left min-w-0">
+                    <div className="p-1.5 rounded-xl bg-white/20">
+                      <Crown size={15} className="text-amber-200" />
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-xs font-black block tracking-tight">WaveLink Pro</span>
+                      <span className="text-[10px] text-white/90 block truncate">{formatPrice(18000)} • Mobile Money</span>
+                    </div>
+                  </div>
+                  <Sparkles size={14} className="text-amber-200 shrink-0 group-hover:rotate-12 transition-transform" />
+                </button>
+              ) : (
+                <div className="p-2.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-between text-xs">
+                  <span className="text-[11px] font-bold text-emerald-700 dark:text-emerald-300 flex items-center gap-1.5">
+                    <Crown size={13} className="text-amber-500" />
+                    <span>WaveLink Pro Active</span>
+                  </span>
+                  <span className="text-[10px] text-emerald-700 dark:text-emerald-300 font-bold bg-emerald-500/15 px-2 py-0.5 rounded-full">VIP</span>
+                </div>
+              )}
+
+              {/* Adsterra Sidebar Sponsored Banner (Free Users Only - hidden if Pro, Blue Star, or Admin) */}
+              <AdsterraAdBanner
+                variant="sidebar"
+                onOpenUpgradeModal={() => handleSelectTab('monetization')}
+              />
+
+              {/* PWA Install Button */}
+              <div className="pt-2">
+                <PWAInstallButton variant="full" />
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/* User Account Footer */}
-      <div className={`border-t border-slate-100 bg-[#F8FAFC] ${collapsedMode ? 'p-2' : 'p-3.5'}`}>
+      <div className={`border-t border-[var(--border-hairline)] bg-[var(--bg-subtle)]/70 ${collapsedMode ? 'p-2' : 'p-3'}`}>
         {collapsedMode ? (
           <div className="flex flex-col items-center gap-2 py-1">
             <button
@@ -367,18 +457,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
               title={`${userProfile?.displayName || currentUser?.displayName || 'Waver'} • Profile & Settings`}
               className="relative group/avatar cursor-pointer"
             >
-              <img
+              <Avatar
+                uid={currentUser?.uid}
                 src={
                   userProfile?.photoURL ||
                   currentUser?.photoURL ||
                   `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                 }
                 alt="Avatar"
-                className={`w-9 h-9 rounded-full object-cover shrink-0 ${
+                fallbackName={userProfile?.displayName || currentUser?.displayName || 'Waver'}
+                size={36}
+                showStatus={true}
+                onlyWhenVisible={false}
+                targetProfile={userProfile}
+                ringClassName={
                   userProfile?.isPro
                     ? 'pro-aura-gold ring-2 ring-amber-400'
-                    : 'ring-2 ring-blue-500/20'
-                }`}
+                    : 'ring-2 ring-[var(--accent-primary)]/30'
+                }
               />
             </button>
             <button
@@ -386,31 +482,37 @@ export const Sidebar: React.FC<SidebarProps> = ({
               onClick={signOut}
               title="Sign Out"
               aria-label="Sign Out"
-              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition"
+              className="p-1.5 text-[var(--text-secondary)] hover:text-rose-600 rounded-xl transition cursor-pointer"
             >
               <LogOut size={15} />
             </button>
           </div>
         ) : (
-          <div className="flex items-center justify-between gap-2 p-2.5 rounded-2xl bg-[#FFFFFF] border border-slate-200/90 shadow-2xs">
+          <div className="flex items-center justify-between gap-2 p-2.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xs">
             <div
               onClick={() => handleSelectTab('settings')}
               className="flex items-center gap-2.5 cursor-pointer min-w-0 flex-1"
             >
-              <img
+              <Avatar
+                uid={currentUser?.uid}
                 src={
                   userProfile?.photoURL ||
                   currentUser?.photoURL ||
                   `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                 }
                 alt="Avatar"
-                className={`w-9 h-9 rounded-full object-cover shrink-0 ${
+                fallbackName={userProfile?.displayName || currentUser?.displayName || 'Waver'}
+                size={36}
+                showStatus={true}
+                onlyWhenVisible={false}
+                targetProfile={userProfile}
+                ringClassName={
                   activeFrameClass
                     ? activeFrameClass
                     : userProfile?.isPro
                     ? 'pro-aura-gold ring-2 ring-amber-400'
-                    : 'ring-2 ring-blue-500/20'
-                }`}
+                    : 'ring-2 ring-[var(--accent-primary)]/30'
+                }
               />
               <div className="min-w-0 flex-1">
                 <div className="truncate">
@@ -426,13 +528,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     showAdminTag={isAdmin}
                   />
                 </div>
-                <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-500 mt-0.5">
-                  <span className="inline-flex items-center gap-0.5 text-amber-600 font-extrabold">
-                    <Coins size={10} className="text-amber-500" />
+                <div className="flex items-center gap-1.5 text-[10px] font-bold text-[var(--text-secondary)] mt-0.5">
+                  <span className="inline-flex items-center gap-0.5 text-amber-500 font-extrabold">
+                    <Coins size={10} />
                     {(userProfile?.wavePoints ?? 10).toLocaleString()} pts
                   </span>
                   <span>•</span>
-                  <span className="inline-flex items-center gap-0.5 text-orange-600 font-extrabold">
+                  <span className="inline-flex items-center gap-0.5 text-orange-500 font-extrabold">
                     <Flame size={10} className="fill-orange-500 text-orange-500" />
                     {Math.max(1, userProfile?.loginStreak ?? 1)}d
                   </span>
@@ -444,18 +546,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <button
                 onClick={signOut}
                 title="Sign Out"
-                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition"
+                className="p-1.5 text-[var(--text-secondary)] hover:text-rose-600 rounded-xl transition cursor-pointer"
               >
                 <LogOut size={15} />
               </button>
             </div>
-          </div>
-        )}
-        {!collapsedMode && (
-          <div className="pt-2.5 text-center">
-            <p className="text-[11px] font-extrabold tracking-wide text-[#0D9488]">
-              Empowering African Creators
-            </p>
           </div>
         )}
       </div>

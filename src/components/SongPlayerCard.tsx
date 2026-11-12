@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import {
   Play,
   Pause,
@@ -8,6 +8,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { resolvePlayableAudioUrl } from '../utils/creatorStudioAudio';
+import { EXCLUSIVE_AUDIO_EVENT } from './VideoPlayer';
 
 export interface SongPlayerCardProps {
   title: string;
@@ -43,6 +44,7 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
   const [duration, setDuration] = useState(30);
   const [isMuted, setIsMuted] = useState(defaultMuted);
 
+  const audioInstanceId = useId();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const manuallyPausedRef = useRef<boolean>(false);
@@ -100,14 +102,40 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
     }
   }, [normalizedVolume, isMuted]);
 
+  const pauseAudio = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    setIsPlaying(false);
+  }, []);
+
+  // Listen to global exclusive audio events so if a video unmutes/plays audio, this music track pauses
+  useEffect(() => {
+    const handleOtherAudio = (e: Event) => {
+      const custom = e as CustomEvent<{ id?: string }>;
+      if (custom.detail?.id && custom.detail.id !== audioInstanceId) {
+        pauseAudio();
+      }
+    };
+    window.addEventListener(EXCLUSIVE_AUDIO_EVENT, handleOtherAudio);
+    return () => {
+      window.removeEventListener(EXCLUSIVE_AUDIO_EVENT, handleOtherAudio);
+    };
+  }, [audioInstanceId, pauseAudio]);
+
   const playAudio = useCallback(
     (fromReplay = false) => {
       const audio = getOrCreateAudio();
 
-      // Stop any other post's audio so only one post plays at a time
+      // Stop any other post's audio (song or video) so only one post plays audio at a time
       if (activeGlobalAudio && activeGlobalAudio !== audio) {
         activeGlobalAudio.pause();
         if (stopActiveGlobalAudio) stopActiveGlobalAudio();
+      }
+      if (!audio.muted && typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent(EXCLUSIVE_AUDIO_EVENT, { detail: { id: audioInstanceId } })
+        );
       }
 
       if (fromReplay || hasEnded || (audio.duration && audio.currentTime >= audio.duration - 0.2)) {
@@ -150,15 +178,8 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
           });
       }
     },
-    [getOrCreateAudio, hasEnded, startOffset]
+    [getOrCreateAudio, hasEnded, startOffset, audioInstanceId]
   );
-
-  const pauseAudio = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-    }
-    setIsPlaying(false);
-  }, []);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -175,14 +196,14 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
     };
   }, []);
 
-  // Auto-play when post scrolls into view; pause when it scrolls away
+  // Auto-play when post is > 60% on screen; pause when it scrolls away
   useEffect(() => {
     if (!autoPlayOnVisible || !cardRef.current) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
         const [entry] = entries;
-        if (entry.isIntersecting) {
+        if (entry.isIntersecting && entry.intersectionRatio >= 0.6) {
           if (!manuallyPausedRef.current && !hasEnded) {
             playAudio(false);
           }
@@ -192,8 +213,8 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
         }
       },
       {
-        threshold: 0.55,
-        rootMargin: '0px 0px -40px 0px',
+        threshold: [0, 0.6, 0.85],
+        rootMargin: '0px 0px -30px 0px',
       }
     );
 
@@ -217,12 +238,23 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
     }
   };
 
+  const handleReplay = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    manuallyPausedRef.current = false;
+    playAudio(true);
+  };
+
   const handleToggleMute = (e: React.MouseEvent) => {
     e.stopPropagation();
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
     if (audioRef.current) {
       audioRef.current.muted = nextMuted;
+    }
+    if (!nextMuted && isPlaying && typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent(EXCLUSIVE_AUDIO_EVENT, { detail: { id: audioInstanceId } })
+      );
     }
   };
 
@@ -257,78 +289,67 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
   return (
     <div
       ref={cardRef}
-      className={`wavelink-inpost-player ${
+      className={`wavelink-inpost-player wavelink-glass-music-pill ${
         compact ? 'py-2 px-3' : 'py-2.5 px-3.5'
-      } rounded-2xl bg-[#FAF7F2] border transition-all ${
-        isPlaying
-          ? 'border-[#2563EB]/60 shadow-2xs'
-          : 'border-[#EFECE6] hover:border-[#2563EB]/30'
+      } rounded-full transition-all ${
+        isPlaying ? 'wavelink-glass-music-pill--playing' : ''
       }`}
     >
       <div className="flex items-center gap-2.5 min-w-0">
-        {/* Play / Pause / Replay Button (>=44px touch target) */}
+        {/* Spinning Disc + Play/Pause Trigger */}
         <button
           type="button"
           onClick={handleTogglePlayOrReplay}
           aria-label={hasEnded ? 'Replay track' : isPlaying ? 'Pause track' : 'Play track'}
-          className={`min-h-[44px] ${
-            hasEnded ? 'px-3.5 gap-1.5' : 'min-w-[44px] w-11'
-          } rounded-xl flex items-center justify-center shrink-0 font-bold text-xs transition active:scale-95 cursor-pointer ${
-            hasEnded
-              ? 'bg-[#0D9488] hover:bg-teal-700 text-white shadow-2xs'
-              : isPlaying
-              ? 'bg-[#2563EB] text-white shadow-2xs'
-              : 'bg-white border border-[#EFECE6] text-[#1C1917] hover:border-[#2563EB]'
-          }`}
+          className="relative w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center shrink-0 transition-transform active:scale-95 cursor-pointer bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white shadow-sm overflow-hidden"
         >
-          {hasEnded ? (
-            <>
-              <RotateCcw size={15} />
-              <span>Replay</span>
-            </>
-          ) : isPlaying ? (
-            <Pause size={16} />
+          {albumArt ? (
+            <img
+              src={albumArt}
+              alt={title}
+              className={`w-full h-full object-cover opacity-85 ${
+                isPlaying ? 'animate-spin' : ''
+              }`}
+              style={{ animationDuration: '5s' }}
+            />
           ) : (
-            <Play size={16} className="ml-0.5 fill-current" />
+            <Disc
+              size={18}
+              className={`text-white/90 ${isPlaying ? 'animate-spin' : ''}`}
+              style={{ animationDuration: '4s' }}
+            />
           )}
+          <span className="absolute inset-0 bg-black/25 flex items-center justify-center">
+            {hasEnded ? (
+              <RotateCcw size={14} className="text-white" />
+            ) : isPlaying ? (
+              <Pause size={14} className="fill-white text-white" />
+            ) : (
+              <Play size={14} className="ml-0.5 fill-white text-white" />
+            )}
+          </span>
         </button>
 
-        {/* Spinning Disc + Track Info + Progress Bar */}
+        {/* Track Info + Thin Scrubbable Progress Bar */}
         <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between gap-2 mb-1.5">
-            <div className="flex items-center gap-2 min-w-0">
-              <div className="relative w-6 h-6 rounded-full overflow-hidden shrink-0 bg-slate-900 flex items-center justify-center border border-[#EFECE6]">
-                {albumArt ? (
-                  <img
-                    src={albumArt}
-                    alt={title}
-                    className={`w-full h-full object-cover ${
-                      isPlaying ? 'animate-spin' : ''
-                    }`}
-                    style={{ animationDuration: '4s' }}
-                  />
-                ) : (
-                  <Disc
-                    size={14}
-                    className={`text-[#2563EB] ${isPlaying ? 'animate-spin' : ''}`}
-                    style={{ animationDuration: '3s' }}
-                  />
-                )}
-              </div>
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <div className="flex items-center gap-1.5 min-w-0">
               <Disc
-                size={14}
-                className={`shrink-0 text-[#2563EB] ${isPlaying ? 'animate-spin' : 'opacity-60'}`}
+                size={13}
+                className={`shrink-0 text-[var(--accent-primary)] ${
+                  isPlaying ? 'animate-spin' : 'opacity-70'
+                }`}
                 style={{ animationDuration: '3s' }}
               />
-              <p className="text-xs font-bold text-[#1C1917] truncate">
+              <p className="text-xs font-extrabold text-[var(--text-primary)] truncate">
                 {title}
                 {artist ? (
-                  <span className="font-medium text-[#57534E]"> · {artist}</span>
+                  <span className="font-semibold text-[var(--text-secondary)]"> · {artist}</span>
                 ) : null}
               </p>
             </div>
 
-            <span className="text-[11px] font-mono text-[#78716C] tabular-nums shrink-0">
+            <span className="text-[10px] font-mono text-[var(--text-secondary)] tabular-nums shrink-0">
               {formatTime(currentTime)}
             </span>
           </div>
@@ -341,7 +362,7 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
             aria-valuemin={0}
             aria-valuemax={Math.round(duration)}
             aria-valuenow={Math.round(currentTime)}
-            className="h-1.5 w-full bg-[#EFECE6] rounded-full overflow-hidden cursor-pointer"
+            className="h-1.5 w-full bg-slate-200/70 dark:bg-white/15 rounded-full overflow-hidden cursor-pointer"
           >
             <div
               className="h-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] rounded-full transition-all duration-150"
@@ -350,21 +371,38 @@ export const SongPlayerCard: React.FC<SongPlayerCardProps> = ({
           </div>
         </div>
 
-        {/* Mute / Unmute Button (>=44px touch target) */}
+        {/* Dedicated Replay Pill Button */}
+        <button
+          type="button"
+          onClick={handleReplay}
+          aria-label="Replay track"
+          title="Replay track from start"
+          className={`min-h-[38px] px-2.5 rounded-full flex items-center gap-1 text-[11px] font-extrabold shrink-0 transition-transform active:scale-95 cursor-pointer ${
+            hasEnded
+              ? 'bg-[#0D9488] text-white shadow-xs'
+              : 'bg-white/60 dark:bg-white/10 text-[var(--text-primary)] border border-white/40 dark:border-white/15 hover:border-[var(--accent-primary)]'
+          }`}
+        >
+          <RotateCcw size={13} />
+          <span className="hidden xs:inline">Replay</span>
+        </button>
+
+        {/* Mute / Unmute Button */}
         <button
           type="button"
           onClick={handleToggleMute}
           aria-label={isMuted ? 'Unmute music' : 'Mute music'}
           title={isMuted ? 'Tap to unmute' : 'Mute'}
-          className={`min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center shrink-0 transition active:scale-95 cursor-pointer ${
+          className={`w-9 h-9 min-w-[36px] min-h-[36px] rounded-full flex items-center justify-center shrink-0 transition-transform active:scale-95 cursor-pointer ${
             isMuted
-              ? 'bg-amber-50 text-amber-700 border border-amber-200'
-              : 'text-[#57534E] hover:text-[#1C1917] hover:bg-white'
+              ? 'bg-amber-500/20 text-amber-600 dark:text-amber-300 border border-amber-400/40'
+              : 'bg-white/60 dark:bg-white/10 text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-white/40 dark:border-white/15'
           }`}
         >
-          {isMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+          {isMuted ? <VolumeX size={15} /> : <Volume2 size={15} />}
         </button>
       </div>
     </div>
   );
 };
+

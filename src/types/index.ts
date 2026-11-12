@@ -1,10 +1,18 @@
 export type UserStatus = 'active' | 'warned' | 'banned';
 export type AppearanceTheme =
+  | 'ocean'
+  | 'hearts'
+  | 'midnight'
+  | 'neon'
+  | 'camo'
+  | 'sunset'
+  | 'flowers'
+  | 'racing'
+  | 'galaxy'
   | 'classic'
   | 'savanna'
   | 'zanzibar'
   | 'kilimanjaro'
-  | 'sunset'
   | 'river'
   | 'sunrise';
 
@@ -29,10 +37,34 @@ export type PanAfricanLanguageCode = 'en' | 'sw' | 'fr' | 'rw' | 'lg' | 'am';
 export type ProBorderEffect = 'aura-gold' | 'neon-pulse' | 'cosmic-glow' | 'emerald-ring' | 'none';
 export type ProAccentColor = 'purple' | 'gold' | 'emerald' | 'neon' | 'crimson';
 
+export type ProfileCoverType = 'default' | 'preset' | 'image' | 'animated' | 'video';
+
+export type ProfileCoverPresetId =
+  | 'theme-default'
+  | 'ocean-waves'
+  | 'cosmic-galaxy'
+  | 'floral-bloom'
+  | 'nitro-racing'
+  | 'neon-cyber'
+  | 'savanna-sunset'
+  | 'aurora-pulse'
+  | 'emerald-matrix';
+
+export interface StoryHighlightItem {
+  id: string;
+  title: string;
+  coverUrl: string;
+  mediaUrl?: string;
+  mediaType?: 'image' | 'video';
+  sparkId?: string;
+  createdAt: string;
+}
+
 export interface UserPrivacySettings {
   profileVisibility: 'public' | 'followers' | 'private';
   showOnlineStatus: boolean;
   showLastSeen: boolean;
+  onlineStatusAudience?: 'everyone' | 'close_friends' | 'nobody';
   allowDirectMessages: 'everyone' | 'followers' | 'none';
   allowCalls: 'everyone' | 'followers' | 'none';
   sparkVisibility: 'everyone' | 'followers';
@@ -95,10 +127,17 @@ export interface UserProfile {
   savedPostIds?: string[];
   followingIds?: string[];
   blockedUserIds?: string[];
+  closeFriendIds?: string[];
   appearanceTheme?: AppearanceTheme;
   privacySettings?: UserPrivacySettings;
   notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;
+  // Profile Cover & Pinned Post & Story Highlights
+  coverImageUrl?: string;
+  coverPresetId?: ProfileCoverPresetId;
+  coverType?: ProfileCoverType;
+  pinnedPostId?: string;
+  storyHighlights?: StoryHighlightItem[];
   // Phase 1: Data Saver preference
   dataSaverEnabled?: boolean;
   // Phase 2: Language preference ('en' | 'sw') & Pan-African option
@@ -352,6 +391,8 @@ export interface CallSignalMessage {
   candidate?: any;
 }
 
+export type CommentReactionType = 'heart' | 'laugh' | 'wow';
+
 export interface PostComment {
   id: string;
   postId: string;
@@ -362,6 +403,21 @@ export interface PostComment {
   authorPhotoURL?: string;
   content: string;
   createdAt: string;
+  updatedAt?: string;
+  parentId?: string | null;
+  replyToName?: string | null;
+  reactions?: {
+    heart?: string[];
+    laugh?: string[];
+    wow?: string[];
+  };
+  reactionCounts?: {
+    heart?: number;
+    laugh?: number;
+    wow?: number;
+  };
+  /** Client-only optimistic state for instant comment rendering and retry */
+  clientStatus?: 'sending' | 'sent' | 'failed';
 }
 
 export interface Announcement {
@@ -425,6 +481,7 @@ export interface ChannelMessage {
   senderPhotoURL?: string;
   text: string;
   mediaUrl?: string;
+  mediaUrls?: string[];
   mediaType?: 'image' | 'video' | 'audio' | 'none';
   audioUrl?: string;
   audioDuration?: number;
@@ -432,6 +489,7 @@ export interface ChannelMessage {
   replyToId?: string;
   replyToText?: string;
   replyToSenderName?: string;
+  reactions?: Record<string, string[]>;
   isEdited?: boolean;
   isDeleted?: boolean;
   isBotReply?: boolean;
@@ -738,7 +796,7 @@ export interface ContentReport {
   reporterId: string;
   reporterEmail: string;
   reporterName?: string;
-  targetType: 'user' | 'post' | 'bot_reply';
+  targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video';
   targetId: string;
   targetAuthorId?: string;
   targetSummary?: string;

@@ -4,7 +4,7 @@ import {
   getFirestore,
   initializeFirestore,
   persistentLocalCache,
-  persistentMultipleTabManager,
+  persistentSingleTabManager,
   setLogLevel,
   doc,
   getDoc
@@ -20,25 +20,55 @@ setLogLevel('silent');
 
 const app = initializeApp(firebaseConfig);
 
-// Enable Firestore offline persistence so repeat visits read from local IndexedDB cache
+// Enable Firestore offline persistence with forceOwnership to prevent multi-tab deadlock hangs
 let firestoreDb: ReturnType<typeof getFirestore>;
 try {
   firestoreDb = initializeFirestore(
     app,
     {
       localCache: persistentLocalCache({
-        tabManager: persistentMultipleTabManager()
+        tabManager: persistentSingleTabManager({ forceOwnership: true })
       })
     },
     firebaseConfig.firestoreDatabaseId
   );
 } catch {
-  firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  try {
+    firestoreDb = initializeFirestore(app, {}, firebaseConfig.firestoreDatabaseId);
+  } catch {
+    firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
 }
 
 export const db = firestoreDb;
 
 export const auth = getAuth(app);
+
+// ============================================================================
+// FIREBASE REALTIME DATABASE (Presence & Ephemeral Typing Indicators)
+// Zero Firestore reads: used for instant online/offline presence & typing status
+// ============================================================================
+import { getDatabase as getFbDatabase, Database } from 'firebase/database';
+
+let realtimeDbInstance: Database | null = null;
+try {
+  // Support custom databaseURL or standard default based on project ID
+  const customDbUrl =
+    (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_DATABASE_URL) ||
+    (firebaseConfig as any).databaseURL ||
+    `https://${firebaseConfig.projectId}-default-rtdb.firebaseio.com`;
+
+  realtimeDbInstance = getFbDatabase(app, customDbUrl);
+} catch (rtdbErr) {
+  try {
+    realtimeDbInstance = getFbDatabase(app);
+  } catch (fallbackErr) {
+    console.warn('[WaveLink RTDB] Realtime Database initialization warning:', fallbackErr);
+    realtimeDbInstance = null;
+  }
+}
+
+export const rtdb = realtimeDbInstance;
 
 // ============================================================================
 // IN-MEMORY USER PROFILE CACHE

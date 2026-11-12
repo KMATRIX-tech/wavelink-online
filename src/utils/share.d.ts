@@ -7,3 +7,20 @@ export function downloadPost(post: Partial<Post> | any): Promise<{ success: bool
 export function sharePost(post: Partial<Post> | any): Promise<{ success: boolean; method: string }>;
 
 export function inviteFriends(customMessage?: string): Promise<{ success: boolean; method: string }>;
+
+export function getPostShareUrl(postOrId: Partial<Post> | string | any): string;
+
+export function sharePostToPlatform(
+  platform:
+    | 'whatsapp'
+    | 'telegram'
+    | 'facebook'
+    | 'x'
+    | 'messenger'
+    | 'instagram'
+    | 'reddit'
+    | 'sms'
+    | 'more',
+  post: Partial<Post> | any
+): Promise<{ success: boolean; method: string; copiedFallback?: boolean }>;
+

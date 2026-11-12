@@ -27,7 +27,8 @@ import {
   isAuthNetworkError,
   getFriendlyAuthErrorMessage,
   getAuthHeaders,
-  getClientDeviceId
+  getClientDeviceId,
+  setCachedUserProfile
 } from '../firebase';
 import {
   UserProfile,
@@ -43,7 +44,10 @@ import {
   UserNotificationSettings,
   UserTermsAgreement,
   AuditActionType,
-  AppLanguage
+  AppLanguage,
+  ProfileCoverPresetId,
+  ProfileCoverType,
+  StoryHighlightItem
 } from '../types';
 import {
   removeCurrentDeviceFcmToken,
@@ -310,6 +314,7 @@ interface AuthContextType {
     proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
     appearanceTheme?: AppearanceTheme;
     followingIds?: string[];
+    closeFriendIds?: string[];
     privacySettings?: UserPrivacySettings;
     notificationSettings?: UserNotificationSettings;
     termsAgreement?: UserTermsAgreement;
@@ -328,11 +333,16 @@ interface AuthContextType {
     weeklyWinnerHashtag?: string;
     isCreatorSpotlight?: boolean;
     spotlightNote?: string;
+    coverImageUrl?: string;
+    coverPresetId?: ProfileCoverPresetId;
+    coverType?: ProfileCoverType;
+    pinnedPostId?: string;
+    storyHighlights?: StoryHighlightItem[];
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
   toggleBlockUser: (targetUserId: string) => Promise<boolean>;
   reportContent: (params: {
-    targetType: 'user' | 'post' | 'bot_reply';
+    targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video';
     targetId: string;
     targetAuthorId?: string;
     targetSummary?: string;
@@ -1242,6 +1252,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const uid = currentUser?.uid;
       if (uid) {
+        // Mark offline in Firebase Realtime Database & detach presence listeners BEFORE signing out
+        try {
+          const { goOfflineAndCleanupPresence } = await import('./PresenceContext');
+          await goOfflineAndCleanupPresence(uid);
+        } catch {
+          // ignore
+        }
         // Delete this device's FCM token from Firestore & server on logout
         await removeCurrentDeviceFcmToken(uid).catch(() => {});
         await setDoc(
@@ -1337,6 +1354,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
     appearanceTheme?: AppearanceTheme;
     followingIds?: string[];
+    closeFriendIds?: string[];
     privacySettings?: UserPrivacySettings;
     notificationSettings?: UserNotificationSettings;
     termsAgreement?: UserTermsAgreement;
@@ -1355,10 +1373,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     weeklyWinnerHashtag?: string;
     isCreatorSpotlight?: boolean;
     spotlightNote?: string;
+    coverImageUrl?: string;
+    coverPresetId?: ProfileCoverPresetId;
+    coverType?: ProfileCoverType;
+    pinnedPostId?: string;
+    storyHighlights?: StoryHighlightItem[];
   }) => {
     if (!currentUser) return;
     try {
       const userRef = doc(db, 'users', currentUser.uid);
+
+      // Guard custom cover fields so only Pro/Admin/Verified users can set custom covers
+      const isUserCurrentlyPro =
+        Boolean(
+          currentUser?.email && currentUser.email.trim().toLowerCase() === 'keylanmbilinyi5@gmail.com'
+        ) ||
+        Boolean((userProfile as any)?.isOwner) ||
+        customClaimRole === 'admin' ||
+        customClaimRole === 'sub_admin' ||
+        serverVerifiedRole === 'admin' ||
+        serverVerifiedRole === 'super_admin' ||
+        serverVerifiedRole === 'sub_admin' ||
+        userProfile?.role === 'admin' ||
+        userProfile?.role === 'super_admin' ||
+        userProfile?.role === 'sub_admin' ||
+        Boolean(userProfile?.isSubAdmin) ||
+        Boolean(userProfile?.isPro) ||
+        Boolean(userProfile?.hasBlueStar) ||
+        Boolean(userProfile?.isVerifiedByAdmin);
+
+      if (
+        !isUserCurrentlyPro &&
+        (data.coverImageUrl !== undefined ||
+          (data.coverPresetId !== undefined && data.coverPresetId !== 'theme-default') ||
+          (data.coverType !== undefined && data.coverType !== 'default'))
+      ) {
+        showGlobalToast('Upgrade to WaveLink Pro to set a custom profile cover.');
+        throw new Error('Upgrade to WaveLink Pro to set a custom profile cover.');
+      }
 
       // Clean username formatting
       let formattedUsername = data.username?.trim();
@@ -1378,6 +1430,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (data.proBadge !== undefined) updatePayload.proBadge = data.proBadge;
       if (data.appearanceTheme !== undefined) updatePayload.appearanceTheme = data.appearanceTheme;
       if (data.followingIds !== undefined) updatePayload.followingIds = data.followingIds;
+      if (data.closeFriendIds !== undefined) updatePayload.closeFriendIds = data.closeFriendIds;
       if (data.privacySettings !== undefined) {
         updatePayload.privacySettings = data.privacySettings;
         updatePayload.isOnline = data.privacySettings.showOnlineStatus;
@@ -1434,6 +1487,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (data.spotlightNote !== undefined) {
         updatePayload.spotlightNote = sanitizeUserText(data.spotlightNote, 200);
       }
+      if (data.coverImageUrl !== undefined) {
+        updatePayload.coverImageUrl = sanitizeUserText(data.coverImageUrl, 2048);
+      }
+      if (data.coverPresetId !== undefined) {
+        updatePayload.coverPresetId = data.coverPresetId;
+      }
+      if (data.coverType !== undefined) {
+        updatePayload.coverType = data.coverType;
+      }
+      if (data.pinnedPostId !== undefined) {
+        updatePayload.pinnedPostId = sanitizeUserText(data.pinnedPostId, 160);
+      }
+      if (data.storyHighlights !== undefined && Array.isArray(data.storyHighlights)) {
+        updatePayload.storyHighlights = data.storyHighlights.slice(0, 20);
+      }
 
       const sanitized = cleanFirestoreData(updatePayload);
       await setDoc(userRef, sanitized, { merge: true });
@@ -1445,7 +1513,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         });
       }
 
-      setUserProfile((prev) => (prev ? { ...prev, ...sanitized } : null));
+      setUserProfile((prev) => {
+        if (!prev) return null;
+        const nextProfile = { ...prev, ...sanitized } as UserProfile;
+        setCachedUserProfile(currentUser.uid, nextProfile);
+        return nextProfile;
+      });
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `users/${currentUser.uid}`);
     }
@@ -1479,7 +1552,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const reportContent = async (params: {
-    targetType: 'user' | 'post' | 'bot_reply';
+    targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video';
     targetId: string;
     targetAuthorId?: string;
     targetSummary?: string;

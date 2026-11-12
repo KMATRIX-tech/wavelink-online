@@ -16,18 +16,14 @@ import {
   updateDoc,
   deleteDoc
 } from 'firebase/firestore';
-import { Post, PostComment } from '../types';
+import { Post } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { CreatorTipModal } from './CreatorTipModal';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { VideoUploadProgressChip } from './VideoUploadProgressChip';
-import { QuotaExceededBanner } from './QuotaExceededBanner';
-import { sendNotification } from '../services/notificationService';
-import { sharePost } from '../utils/share.js';
-
-function sanitizeUserText(raw: string, maxLen = 800): string {
-  return (raw || '').trim().slice(0, maxLen);
-}
+import { CommentsSheet } from './CommentsSheet';
+import { ShareSheet } from './ShareSheet';
+import { Avatar } from './Avatar';
 import {
   cloneVideoFileToMemory,
   inspectAndValidateVideoFile,
@@ -427,14 +423,17 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
             className="absolute left-3.5 sm:left-4 right-20 sm:right-4 bottom-4 sm:bottom-6 z-20 flex flex-col gap-2 text-white pointer-events-auto"
           >
             <div className="flex items-center gap-2.5">
-              <img
+              <Avatar
+                uid={post.authorId}
                 src={
                   post.authorPhotoURL ||
                   `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`
                 }
                 alt={post.authorName}
-                referrerPolicy="no-referrer"
-                className="w-10 h-10 rounded-2xl object-cover ring-2 ring-white/85 shadow-md shrink-0 bg-stone-800"
+                fallbackName={post.authorName}
+                size={40}
+                showStatus={true}
+                ringClassName="ring-2 ring-white/85 shadow-md bg-stone-800"
               />
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5 flex-wrap">
@@ -508,7 +507,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
             </span>
           </button>
 
-          {/* 3. Share */}
+          {/* 3. Share (Opens Frosted Share Sheet / Modal) */}
           <button
             type="button"
             onClick={() => onShare(post)}
@@ -524,8 +523,8 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
             >
               {isCopied ? <Check size={19} /> : <Share2 size={19} />}
             </span>
-            <span className="text-[10px] font-bold text-white drop-shadow-xs">
-              {isCopied ? 'Copied' : 'Share'}
+            <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
+              {isCopied ? 'Shared' : post.sharesCount ? post.sharesCount : 'Share'}
             </span>
           </button>
 
@@ -586,12 +585,9 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
   // Remembered sound preference across reels
   const [isMuted, setIsMuted] = useState<boolean>(() => getRememberedMuted());
 
-  // Comments Bottom Sheet state
+  // Comments & Share Sheet state
   const [activeCommentsPost, setActiveCommentsPost] = useState<Post | null>(null);
-  const [reelComments, setReelComments] = useState<PostComment[]>([]);
-  const [isLoadingComments, setIsLoadingComments] = useState<boolean>(false);
-  const [commentText, setCommentText] = useState<string>('');
-  const [isSendingComment, setIsSendingComment] = useState<boolean>(false);
+  const [activeSharePost, setActiveSharePost] = useState<Post | null>(null);
 
   // Tip Creator Modal state
   const [tippingPost, setTippingPost] = useState<Post | null>(null);
@@ -790,36 +786,6 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
     }
   };
 
-  // Real-time comments listener for the active bottom sheet reel
-  useEffect(() => {
-    if (!activeCommentsPost?.id) {
-      setReelComments([]);
-      return;
-    }
-    setIsLoadingComments(true);
-    const q = query(
-      collection(db, 'posts', activeCommentsPost.id, 'comments'),
-      orderBy('createdAt', 'asc'),
-      limit(30)
-    );
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const list: PostComment[] = [];
-        snap.forEach((d) => {
-          list.push({ ...(d.data() as Omit<PostComment, 'id'>), id: d.id });
-        });
-        setReelComments(list);
-        setIsLoadingComments(false);
-      },
-      (err) => {
-        setIsLoadingComments(false);
-        handleFirestoreError(err, OperationType.LIST, `posts/${activeCommentsPost.id}/comments`);
-      }
-    );
-    return () => unsub();
-  }, [activeCommentsPost?.id]);
-
   const handleToggleSound = (e: React.MouseEvent) => {
     e.stopPropagation();
     const nextMuted = !isMuted;
@@ -833,11 +799,21 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
     const updatedLikes = isLiked
       ? (post.likes || []).filter((id) => id !== currentUser.uid)
       : [...(post.likes || []), currentUser.uid];
+    const nextLikesCount = updatedLikes.length;
+
+    // Instant optimistic update on the reel list
+    setVideoPosts((prev) =>
+      prev.map((item) =>
+        item.id === post.id
+          ? { ...item, likes: updatedLikes, likesCount: nextLikesCount }
+          : item
+      )
+    );
 
     try {
       await updateDoc(doc(db, 'posts', post.id), {
         likes: updatedLikes,
-        likesCount: updatedLikes.length
+        likesCount: nextLikesCount
       });
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `posts/${post.id}`);
@@ -848,96 +824,29 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
     await toggleSavePost(postId);
   };
 
-  const handleShare = async (post: Post) => {
-    try {
-      const res = await sharePost(post);
-      if (res?.method === 'clipboard') {
-        setCopiedId(post.id);
-        setTimeout(() => setCopiedId(null), 2000);
-      }
-    } catch {
-      navigator.clipboard?.writeText(`${window.location.origin}/#video-${post.id}`);
-      setCopiedId(post.id);
-      setTimeout(() => setCopiedId(null), 2000);
-    }
+  const handleShare = (post: Post) => {
+    setActiveSharePost(post);
   };
 
-  const handleSubmitReelComment = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!currentUser || !activeCommentsPost) return;
-    const cleanText = sanitizeUserText(commentText, 800);
-    if (!cleanText) return;
+  const handleCommentCountChange = useCallback((postId: string, newCount: number) => {
+    setVideoPosts((prev) =>
+      prev.map((p) => (p.id === postId ? { ...p, commentsCount: newCount } : p))
+    );
+    setActiveCommentsPost((prev) =>
+      prev && prev.id === postId ? { ...prev, commentsCount: newCount } : prev
+    );
+  }, []);
 
-    setIsSendingComment(true);
-    try {
-      const postId = activeCommentsPost.id;
-      const commentData = {
-        postId,
-        authorId: currentUser.uid,
-        authorEmail: currentUser.email || '',
-        authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
-        authorUsername:
-          userProfile?.username || `@${currentUser.email?.split('@')[0] || 'waver'}`,
-        authorPhotoURL:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
-        content: cleanText,
-        createdAt: new Date().toISOString()
-      };
-
-      await addDoc(collection(db, 'posts', postId, 'comments'), commentData);
-
-      const latestPost = videoPosts.find((p) => p.id === postId) || activeCommentsPost;
-      const newCount = (latestPost.commentsCount || 0) + 1;
-      await updateDoc(doc(db, 'posts', postId), {
-        commentsCount: newCount
-      });
-
-      if (latestPost.authorId && latestPost.authorId !== currentUser.uid) {
-        sendNotification({
-          recipientId: latestPost.authorId,
-          type: 'post_comment',
-          title: 'New Comment on Reel 💬',
-          body: `${userProfile?.displayName || currentUser.displayName || 'A waver'} commented: "${cleanText.substring(0, 50)}${cleanText.length > 50 ? '...' : ''}"`,
-          entityId: postId,
-          actorId: currentUser.uid,
-          actorName: userProfile?.displayName || currentUser.displayName || 'A waver',
-          actorPhotoURL: userProfile?.photoURL || currentUser.photoURL || undefined
-        }).catch(() => {});
-      }
-
-      setCommentText('');
-    } catch (error) {
-      handleFirestoreError(
-        error,
-        OperationType.CREATE,
-        `posts/${activeCommentsPost.id}/comments`
-      );
-    } finally {
-      setIsSendingComment(false);
-    }
-  };
-
-  const handleDeleteReelComment = async (comment: PostComment) => {
-    if (!currentUser || !activeCommentsPost) return;
-    if (comment.authorId !== currentUser.uid && !isAdmin) return;
-    try {
-      const postId = activeCommentsPost.id;
-      await deleteDoc(doc(db, 'posts', postId, 'comments', comment.id));
-      const latestPost = videoPosts.find((p) => p.id === postId) || activeCommentsPost;
-      const nextCount = Math.max(0, (latestPost.commentsCount || 1) - 1);
-      await updateDoc(doc(db, 'posts', postId), {
-        commentsCount: nextCount
-      });
-    } catch (error) {
-      handleFirestoreError(
-        error,
-        OperationType.DELETE,
-        `posts/${activeCommentsPost.id}/comments/${comment.id}`
-      );
-    }
-  };
+  const handleShareCountChange = useCallback((postId: string, newCount: number) => {
+    setVideoPosts((prev) =>
+      prev.map((p) => (p.id === postId ? { ...p, sharesCount: newCount } : p))
+    );
+    setActiveSharePost((prev) =>
+      prev && prev.id === postId ? { ...prev, sharesCount: newCount } : prev
+    );
+    setCopiedId(postId);
+    setTimeout(() => setCopiedId((prev) => (prev === postId ? null : prev)), 2000);
+  }, []);
 
   const handleVideoFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const rawFile = e.target.files?.[0];
@@ -1201,122 +1110,21 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
         </div>
       )}
 
-      {/* Comments Bottom Sheet over the Active Reel */}
-      {activeCommentsPost && (
-        <div
-          className="fixed inset-0 z-50 flex flex-col justify-end bg-black/55 backdrop-blur-xs animate-fade-in"
-          onClick={() => setActiveCommentsPost(null)}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom, 0px))' }}
-            className="w-full max-w-xl mx-auto bg-[var(--bg-surface)] text-[var(--text-primary)] rounded-t-3xl border-t border-[var(--border-hairline)] shadow-2xl max-h-[72dvh] flex flex-col overflow-hidden"
-          >
-            {/* Grab Handle & Header */}
-            <div className="pt-2.5 pb-3 px-5 border-b border-[var(--border-hairline)] flex flex-col items-center relative">
-              <div className="w-10 h-1.5 rounded-full bg-stone-300 mb-2" />
-              <div className="w-full flex items-center justify-between">
-                <h4 className="text-sm font-extrabold text-[var(--text-primary)]">
-                  Comments ({reelComments.length})
-                </h4>
-                <button
-                  type="button"
-                  onClick={() => setActiveCommentsPost(null)}
-                  className="p-1.5 rounded-xl text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] transition cursor-pointer"
-                  aria-label="Close comments"
-                >
-                  <X size={18} />
-                </button>
-              </div>
-            </div>
+      {/* Frosted-Glass Comments Sheet (Mobile Bottom Sheet / Desktop Right-Side Panel) */}
+      <CommentsSheet
+        post={activeCommentsPost}
+        isOpen={Boolean(activeCommentsPost)}
+        onClose={() => setActiveCommentsPost(null)}
+        onCommentCountChange={handleCommentCountChange}
+      />
 
-            {/* Scrollable Comments List */}
-            <div className="flex-1 overflow-y-auto px-5 py-3.5 space-y-3 min-h-[180px]">
-              {isLoadingComments ? (
-                <div className="py-10 text-center text-xs text-[var(--text-secondary)]">
-                  Loading comments...
-                </div>
-              ) : reelComments.length === 0 ? (
-                <div className="py-10 text-center text-xs text-[var(--text-secondary)]">
-                  No comments yet. Start the conversation!
-                </div>
-              ) : (
-                reelComments.map((comment) => {
-                  const canDeleteComment =
-                    currentUser?.uid === comment.authorId || isAdmin;
-                  return (
-                    <div
-                      key={comment.id}
-                      className="flex items-start gap-2.5 p-2.5 rounded-2xl bg-[var(--bg-subtle)]/70"
-                    >
-                      <img
-                        src={
-                          comment.authorPhotoURL ||
-                          `https://api.dicebear.com/7.x/shapes/svg?seed=${comment.authorId}`
-                        }
-                        alt={comment.authorName}
-                        referrerPolicy="no-referrer"
-                        className="w-8 h-8 rounded-xl object-cover shrink-0 mt-0.5"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <span className="text-xs font-extrabold text-[var(--text-primary)] truncate">
-                              {comment.authorName}
-                            </span>
-                            <span className="text-[10px] font-mono text-[var(--text-secondary)]">
-                              {new Date(comment.createdAt).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit'
-                              })}
-                            </span>
-                          </div>
-                          {canDeleteComment && (
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteReelComment(comment)}
-                              className="p-1 text-stone-400 hover:text-rose-600 rounded-lg transition cursor-pointer"
-                              title="Delete comment"
-                            >
-                              <Trash2 size={13} />
-                            </button>
-                          )}
-                        </div>
-                        <p className="text-xs text-[var(--text-primary)] mt-0.5 break-words leading-relaxed">
-                          {comment.content}
-                        </p>
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-
-            {/* Comment Input Form */}
-            <form
-              onSubmit={handleSubmitReelComment}
-              className="px-4 pt-2.5 pb-1 border-t border-[var(--border-hairline)] flex items-center gap-2"
-            >
-              <input
-                type="text"
-                value={commentText}
-                onChange={(e) => setCommentText(e.target.value)}
-                placeholder="Add a comment..."
-                maxLength={800}
-                className="flex-1 px-4 py-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:outline-none focus:border-[#2563EB]"
-              />
-              <button
-                type="submit"
-                disabled={isSendingComment || !commentText.trim()}
-                className="min-h-[42px] px-4 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-blue-600 text-white font-extrabold text-xs flex items-center gap-1.5 transition disabled:opacity-40 cursor-pointer shrink-0"
-              >
-                <Send size={14} />
-                <span>Send</span>
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
+      {/* Frosted-Glass Share Sheet (Mobile Bottom Sheet / Desktop Centered Modal) */}
+      <ShareSheet
+        post={activeSharePost}
+        isOpen={Boolean(activeSharePost)}
+        onClose={() => setActiveSharePost(null)}
+        onShareCountChange={handleShareCountChange}
+      />
 
       {/* Upload Reel Modal over Reels */}
       {showUploadBox && selectedVideoFile && (

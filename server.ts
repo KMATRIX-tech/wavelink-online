@@ -5242,6 +5242,51 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     }
   });
 
+  /**
+   * POST /api/posts/create
+   * High-speed server-side post creation with Firebase Admin SDK.
+   * Guarantees post persistence even if client-side IndexedDB tab locks or network acks stall.
+   */
+  app.post('/api/posts/create', async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdTokenHeader(req);
+      const postData = req.body || {};
+      const authorId = String(postData.authorId || authUser?.uid || '').trim();
+
+      if (!authorId) {
+        return res.status(401).json({ error: 'Authentication required to create a post.' });
+      }
+
+      // If user token is provided, verify authorId matches (unless system admin)
+      if (authUser?.uid && authUser.uid !== authorId && !authUser.email?.endsWith('@wavelink.app')) {
+        return res.status(403).json({ error: 'Cannot create post on behalf of another user.' });
+      }
+
+      const postId = String(
+        postData.id || `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+      ).trim();
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(500).json({ error: 'Server database unavailable' });
+      }
+
+      const payload = {
+        ...postData,
+        id: postId,
+        authorId,
+        createdAt: postData.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      await adminDb.collection('posts').doc(postId).set(payload, { merge: true });
+      return res.json({ success: true, postId, post: payload });
+    } catch (err: any) {
+      console.error('[WaveLink Server Post Create Error]:', err?.message || err);
+      return res.status(500).json({ error: err?.message || 'Failed to save post on server' });
+    }
+  });
+
   // Phase 4: Server-enforced Anti-Spam Share Verification for Weekly Creator Challenges
   app.post('/api/challenges/record-share', async (req, res) => {
     const authUser = await verifyFirebaseIdTokenHeader(req);

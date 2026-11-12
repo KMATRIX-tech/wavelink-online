@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { doc, setDoc } from 'firebase/firestore';
+import { savePostDocument } from './postService';
 import {
   db,
   cleanFirestoreData,
@@ -572,10 +573,8 @@ class VideoUploadQueueManager {
         createdAt: new Date().toISOString()
       };
 
-      const cleanedPayload = cleanFirestoreData(postPayload);
-
       try {
-        await setDoc(doc(db, 'posts', postId), cleanedPayload);
+        await savePostDocument(postPayload);
       } catch (firestoreErr) {
         console.error('[WaveLink Video Post Firestore Error]', firestoreErr);
         try {
@@ -585,13 +584,6 @@ class VideoUploadQueueManager {
       }
 
       clearFailedVideoAndStudioDrafts();
-
-      // Immediately notify FeedView / VideosHubView so the saved post appears at the top of the feed right away
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('wavelink:video-post-created', { detail: postPayload })
-        );
-      }
 
       this.compressedFilesCache.delete(jobId);
       this.updateJob(jobId, {

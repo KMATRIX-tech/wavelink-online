@@ -110,7 +110,17 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               <section className="space-y-2">
                 <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-[#0D9488]" />
-                  2. Private Chats &amp; Member-Only Access
+                  2. Online / Offline Presence &amp; Typing Indicators
+                </h3>
+                <p>
+                  To show whether friends are available to chat, WaveLink stores a minimal real-time presence flag (<code>online</code> or <code>offline</code> plus <code>lastChanged</code> timestamp) and temporary chat typing indicators in Firebase Realtime Database. We <strong>never</strong> collect or attach GPS location, IP addresses, or device telemetry to your online status. You can turn off <strong>Show my online status</strong> or <strong>Show last seen</strong>, or limit visibility to <strong>Close Friends Only</strong> or <strong>Nobody</strong> in Settings → Privacy &amp; Security.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  3. Private Chats &amp; Member-Only Access
                 </h3>
                 <p>
                   Direct messages and group conversations are strictly readable only by their members. Our Firebase Security Rules enforce participant checks so no outside account can read your private conversations.
@@ -120,7 +130,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               <section className="space-y-2">
                 <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-[#0D9488]" />
-                  3. Zero Sale of Personal Information
+                  4. Zero Sale of Personal Information
                 </h3>
                 <p>
                   WaveLink never sells, rents, or shares your personal data with data brokers or advertisers.
@@ -130,7 +140,20 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               <section className="space-y-2">
                 <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-[#0D9488]" />
-                  4. Delete My Account Anytime
+                  5. Google Play Store Data Safety Summary
+                </h3>
+                <div className="p-3.5 rounded-2xl bg-[#FAF7F2] border border-[var(--border-subtle)] space-y-1.5 text-xs">
+                  <p><strong>Data Types:</strong> Account Info (name, @username, photo), User Content (posts, chats, Sparks), and App Activity (ephemeral online/offline status &amp; typing flag).</p>
+                  <p><strong>Purpose:</strong> App functionality, messaging delivery, account security, and fraud prevention only.</p>
+                  <p><strong>Data Sharing &amp; Encryption:</strong> Encrypted in transit (HTTPS/WSS). Never sold or shared with third-party advertisers.</p>
+                  <p><strong>User Control:</strong> Presence visibility can be disabled or restricted in Privacy Settings; accounts can be permanently deleted anytime.</p>
+                </div>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  6. Delete My Account Anytime
                 </h3>
                 <p>
                   You are in full control of your data. You can delete any post or comment at any time, or use the <strong>Delete My Account</strong> button in Settings → Password &amp; Security to permanently remove your profile, posts, and sparks.

@@ -10,6 +10,29 @@ import { isSuperAdminEmail, ADMIN_EMAIL } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { toggleFollowUser } from '../services/notificationService';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
+import { Avatar } from './Avatar';
+import { usePresence } from '../context/PresenceContext';
+
+const DirectoryPresenceBadge: React.FC<{ user: UserProfile }> = ({ user }) => {
+  const presence = usePresence(user.id, user);
+  if (presence.status === 'hidden' || presence.status === 'unreachable' || presence.status === 'loading') {
+    return null;
+  }
+  if (presence.status === 'online') {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-[#15803d] border border-emerald-200">
+        <span className="w-1.5 h-1.5 rounded-full bg-[#22c55e] animate-pulse" />
+        <span>Online</span>
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
+      <span className="w-1.5 h-1.5 rounded-full bg-[#ef4444]" />
+      <span>Offline</span>
+    </span>
+  );
+};
 
 interface UserDirectoryViewProps {
   onStartChat: (userId: string) => void;
@@ -180,19 +203,16 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
               >
                 <div>
                   <div className="flex items-start justify-between gap-3 mb-3">
-                    <div className="relative">
-                      <img
-                        src={user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.id}`}
-                        alt={user.displayName}
-                        className="w-12 h-12 rounded-full object-cover ring-2 ring-[#2563EB]/20"
-                      />
-                      {!user.isBanned && (
-                        <span
-                          className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#0D9488] ring-2 ring-white"
-                          title="Online Member"
-                        />
-                      )}
-                    </div>
+                    <Avatar
+                      uid={user.id}
+                      src={user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.id}`}
+                      alt={user.displayName}
+                      fallbackName={user.displayName}
+                      size={48}
+                      showStatus={!user.isBanned}
+                      targetProfile={user}
+                      ringClassName="ring-2 ring-[#2563EB]/20"
+                    />
 
                     <div>
                       {user.isBanned ? (
@@ -206,10 +226,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                           Warned
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-pulse" />
-                          <span>Online</span>
-                        </span>
+                        <DirectoryPresenceBadge user={user} />
                       )}
                     </div>
                   </div>

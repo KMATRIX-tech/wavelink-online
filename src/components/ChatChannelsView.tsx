@@ -75,7 +75,13 @@ import {
   ArrowLeft,
   History,
   AlertTriangle,
-  RefreshCw
+  RefreshCw,
+  Play,
+  Pause,
+  PanelRight,
+  Bell,
+  BellOff,
+  FileText
 } from 'lucide-react';
 import { ADMIN_EMAIL, isSuperAdminEmail, getAuthHeaders } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
@@ -94,6 +100,146 @@ import {
   isSupportBotUser,
   sanitizeUserText
 } from '../utils/security';
+import { Avatar } from './Avatar';
+import { usePresence, usePresenceManager } from '../context/PresenceContext';
+import { formatPresenceSubtitle } from '../utils/presenceFormat';
+import { useLanguage } from '../context/LanguageContext';
+
+// Module-level in-memory caches so user profiles, avatars, and groups are read once and reused across tab switches
+const chatProfileMemoryCache = new Map<string, UserProfile>();
+let chatGroupsMemoryCache: ChatGroup[] = [];
+
+const QUICK_REACTION_EMOJIS = ['❤️', '😂', '🔥', '👍', '🙌', '😮'];
+const WAVEFORM_BAR_HEIGHTS = [35, 62, 48, 82, 55, 92, 44, 74, 88, 50, 68, 95, 60, 78, 42, 84, 58, 72, 46, 64];
+
+interface VoiceNoteBubblePlayerProps {
+  src: string;
+  duration?: number;
+  isOwn: boolean;
+}
+
+const VoiceNoteBubblePlayer: React.FC<VoiceNoteBubblePlayerProps> = ({ src, duration, isOwn }) => {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [resolvedDuration, setResolvedDuration] = useState<number>(duration && duration > 0 ? duration : 0);
+
+  useEffect(() => {
+    if (duration && duration > 0 && !resolvedDuration) {
+      setResolvedDuration(duration);
+    }
+  }, [duration, resolvedDuration]);
+
+  const togglePlay = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (isPlaying) {
+      audio.pause();
+      setIsPlaying(false);
+    } else {
+      audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+    }
+  };
+
+  const handleSeek = (barIndex: number) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const total = resolvedDuration || audio.duration || 1;
+    const ratio = (barIndex + 0.5) / WAVEFORM_BAR_HEIGHTS.length;
+    audio.currentTime = ratio * total;
+    setProgress(ratio * 100);
+    setCurrentTime(audio.currentTime);
+  };
+
+  const displaySeconds = isPlaying || currentTime > 0 ? currentTime : resolvedDuration || duration || 1;
+
+  return (
+    <div
+      className={`px-3 py-2.5 rounded-2xl flex items-center gap-3 w-full min-w-[210px] max-w-[300px] transition ${
+        isOwn
+          ? 'bg-black/15 border border-white/25 text-white'
+          : 'bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)]'
+      }`}
+    >
+      <audio
+        ref={audioRef}
+        src={src}
+        preload="metadata"
+        onLoadedMetadata={(e) => {
+          const d = e.currentTarget.duration;
+          if (d && isFinite(d) && d > 0) setResolvedDuration(Math.round(d));
+        }}
+        onTimeUpdate={(e) => {
+          const cur = e.currentTarget.currentTime;
+          const tot = resolvedDuration || e.currentTarget.duration || 1;
+          setCurrentTime(cur);
+          setProgress(Math.min(100, Math.max(0, (cur / tot) * 100)));
+        }}
+        onEnded={() => {
+          setIsPlaying(false);
+          setProgress(0);
+          setCurrentTime(0);
+        }}
+        onPause={() => setIsPlaying(false)}
+        onPlay={() => setIsPlaying(true)}
+        className="hidden"
+      />
+      <button
+        type="button"
+        onClick={togglePlay}
+        aria-label={isPlaying ? 'Pause voice note' : 'Play voice note'}
+        className={`w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center shrink-0 shadow-xs transition active:scale-95 cursor-pointer ${
+          isOwn
+            ? 'bg-white text-[var(--accent-primary)] hover:bg-white/90'
+            : 'bg-[var(--accent-primary)] text-white hover:opacity-90'
+        }`}
+      >
+        {isPlaying ? <Pause size={16} className="fill-current" /> : <Play size={16} className="fill-current ml-0.5" />}
+      </button>
+
+      <div className="flex-1 min-w-0 flex flex-col gap-1.5">
+        <div className="flex items-center gap-[3px] h-7 w-full" role="slider" aria-valuenow={Math.round(progress)}>
+          {WAVEFORM_BAR_HEIGHTS.map((h, idx) => {
+            const barPct = ((idx + 1) / WAVEFORM_BAR_HEIGHTS.length) * 100;
+            const isPlayed = progress >= barPct;
+            return (
+              <button
+                key={idx}
+                type="button"
+                onClick={() => handleSeek(idx)}
+                style={{
+                  height: `${h}%`,
+                  animationDelay: `${(idx % 5) * 110}ms`
+                }}
+                className={`flex-1 min-w-[3px] rounded-full transition-all cursor-pointer ${
+                  isPlaying ? 'wavelink-waveform-bar--playing' : ''
+                } ${
+                  isOwn
+                    ? isPlayed
+                      ? 'bg-white'
+                      : 'bg-white/45 hover:bg-white/75'
+                    : isPlayed
+                    ? 'bg-[var(--accent-primary)]'
+                    : 'bg-[var(--text-secondary)]/35 hover:bg-[var(--accent-primary)]/60'
+                }`}
+                title="Seek voice note"
+              />
+            );
+          })}
+        </div>
+        <div className="flex items-center justify-between text-[11px] font-mono font-bold leading-none">
+          <span className={isOwn ? 'text-white/90' : 'text-[var(--text-secondary)]'}>
+            {isPlaying ? 'Playing...' : 'Voice note'}
+          </span>
+          <span className="tabular-nums">
+            {formatVoiceDuration(displaySeconds)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 /**
  * Deterministic conversationId generator:
@@ -196,11 +342,203 @@ const formatLastSeenTimestamp = (iso?: string): string => {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 };
 
+const formatCompactConvoTime = (iso?: string): string => {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (isNaN(date.getTime())) return '';
+  const diffSec = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (diffSec < 60) return 'Now';
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
+  if (diffSec < 86400) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+};
+
 const formatVoiceDuration = (totalSeconds?: number): string => {
   const safeSecs = Math.max(0, Math.floor(totalSeconds || 0));
   const mins = Math.floor(safeSecs / 60);
   const secs = safeSecs % 60;
   return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+};
+
+interface ChatPersonGridCardProps {
+  person: UserProfile;
+  language: 'en' | 'sw';
+  compact?: boolean;
+  onSelect: (uid: string) => void;
+}
+
+const ChatPersonGridCard: React.FC<ChatPersonGridCardProps> = ({
+  person,
+  language,
+  compact = false,
+  onSelect
+}) => {
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const [inView, setInView] = useState(false);
+  const isBot = person.id === SUPPORT_BOT_ID;
+
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el || isBot || typeof IntersectionObserver === 'undefined') {
+      setInView(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]) setInView(entries[0].isIntersecting);
+      },
+      { rootMargin: '60px 0px', threshold: 0.01 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [isBot]);
+
+  const presence = usePresence(!isBot && inView ? person.id : undefined, person);
+  const isOnline = presence.status === 'online';
+  const showPresenceText =
+    !isBot && (presence.status === 'online' || presence.status === 'offline');
+  const subtitle = isBot
+    ? '24/7 Assistant'
+    : showPresenceText
+    ? formatPresenceSubtitle({
+        isOnline,
+        lastChanged: presence.lastChanged,
+        lastSeenIso: person.lastSeenAt || person.lastSeen,
+        language,
+        showLastSeen: presence.canShowLastSeen
+      })
+    : person.username || 'WaveLink';
+
+  if (compact) {
+    return (
+      <div
+        ref={cardRef}
+        onClick={() => onSelect(person.id)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') onSelect(person.id);
+        }}
+        className="p-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] flex flex-col items-center text-center gap-1.5 transition hover:-translate-y-0.5 cursor-pointer"
+      >
+        <div className="relative shrink-0">
+          <Avatar
+            uid={person.id}
+            src={
+              person.photoURL ||
+              `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+            }
+            alt={person.displayName}
+            fallbackName={person.displayName}
+            size={44}
+            showStatus={!isBot}
+            targetProfile={person}
+            className="ring-2 ring-[var(--accent-primary)]/35 rounded-full"
+          />
+          {isBot && (
+            <span
+              className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+              title="24/7 Assistant"
+            />
+          )}
+        </div>
+        <div className="min-w-0 w-full">
+          <p className="text-xs font-extrabold text-[var(--text-primary)] truncate">
+            {person.displayName}
+          </p>
+          <p
+            className={`text-[10px] font-semibold truncate ${
+              isBot || isOnline
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : 'text-[var(--text-secondary)]'
+            }`}
+          >
+            {subtitle}
+          </p>
+        </div>
+        <span
+          className="w-full py-1 px-2 rounded-xl text-[10px] font-extrabold text-white"
+          style={{
+            background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+          }}
+        >
+          Message
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={cardRef}
+      onClick={() => onSelect(person.id)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') onSelect(person.id);
+      }}
+      className="p-3 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] shadow-2xs flex flex-col items-center text-center gap-2 transition hover:-translate-y-0.5 cursor-pointer"
+    >
+      <div
+        className="relative p-[2px] rounded-full"
+        style={{
+          background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+        }}
+      >
+        <Avatar
+          uid={person.id}
+          src={
+            person.photoURL ||
+            `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+          }
+          alt={person.displayName}
+          fallbackName={person.displayName}
+          size={56}
+          showStatus={!isBot}
+          targetProfile={person}
+          imageClassName="border-2 border-[var(--bg-surface)]"
+        />
+        {isBot && (
+          <span
+            className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+            title="24/7 Assistant"
+          />
+        )}
+      </div>
+
+      <div className="w-full min-w-0">
+        <p className="text-xs font-extrabold text-[var(--text-primary)] truncate">
+          {person.displayName}
+        </p>
+        <p
+          className={`text-[11px] font-semibold truncate mt-0.5 ${
+            isBot || isOnline
+              ? 'text-emerald-600 dark:text-emerald-400'
+              : 'text-[var(--text-secondary)]'
+          }`}
+        >
+          {subtitle}
+        </p>
+      </div>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelect(person.id);
+        }}
+        className="w-full min-h-[38px] py-1.5 px-3 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-2xs transition active:scale-95 cursor-pointer"
+        style={{
+          background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+        }}
+      >
+        <MessageSquare size={12} />
+        <span>Message</span>
+      </button>
+    </div>
+  );
 };
 
 export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, initialTargetUserId }) => {
@@ -216,6 +554,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     reportContent,
     showGlobalToast
   } = useAuth();
+  const { language } = useLanguage();
+  const { getCachedIsOnline, setTyping: setRtdbTyping, subscribeTyping: subscribeRtdbTyping } =
+    usePresenceManager();
   const [isBotReplying, setIsBotReplying] = useState(false);
 
   // Active channel identifier: can be a groupId (e.g. `grp_...`) or DM id (`dm_...`)
@@ -247,6 +588,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const [wsChannelTyping, setWsChannelTyping] = useState<
     Record<string, Record<string, TypingStatusEntry>>
   >({});
+  const [rtdbChannelTyping, setRtdbChannelTyping] = useState<
+    Record<string, Record<string, number>>
+  >({});
   const [wsChannelLastSeen, setWsChannelLastSeen] = useState<
     Record<string, Record<string, string>>
   >({});
@@ -257,8 +601,30 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const isCurrentlyTypingRef = useRef<boolean>(false);
   const prevActiveChannelRef = useRef<string>('');
 
+  // Optional "Online first" sorting toggle in Chat Home
+  const [onlineFirstSort, setOnlineFirstSort] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('wavelink_chat_online_first') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const handleToggleOnlineFirstSort = () => {
+    setOnlineFirstSort((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('wavelink_chat_online_first', String(next));
+      } catch {
+        // ignore storage error
+      }
+      return next;
+    });
+  };
+
   // Media upload & voice note recording in chat
   const [chatMediaUrl, setChatMediaUrl] = useState<string>('');
+  const [chatMediaUrls, setChatMediaUrls] = useState<string[]>([]);
   const [chatMediaType, setChatMediaType] = useState<'image' | 'video' | 'audio' | 'none'>('none');
   const [chatMediaNotice, setChatMediaNotice] = useState<string | null>(null);
   const chatFileRef = useRef<HTMLInputElement | null>(null);
@@ -276,15 +642,37 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const voiceSpeechRecRef = useRef<any>(null);
   const voiceTranscriptRef = useRef<string>('');
 
-  // Popups & pickers
+  // Popups, pickers, reactions, lightbox & desktop right panel
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showGifPicker, setShowGifPicker] = useState(false);
+  const [showHeaderMenu, setShowHeaderMenu] = useState(false);
+  const [showDesktopRightPanel, setShowDesktopRightPanel] = useState(true);
+  const [reactionMenuMsgId, setReactionMenuMsgId] = useState<string | null>(null);
+  const [lightboxPhotoUrl, setLightboxPhotoUrl] = useState<string | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const swipeTouchStartRef = useRef<{ x: number; y: number; msgId: string } | null>(null);
 
-  const [groups, setGroups] = useState<ChatGroup[]>([]);
-  const [members, setMembers] = useState<UserProfile[]>([]);
+  const [groups, setGroups] = useState<ChatGroup[]>(() =>
+    chatGroupsMemoryCache.length > 0 ? chatGroupsMemoryCache : []
+  );
+  const [members, setMembers] = useState<UserProfile[]>(() => {
+    if (chatProfileMemoryCache.size > 0) {
+      const cached = Array.from(chatProfileMemoryCache.values()).filter(
+        (u) => u.id !== currentUser?.uid && u.id !== SUPPORT_BOT_ID
+      );
+      return [SUPPORT_BOT_PROFILE, ...cached];
+    }
+    return [SUPPORT_BOT_PROFILE];
+  });
+  const [isLoadingConversations, setIsLoadingConversations] = useState<boolean>(
+    () => chatProfileMemoryCache.size === 0
+  );
+  const [isLoadingMessages, setIsLoadingMessages] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [convoFilter, setConvoFilter] = useState<'all' | 'groups' | 'dms'>('all');
+  const [convoFilter, setConvoFilter] = useState<'chats' | 'people' | 'groups'>('chats');
   const [messageLimit, setMessageLimit] = useState<number>(30);
+  const [convoDisplayLimit, setConvoDisplayLimit] = useState<number>(20);
+  const [convoFetchLimit, setConvoFetchLimit] = useState<number>(20);
 
   // Group creation modal state
   const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false);
@@ -308,9 +696,35 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const chatShellRef = useRef<HTMLDivElement | null>(null);
   const messagesListRef = useRef<HTMLDivElement | null>(null);
-  const chatInputRef = useRef<HTMLInputElement | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const isInputFocusedRef = useRef<boolean>(false);
   const wasKeyboardOpenRef = useRef<boolean>(false);
+
+  // Per-channel mute preference persisted locally
+  const [mutedChannelIds, setMutedChannelIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_muted_channels');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const toggleMuteChannel = (channelId: string) => {
+    if (!channelId) return;
+    setMutedChannelIds((prev) => {
+      const next = prev.includes(channelId)
+        ? prev.filter((id) => id !== channelId)
+        : [...prev, channelId];
+      try {
+        localStorage.setItem('wavelink_muted_channels', JSON.stringify(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  };
 
   // Detect virtual keyboard open/close on mobile via window.visualViewport and adjust chat bounds without clipping
   useEffect(() => {
@@ -408,18 +822,23 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     };
   }, [activeChannel, showMobileChannels]);
 
-  // 1. Load registered users / online members once with limit(30) (with Support Bot pinned first)
+  // 1. Load registered users / online members once with limit(convoFetchLimit) and in-memory caching
   useEffect(() => {
     let isMounted = true;
     const fetchUsers = async () => {
       try {
-        const usersCol = query(collection(db, 'users'), limit(30));
+        if (chatProfileMemoryCache.size === 0) {
+          setIsLoadingConversations(true);
+        }
+        const usersCol = query(collection(db, 'users'), limit(convoFetchLimit));
         const snap = await getDocs(usersCol);
         if (!isMounted) return;
         const otherUsers: UserProfile[] = [];
         snap.forEach((d) => {
+          const prof = { id: d.id, ...d.data() } as UserProfile;
+          chatProfileMemoryCache.set(d.id, prof);
           if (d.id !== currentUser?.uid && d.id !== SUPPORT_BOT_ID) {
-            otherUsers.push({ id: d.id, ...d.data() } as UserProfile);
+            otherUsers.push(prof);
           }
         });
         batchCacheUserProfiles(otherUsers);
@@ -432,36 +851,28 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
         const list: UserProfile[] = [SUPPORT_BOT_PROFILE, ...otherUsers];
         setMembers(list);
+        setIsLoadingConversations(false);
 
         // If target user specified from directory/feed, open that DM immediately
         if (initialTargetUserId && currentUser?.uid) {
           const dmId = computeDmConversationId(currentUser.uid, initialTargetUserId);
           setActiveChannel(dmId);
           setShowMobileChannels(false);
-        } else if (
-          currentUser?.uid &&
-          list.length > 0 &&
-          typeof window !== 'undefined' &&
-          window.innerWidth >= 1024
-        ) {
-          // On desktop (>= 1024px), ensure a default conversation is selected if none is active
-          setActiveChannel((prev) => {
-            if (prev) return prev;
-            const firstTarget = list[0];
-            return computeDmConversationId(currentUser.uid, firstTarget.id);
-          });
         }
       } catch (e) {
-        if (isMounted) setMembers([SUPPORT_BOT_PROFILE]);
+        if (isMounted) {
+          setMembers([SUPPORT_BOT_PROFILE]);
+          setIsLoadingConversations(false);
+        }
       }
     };
     fetchUsers();
     return () => {
       isMounted = false;
     };
-  }, [currentUser?.uid, initialTargetUserId]);
+  }, [currentUser?.uid, initialTargetUserId, convoFetchLimit]);
 
-  // 2. Load user-created groups once with limit(20)
+  // 2. Load user-created groups once with limit(20) and in-memory caching
   useEffect(() => {
     let isMounted = true;
     const fetchGroups = async () => {
@@ -478,15 +889,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           const timeB = b.createdAt ? Date.parse(b.createdAt) || 0 : 0;
           return timeB - timeA;
         });
+        chatGroupsMemoryCache = list;
         setGroups(list);
 
-        // On desktop, only fallback to a group if the user is a member and no channel is selected
-        if (typeof window !== 'undefined' && window.innerWidth >= 1024 && currentUser?.uid) {
-          setActiveChannel((prev) => {
-            if (prev) return prev;
-            const joinedGroup = list.find((g) => g.memberIds?.includes(currentUser.uid));
-            return joinedGroup ? joinedGroup.id : '';
-          });
+        // Populate group lastMessage previews from metadata without opening extra message listeners
+        const groupLatest: Record<
+          string,
+          { text: string; senderId: string; senderName: string; createdAt: string }
+        > = {};
+        list.forEach((grp: any) => {
+          if (grp.lastMessageText) {
+            groupLatest[grp.id] = {
+              text: grp.lastMessageText,
+              senderId: grp.lastMessageSenderId || grp.creatorId || '',
+              senderName: grp.lastMessageSenderName || grp.creatorName || 'Member',
+              createdAt: grp.lastMessageAt || grp.updatedAt || grp.createdAt || ''
+            };
+          }
+        });
+        if (Object.keys(groupLatest).length > 0) {
+          setLatestMessageByChannel((prev) => ({ ...groupLatest, ...prev }));
         }
       } catch (err) {
         console.warn('[WaveLink Chat] Groups fetch notice:', err);
@@ -509,19 +931,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       const otherUid = getOtherDmParticipantId(meta.id, currentUser.uid);
       if (otherUid && otherUid !== currentUser.uid && !knownIds.has(otherUid)) {
         knownIds.add(otherUid);
-        extraMembers.push({
-          id: otherUid,
-          email: `${otherUid.slice(0, 8)}@wavelink.user`,
-          username: `@waver_${otherUid.slice(0, 6)}`,
-          displayName:
-            meta.lastMessageSenderId === otherUid && meta.lastMessageSenderName
-              ? meta.lastMessageSenderName
-              : `Waver (${otherUid.slice(0, 6)})`,
-          photoURL: `https://api.dicebear.com/7.x/shapes/svg?seed=${otherUid}`,
-          status: 'active',
-          isBanned: false,
-          createdAt: meta.updatedAt || new Date().toISOString()
-        });
+        const cached = chatProfileMemoryCache.get(otherUid);
+        if (cached) {
+          extraMembers.push(cached);
+        } else {
+          const synth: UserProfile = {
+            id: otherUid,
+            email: `${otherUid.slice(0, 8)}@wavelink.user`,
+            username: `@waver_${otherUid.slice(0, 6)}`,
+            displayName:
+              meta.lastMessageSenderId === otherUid && meta.lastMessageSenderName
+                ? meta.lastMessageSenderName
+                : `Waver (${otherUid.slice(0, 6)})`,
+            photoURL: `https://api.dicebear.com/7.x/shapes/svg?seed=${otherUid}`,
+            status: 'active',
+            isBanned: false,
+            createdAt: meta.updatedAt || new Date().toISOString()
+          };
+          chatProfileMemoryCache.set(otherUid, synth);
+          extraMembers.push(synth);
+        }
       }
     });
 
@@ -560,6 +989,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       !isChattingWithSupportBot &&
       (userProfile?.blockedUserIds || []).includes(directRecipient.id)
   );
+  const directRecipientPresence = usePresence(
+    directRecipient && !isChattingWithSupportBot ? directRecipient.id : undefined,
+    directRecipient
+  );
+  const directRecipientStatusText = isChattingWithSupportBot
+    ? '24/7 Assistant'
+    : directRecipientPresence.status === 'online' || directRecipientPresence.status === 'offline'
+    ? formatPresenceSubtitle({
+        isOnline: directRecipientPresence.status === 'online',
+        lastChanged: directRecipientPresence.lastChanged,
+        lastSeenIso: directRecipient?.lastSeenAt || directRecipient?.lastSeen,
+        language: language === 'sw' ? 'sw' : 'en',
+        showLastSeen: directRecipientPresence.canShowLastSeen
+      })
+    : '';
 
   const isCurrentUserGroupAdmin = activeGroup && currentUser
     ? (activeGroup.adminIds?.includes(currentUser.uid) || activeGroup.creatorId === currentUser.uid || isAdmin)
@@ -569,13 +1013,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     ? activeGroup.memberIds?.includes(currentUser.uid)
     : false;
 
-  // 2b. Real-time listener for all DM channels metadata (lastSeen + typing indicators + lastMessage)
+  // 2b. Real-time listener for DM channels metadata (limited to convoFetchLimit, default 20)
+  // NOTE: Real-time message subcollection listener is strictly scoped ONLY to the open `activeChannel`.
   useEffect(() => {
     if (!currentUser?.uid) return;
 
-    const channelsColRef = collection(db, 'channels');
+    const channelsQuery = query(collection(db, 'channels'), limit(convoFetchLimit));
     const unsub = onSnapshot(
-      channelsColRef,
+      channelsQuery,
       (snapshot) => {
         const nextTypingMap: Record<string, Record<string, TypingStatusEntry>> = {};
         const nextMetaMap: Record<string, ChatChannelMeta> = {};
@@ -615,16 +1060,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 1,
                 Number(data?.unreadCounts?.[currentUser.uid] || 1)
               );
+            } else if (chanId === activeChannel) {
+              nextBaselineUnread[chanId] = 0;
             }
           }
         });
         setChannelMetaMap(nextMetaMap);
         setFirestoreChannelTyping(nextTypingMap);
         if (Object.keys(nextLatestMap).length > 0) {
-          setLatestMessageByChannel((prev) => ({ ... nextLatestMap, ...prev }));
+          setLatestMessageByChannel((prev) => ({ ...prev, ...nextLatestMap }));
         }
         if (Object.keys(nextBaselineUnread).length > 0) {
-          setUnreadCountsByChannel((prev) => ({ ...nextBaselineUnread, ...prev }));
+          setUnreadCountsByChannel((prev) => ({ ...prev, ...nextBaselineUnread }));
         }
       },
       (err) => {
@@ -633,151 +1080,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     );
 
     return () => unsub();
-  }, [currentUser?.uid, activeChannel]);
-
-  // 2b-ii. Real-time listeners for unread message counts & latest message across active conversations
-  const activeDmChannelIdsKey = React.useMemo(() => {
-    if (!currentUser?.uid) return '';
-    const existingIds = Object.keys(channelMetaMap).filter(
-      (id) =>
-        id.startsWith('dm_') &&
-        (id.startsWith(`dm_${currentUser.uid}_`) || id.endsWith(`_${currentUser.uid}`))
-    );
-    const botConvId = computeDmConversationId(currentUser.uid, SUPPORT_BOT_ID);
-    const combined = Array.from(new Set([botConvId, ...existingIds].filter(Boolean))).slice(0, 10);
-    return combined.join(',');
-  }, [channelMetaMap, currentUser?.uid]);
-
-  useEffect(() => {
-    if (!currentUser?.uid) return;
-
-    const unsubs: Array<() => void> = [];
-    const dmConversationIds = activeDmChannelIdsKey
-      ? activeDmChannelIdsKey.split(',').filter(Boolean)
-      : [];
-    const joinedGroupIds = groups
-      .filter((g) => g.memberIds?.includes(currentUser.uid))
-      .slice(0, 8)
-      .map((g) => g.id);
-
-    dmConversationIds.forEach((convId) => {
-      const colRef = collection(db, 'channels', convId, 'messages');
-      const unsub = onSnapshot(
-        colRef,
-        (snap) => {
-          let unread = 0;
-          let latestMsg: ChannelMessage | null = null;
-          let latestTimeMs = -1;
-
-          snap.forEach((d) => {
-            const msg = { id: d.id, ...d.data() } as ChannelMessage;
-            if (msg.isDeleted) return;
-            const msgMs = getMessageTimestampMs(msg);
-            if (msgMs >= latestTimeMs) {
-              latestTimeMs = msgMs;
-              latestMsg = msg;
-            }
-            if (
-              msg.senderId !== currentUser.uid &&
-              !(msg.readBy || []).includes(currentUser.uid)
-            ) {
-              unread += 1;
-            }
-          });
-
-          setUnreadCountsByChannel((prev) => {
-            if (prev[convId] === unread) return prev;
-            return { ...prev, [convId]: unread };
-          });
-
-          if (latestMsg) {
-            const finalLatest = latestMsg as ChannelMessage;
-            const previewText =
-              finalLatest.text ||
-              (finalLatest.gifUrl
-                ? '[GIF]'
-                : finalLatest.mediaType === 'audio' || finalLatest.audioUrl
-                ? '🎤 Voice note'
-                : finalLatest.mediaUrl
-                ? '📷 Media'
-                : '');
-            setLatestMessageByChannel((prev) => ({
-              ...prev,
-              [convId]: {
-                text: previewText,
-                senderId: finalLatest.senderId,
-                senderName: finalLatest.senderName || 'Waver',
-                createdAt: finalLatest.createdAt || new Date(latestTimeMs || Date.now()).toISOString()
-              }
-            }));
-          }
-        },
-        () => {}
-      );
-      unsubs.push(unsub);
-    });
-
-    joinedGroupIds.forEach((grpId) => {
-      const colRef = collection(db, 'groups', grpId, 'messages');
-      const unsub = onSnapshot(
-        colRef,
-        (snap) => {
-          let unread = 0;
-          let latestMsg: ChannelMessage | null = null;
-          let latestTimeMs = -1;
-
-          snap.forEach((d) => {
-            const msg = { id: d.id, ...d.data() } as ChannelMessage;
-            if (msg.isDeleted) return;
-            const msgMs = getMessageTimestampMs(msg);
-            if (msgMs >= latestTimeMs) {
-              latestTimeMs = msgMs;
-              latestMsg = msg;
-            }
-            if (
-              msg.senderId !== currentUser.uid &&
-              !(msg.readBy || []).includes(currentUser.uid)
-            ) {
-              unread += 1;
-            }
-          });
-
-          setUnreadCountsByChannel((prev) => {
-            if (prev[grpId] === unread) return prev;
-            return { ...prev, [grpId]: unread };
-          });
-
-          if (latestMsg) {
-            const finalLatest = latestMsg as ChannelMessage;
-            const previewText =
-              finalLatest.text ||
-              (finalLatest.gifUrl
-                ? '[GIF]'
-                : finalLatest.mediaType === 'audio' || finalLatest.audioUrl
-                ? '🎤 Voice note'
-                : finalLatest.mediaUrl
-                ? '📷 Media'
-                : '');
-            setLatestMessageByChannel((prev) => ({
-              ...prev,
-              [grpId]: {
-                text: previewText,
-                senderId: finalLatest.senderId,
-                senderName: finalLatest.senderName || 'Member',
-                createdAt: finalLatest.createdAt || new Date(latestTimeMs || Date.now()).toISOString()
-              }
-            }));
-          }
-        },
-        () => {}
-      );
-      unsubs.push(unsub);
-    });
-
-    return () => {
-      unsubs.forEach((u) => u());
-    };
-  }, [currentUser?.uid, activeDmChannelIdsKey, groups.length]);
+  }, [currentUser?.uid, activeChannel, convoFetchLimit]);
 
   // 2c. Real-time WebSocket connection for instant (<20ms) typing indicators + 1s expiry clock
   useEffect(() => {
@@ -935,7 +1238,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       }
     }
 
-    // 2. Real-time Firestore channel/group typing map sync
+    // 2. Real-time RTDB ephemeral typing indicator (/typing/{conversationId}/{uid})
+    setRtdbTyping(channelId, isTyping).catch(() => {});
+
+    // 3. Real-time Firestore channel/group typing map sync
     const typingEntry: TypingStatusEntry = {
       userId: currentUser.uid,
       name: senderName,
@@ -961,7 +1267,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     ).catch(() => {});
   };
 
-  // Clear typing status on previous channel when switching conversations
+  // Clear typing status on previous channel when switching conversations & subscribe to active channel RTDB typing
   useEffect(() => {
     const prevChannel = prevActiveChannelRef.current;
     if (prevChannel && prevChannel !== activeChannel && isCurrentlyTypingRef.current) {
@@ -987,7 +1293,19 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         // ignore
       }
     }
-  }, [activeChannel]);
+
+    if (!activeChannel) return;
+    const unsubRtdbTyping = subscribeRtdbTyping(activeChannel, (typers) => {
+      setRtdbChannelTyping((prev) => ({
+        ...prev,
+        [activeChannel]: typers
+      }));
+    });
+
+    return () => {
+      unsubRtdbTyping();
+    };
+  }, [activeChannel, subscribeRtdbTyping]);
 
   // Handle input text change with automatic typing start/stop lifecycle
   const handleInputTextChange = (nextText: string) => {
@@ -1052,6 +1370,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       });
     }
 
+    // 4. Merge Realtime Database ephemeral typing entries (/typing/{conversationId}/{uid})
+    const rtdbTyping = rtdbChannelTyping[channelId];
+    if (rtdbTyping) {
+      Object.entries(rtdbTyping).forEach(([uId, lastChangedMs]) => {
+        if (!uId || uId === currentUser?.uid) return;
+        const existing = mergedByUser.get(uId);
+        const existingMs = existing ? new Date(existing.updatedAt).getTime() : 0;
+        if (!existing || lastChangedMs >= existingMs) {
+          const memberProfile = allMembers.find((m) => m.id === uId);
+          mergedByUser.set(uId, {
+            userId: uId,
+            name: memberProfile?.displayName || 'Waver',
+            photoURL: memberProfile?.photoURL,
+            isTyping: true,
+            updatedAt: new Date(lastChangedMs).toISOString()
+          });
+        }
+      });
+    }
+
     // Filter to entries where isTyping === true and updatedAt is within the last 6 seconds
     const activeList: TypingStatusEntry[] = [];
     mergedByUser.forEach((entry) => {
@@ -1092,9 +1430,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   useEffect(() => {
     setMessages([]);
     setChatLoadError(null);
+    setReactionMenuMsgId(null);
     if (!activeChannel) {
+      setIsLoadingMessages(false);
       return;
     }
+    setIsLoadingMessages(true);
 
     const isBotChannel = activeChannel.includes(SUPPORT_BOT_ID);
     const messagesCol = isDirectMessage
@@ -1136,6 +1477,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
       setChatLoadError(null);
       setMessages(combined);
+      setIsLoadingMessages(false);
       setTimeout(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }, 80);
@@ -1154,6 +1496,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           ? `Permission denied while loading messages for conversation "${activeChannel}". Please verify you are a participant in this conversation.`
           : `Could not load messages (${err?.message || 'connection error'}). Please tap Retry.`;
       setChatLoadError(friendlyMsg);
+      setIsLoadingMessages(false);
     };
 
     const unsub = onSnapshot(
@@ -1387,62 +1730,80 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     };
   };
 
-  // Handle image or video file upload in chat directly from browser to Cloudinary (monarcking72)
+  // Handle single or multiple image / video file upload in chat directly from browser to Cloudinary
   const handleChatFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const fileList: File[] = e.target.files ? Array.from(e.target.files) : [];
+    if (fileList.length === 0) return;
 
-    const isVideo = file.type.startsWith('video/');
-    const isImage = file.type.startsWith('image/');
+    const firstFile = fileList[0];
+    const isVideo = firstFile.type.startsWith('video/');
+    const imageFiles = fileList.filter((f) => f.type.startsWith('image/')).slice(0, 4);
 
-    if (!isVideo && !isImage) {
+    if (!isVideo && imageFiles.length === 0) {
       setChatMediaNotice('Please select a valid image or video file.');
       return;
     }
 
     try {
       setChatMediaNotice(null);
-      if (isImage) {
+      if (imageFiles.length > 0 && !isVideo) {
         e.target.value = '';
-        setChatMediaNotice('Uploading photo to Cloudinary...');
-        const uploadedUrl = await compressImage(file, 1280, 1280, 0.85, (pct) => {
-          setChatMediaNotice(`Uploading photo to Cloudinary (${pct}%)...`);
-        });
-        if (uploadedUrl && uploadedUrl.startsWith('http')) {
+        const uploadedUrls: string[] = [];
+        for (let i = 0; i < imageFiles.length; i++) {
+          const imgFile = imageFiles[i];
+          setChatMediaNotice(
+            imageFiles.length > 1
+              ? `Uploading photo ${i + 1} of ${imageFiles.length}...`
+              : 'Uploading photo...'
+          );
+          const uploadedUrl = await compressImage(imgFile, 1280, 1280, 0.85, (pct) => {
+            setChatMediaNotice(
+              imageFiles.length > 1
+                ? `Uploading photo ${i + 1}/${imageFiles.length} (${pct}%)...`
+                : `Uploading photo (${pct}%)...`
+            );
+          });
+          if (uploadedUrl && uploadedUrl.startsWith('http')) {
+            uploadedUrls.push(uploadedUrl);
+          }
+        }
+        if (uploadedUrls.length > 0) {
           setChatMediaType('image');
-          setChatMediaUrl(uploadedUrl);
+          setChatMediaUrl(uploadedUrls[0]);
+          setChatMediaUrls(uploadedUrls);
           setChatMediaNotice(null);
         } else {
-          setChatMediaNotice('Could not upload photo to Cloudinary. Please try again.');
+          setChatMediaNotice('Could not upload photo. Please try again.');
         }
       } else {
         const canUploadLarge = Boolean(isProEffective || isAdmin);
-        const validation = validateVideoFileSize(file, canUploadLarge);
+        const validation = validateVideoFileSize(firstFile, canUploadLarge);
         if (!validation.valid) {
           e.target.value = '';
           setChatMediaNotice(validation.error || 'Video exceeds your plan upload limit.');
           return;
         }
 
-        const safeVideo = await cloneVideoFileToMemory(file);
+        const safeVideo = await cloneVideoFileToMemory(firstFile);
         e.target.value = '';
-        setChatMediaNotice('Uploading video to Cloudinary (0%)...');
+        setChatMediaNotice('Uploading video (0%)...');
         const chatVidId = `chatvid_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
         const cloudUrl = await uploadVideoChunkedToServer(chatVidId, safeVideo, (pct) => {
-          setChatMediaNotice(`Uploading video to Cloudinary (${pct}%)...`);
+          setChatMediaNotice(`Uploading video (${pct}%)...`);
         });
         if (cloudUrl && cloudUrl.startsWith('http')) {
           setChatMediaType('video');
           setChatMediaUrl(cloudUrl);
+          setChatMediaUrls([cloudUrl]);
           setChatMediaNotice(null);
         } else {
-          setChatMediaNotice('Could not upload video to Cloudinary. Please try again.');
+          setChatMediaNotice('Could not upload video. Please try again.');
         }
       }
     } catch (err: any) {
-      console.error('Error uploading chat media to Cloudinary:', err);
+      console.error('Error uploading chat media:', err);
       setChatMediaNotice(
-        err instanceof Error ? err.message : 'Could not upload media to Cloudinary. Please try again.'
+        err instanceof Error ? err.message : 'Could not upload media. Please try again.'
       );
     }
   };
@@ -1590,23 +1951,24 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         }
 
         const voiceNoteId = `voicenote_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-        setChatMediaNotice('Uploading voice note to Cloudinary...');
+        setChatMediaNotice('Uploading voice note...');
         uploadVideoChunkedToServer(voiceNoteId, audioBlob, (pct) => {
-          setChatMediaNotice(`Uploading voice note to Cloudinary (${pct}%)...`);
+          setChatMediaNotice(`Uploading voice note (${pct}%)...`);
         })
           .then((cloudAudioUrl) => {
             if (cloudAudioUrl && cloudAudioUrl.startsWith('http')) {
               setChatMediaType('audio');
               setChatMediaUrl(cloudAudioUrl);
+              setChatMediaUrls([cloudAudioUrl]);
               setVoiceNoteDuration(finalSecs);
               setChatMediaNotice(null);
             } else {
-              setChatMediaNotice('Could not upload recorded voice note to Cloudinary.');
+              setChatMediaNotice('Could not upload recorded voice note.');
             }
           })
           .catch((err) => {
-            console.error('Voice note Cloudinary upload error:', err);
-            setChatMediaNotice('Could not upload recorded voice note to Cloudinary. Please try again.');
+            console.error('Voice note upload error:', err);
+            setChatMediaNotice('Could not upload recorded voice note. Please try again.');
           });
       };
 
@@ -1675,6 +2037,39 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     setRecordingSeconds(0);
   };
 
+  // Toggle emoji reaction on a message (long-press or tap reaction button)
+  const handleToggleMessageReaction = async (msg: ChannelMessage, emoji: string) => {
+    if (!currentUser?.uid || !activeChannel) return;
+    setReactionMenuMsgId(null);
+    const currentList = msg.reactions?.[emoji] || [];
+    const hasReacted = currentList.includes(currentUser.uid);
+
+    // Optimistic local state update
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== msg.id) return m;
+        const nextReactions = { ...(m.reactions || {}) };
+        nextReactions[emoji] = hasReacted
+          ? currentList.filter((id) => id !== currentUser.uid)
+          : [...currentList, currentUser.uid];
+        return { ...m, reactions: nextReactions };
+      })
+    );
+
+    try {
+      const msgRef = isDirectMessage
+        ? doc(db, 'channels', activeChannel, 'messages', msg.id)
+        : doc(db, 'groups', activeChannel, 'messages', msg.id);
+      await updateDoc(msgRef, {
+        [`reactions.${emoji}`]: hasReacted
+          ? arrayRemove(currentUser.uid)
+          : arrayUnion(currentUser.uid)
+      });
+    } catch {
+      // ignore if rules restrict reaction update on non-owned doc
+    }
+  };
+
   // Send message (with XSS sanitization + deterministic conversationId + serverTimestamp + Support Bot response)
   const handleSendMessage = async (customGifUrl?: string) => {
     if ((!inputText.trim() && !customGifUrl && !chatMediaUrl) || !currentUser || !activeChannel) return;
@@ -1709,8 +2104,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         ? '[GIF]'
         : chatMediaType === 'audio'
         ? `🎤 Voice note (${formatVoiceDuration(voiceNoteDuration)})`
+        : chatMediaUrls.length > 1
+        ? `📷 ${chatMediaUrls.length} Photos`
         : chatMediaUrl
-        ? '[Media]'
+        ? '📷 Photo'
         : '';
       const rawSnippet = (sanitizedText || defaultAttachmentLabel).replace(/\s+/g, ' ').trim();
       const messagePreview =
@@ -1741,6 +2138,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
       if (chatMediaUrl) {
         data.mediaUrl = chatMediaUrl;
+        if (chatMediaUrls.length > 0 && chatMediaType === 'image') {
+          data.mediaUrls = chatMediaUrls;
+        }
         if (chatMediaType === 'audio') {
           data.audioUrl = chatMediaUrl;
           data.audioDuration = voiceNoteDuration || 1;
@@ -1844,6 +2244,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
       setInputText('');
       setChatMediaUrl('');
+      setChatMediaUrls([]);
       setChatMediaType('none');
       setVoiceNoteDuration(0);
       voiceTranscriptRef.current = '';
@@ -2339,6 +2740,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       if (a.id === SUPPORT_BOT_ID) return -1;
       if (b.id === SUPPORT_BOT_ID) return 1;
       if (!currentUser?.uid) return 0;
+      if (onlineFirstSort) {
+        const onlineA = getCachedIsOnline(a.id) ? 1 : 0;
+        const onlineB = getCachedIsOnline(b.id) ? 1 : 0;
+        if (onlineA !== onlineB) return onlineB - onlineA;
+      }
       const dmA = computeDmConversationId(currentUser.uid, a.id);
       const dmB = computeDmConversationId(currentUser.uid, b.id);
       const unreadA = unreadCountsByChannel[dmA] || 0;
@@ -2365,186 +2771,464 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     0
   );
 
+  useEffect(() => {
+    window.dispatchEvent(
+      new CustomEvent('wavelink:unread-chat-count', {
+        detail: { count: totalUnreadMessages }
+      })
+    );
+  }, [totalUnreadMessages]);
+
+  useEffect(() => {
+    return () => {
+      window.dispatchEvent(
+        new CustomEvent('wavelink:chat-input-focus', {
+          detail: { focused: false }
+        })
+      );
+    };
+  }, []);
+
   // On mobile/tablet (< 1024px), show the Chat List screen when showMobileChannels is true or no conversation is active
   const isMobileListScreenVisible = showMobileChannels || !activeChannel;
+  const visibleMembersList = filteredMembers.slice(0, convoDisplayLimit);
+  const isActiveChannelMuted = Boolean(activeChannel && mutedChannelIds.includes(activeChannel));
+  const sharedPhotosInChat = messages.flatMap((m) => {
+    if (m.isDeleted || m.mediaType === 'audio' || m.mediaType === 'video') return [];
+    if (m.mediaUrls && m.mediaUrls.length > 0) return m.mediaUrls;
+    if (m.mediaUrl) return [m.mediaUrl];
+    return [];
+  });
+  const sharedFilesInChat = messages.flatMap(
+    (
+      m
+    ): {
+      id: string;
+      url: string;
+      type: 'Video clip' | 'Voice note';
+      senderName: string;
+      createdAt: string;
+    }[] => {
+      if (m.isDeleted) return [];
+      if (m.mediaType === 'video' && m.mediaUrl) {
+        return [
+          {
+            id: m.id,
+            url: m.mediaUrl,
+            type: 'Video clip',
+            senderName: m.senderName,
+            createdAt: m.createdAt
+          }
+        ];
+      }
+      if ((m.mediaType === 'audio' || m.audioUrl) && (m.audioUrl || m.mediaUrl)) {
+        return [
+          {
+            id: m.id,
+            url: (m.audioUrl || m.mediaUrl)!,
+            type: 'Voice note',
+            senderName: m.senderName,
+            createdAt: m.createdAt
+          }
+        ];
+      }
+      return [];
+    }
+  );
+
+  const handleOpenMemberChat = (memberId: string) => {
+    if (!currentUser?.uid) return;
+    const dmId = computeDmConversationId(currentUser.uid, memberId);
+    setActiveChannel(dmId);
+    setReplyingTo(null);
+    setReactionMenuMsgId(null);
+    setShowHeaderMenu(false);
+    setShowMobileChannels(false);
+  };
 
   return (
     <div className="wavelink-chat-wrapper w-full max-w-full overflow-x-hidden">
       <div
         ref={chatShellRef}
-        className="wavelink-chat-shell bg-[var(--bg-surface)] border-y lg:border border-[var(--border-subtle)] shadow-xs w-full max-w-full"
+        className="wavelink-chat-shell bg-[var(--bg-surface)] text-[var(--text-primary)] border-y lg:border border-[var(--border-hairline)] shadow-sm w-full max-w-full overflow-hidden"
       >
-        {/* SCREEN 1 (Mobile Full-Width Chat List Screen; Desktop Left Sidebar >= 1024px) */}
+        {/* =====================================================================
+            SCREEN 1: CHAT HOME (Mobile Full Screen; Desktop Left Column >= 1024px)
+           ===================================================================== */}
         <div
-          className={`w-full lg:w-80 xl:w-96 h-full lg:border-r border-[#EFECE6] flex-col bg-[#FAF7F2] shrink-0 ${
+          className={`wavelink-chat-left-col relative w-full h-full lg:border-r border-[var(--border-hairline)] flex-col bg-[var(--bg-canvas)] shrink-0 ${
             isMobileListScreenVisible ? 'flex' : 'hidden lg:flex'
           }`}
         >
-          {/* Top Bar with Create Group Button */}
-          <div className="p-3.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2 min-w-0">
-              <MessageSquare size={18} className="text-[#2563EB] shrink-0" />
-              <h3 className="font-extrabold text-xs sm:text-sm uppercase tracking-wider text-[#1C1917] truncate">
-                Conversations
-              </h3>
-              {totalUnreadMessages > 0 && (
-                <span className="px-2 py-0.5 rounded-full bg-[#2563EB] text-white text-[11px] font-extrabold shrink-0">
-                  {totalUnreadMessages} new
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedMemberIds([]);
-                  setNewGroupName('');
-                  setNewGroupDesc('');
-                  setNewGroupLogo(PRESET_LOGOS[0].url);
-                  setIsCreateGroupOpen(true);
-                }}
-                className="min-h-[44px] flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold text-xs shadow-2xs transition"
-                title="Create a new group"
-              >
-                <Plus size={14} />
-                <span>New Group</span>
-              </button>
-            </div>
-          </div>
+          {/* Top Header & Search Bar */}
+          <div className="p-3.5 sm:p-4 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] space-y-3 shrink-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div
+                  className="w-9 h-9 rounded-2xl flex items-center justify-center text-white shadow-xs shrink-0"
+                  style={{
+                    background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  <MessageSquare size={18} />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <h2 className="font-extrabold text-base sm:text-lg tracking-tight text-[var(--text-primary)] truncate">
+                      Chat
+                    </h2>
+                    {totalUnreadMessages > 0 && (
+                      <span
+                        className="px-2 py-0.5 rounded-full text-white text-[11px] font-extrabold shrink-0 shadow-2xs"
+                        style={{ backgroundColor: 'var(--accent-primary)' }}
+                      >
+                        {totalUnreadMessages} new
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
 
-          {/* Search bar & Filter Tabs */}
-          <div className="p-3 border-b border-[#EFECE6] bg-white/80 space-y-2">
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedMemberIds([]);
+                    setNewGroupName('');
+                    setNewGroupDesc('');
+                    setNewGroupLogo(PRESET_LOGOS[0].url);
+                    setIsCreateGroupOpen(true);
+                  }}
+                  className="min-h-[44px] flex items-center gap-1.5 px-3.5 py-2 rounded-2xl text-white font-extrabold text-xs shadow-xs transition active:scale-95 cursor-pointer"
+                  style={{
+                    background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                  title="Create a new group"
+                >
+                  <Plus size={15} />
+                  <span>New Group</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Search Input */}
             <div className="relative">
-              <Search size={15} className="absolute left-3.5 top-3.5 text-[#57534E]" />
+              <Search
+                size={16}
+                className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none"
+              />
               <input
+                ref={searchInputRef}
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search groups or people..."
-                className="w-full min-h-[44px] pl-9 pr-3 py-2 rounded-xl bg-[#FAF7F2] border border-[#D6D3CD] text-base sm:text-sm text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                placeholder="Search chats, people or groups..."
+                className="w-full min-h-[44px] pl-10 pr-9 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 transition"
               />
-            </div>
-            <div className="flex items-center gap-1">
-              {(['all', 'groups', 'dms'] as const).map((filter) => (
+              {searchQuery && (
                 <button
-                  key={filter}
                   type="button"
-                  onClick={() => setConvoFilter(filter)}
-                  className={`flex-1 min-h-[44px] py-2 text-xs font-bold rounded-xl capitalize transition ${
-                    convoFilter === filter
-                      ? 'bg-[#2563EB] text-white shadow-2xs'
-                      : 'text-[#57534E] hover:text-[#1C1917] hover:bg-white'
-                  }`}
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                  aria-label="Clear search"
                 >
-                  {filter === 'dms' ? 'Direct Chats' : filter}
+                  <X size={14} />
                 </button>
-              ))}
+              )}
+            </div>
+
+            {/* Tabs: Chats, People, Groups */}
+            <div className="grid grid-cols-3 gap-1.5 p-1 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
+              {(
+                [
+                  { id: 'chats', label: 'Chats', count: totalUnreadMessages },
+                  { id: 'people', label: 'People', count: 0 },
+                  { id: 'groups', label: 'Groups', count: filteredGroups.length }
+                ] as const
+              ).map((tab) => {
+                const isSelected = convoFilter === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSelected}
+                    onClick={() => setConvoFilter(tab.id)}
+                    className={`min-h-[40px] px-2.5 py-1.5 rounded-xl text-xs font-extrabold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                      isSelected
+                        ? 'text-white shadow-xs'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                    style={
+                      isSelected
+                        ? {
+                            background:
+                              'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                          }
+                        : undefined
+                    }
+                  >
+                    <span>{tab.label}</span>
+                    {tab.count > 0 && (
+                      <span
+                        className={`px-1.5 py-0.2 rounded-full text-[10px] font-black ${
+                          isSelected
+                            ? 'bg-white/25 text-white'
+                            : 'bg-[var(--accent-primary)]/15 text-[var(--accent-primary)]'
+                        }`}
+                      >
+                        {tab.count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
-          {/* Conversation List */}
-          <div className="flex-1 overflow-y-auto p-3 space-y-4">
-            {/* User-Created Groups Section */}
-            {(convoFilter === 'all' || convoFilter === 'groups') && (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between px-2 py-1">
-                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-[#57534E] flex items-center gap-1.5">
-                    <Users size={13} className="text-[#0D9488]" />
-                    <span>User Groups ({filteredGroups.length})</span>
+          {/* Scrollable Chat Home Body */}
+          <div className="flex-1 overflow-y-auto p-3.5 space-y-5 pb-24">
+            {/* 1. Horizontal "Active now" row of round avatars with colored ring & realtime presence dot */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between px-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-[#22c55e] animate-pulse" />
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
+                    Active now
                   </span>
+                </div>
+                <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
+                  {allMembers
+                    .slice(0, 12)
+                    .filter((m) => m.id === SUPPORT_BOT_ID || getCachedIsOnline(m.id))
+                    .length}{' '}
+                  online
+                </span>
+              </div>
+
+              <div className="flex items-center gap-3 overflow-x-auto pb-1.5 pt-0.5 no-scrollbar">
+                {allMembers.slice(0, 12).map((person) => {
+                  const firstName = (person.displayName || 'Waver').split(' ')[0];
+                  const isBot = person.id === SUPPORT_BOT_ID;
+                  return (
+                    <button
+                      key={`active_${person.id}`}
+                      type="button"
+                      onClick={() => handleOpenMemberChat(person.id)}
+                      className="flex flex-col items-center gap-1.5 shrink-0 group cursor-pointer min-w-[60px]"
+                      title={`Chat with ${person.displayName}`}
+                    >
+                      <div
+                        className="relative p-[2.5px] rounded-full transition-transform group-hover:scale-105 group-active:scale-95 shadow-xs"
+                        style={{
+                          background:
+                            'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                        }}
+                      >
+                        <Avatar
+                          uid={person.id}
+                          src={
+                            person.photoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+                          }
+                          alt={person.displayName}
+                          fallbackName={person.displayName}
+                          size={52}
+                          showStatus={!isBot}
+                          targetProfile={person}
+                          imageClassName="border-2 border-[var(--bg-surface)]"
+                        />
+                        {isBot && (
+                          <span
+                            className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                            title="24/7 Assistant"
+                          />
+                        )}
+                      </div>
+                      <span className="text-[11px] font-bold text-[var(--text-primary)] max-w-[64px] truncate">
+                        {firstName}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 2. People Grid of Large Rounded Avatar Cards (2 to 3 per row on phones) */}
+            {(convoFilter === 'people' || convoFilter === 'chats') && (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
+                    <Sparkles size={13} className="text-[var(--accent-primary)]" />
+                    <span>{convoFilter === 'people' ? `All People (${filteredMembers.length})` : 'Quick Connect'}</span>
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleToggleOnlineFirstSort}
+                      aria-pressed={onlineFirstSort}
+                      className={`px-2.5 py-1 rounded-full text-[11px] font-extrabold border transition flex items-center gap-1.5 cursor-pointer ${
+                        onlineFirstSort
+                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/40'
+                          : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-hairline)]'
+                      }`}
+                      title="Sort online contacts to the top"
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          onlineFirstSort ? 'bg-[#22c55e]' : 'bg-slate-400'
+                        }`}
+                      />
+                      <span>Online first</span>
+                    </button>
+                    {convoFilter === 'chats' && filteredMembers.length > 3 && (
+                      <button
+                        type="button"
+                        onClick={() => setConvoFilter('people')}
+                        className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline cursor-pointer"
+                      >
+                        See all
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-2.5">
+                  {(convoFilter === 'people'
+                    ? visibleMembersList
+                    : filteredMembers.slice(0, 4)
+                  ).map((person) => (
+                    <ChatPersonGridCard
+                      key={`grid_${person.id}`}
+                      person={person}
+                      language={language === 'sw' ? 'sw' : 'en'}
+                      onSelect={handleOpenMemberChat}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 3. Groups Section (shown in Groups tab or Chats tab) */}
+            {(convoFilter === 'groups' || (convoFilter === 'chats' && filteredGroups.length > 0)) && (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
+                    <Users size={13} className="text-[var(--accent-secondary)]" />
+                    <span>Groups ({filteredGroups.length})</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setIsCreateGroupOpen(true)}
+                    className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline flex items-center gap-1 cursor-pointer"
+                  >
+                    <Plus size={12} />
+                    <span>New Group</span>
+                  </button>
                 </div>
 
                 {filteredGroups.length === 0 ? (
-                  <div className="p-4 rounded-2xl bg-white border border-dashed border-[#D6D3CD] text-center space-y-2">
-                    <p className="text-xs font-medium text-[#57534E]">
-                      No groups made yet.
+                  <div className="p-5 rounded-3xl bg-[var(--bg-surface)] border border-dashed border-[var(--border-hairline)] text-center space-y-2.5">
+                    <p className="text-xs font-semibold text-[var(--text-secondary)]">
+                      No groups created yet. Start a group to chat with friends together!
                     </p>
                     <button
                       type="button"
                       onClick={() => setIsCreateGroupOpen(true)}
-                      className="min-h-[44px] px-3 text-xs text-[#2563EB] font-bold hover:underline inline-flex items-center gap-1"
+                      className="min-h-[44px] px-4 py-2 rounded-2xl text-xs text-white font-extrabold inline-flex items-center gap-1.5 shadow-xs cursor-pointer"
+                      style={{
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }}
                     >
-                      <Plus size={12} />
-                      <span>Create the first group</span>
+                      <Plus size={14} />
+                      <span>Create First Group</span>
                     </button>
                   </div>
                 ) : (
-                  filteredGroups.map((group) => {
-                    const isActive = activeChannel === group.id && !showMobileChannels;
-                    const isGrpAdmin =
-                      group.adminIds?.includes(currentUser?.uid || '') ||
-                      group.creatorId === currentUser?.uid;
-                    const grpUnread =
-                      isActive ? 0 : unreadCountsByChannel[group.id] || 0;
-                    const grpLatest = latestMessageByChannel[group.id];
+                  <div className="space-y-2.5">
+                    {(convoFilter === 'groups' ? filteredGroups : filteredGroups.slice(0, 4)).map(
+                      (group) => {
+                        const isActive = activeChannel === group.id && !showMobileChannels;
+                        const isGrpAdmin =
+                          group.adminIds?.includes(currentUser?.uid || '') ||
+                          group.creatorId === currentUser?.uid;
+                        const grpUnread =
+                          isActive ? 0 : unreadCountsByChannel[group.id] || 0;
+                        const grpLatest = latestMessageByChannel[group.id];
+                        const grpTypers = getActiveTypingUsersForChannel(group.id);
+                        const timeLabel = formatCompactConvoTime(
+                          grpLatest?.createdAt || group.lastMessageAt || group.updatedAt || group.createdAt
+                        );
 
-                    return (
-                      <button
-                        key={group.id}
-                        type="button"
-                        onClick={() => {
-                          setActiveChannel(group.id);
-                          setReplyingTo(null);
-                          setShowMobileChannels(false);
-                        }}
-                        className={`w-full min-h-[60px] flex items-center gap-3 p-3 rounded-2xl text-left transition relative group border ${
-                          isActive
-                            ? 'bg-blue-50/95 border-[#2563EB] text-[#1C1917] shadow-2xs'
-                            : grpUnread > 0
-                            ? 'bg-blue-50/50 border-[#2563EB]/50 text-[#1C1917] shadow-2xs'
-                            : 'bg-white/80 text-[#1C1917] border-[#EFECE6] hover:bg-white hover:border-[#D6D3CD]'
-                        }`}
-                      >
-                        {/* Group Custom Logo */}
-                        <div className="relative shrink-0">
-                          <img
-                            src={group.logoUrl || PRESET_LOGOS[0].url}
-                            alt={group.name}
-                            className={`w-11 h-11 rounded-xl object-cover ring-2 ${
-                              isActive ? 'ring-[#2563EB]/40' : 'ring-[#EFECE6]'
+                        return (
+                          <button
+                            key={group.id}
+                            type="button"
+                            onClick={() => {
+                              setActiveChannel(group.id);
+                              setReplyingTo(null);
+                              setReactionMenuMsgId(null);
+                              setShowMobileChannels(false);
+                            }}
+                            className={`w-full min-h-[76px] flex items-center gap-3.5 p-3.5 rounded-3xl text-left transition border cursor-pointer ${
+                              isActive
+                                ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/20 shadow-sm'
+                                : grpUnread > 0
+                                ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)]/60 shadow-xs'
+                                : 'bg-[var(--bg-surface)] border-[var(--border-hairline)] hover:border-[var(--accent-primary)]/50'
                             }`}
-                          />
-                          {isGrpAdmin && (
-                            <span
-                              className="absolute -top-1 -right-1 p-0.5 rounded-full bg-amber-500 text-white shadow-2xs"
-                              title="You are Group Admin"
+                          >
+                            <div
+                              className="relative p-[2px] rounded-2xl shrink-0"
+                              style={{
+                                background:
+                                  'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                              }}
                             >
-                              <Crown size={10} />
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Group Info */}
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between gap-1">
-                            <span className="font-bold text-sm text-[#1C1917] truncate">
-                              {group.name}
-                            </span>
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              {grpUnread > 0 && (
-                                <>
-                                  <span className="px-2 py-0.5 rounded-full bg-emerald-600 text-white text-[10px] font-extrabold uppercase tracking-wide">
-                                    New message
-                                  </span>
-                                  <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-[#2563EB] text-white text-[11px] font-extrabold inline-flex items-center justify-center">
-                                    {grpUnread}
-                                  </span>
-                                </>
+                              <img
+                                src={group.logoUrl || PRESET_LOGOS[0].url}
+                                alt={group.name}
+                                className="w-12 h-12 rounded-[14px] object-cover bg-[var(--bg-surface)]"
+                              />
+                              {isGrpAdmin && (
+                                <span
+                                  className="absolute -top-1 -right-1 p-1 rounded-full bg-amber-500 text-white shadow-2xs"
+                                  title="Group Admin"
+                                >
+                                  <Crown size={10} />
+                                </span>
                               )}
-                              <span className="text-[11px] font-semibold text-[#57534E]">
-                                {group.memberIds?.length || 1}m
-                              </span>
                             </div>
-                          </div>
-                          {(() => {
-                            const grpTypers = getActiveTypingUsersForChannel(group.id);
-                            if (grpTypers.length > 0) {
-                              return (
-                                <p className="text-xs text-[#0D9488] font-bold truncate mt-0.5 flex items-center gap-1.5">
+
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-extrabold text-sm text-[var(--text-primary)] truncate">
+                                  {group.name}
+                                </span>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {timeLabel && (
+                                    <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
+                                      {timeLabel}
+                                    </span>
+                                  )}
+                                  {grpUnread > 0 && (
+                                    <span
+                                      className="min-w-[22px] h-5 px-1.5 rounded-full text-white text-[11px] font-extrabold inline-flex items-center justify-center shadow-2xs"
+                                      style={{ backgroundColor: 'var(--accent-primary)' }}
+                                    >
+                                      {grpUnread}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+
+                              {grpTypers.length > 0 ? (
+                                <p className="text-xs text-emerald-600 dark:text-emerald-400 font-extrabold truncate mt-1 flex items-center gap-1.5">
                                   <span className="inline-flex items-center gap-0.5">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.3s]" />
-                                    <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.15s]" />
-                                    <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce" />
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
                                   </span>
                                   <span className="truncate">
                                     {grpTypers.length === 1
@@ -2552,246 +3236,417 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                                       : `${grpTypers.length} people typing...`}
                                   </span>
                                 </p>
-                              );
-                            }
-                            if (grpLatest?.text) {
-                              return (
+                              ) : grpLatest?.text ? (
                                 <p
-                                  className={`text-xs truncate mt-0.5 ${
+                                  className={`text-xs truncate mt-1 ${
                                     grpUnread > 0
-                                      ? 'font-extrabold text-[#1C1917]'
-                                      : 'text-[#57534E]'
+                                      ? 'font-extrabold text-[var(--text-primary)]'
+                                      : 'font-medium text-[var(--text-secondary)]'
                                   }`}
                                 >
                                   {grpLatest.senderId === currentUser?.uid
                                     ? `You: ${grpLatest.text}`
                                     : `${grpLatest.senderName.split(' ')[0]}: ${grpLatest.text}`}
                                 </p>
-                              );
-                            }
-                            return (
-                              <p className="text-xs text-[#57534E] truncate mt-0.5">
-                                {group.description || `Created by ${group.creatorName}`}
-                              </p>
-                            );
-                          })()}
-                        </div>
-                      </button>
-                    );
-                  })
+                              ) : (
+                                <p className="text-xs text-[var(--text-secondary)] truncate mt-1">
+                                  {group.description || `${group.memberIds?.length || 1} members`}
+                                </p>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      }
+                    )}
+                  </div>
                 )}
               </div>
             )}
 
-            {/* Direct 1-on-1 Chats Section */}
-            {(convoFilter === 'all' || convoFilter === 'dms') && (
-              <div className="space-y-1.5 pt-2">
-                <div className="text-[11px] font-extrabold uppercase tracking-wider text-[#57534E] px-2 py-1 flex items-center gap-1.5">
-                  <UserIcon size={13} className="text-[#2563EB]" />
-                  <span>Direct Chats ({filteredMembers.length})</span>
+            {/* 4. Conversation List (Comfortable >= 76px row height, big avatar with ring, preview, time, unread badge, typing...) */}
+            {convoFilter === 'chats' && (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
+                    <MessageSquare size={13} className="text-[var(--accent-primary)]" />
+                    <span>Recent Conversations ({filteredMembers.length})</span>
+                  </span>
                 </div>
-                {filteredMembers.length === 0 ? (
-                  <p className="text-xs text-[#57534E] italic px-2 py-2">
-                    No other users registered yet.
-                  </p>
-                ) : (
-                  filteredMembers.map((member) => {
-                    if (!currentUser) return null;
-                    const dmId = computeDmConversationId(currentUser.uid, member.id);
-                    const isActive = activeChannel === dmId && !showMobileChannels;
-                    const dmTypers = getActiveTypingUsersForChannel(dmId);
-                    const isMemberTyping =
-                      dmTypers.length > 0 || (member.id === SUPPORT_BOT_ID && isBotReplying);
-                    const unreadCount = isActive ? 0 : unreadCountsByChannel[dmId] || 0;
-                    const latestMsg = latestMessageByChannel[dmId];
-                    const metaLastText = channelMetaMap[dmId]?.lastMessageText;
-                    const metaLastSenderId = channelMetaMap[dmId]?.lastMessageSenderId;
-                    const previewText = latestMsg?.text || metaLastText || '';
-                    const previewSenderId = latestMsg?.senderId || metaLastSenderId || '';
 
-                    return (
-                      <button
-                        key={member.id}
-                        type="button"
-                        onClick={() => {
-                          setActiveChannel(dmId);
-                          setReplyingTo(null);
-                          setShowMobileChannels(false);
-                        }}
-                        className={`w-full min-h-[64px] flex items-center gap-3 p-3 rounded-2xl text-left transition border ${
-                          isActive
-                            ? 'bg-blue-50/95 border-[#2563EB] text-[#1C1917] shadow-2xs'
-                            : unreadCount > 0
-                            ? 'bg-blue-50/60 border-[#2563EB]/60 text-[#1C1917] shadow-2xs'
-                            : 'bg-white/80 text-[#1C1917] border-[#EFECE6] hover:bg-white hover:border-[#D6D3CD]'
-                        }`}
+                {isLoadingConversations ? (
+                  <div className="space-y-2.5">
+                    {[1, 2, 3, 4].map((n) => (
+                      <div
+                        key={n}
+                        className="w-full min-h-[76px] p-3.5 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] flex items-center gap-3.5 animate-pulse"
                       >
-                        <div className="relative shrink-0">
-                          <img
-                            src={
-                              member.photoURL ||
-                              `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
-                            }
-                            alt={member.displayName}
-                            className="w-11 h-11 rounded-full object-cover ring-2 ring-[#2563EB]/20 shrink-0"
-                          />
-                          {unreadCount > 0 && (
-                            <span className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1.5 rounded-full bg-[#2563EB] text-white text-[11px] font-extrabold flex items-center justify-center ring-2 ring-white shadow-xs">
-                              {unreadCount}
-                            </span>
-                          )}
+                        <div className="w-13 h-13 rounded-full bg-[var(--bg-subtle)] shrink-0" />
+                        <div className="flex-1 space-y-2">
+                          <div className="h-3.5 w-32 rounded-full bg-[var(--bg-subtle)]" />
+                          <div className="h-3 w-48 rounded-full bg-[var(--bg-subtle)]" />
                         </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between gap-1">
-                            <span className="truncate">
-                              <CrystalBadge
-                                email={member.email}
-                                name={member.displayName}
-                                isPro={member.isPro}
-                                hasBlueStar={member.hasBlueStar || member.isPro}
-                                isSubAdmin={member.isSubAdmin || member.role === 'sub_admin'}
-                                role={member.role}
-                                size="sm"
-                              />
-                            </span>
-                            <div className="flex items-center gap-1 shrink-0">
-                              {unreadCount > 0 && (
-                                <span className="px-2 py-0.5 rounded-full bg-emerald-600 text-white text-[10px] font-extrabold uppercase tracking-wide shadow-2xs">
-                                  New message
-                                </span>
-                              )}
-                              {isSuperAdminEmail(member.email, member.role) && !canTalkToAdmin ? (
-                                <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold flex items-center gap-0.5 shrink-0">
-                                  <Lock size={9} />
-                                  <span>Pro</span>
-                                </span>
-                              ) : isMemberTyping ? (
-                                <span className="text-[10px] px-2 py-0.5 rounded-full shrink-0 bg-teal-100 text-[#0D9488] border border-teal-300 font-extrabold animate-pulse">
-                                  Typing...
-                                </span>
-                              ) : unreadCount === 0 ? (
-                                <span className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 bg-teal-50 text-[#0D9488] border border-teal-200/70 font-bold">
-                                  Live
-                                </span>
-                              ) : null}
-                            </div>
-                          </div>
-                          {isMemberTyping ? (
-                            <span className="text-xs font-bold text-[#0D9488] flex items-center gap-1.5 truncate mt-0.5">
-                              <span className="inline-flex items-center gap-0.5">
-                                <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.3s]" />
-                                <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.15s]" />
-                                <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce" />
-                              </span>
-                              <span>typing a message...</span>
-                            </span>
-                          ) : previewText ? (
-                            <span
-                              className={`text-xs block truncate mt-0.5 ${
-                                unreadCount > 0
-                                  ? 'font-extrabold text-[#1C1917]'
-                                  : 'font-medium text-[#57534E]'
-                              }`}
+                      </div>
+                    ))}
+                  </div>
+                ) : visibleMembersList.length === 0 ? (
+                  <div className="p-6 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-center space-y-2">
+                    <p className="text-sm font-extrabold text-[var(--text-primary)]">
+                      No conversations found
+                    </p>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      Try another search name or tap a person above to say hello!
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {visibleMembersList.map((member) => {
+                      if (!currentUser) return null;
+                      const dmId = computeDmConversationId(currentUser.uid, member.id);
+                      const isActive = activeChannel === dmId && !showMobileChannels;
+                      const dmTypers = getActiveTypingUsersForChannel(dmId);
+                      const isMemberTyping =
+                        dmTypers.length > 0 || (member.id === SUPPORT_BOT_ID && isBotReplying);
+                      const unreadCount = isActive ? 0 : unreadCountsByChannel[dmId] || 0;
+                      const latestMsg = latestMessageByChannel[dmId];
+                      const metaLastText = channelMetaMap[dmId]?.lastMessageText;
+                      const metaLastSenderId = channelMetaMap[dmId]?.lastMessageSenderId;
+                      const previewText = latestMsg?.text || metaLastText || '';
+                      const previewSenderId = latestMsg?.senderId || metaLastSenderId || '';
+                      const previewTimeIso =
+                        latestMsg?.createdAt ||
+                        channelMetaMap[dmId]?.lastMessageAt ||
+                        channelMetaMap[dmId]?.updatedAt ||
+                        member.lastSeen ||
+                        '';
+                      const compactTime = formatCompactConvoTime(previewTimeIso);
+
+                      return (
+                        <button
+                          key={member.id}
+                          type="button"
+                          onClick={() => handleOpenMemberChat(member.id)}
+                          className={`w-full min-h-[76px] flex items-center gap-3.5 p-3.5 rounded-3xl text-left transition border cursor-pointer ${
+                            isActive
+                              ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/20 shadow-sm'
+                              : unreadCount > 0
+                              ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)]/60 shadow-xs'
+                              : 'bg-[var(--bg-surface)] border-[var(--border-hairline)] hover:border-[var(--accent-primary)]/40'
+                          }`}
+                        >
+                          {/* Big Avatar with Colored Ring + Live RTDB Presence Dot */}
+                          <div className="relative shrink-0">
+                            <div
+                              className="p-[2px] rounded-full"
+                              style={{
+                                background:
+                                  'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                              }}
                             >
-                              {previewSenderId === currentUser.uid
-                                ? `You: ${previewText}`
-                                : previewText}
-                            </span>
-                          ) : (
-                            <span className="text-xs font-medium text-[#57534E] block truncate mt-0.5">
-                              {member.username || `@${(member.email || 'waver').split('@')[0]}`}
-                            </span>
-                          )}
-                        </div>
-                      </button>
-                    );
-                  })
+                              <Avatar
+                                uid={member.id}
+                                src={
+                                  member.photoURL ||
+                                  `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
+                                }
+                                alt={member.displayName}
+                                fallbackName={member.displayName}
+                                size={48}
+                                showStatus={member.id !== SUPPORT_BOT_ID}
+                                targetProfile={member}
+                                imageClassName="border-2 border-[var(--bg-surface)]"
+                              />
+                            </div>
+                            {member.id === SUPPORT_BOT_ID && (
+                              <span
+                                className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                                title="24/7 Assistant"
+                              />
+                            )}
+                          </div>
+
+                          {/* Conversation Info */}
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="truncate">
+                                <CrystalBadge
+                                  email={member.email}
+                                  name={member.displayName}
+                                  isPro={member.isPro}
+                                  hasBlueStar={member.hasBlueStar || member.isPro}
+                                  isSubAdmin={member.isSubAdmin || member.role === 'sub_admin'}
+                                  role={member.role}
+                                  size="sm"
+                                />
+                              </span>
+
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {compactTime && (
+                                  <span
+                                    className={`text-[11px] font-semibold ${
+                                      unreadCount > 0
+                                        ? 'text-[var(--accent-primary)] font-extrabold'
+                                        : 'text-[var(--text-secondary)]'
+                                    }`}
+                                  >
+                                    {compactTime}
+                                  </span>
+                                )}
+                                {isSuperAdminEmail(member.email, member.role) && !canTalkToAdmin && (
+                                  <span className="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 text-[10px] font-bold flex items-center gap-0.5 shrink-0">
+                                    <Lock size={9} />
+                                    <span>Pro</span>
+                                  </span>
+                                )}
+                                {unreadCount > 0 && (
+                                  <span
+                                    className="min-w-[22px] h-5 px-1.5 rounded-full text-white text-[11px] font-extrabold flex items-center justify-center shadow-2xs"
+                                    style={{ backgroundColor: 'var(--accent-primary)' }}
+                                  >
+                                    {unreadCount}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            {isMemberTyping ? (
+                              <span className="text-xs font-extrabold text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5 truncate mt-1">
+                                <span className="inline-flex items-center gap-0.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
+                                </span>
+                                <span>typing...</span>
+                              </span>
+                            ) : previewText ? (
+                              <span
+                                className={`text-xs block truncate mt-1 ${
+                                  unreadCount > 0
+                                    ? 'font-extrabold text-[var(--text-primary)]'
+                                    : 'font-medium text-[var(--text-secondary)]'
+                                }`}
+                              >
+                                {previewSenderId === currentUser.uid
+                                  ? `You: ${previewText}`
+                                  : previewText}
+                              </span>
+                            ) : (
+                              <span className="text-xs font-medium text-[var(--text-secondary)] block truncate mt-1">
+                                {member.bio ||
+                                  (member.interests && member.interests.length > 0
+                                    ? member.interests.slice(0, 2).join(' • ')
+                                    : 'Tap to start chatting 👋')}
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Load More Conversations Button (20 at first) */}
+                {(filteredMembers.length > convoDisplayLimit || members.length >= convoFetchLimit) && (
+                  <div className="pt-2 flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConvoDisplayLimit((prev) => prev + 20);
+                        setConvoFetchLimit((prev) => prev + 20);
+                      }}
+                      className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
+                    >
+                      <History size={14} className="text-[var(--accent-primary)]" />
+                      <span>Load more conversations</span>
+                    </button>
+                  </div>
                 )}
               </div>
             )}
           </div>
+
+          {/* Floating "New Chat" Button inside Chat Home */}
+          <button
+            type="button"
+            onClick={() => {
+              setConvoFilter((prev) => (prev === 'people' ? 'chats' : 'people'));
+            }}
+            className="absolute bottom-4 right-4 z-20 min-h-[48px] px-4 py-2.5 rounded-full text-white font-extrabold text-xs flex items-center gap-2 shadow-lg transition hover:scale-105 active:scale-95 cursor-pointer"
+            style={{
+              background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+            }}
+            title="Start a new chat"
+          >
+            <MessageSquare size={16} />
+            <span>{convoFilter === 'people' ? 'Back to Chats' : 'New chat'}</span>
+          </button>
         </div>
 
-        {/* SCREEN 2 (Separate Full-Screen Conversation Screen on Phones < 1024px; Right Pane on Desktop >= 1024px) */}
+        {/* =====================================================================
+            SCREEN 2: CONVERSATION SCREEN (Mobile Full-Screen; Desktop Middle Column)
+           ===================================================================== */}
         <div
-          className={`wavelink-mobile-conversation-screen flex-1 flex-col min-w-0 h-full bg-white ${
+          className={`wavelink-mobile-conversation-screen wavelink-chat-center-col flex-1 flex-col min-w-0 h-full bg-[var(--bg-canvas)] ${
             isMobileListScreenVisible ? 'hidden lg:flex' : 'flex'
           }`}
         >
-          {/* Header Bar with prominent >= 44px Back Button on mobile */}
-          <div className="p-2.5 sm:p-4 border-b border-[#EFECE6] bg-white flex items-center justify-between gap-2 shrink-0">
-            <div className="flex items-center gap-2 min-w-0">
+          {!activeChannel ? (
+            /* Middle Column Empty State when no chat is selected (Desktop >= 1024px) */
+            <div className="flex-1 h-full flex flex-col items-center justify-center p-8 text-center bg-[var(--bg-canvas)] select-none">
+              <div className="max-w-md w-full p-8 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-sm flex flex-col items-center gap-4">
+                <div
+                  className="w-20 h-20 rounded-3xl flex items-center justify-center text-white shadow-md"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  <MessageSquare size={38} />
+                </div>
+                <div className="space-y-1.5">
+                  <h3 className="font-extrabold text-xl text-[var(--text-primary)] tracking-tight">
+                    Select a chat to start talking
+                  </h3>
+                  <p className="text-sm text-[var(--text-secondary)] leading-relaxed">
+                    Choose a conversation or active friend on the left, or start a brand new chat right now.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConvoFilter('people');
+                      searchInputRef.current?.focus();
+                    }}
+                    className="min-h-[44px] px-5 py-2.5 rounded-2xl text-white font-extrabold text-sm flex items-center gap-2 shadow-sm hover:opacity-95 active:scale-95 transition cursor-pointer"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                  >
+                    <Plus size={16} />
+                    <span>New Chat</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedMemberIds([]);
+                      setNewGroupName('');
+                      setNewGroupDesc('');
+                      setNewGroupLogo(PRESET_LOGOS[0].url);
+                      setIsCreateGroupOpen(true);
+                    }}
+                    className="min-h-[44px] px-4 py-2.5 rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] font-extrabold text-sm flex items-center gap-2 transition active:scale-95 cursor-pointer"
+                  >
+                    <Users size={16} className="text-[var(--accent-primary)]" />
+                    <span>New Group</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
+          {/* Conversation Header: Avatar with ring, name, verified tick, Active now, bio/interests, voice, video & menu */}
+          <div className="px-3 py-2.5 sm:px-4 sm:py-3 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] flex items-center justify-between gap-2 shrink-0 relative z-20">
+            <div className="flex items-center gap-2.5 min-w-0">
               <button
                 type="button"
                 onClick={() => setShowMobileChannels(true)}
-                className="lg:hidden min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] hover:bg-[#EFECE6] flex items-center justify-center gap-1.5 text-xs font-extrabold shrink-0"
-                title="Back to Conversations List"
-                aria-label="Back to Conversations List"
+                className="lg:hidden min-w-[44px] min-h-[44px] px-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] hover:border-[var(--accent-primary)] flex items-center justify-center gap-1 text-xs font-extrabold shrink-0 cursor-pointer"
+                title="Back to Conversations"
+                aria-label="Back to Conversations"
               >
-                <ArrowLeft size={18} className="text-[#2563EB]" />
-                <span>Back</span>
+                <ArrowLeft size={18} className="text-[var(--accent-primary)]" />
               </button>
 
               {activeGroup ? (
-                // Group Chat Header
                 <div
                   onClick={() => setIsGroupInfoOpen(true)}
                   className="flex items-center gap-2.5 sm:gap-3 cursor-pointer group/title min-w-0"
                 >
-                  <img
-                    src={activeGroup.logoUrl || PRESET_LOGOS[0].url}
-                    alt={activeGroup.name}
-                    className="w-10 h-10 rounded-2xl object-cover ring-2 ring-[#2563EB]/25 group-hover/title:scale-105 transition shrink-0"
-                  />
+                  <div
+                    className="relative p-[2px] rounded-2xl shrink-0"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                  >
+                    <img
+                      src={activeGroup.logoUrl || PRESET_LOGOS[0].url}
+                      alt={activeGroup.name}
+                      className="w-10 h-10 rounded-[14px] object-cover bg-[var(--bg-surface)]"
+                    />
+                  </div>
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <h2 className="font-extrabold text-sm sm:text-base text-[#1C1917] truncate">
+                      <h2 className="font-extrabold text-sm sm:text-base text-[var(--text-primary)] truncate">
                         {activeGroup.name}
                       </h2>
-                      {isCurrentUserGroupAdmin && (
-                        <span className="px-2 py-0.5 rounded-full bg-blue-50 text-[#2563EB] border border-blue-200/80 text-[10px] font-bold flex items-center gap-1">
-                          <Crown size={10} />
-                          <span>Admin</span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[var(--text-secondary)]">
+                        <Users size={11} className="text-[var(--accent-primary)]" />
+                        <span>
+                          {(() => {
+                            const onlineMembers = (activeGroup.memberIds || []).filter((id) =>
+                              getCachedIsOnline(id)
+                            ).length;
+                            const totalMembers = activeGroup.memberIds?.length || 1;
+                            return onlineMembers > 0
+                              ? `${onlineMembers} online • ${totalMembers} members`
+                              : `${totalMembers} members`;
+                          })()}
                         </span>
-                      )}
+                      </span>
                     </div>
                     {activeChannelTypingUsers.length > 0 ? (
-                      <p className="text-xs text-[#0D9488] truncate flex items-center gap-1.5 font-extrabold mt-0.5">
-                        <span className="inline-flex items-center gap-0.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.3s]" />
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.15s]" />
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce" />
-                        </span>
-                        <span className="truncate">
+                      <p className="text-xs text-emerald-600 dark:text-emerald-400 truncate flex items-center gap-1.5 font-extrabold mt-0.5">
+                        <span>
                           {activeChannelTypingUsers.length === 1
                             ? `${activeChannelTypingUsers[0].name} is typing...`
                             : `${activeChannelTypingUsers.map((u) => u.name.split(' ')[0]).join(', ')} are typing...`}
                         </span>
                       </p>
                     ) : (
-                      <p className="text-xs text-[#57534E] truncate flex items-center gap-1.5 font-medium">
-                        <span>{activeGroup.memberIds?.length || 1} members</span>
-                        <span>•</span>
-                        <span className="text-[#2563EB] font-semibold group-hover/title:underline">
-                          Group Info
-                        </span>
+                      <p className="text-xs text-[var(--text-secondary)] truncate mt-0.5">
+                        {activeGroup.description || 'Tap header for group members & info'}
                       </p>
                     )}
                   </div>
                 </div>
               ) : directRecipient ? (
-                // Direct Chat Header
                 <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
-                  <img
-                    src={
-                      directRecipient.photoURL ||
-                      `https://api.dicebear.com/7.x/shapes/svg?seed=${directRecipient.id}`
-                    }
-                    alt={directRecipient.displayName}
-                    className="w-10 h-10 rounded-full object-cover ring-2 ring-[#2563EB]/25 shrink-0"
-                  />
+                  <div className="relative shrink-0">
+                    <div
+                      className="p-[2px] rounded-full"
+                      style={{
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }}
+                    >
+                      <Avatar
+                        uid={directRecipient.id}
+                        src={
+                          directRecipient.photoURL ||
+                          `https://api.dicebear.com/7.x/shapes/svg?seed=${directRecipient.id}`
+                        }
+                        alt={directRecipient.displayName}
+                        fallbackName={directRecipient.displayName}
+                        size={42}
+                        showStatus={!isChattingWithSupportBot}
+                        onlyWhenVisible={false}
+                        targetProfile={directRecipient}
+                        priority={true}
+                        imageClassName="border-2 border-[var(--bg-surface)]"
+                      />
+                    </div>
+                    {isChattingWithSupportBot && (
+                      <span
+                        className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                        title="24/7 Assistant"
+                      />
+                    )}
+                  </div>
+
                   <div className="min-w-0">
-                    <div className="flex items-center gap-1.5 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <CrystalBadge
                         email={directRecipient.email}
                         name={directRecipient.displayName}
@@ -2802,64 +3657,67 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         }
                         size="md"
                       />
+                      {directRecipientStatusText && (
+                        <span
+                          className={`inline-flex items-center gap-1 text-[11px] font-extrabold ${
+                            isChattingWithSupportBot || directRecipientPresence.status === 'online'
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'text-[var(--text-secondary)]'
+                          }`}
+                        >
+                          <span
+                            className={`w-1.5 h-1.5 rounded-full ${
+                              isChattingWithSupportBot || directRecipientPresence.status === 'online'
+                                ? 'bg-[#22c55e] animate-pulse'
+                                : 'bg-[#ef4444]'
+                            }`}
+                          />
+                          <span>{directRecipientStatusText}</span>
+                        </span>
+                      )}
                     </div>
+
                     {activeChannelTypingUsers.length > 0 ? (
-                      <p className="text-xs text-[#0D9488] truncate mt-0.5 flex items-center gap-1.5 font-extrabold">
+                      <p className="text-xs text-emerald-600 dark:text-emerald-400 truncate mt-0.5 flex items-center gap-1.5 font-extrabold">
                         <span className="inline-flex items-center gap-0.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.3s]" />
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.15s]" />
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce" />
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
                         </span>
                         <span>{directRecipient.displayName.split(' ')[0]} is typing...</span>
                       </p>
                     ) : (
-                      <p className="text-xs text-[#57534E] truncate mt-0.5 flex items-center gap-1.5 font-medium">
-                        <span className="truncate">{directRecipient.username}</span>
-                        <span>•</span>
-                        {channelLastSeen[directRecipient.id] ||
-                        directRecipient.lastSeen ||
-                        directRecipient.lastSeenAt ? (
-                          <span className="text-[#0D9488] font-semibold truncate">
-                            Last seen{' '}
-                            {formatLastSeenTimestamp(
-                              channelLastSeen[directRecipient.id] ||
-                                directRecipient.lastSeen ||
-                                directRecipient.lastSeenAt
-                            )}
-                          </span>
-                        ) : (
-                          <span>Direct Message</span>
-                        )}
+                      <p className="text-xs text-[var(--text-secondary)] truncate mt-0.5 font-medium">
+                        {directRecipient.interests && directRecipient.interests.length > 0
+                          ? directRecipient.interests.slice(0, 3).join(' • ')
+                          : directRecipient.bio
+                          ? directRecipient.bio
+                          : directRecipient.username || 'WaveLink Member'}
                       </p>
                     )}
                   </div>
                 </div>
               ) : (
                 <div className="flex items-center gap-2">
-                  <MessageSquare size={20} className="text-[#2563EB]" />
-                  <span className="font-bold text-sm text-[#1C1917]">
-                    Select a group or member to chat
+                  <MessageSquare size={20} className="text-[var(--accent-primary)]" />
+                  <span className="font-bold text-sm text-[var(--text-primary)]">
+                    Select a conversation to start chatting
                   </span>
                 </div>
               )}
             </div>
 
-            {/* Right Action Icons: Video/Voice Calling, Block & Report for DMs, Group Info for Groups (all >= 44px tap targets) */}
-            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-              {isDirectMessage && directRecipient && (
-                isChattingWithSupportBot ? (
-                  <span className="hidden sm:flex px-2.5 py-1.5 rounded-xl bg-teal-50 border border-teal-200 text-[#0D9488] text-xs font-extrabold items-center gap-1.5">
-                    <Bot size={14} />
-                    <span>Assistant</span>
-                  </span>
-                ) : isBlockedFromAdminChat ? (
+            {/* Header Action Buttons: Voice Call, Video Call, and Menu (all >= 44px tap targets) */}
+            <div className="flex items-center gap-1.5 shrink-0 relative">
+              {isDirectMessage && directRecipient && !isChattingWithSupportBot && (
+                isBlockedFromAdminChat ? (
                   <button
                     type="button"
                     onClick={() => setShowPaymentModal(true)}
-                    className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-xl bg-amber-50 border border-amber-300/80 hover:bg-amber-100 text-amber-900 text-xs font-bold flex items-center gap-1.5 transition"
+                    className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-2xl bg-amber-500/15 border border-amber-400/50 text-amber-600 dark:text-amber-300 text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer"
                     title="Try Pro to message or call Admin directly"
                   >
-                    <Lock size={14} className="text-amber-600" />
+                    <Lock size={14} />
                     <span>Try Pro</span>
                   </button>
                 ) : (
@@ -2873,12 +3731,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           photoURL: directRecipient.photoURL
                         })
                       }
-                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] text-xs font-bold flex items-center justify-center gap-1.5 transition shrink-0"
+                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer"
                       title="Start Voice Call"
+                      aria-label="Start Voice Call"
                     >
-                      <PhoneCall size={16} className="text-[#0D9488]" />
+                      <PhoneCall size={17} className="text-emerald-500" />
                       <span className="hidden sm:inline">Voice</span>
                     </button>
+
                     <button
                       type="button"
                       onClick={() =>
@@ -2888,75 +3748,144 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           photoURL: directRecipient.photoURL
                         })
                       }
-                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-2xs transition shrink-0"
+                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-xs transition shrink-0 cursor-pointer"
+                      style={{
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }}
                       title="Start Video Call"
+                      aria-label="Start Video Call"
                     >
-                      <Video size={16} />
+                      <Video size={17} />
                       <span className="hidden sm:inline">Video</span>
                     </button>
-                    {!isSuperAdminEmail(directRecipient.email, directRecipient.role) && (
+                  </>
+                )
+              )}
+
+              {/* Header Menu Button (MoreVertical) */}
+              <button
+                type="button"
+                onClick={() => setShowHeaderMenu((prev) => !prev)}
+                className="min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                title="Conversation menu"
+                aria-label="Conversation menu"
+              >
+                <MoreVertical size={18} />
+              </button>
+
+              {showHeaderMenu && (
+                <div className="absolute right-0 top-13 w-56 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-40 space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowDesktopRightPanel((prev) => !prev);
+                      setShowHeaderMenu(false);
+                    }}
+                    className="hidden xl:flex w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] items-center gap-2.5 cursor-pointer"
+                  >
+                    <PanelRight size={15} className="text-[var(--accent-primary)]" />
+                    <span>{showDesktopRightPanel ? 'Hide Details Panel' : 'Show Details Panel'}</span>
+                  </button>
+
+                  {activeChannel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toggleMuteChannel(activeChannel);
+                        setShowHeaderMenu(false);
+                      }}
+                      className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center gap-2.5 cursor-pointer"
+                    >
+                      {isActiveChannelMuted ? (
+                        <Bell size={15} className="text-[var(--accent-primary)]" />
+                      ) : (
+                        <BellOff size={15} className="text-[var(--accent-primary)]" />
+                      )}
+                      <span>
+                        {isActiveChannelMuted ? 'Unmute Notifications' : 'Mute Notifications'}
+                      </span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveChannel('');
+                      setShowMobileChannels(true);
+                      setShowHeaderMenu(false);
+                    }}
+                    className="hidden lg:flex w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)] items-center gap-2.5 cursor-pointer"
+                  >
+                    <X size={15} />
+                    <span>Close Conversation</span>
+                  </button>
+
+                  {activeGroup && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsGroupInfoOpen(true);
+                          setShowHeaderMenu(false);
+                        }}
+                        className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center gap-2.5 cursor-pointer"
+                      >
+                        <Info size={15} className="text-[var(--accent-primary)]" />
+                        <span>Group Info &amp; Members</span>
+                      </button>
+                      {isCurrentUserMember && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowHeaderMenu(false);
+                            handleExitGroup(activeGroup);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-rose-600 hover:bg-rose-500/10 flex items-center gap-2.5 cursor-pointer"
+                        >
+                          <LogOut size={15} />
+                          <span>Exit Group</span>
+                        </button>
+                      )}
+                    </>
+                  )}
+
+                  {isDirectMessage &&
+                    directRecipient &&
+                    !isChattingWithSupportBot &&
+                    !isSuperAdminEmail(directRecipient.email, directRecipient.role) && (
                       <>
                         <button
                           type="button"
-                          onClick={() => toggleBlockUser(directRecipient.id)}
-                          className={`hidden sm:flex min-w-[44px] min-h-[44px] px-2.5 py-2 rounded-xl border text-xs font-bold items-center justify-center gap-1 transition shrink-0 ${
-                            isRecipientBlocked
-                              ? 'bg-rose-600 text-white border-rose-600'
-                              : 'bg-[#FAF7F2] hover:bg-rose-50 border-[#EFECE6] text-[#57534E] hover:text-rose-600'
-                          }`}
-                          title={isRecipientBlocked ? 'Unblock User' : 'Block User'}
+                          onClick={() => {
+                            toggleBlockUser(directRecipient.id);
+                            setShowHeaderMenu(false);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-rose-500/10 hover:text-rose-600 flex items-center gap-2.5 cursor-pointer"
                         >
-                          <Ban size={14} />
-                          <span className="hidden lg:inline">
-                            {isRecipientBlocked ? 'Unblocked?' : 'Block'}
-                          </span>
+                          <Ban size={15} className="text-rose-500" />
+                          <span>{isRecipientBlocked ? 'Unblock User' : 'Block User'}</span>
                         </button>
                         <button
                           type="button"
-                          onClick={() =>
+                          onClick={() => {
+                            setShowHeaderMenu(false);
                             reportContent({
                               targetType: 'user',
                               targetId: directRecipient.id,
                               targetAuthorId: directRecipient.id,
                               targetSummary: `${directRecipient.displayName} (${directRecipient.username || directRecipient.email})`,
                               reason: 'Reported user from Direct Messages'
-                            })
-                          }
-                          className="hidden sm:flex min-w-[44px] min-h-[44px] px-2.5 py-2 rounded-xl bg-[#FAF7F2] hover:bg-amber-50 border border-[#EFECE6] text-[#57534E] hover:text-amber-700 text-xs font-bold items-center justify-center gap-1 transition shrink-0"
-                          title="Report User"
+                            });
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-amber-600 hover:bg-amber-500/10 flex items-center gap-2.5 cursor-pointer"
                         >
-                          <Flag size={14} />
+                          <Flag size={15} />
+                          <span>Report User</span>
                         </button>
                       </>
                     )}
-                  </>
-                )
-              )}
-
-              {activeGroup && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setIsGroupInfoOpen(true)}
-                    className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] text-xs font-bold flex items-center justify-center gap-1.5 transition"
-                    title="Group Settings & Members"
-                  >
-                    <Info size={16} className="text-[#2563EB]" />
-                    <span className="hidden sm:inline">Info</span>
-                  </button>
-
-                  {isCurrentUserMember && (
-                    <button
-                      type="button"
-                      onClick={() => handleExitGroup(activeGroup)}
-                      className="min-w-[44px] min-h-[44px] px-2.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200/80 text-rose-700 text-xs font-bold flex items-center justify-center gap-1 transition"
-                      title="Exit Group"
-                    >
-                      <LogOut size={15} />
-                      <span className="hidden sm:inline">Exit</span>
-                    </button>
-                  )}
-                </>
+                </div>
               )}
             </div>
           </div>
@@ -2971,7 +3900,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 <AlertTriangle size={18} className="text-rose-600 shrink-0 mt-0.5" />
                 <div className="min-w-0">
                   <p className="text-xs font-extrabold text-rose-900">
-                    Chat Connection / Permission Notice
+                    Connection Notice
                   </p>
                   <p className="text-xs text-rose-800 break-words mt-0.5">
                     {chatLoadError}
@@ -2992,10 +3921,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           )}
 
-          {/* Messages Feed — Soft Cream Background & Extra Bottom Padding so last message is never hidden */}
+          {/* Messages Stream — Theme-aware spacious canvas */}
           <div
             ref={messagesListRef}
-            className="wavelink-chat-messages-list flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 bg-[#FAF7F2]"
+            onClick={() => {
+              if (reactionMenuMsgId) setReactionMenuMsgId(null);
+              if (showHeaderMenu) setShowHeaderMenu(false);
+            }}
+            className="wavelink-chat-messages-list flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 bg-[var(--bg-canvas)]"
           >
             <QuotaExceededBanner compact={true} className="mb-2" />
 
@@ -3004,32 +3937,54 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 <button
                   type="button"
                   onClick={() => setMessageLimit((prev) => prev + 30)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 border border-slate-200/90 text-slate-700 text-xs font-bold transition active:scale-95 shadow-2xs cursor-pointer"
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold transition active:scale-95 shadow-2xs cursor-pointer"
                 >
-                  <History size={13} className="text-teal-600" />
+                  <History size={14} className="text-[var(--accent-primary)]" />
                   <span>Load older messages (30 more)</span>
                 </button>
               </div>
             )}
 
-            {messages.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center p-6 text-[#57534E]">
-                <div className="p-4 rounded-3xl bg-blue-50 text-[#2563EB] border border-blue-200/60 mb-3">
-                  <MessageSquare size={32} />
+            {isLoadingMessages && messages.length === 0 ? (
+              <div className="space-y-4 py-4">
+                {[1, 2, 3].map((i) => (
+                  <div
+                    key={i}
+                    className={`flex items-end gap-2.5 animate-pulse ${
+                      i % 2 === 0 ? 'justify-end' : 'justify-start'
+                    }`}
+                  >
+                    {i % 2 !== 0 && (
+                      <div className="w-8 h-8 rounded-full bg-[var(--bg-subtle)] shrink-0" />
+                    )}
+                    <div className="w-56 h-16 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)]" />
+                  </div>
+                ))}
+              </div>
+            ) : messages.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center p-6 text-[var(--text-secondary)]">
+                <div
+                  className="w-16 h-16 rounded-3xl flex items-center justify-center text-white mb-3 shadow-md"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  <MessageSquare size={30} />
                 </div>
-                <h4 className="font-extrabold text-[#1C1917] text-base">
-                  No messages yet
+                <h4 className="font-extrabold text-[var(--text-primary)] text-base">
+                  Say hello! 👋
                 </h4>
-                <p className="text-xs sm:text-sm text-[#57534E] max-w-sm mt-1 leading-relaxed">
+                <p className="text-xs sm:text-sm text-[var(--text-secondary)] max-w-xs mt-1 leading-relaxed">
                   {activeGroup
                     ? `Be the first to start the conversation in ${activeGroup.name}!`
-                    : 'Send a wave or photo to start chatting!'}
+                    : `Send a message, voice note or photo to start chatting with ${
+                        directRecipient?.displayName || 'your friend'
+                      }.`}
                 </p>
               </div>
             ) : (
               (() => {
-                // Identify the most recent outgoing message that has been seen so we can render
-                // a rich "Seen by..." indicator with mini avatar(s) directly beneath it.
                 let latestSeenOwnMessageId: string | null = null;
                 for (let i = messages.length - 1; i >= 0; i--) {
                   const candidate = messages[i];
@@ -3052,78 +4007,161 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                     hour: '2-digit',
                     minute: '2-digit'
                   });
+                  const photoList =
+                    msg.mediaUrls && msg.mediaUrls.length > 0
+                      ? msg.mediaUrls
+                      : msg.mediaUrl && msg.mediaType !== 'audio' && msg.mediaType !== 'video'
+                      ? [msg.mediaUrl]
+                      : [];
+                  const reactionEntries = (
+                    Object.entries(msg.reactions || {}) as [string, string[]][]
+                  ).filter(([, uids]) => Array.isArray(uids) && uids.length > 0);
 
                   return (
                     <div
                       key={msg.id}
-                      className={`w-full flex items-start gap-2.5 sm:gap-3 group/msg ${
+                      onTouchStart={(e) => {
+                        const touch = e.touches[0];
+                        if (!touch) return;
+                        swipeTouchStartRef.current = {
+                          x: touch.clientX,
+                          y: touch.clientY,
+                          msgId: msg.id
+                        };
+                        if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+                        longPressTimerRef.current = setTimeout(() => {
+                          setReactionMenuMsgId(msg.id);
+                        }, 430);
+                      }}
+                      onTouchMove={(e) => {
+                        const touch = e.touches[0];
+                        const start = swipeTouchStartRef.current;
+                        if (!touch || !start || start.msgId !== msg.id) return;
+                        const dx = touch.clientX - start.x;
+                        const dy = Math.abs(touch.clientY - start.y);
+                        if (Math.abs(dx) > 12 || dy > 12) {
+                          if (longPressTimerRef.current) {
+                            clearTimeout(longPressTimerRef.current);
+                            longPressTimerRef.current = null;
+                          }
+                        }
+                        if (dx > 52 && dy < 30 && !msg.isDeleted) {
+                          swipeTouchStartRef.current = null;
+                          setReplyingTo(msg);
+                        }
+                      }}
+                      onTouchEnd={() => {
+                        if (longPressTimerRef.current) {
+                          clearTimeout(longPressTimerRef.current);
+                          longPressTimerRef.current = null;
+                        }
+                        swipeTouchStartRef.current = null;
+                      }}
+                      className={`w-full flex items-end gap-2.5 group/msg relative ${
                         isOwn ? 'flex-row-reverse justify-start' : 'flex-row justify-start'
                       }`}
                     >
-                      {/* User Avatar */}
-                      <img
-                        src={
-                          msg.senderPhotoURL ||
-                          `https://api.dicebear.com/7.x/shapes/svg?seed=${msg.senderId}`
-                        }
-                        alt={msg.senderName}
-                        className="w-8 h-8 rounded-full object-cover ring-1 ring-[#2563EB]/25 shrink-0 mt-1 bg-white"
-                      />
+                      {/* Small Avatar beside received messages */}
+                      {!isOwn && (
+                        <Avatar
+                          uid={msg.senderId}
+                          src={
+                            msg.senderPhotoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${msg.senderId}`
+                          }
+                          alt={msg.senderName}
+                          fallbackName={msg.senderName}
+                          size={32}
+                          showStatus={!isSupportBotUser(msg.senderId)}
+                          className="ring-2 ring-[var(--accent-primary)]/30 rounded-full mb-5"
+                        />
+                      )}
 
-                      {/* Message Bubble Wrapper (Received on LEFT, Mine on RIGHT, up to 80% width on phones) */}
+                      {/* Message Bubble Wrapper (Max 78% width on phones; Max 60% width on desktop via CSS) */}
                       <div
-                        className={`wavelink-chat-bubble-wrap max-w-[80%] lg:max-w-[70%] min-w-0 flex flex-col ${
+                        className={`wavelink-chat-bubble-wrap min-w-0 flex flex-col relative ${
                           isOwn ? 'items-end self-end' : 'items-start self-start'
                         }`}
                       >
-                        {/* Sender Name & Single Small Admin Badge Header (Strong Contrast) */}
-                        <div
-                          className={`flex items-center gap-1.5 mb-1 px-1 ${
-                            isOwn ? 'justify-end' : 'justify-start'
-                          }`}
-                        >
-                          <CrystalBadge
-                            email={msg.senderEmail}
-                            name={msg.senderName}
-                            size="sm"
-                          />
-                        </div>
-
-                        {/* Reply Reference if replying to another message */}
-                        {msg.replyToText && (
+                        {/* Sender Name on group or received messages */}
+                        {(!isOwn || !isDirectMessage) && (
                           <div
-                            className={`text-xs p-2.5 rounded-xl border-l-3 mb-1.5 w-full ${
-                              isOwn
-                                ? 'bg-blue-50 border-[#2563EB] text-[#1C1917]'
-                                : 'bg-white border-[#0D9488] text-[#1C1917] shadow-2xs'
+                            className={`flex items-center gap-1.5 mb-1 px-1 ${
+                              isOwn ? 'justify-end' : 'justify-start'
                             }`}
                           >
-                            <span className="font-bold block text-[11px] text-[#2563EB]">
-                              Replying to {msg.replyToSenderName || 'message'}:
+                            <CrystalBadge
+                              email={msg.senderEmail}
+                              name={msg.senderName}
+                              size="sm"
+                            />
+                          </div>
+                        )}
+
+                        {/* Long-press / Tap Emoji Reaction Bar */}
+                        {reactionMenuMsgId === msg.id && !msg.isDeleted && (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className={`absolute -top-12 z-30 flex items-center gap-1 px-2.5 py-1.5 rounded-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl animate-in fade-in zoom-in-95 duration-150 ${
+                              isOwn ? 'right-0' : 'left-0'
+                            }`}
+                          >
+                            {QUICK_REACTION_EMOJIS.map((emoji) => (
+                              <button
+                                key={emoji}
+                                type="button"
+                                onClick={() => handleToggleMessageReaction(msg, emoji)}
+                                className="w-8 h-8 rounded-full hover:bg-[var(--bg-subtle)] flex items-center justify-center text-base transition hover:scale-125 active:scale-95 cursor-pointer"
+                              >
+                                {emoji}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Reply Reference Banner */}
+                        {msg.replyToText && (
+                          <div
+                            className={`text-xs p-2.5 rounded-2xl border-l-4 mb-1.5 w-full bg-[var(--bg-subtle)] text-[var(--text-primary)] border-[var(--accent-primary)]`}
+                          >
+                            <span className="font-extrabold block text-[11px] text-[var(--accent-primary)]">
+                              Replying to {msg.replyToSenderName || 'message'}
                             </span>
-                            <span className="truncate block text-[#57534E]">
+                            <span className="truncate block text-[var(--text-secondary)]">
                               {msg.replyToText}
                             </span>
                           </div>
                         )}
 
-                        {/* Message Bubble Card */}
+                        {/* Message Bubble Card: Bold Accent Gradient for Sent, Soft Theme Card for Received */}
                         <div
-                          className={`w-full max-w-full rounded-2xl px-3.5 py-2.5 text-base sm:text-[15px] leading-relaxed relative break-words [overflow-wrap:anywhere] ${
+                          onDoubleClick={() => {
+                            if (!msg.isDeleted) handleToggleMessageReaction(msg, '❤️');
+                          }}
+                          style={
+                            !msg.isDeleted && isOwn
+                              ? {
+                                  background:
+                                    'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                                  color: '#FFFFFF'
+                                }
+                              : undefined
+                          }
+                          className={`w-full max-w-full rounded-3xl px-4 py-3 text-base sm:text-[15px] leading-relaxed relative break-words [overflow-wrap:anywhere] transition ${
                             msg.isDeleted
-                              ? 'italic bg-white/80 border border-[#EFECE6] text-[#57534E]'
+                              ? 'italic bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-secondary)]'
                               : isOwn
-                              ? 'bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white rounded-tr-xs shadow-xs'
-                              : 'bg-white text-[#1C1917] rounded-tl-xs border border-[#EFECE6] shadow-2xs'
+                              ? 'text-white rounded-br-md shadow-sm'
+                              : 'bg-[var(--bg-surface)] text-[var(--text-primary)] rounded-bl-md border border-[var(--border-hairline)] shadow-xs'
                           }`}
                         >
                           {isEditing ? (
-                            <div className="space-y-2 w-full min-w-[160px] max-w-full">
+                            <div className="space-y-2 w-full min-w-[180px] max-w-full">
                               <input
                                 type="text"
                                 value={editText}
                                 onChange={(e) => setEditText(e.target.value)}
-                                className="w-full p-2 rounded-xl bg-white text-[#1C1917] text-base sm:text-sm border border-white/40 focus:outline-none"
+                                className="w-full p-2 rounded-xl bg-[var(--bg-surface)] text-[var(--text-primary)] text-base sm:text-sm border border-[var(--border-hairline)] focus:outline-none"
                               />
                               <div className="flex justify-end gap-2 text-xs">
                                 <button
@@ -3144,238 +4182,212 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                             </div>
                           ) : (
                             <>
-                              {/* Media Attachment (Audio Voice Note / Video / Image) */}
-                              {(msg.mediaUrl || msg.audioUrl) && !msg.isDeleted && (
-                                <div className="mb-2 rounded-xl overflow-hidden w-full max-w-sm">
-                                  {msg.mediaType === 'audio' || msg.audioUrl ? (
-                                    <div
-                                      className={`p-2.5 rounded-xl flex flex-col gap-2 w-full max-w-full ${
-                                        isOwn
-                                          ? 'bg-white/15 border border-white/25 text-white'
-                                          : 'bg-[#FAF7F2] border border-[#E7E2DA] text-[#1C1917]'
+                              {/* Voice Note Attachment with Play Button, Animated Waveform & Duration */}
+                              {(msg.mediaType === 'audio' || msg.audioUrl) &&
+                                !msg.isDeleted &&
+                                (msg.audioUrl || msg.mediaUrl) && (
+                                  <div className="mb-2">
+                                    <VoiceNoteBubblePlayer
+                                      src={(msg.audioUrl || msg.mediaUrl)!}
+                                      duration={msg.audioDuration}
+                                      isOwn={isOwn}
+                                    />
+                                  </div>
+                                )}
+
+                              {/* Video Attachment */}
+                              {msg.mediaType === 'video' && msg.mediaUrl && !msg.isDeleted && (
+                                <div className="mb-2 rounded-2xl overflow-hidden w-full max-w-sm">
+                                  <video
+                                    src={msg.mediaUrl}
+                                    controls
+                                    className="max-h-64 w-full object-cover rounded-2xl"
+                                  />
+                                </div>
+                              )}
+
+                              {/* Shared Photos: Stacked / Grid Group inside the Bubble */}
+                              {photoList.length > 0 && !msg.isDeleted && (
+                                <div
+                                  className={`mb-2 overflow-hidden rounded-2xl ${
+                                    photoList.length === 1
+                                      ? 'w-full max-w-xs'
+                                      : 'grid grid-cols-2 gap-1.5 w-full max-w-xs'
+                                  }`}
+                                >
+                                  {photoList.map((url, idx) => (
+                                    <button
+                                      key={`${msg.id}_img_${idx}`}
+                                      type="button"
+                                      onClick={() => setLightboxPhotoUrl(url)}
+                                      className={`relative overflow-hidden rounded-xl group/photo block w-full cursor-pointer ${
+                                        photoList.length === 3 && idx === 0 ? 'col-span-2' : ''
                                       }`}
                                     >
-                                      <div className="flex items-center justify-between gap-2">
-                                        <div className="flex items-center gap-2">
-                                          <span
-                                            className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
-                                              isOwn
-                                                ? 'bg-white text-[#2563EB]'
-                                                : 'bg-[#2563EB] text-white'
-                                            }`}
-                                          >
-                                            <Volume2 size={14} />
-                                          </span>
-                                          <span
-                                            className={`text-xs font-extrabold ${
-                                              isOwn ? 'text-white' : 'text-[#1C1917]'
-                                            }`}
-                                          >
-                                            Voice Note
-                                          </span>
-                                        </div>
-                                        {typeof msg.audioDuration === 'number' && msg.audioDuration > 0 && (
-                                          <span
-                                            className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded-md ${
-                                              isOwn
-                                                ? 'bg-black/20 text-white'
-                                                : 'bg-white border border-[#E7E2DA] text-[#57534E]'
-                                            }`}
-                                          >
-                                            {formatVoiceDuration(msg.audioDuration)}
-                                          </span>
-                                        )}
-                                      </div>
-                                      <audio
-                                        controls
-                                        preload="metadata"
-                                        src={msg.audioUrl || msg.mediaUrl}
-                                        className="w-full h-9 rounded-lg"
+                                      <img
+                                        src={url}
+                                        alt={`Shared photo ${idx + 1}`}
+                                        loading="lazy"
+                                        className={`${
+                                          photoList.length === 1 ? 'max-h-64' : 'h-32'
+                                        } w-full object-cover rounded-xl group-hover/photo:scale-105 transition-transform duration-200`}
                                       />
-                                    </div>
-                                  ) : msg.mediaType === 'video' ? (
-                                    <video
-                                      src={msg.mediaUrl}
-                                      controls
-                                      className="max-h-60 w-full object-cover rounded-xl"
-                                    />
-                                  ) : (
-                                    <img
-                                      src={msg.mediaUrl}
-                                      alt="Chat Media"
-                                      className="max-h-64 w-full object-cover rounded-xl"
-                                    />
-                                  )}
+                                    </button>
+                                  ))}
                                 </div>
                               )}
 
                               {/* GIF Attachment */}
                               {msg.gifUrl && !msg.isDeleted && (
-                                <div className="mb-2 rounded-xl overflow-hidden max-w-xs">
+                                <div className="mb-2 rounded-2xl overflow-hidden max-w-xs">
                                   <img
                                     src={msg.gifUrl}
                                     alt="GIF reaction"
-                                    className="w-full rounded-xl object-cover"
+                                    loading="lazy"
+                                    className="w-full rounded-2xl object-cover"
                                   />
                                 </div>
                               )}
 
+                              {/* Message Text */}
                               {msg.text && (
                                 <p
                                   className={`whitespace-pre-wrap break-words ${
                                     msg.isDeleted
-                                      ? 'text-[#57534E]'
+                                      ? 'text-[var(--text-secondary)]'
                                       : isOwn
                                       ? 'text-white'
-                                      : 'text-[#1C1917]'
+                                      : 'text-[var(--text-primary)]'
                                   }`}
                                 >
                                   {msg.text}
                                 </p>
                               )}
-
-                              {/* Time & Read Receipt ('Seen' / 'Sent') inside the bubble footer */}
-                              <div
-                                className={`mt-1.5 flex items-center justify-end gap-1.5 text-[11px] leading-none select-none ${
-                                  msg.isDeleted
-                                    ? 'text-[#57534E]'
-                                    : isOwn
-                                    ? 'text-white/95'
-                                    : 'text-[#57534E]'
-                                }`}
-                              >
-                                {msg.isEdited && !msg.isDeleted && (
-                                  <span className="italic mr-0.5">(edited)</span>
-                                )}
-                                <span className="font-mono tabular-nums font-medium">
-                                  {timeString}
-                                </span>
-                                {isOwn && !msg.isDeleted && (
-                                  <span
-                                    className="inline-flex items-center gap-0.5 font-semibold"
-                                    title={
-                                      receipt?.isSeen
-                                        ? `Seen${
-                                            receipt.seenByUsers.length > 0
-                                              ? ` by ${receipt.seenByUsers.map((u) => u.name).join(', ')}`
-                                              : ''
-                                          }${
-                                            receipt.seenAt
-                                              ? ` • ${formatLastSeenTimestamp(receipt.seenAt)}`
-                                              : ''
-                                          }`
-                                        : 'Sent'
-                                    }
-                                  >
-                                    {receipt?.isSeen ? (
-                                      <>
-                                        <CheckCheck
-                                          size={14}
-                                          className="text-teal-100 stroke-[2.5] shrink-0"
-                                        />
-                                        <span className="text-[10px] font-bold text-teal-100">
-                                          {!isDirectMessage && receipt.seenCount > 1
-                                            ? `Seen (${receipt.seenCount})`
-                                            : 'Seen'}
-                                        </span>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <Check
-                                          size={13}
-                                          className="text-white/85 stroke-[2.25] shrink-0"
-                                        />
-                                        <span className="text-[10px] text-white/85">Sent</span>
-                                      </>
-                                    )}
-                                  </span>
-                                )}
-                              </div>
                             </>
                           )}
                         </div>
 
-                        {/* Dedicated Read Receipt ('Seen') Status Row below the latest seen outgoing message */}
+                        {/* Emoji Reactions Pill Row */}
+                        {reactionEntries.length > 0 && !msg.isDeleted && (
+                          <div
+                            className={`flex items-center flex-wrap gap-1 -mt-2 z-10 px-2 ${
+                              isOwn ? 'justify-end' : 'justify-start'
+                            }`}
+                          >
+                            {reactionEntries.map(([emoji, uids]) => {
+                              const mine = currentUser?.uid ? uids.includes(currentUser.uid) : false;
+                              return (
+                                <button
+                                  key={emoji}
+                                  type="button"
+                                  onClick={() => handleToggleMessageReaction(msg, emoji)}
+                                  className={`px-2 py-0.5 rounded-full text-xs font-bold flex items-center gap-1 border shadow-2xs transition cursor-pointer ${
+                                    mine
+                                      ? 'bg-[var(--accent-primary)] text-white border-[var(--accent-primary)]'
+                                      : 'bg-[var(--bg-surface)] text-[var(--text-primary)] border-[var(--border-hairline)]'
+                                  }`}
+                                >
+                                  <span>{emoji}</span>
+                                  <span className="text-[10px]">{uids.length}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* Time & Double-Tick Read Status Under Each Bubble + Quick Actions */}
+                        <div
+                          className={`mt-1 flex items-center gap-2 px-1 text-[11px] text-[var(--text-secondary)] select-none ${
+                            isOwn ? 'justify-end' : 'justify-start'
+                          }`}
+                        >
+                          {msg.isEdited && !msg.isDeleted && (
+                            <span className="italic">(edited)</span>
+                          )}
+                          <span className="font-mono tabular-nums font-semibold">
+                            {timeString}
+                          </span>
+
+                          {isOwn && !msg.isDeleted && (
+                            <span
+                              className="inline-flex items-center gap-0.5 font-bold"
+                              title={receipt?.isSeen ? 'Read' : 'Sent'}
+                            >
+                              {receipt?.isSeen ? (
+                                <CheckCheck
+                                  size={14}
+                                  className="text-[var(--accent-primary)] stroke-[2.5] shrink-0"
+                                />
+                              ) : (
+                                <Check
+                                  size={13}
+                                  className="text-[var(--text-secondary)] stroke-[2.25] shrink-0"
+                                />
+                              )}
+                            </span>
+                          )}
+
+                          {/* Quick Reaction, Reply, Edit & Unsend controls */}
+                          {!msg.isDeleted && (
+                            <div className="inline-flex items-center gap-1 opacity-85 sm:opacity-0 sm:group-hover/msg:opacity-100 transition-opacity">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setReactionMenuMsgId((prev) =>
+                                    prev === msg.id ? null : msg.id
+                                  );
+                                }}
+                                className="p-1 rounded-lg hover:bg-[var(--bg-subtle)] hover:text-[var(--accent-primary)] cursor-pointer"
+                                title="React"
+                              >
+                                <Smile size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setReplyingTo(msg)}
+                                className="p-1 rounded-lg hover:bg-[var(--bg-subtle)] hover:text-[var(--accent-primary)] cursor-pointer"
+                                title="Reply"
+                              >
+                                <Reply size={13} />
+                              </button>
+                              {isOwn && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingMessageId(msg.id);
+                                      setEditText(msg.text);
+                                    }}
+                                    className="p-1 rounded-lg hover:bg-[var(--bg-subtle)] hover:text-[var(--accent-primary)] cursor-pointer"
+                                    title="Edit"
+                                  >
+                                    <Edit2 size={12} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteMessage(msg.id)}
+                                    className="p-1 rounded-lg hover:bg-rose-500/10 hover:text-rose-500 cursor-pointer"
+                                    title="Unsend"
+                                  >
+                                    <Trash2 size={12} />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Seen by indicator under latest seen own message */}
                         {isLatestSeenOwn && receipt?.isSeen && !msg.isDeleted && (
-                          <div className="mt-1 flex items-center justify-end gap-1.5 px-1 text-[11px] text-[#0D9488] font-bold select-none">
-                            {receipt.seenByUsers.length > 0 && (
-                              <div className="flex items-center -space-x-1.5">
-                                {receipt.seenByUsers.slice(0, 3).map((u) => (
-                                  <img
-                                    key={u.id}
-                                    src={u.photoURL}
-                                    alt={u.name}
-                                    className="w-4 h-4 rounded-full object-cover ring-1 ring-white"
-                                  />
-                                ))}
-                              </div>
-                            )}
-                            <CheckCheck size={13} className="text-[#0D9488] shrink-0" />
+                          <div className="mt-0.5 flex items-center justify-end gap-1.5 px-1 text-[10px] text-[var(--accent-primary)] font-bold select-none">
                             <span>
                               {isDirectMessage
                                 ? 'Seen'
                                 : receipt.seenByUsers.length === 1
-                                  ? `Seen by ${receipt.seenByUsers[0].name.split(' ')[0]}`
-                                  : `Seen by ${receipt.seenCount} members`}
-                              {receipt.seenAt ? ` • ${formatLastSeenTimestamp(receipt.seenAt)}` : ''}
+                                ? `Seen by ${receipt.seenByUsers[0].name.split(' ')[0]}`
+                                : `Seen by ${receipt.seenCount} members`}
                             </span>
-                          </div>
-                        )}
-
-                        {/* Action buttons on hover */}
-                        {!msg.isDeleted && (
-                          <div
-                            className={`flex items-center gap-1.5 mt-1 opacity-80 sm:opacity-0 sm:group-hover/msg:opacity-100 transition-opacity text-xs text-[#57534E] ${
-                              isOwn ? 'justify-end' : 'justify-start'
-                            }`}
-                          >
-                            <button
-                              type="button"
-                              onClick={() => setReplyingTo(msg)}
-                              className="p-1 hover:text-[#2563EB] rounded"
-                              title="Reply"
-                            >
-                              <Reply size={13} />
-                            </button>
-                            {(msg.isBotReply || isSupportBotUser(msg.senderId) || isSupportBotUser(msg.senderEmail)) && (
-                              <button
-                                type="button"
-                                onClick={() => handleReportBadBotReply(msg)}
-                                disabled={Boolean(msg.reportedBadReply)}
-                                className={`px-2 py-0.5 rounded-lg text-[11px] font-bold flex items-center gap-1 border transition ${
-                                  msg.reportedBadReply
-                                    ? 'bg-amber-50 text-amber-800 border-amber-200 cursor-default'
-                                    : 'bg-white hover:bg-rose-50 text-[#57534E] hover:text-rose-600 border-[#EFECE6]'
-                                }`}
-                                title="Report a bad or inaccurate bot reply"
-                              >
-                                <Flag size={11} />
-                                <span>{msg.reportedBadReply ? 'Reported for review' : 'Report bad bot reply'}</span>
-                              </button>
-                            )}
-                            {isOwn && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setEditingMessageId(msg.id);
-                                    setEditText(msg.text);
-                                  }}
-                                  className="p-1 hover:text-[#2563EB] rounded"
-                                  title="Edit"
-                                >
-                                  <Edit2 size={13} />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteMessage(msg.id)}
-                                  className="p-1 hover:text-rose-600 rounded"
-                                  title="Unsend"
-                                >
-                                  <Trash2 size={13} />
-                                </button>
-                              </>
-                            )}
                           </div>
                         )}
                       </div>
@@ -3385,53 +4397,61 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               })()
             )}
 
-            {/* Support Bot Live Thinking / Replying Indicator — strictly scoped to WaveLink Support DM */}
+            {/* Support Bot Live Thinking / Replying Indicator */}
             {isBotReplying && isChattingWithSupportBot && activeChannel === supportBotChannelId && (
               <div className="flex items-end gap-2.5 animate-in fade-in duration-150 pt-1">
-                <img
+                <Avatar
+                  uid={SUPPORT_BOT_ID}
                   src={SUPPORT_BOT_AVATAR}
                   alt={SUPPORT_BOT_NAME}
-                  className="w-7 h-7 rounded-full object-cover ring-2 ring-teal-200 bg-white shadow-2xs"
+                  fallbackName={SUPPORT_BOT_NAME}
+                  size={28}
+                  showStatus={false}
+                  className="ring-2 ring-[var(--accent-primary)]/40 rounded-full"
                 />
-                <div className="px-4 py-2.5 rounded-2xl rounded-bl-md bg-white border border-teal-200 shadow-2xs flex items-center gap-2.5">
-                  <span className="text-xs font-bold text-[#0D9488]">
-                    WaveLink Support Bot is answering
+                <div className="px-4 py-2.5 rounded-3xl rounded-bl-md bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xs flex items-center gap-2.5">
+                  <span className="text-xs font-bold text-[var(--accent-primary)]">
+                    WaveLink Assistant is typing...
                   </span>
                   <span className="inline-flex items-center gap-1 pt-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.3s]" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#2563EB] animate-bounce [animation-delay:-0.15s]" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-primary)] animate-bounce [animation-delay:-0.3s]" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-secondary)] animate-bounce [animation-delay:-0.15s]" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-primary)] animate-bounce" />
                   </span>
                 </div>
               </div>
             )}
 
-            {/* Real-Time Typing Indicator Bubble in the Chat Stream */}
+            {/* Real-Time "Name is typing..." Bubble in the Chat Stream */}
             {activeChannelTypingUsers.length > 0 && (
               <div className="flex items-end gap-2.5 animate-in fade-in slide-in-from-bottom-2 duration-200 pt-1">
                 <div className="flex -space-x-2 shrink-0">
                   {activeChannelTypingUsers.slice(0, 3).map((typer) => (
-                    <img
+                    <Avatar
                       key={typer.userId}
+                      uid={typer.userId}
                       src={
                         typer.photoURL ||
                         `https://api.dicebear.com/7.x/shapes/svg?seed=${typer.userId}`
                       }
                       alt={typer.name}
-                      className="w-7 h-7 rounded-full object-cover ring-2 ring-white bg-white shadow-2xs"
+                      fallbackName={typer.name}
+                      size={28}
+                      showStatus={false}
+                      className="ring-2 ring-[var(--bg-surface)] rounded-full shadow-2xs"
                     />
                   ))}
                 </div>
-                <div className="px-4 py-2.5 rounded-2xl rounded-bl-md bg-white border border-[#E7E2DA] shadow-2xs flex items-center gap-2.5">
-                  <span className="text-xs font-bold text-[#1C1917]">
+                <div className="px-4 py-2.5 rounded-3xl rounded-bl-md bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xs flex items-center gap-2.5">
+                  <span className="text-xs font-bold text-[var(--text-primary)]">
                     {activeChannelTypingUsers.length === 1
-                      ? `${activeChannelTypingUsers[0].name} is typing`
-                      : `${activeChannelTypingUsers.map((u) => u.name.split(' ')[0]).join(', ')} are typing`}
+                      ? `${activeChannelTypingUsers[0].name} is typing...`
+                      : `${activeChannelTypingUsers.map((u) => u.name.split(' ')[0]).join(', ')} are typing...`}
                   </span>
                   <span className="inline-flex items-center gap-1 pt-0.5" aria-label="Typing">
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#2563EB] animate-bounce [animation-delay:-0.3s]" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#0D9488] animate-bounce [animation-delay:-0.15s]" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#2563EB] animate-bounce" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-primary)] animate-bounce [animation-delay:-0.3s]" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-secondary)] animate-bounce [animation-delay:-0.15s]" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-primary)] animate-bounce" />
                   </span>
                 </div>
               </div>
@@ -3440,81 +4460,79 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             <div ref={messagesEndRef} className="h-2" />
           </div>
 
-          {/* Replying banner */}
+          {/* Replying Banner */}
           {replyingTo && (
-            <div className="px-4 py-2 bg-blue-50 border-t border-blue-200 flex items-center justify-between text-xs shrink-0">
+            <div className="px-4 py-2 bg-[var(--bg-subtle)] border-t border-[var(--border-hairline)] flex items-center justify-between text-xs shrink-0">
               <div className="flex items-center gap-2 truncate">
-                <Reply size={14} className="text-[#2563EB] shrink-0" />
-                <span className="text-[#1C1917] font-semibold truncate">
-                  Replying to {replyingTo.senderName}: &quot;{replyingTo.text}&quot;
+                <Reply size={14} className="text-[var(--accent-primary)] shrink-0" />
+                <span className="text-[var(--text-primary)] font-bold truncate">
+                  Replying to {replyingTo.senderName}: &quot;{replyingTo.text || 'Media'}&quot;
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() => setReplyingTo(null)}
-                className="text-[#57534E] hover:text-[#1C1917] p-1"
+                className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] p-1 cursor-pointer"
               >
                 <X size={14} />
               </button>
             </div>
           )}
 
-          {/* Video / Media Size Limit Notice */}
+          {/* Media Upload Notice */}
           {chatMediaNotice && (
-            <div className="px-4 py-2.5 bg-amber-50 border-t border-amber-200 flex items-center justify-between gap-2 text-xs text-amber-950 font-semibold shrink-0">
+            <div className="px-4 py-2 bg-amber-500/15 border-t border-amber-400/40 flex items-center justify-between gap-2 text-xs text-[var(--text-primary)] font-bold shrink-0">
               <span>{chatMediaNotice}</span>
               <button
                 type="button"
                 onClick={() => setChatMediaNotice(null)}
-                className="text-amber-700 hover:text-amber-950 p-1 shrink-0"
+                className="p-1 shrink-0 cursor-pointer"
               >
                 <X size={14} />
               </button>
             </div>
           )}
 
-          {/* Selected Media / Voice Note Preview Bar */}
+          {/* Selected Photo Grid / Voice Note Preview Bar */}
           {chatMediaUrl && (
-            <div className="p-3 bg-[#FAF7F2] border-t border-[#EFECE6] flex items-center justify-between gap-3 shrink-0">
+            <div className="p-3 bg-[var(--bg-subtle)] border-t border-[var(--border-hairline)] flex items-center justify-between gap-3 shrink-0">
               {chatMediaType === 'audio' ? (
                 <div className="flex items-center gap-3 flex-1 min-w-0">
-                  <div className="w-10 h-10 bg-gradient-to-br from-[#2563EB] to-[#0D9488] rounded-xl flex items-center justify-center text-white shrink-0 shadow-2xs">
-                    <Mic size={18} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="text-xs font-extrabold text-[#1C1917]">
-                        Voice Note Preview
-                      </span>
-                      <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded-md bg-white border border-[#E7E2DA] text-[#2563EB]">
-                        {formatVoiceDuration(voiceNoteDuration)}
-                      </span>
-                    </div>
-                    <audio
-                      controls
-                      src={chatMediaUrl}
-                      className="w-full max-w-xs h-8 rounded-lg"
-                    />
-                  </div>
+                  <VoiceNoteBubblePlayer
+                    src={chatMediaUrl}
+                    duration={voiceNoteDuration}
+                    isOwn={false}
+                  />
                 </div>
               ) : (
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 min-w-0">
                   {chatMediaType === 'video' ? (
-                    <div className="w-12 h-12 bg-[#1C1917] rounded-xl flex items-center justify-center text-white">
+                    <div className="w-12 h-12 bg-black rounded-2xl flex items-center justify-center text-white shrink-0">
                       <Film size={20} />
                     </div>
                   ) : (
-                    <img
-                      src={chatMediaUrl}
-                      alt="Preview"
-                      className="w-12 h-12 rounded-xl object-cover border border-[#EFECE6]"
-                    />
+                    <div className="flex items-center -space-x-2 shrink-0">
+                      {(chatMediaUrls.length > 0 ? chatMediaUrls : [chatMediaUrl]).map((u, i) => (
+                        <img
+                          key={i}
+                          src={u}
+                          alt="Preview"
+                          className="w-12 h-12 rounded-2xl object-cover border-2 border-[var(--bg-surface)] shadow-xs"
+                        />
+                      ))}
+                    </div>
                   )}
-                  <div>
-                    <span className="text-xs font-bold text-[#1C1917] block">
-                      {chatMediaType === 'video' ? 'Video Attachment' : 'Photo Attachment'}
+                  <div className="min-w-0">
+                    <span className="text-xs font-extrabold text-[var(--text-primary)] block truncate">
+                      {chatMediaType === 'video'
+                        ? 'Video Ready'
+                        : chatMediaUrls.length > 1
+                        ? `${chatMediaUrls.length} Photos Ready`
+                        : 'Photo Ready'}
                     </span>
-                    <span className="text-[11px] text-[#57534E]">Ready to send</span>
+                    <span className="text-[11px] text-[var(--text-secondary)]">
+                      Tap Send to share
+                    </span>
                   </div>
                 </div>
               )}
@@ -3522,10 +4540,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 type="button"
                 onClick={() => {
                   setChatMediaUrl('');
+                  setChatMediaUrls([]);
                   setChatMediaType('none');
                   setVoiceNoteDuration(0);
                 }}
-                className="p-2 rounded-xl bg-white border border-[#EFECE6] text-[#57534E] hover:text-rose-600 shrink-0"
+                className="min-w-[40px] min-h-[40px] p-2 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-secondary)] hover:text-rose-500 flex items-center justify-center shrink-0 cursor-pointer"
                 title="Discard attachment"
               >
                 <Trash2 size={16} />
@@ -3533,11 +4552,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           )}
 
-          {/* Input & Action Footer Bar — Fixed/pinned at the bottom above the keyboard */}
-          <div className="wavelink-chat-input-bar p-2 sm:p-3.5 border-t border-[#EFECE6] bg-white shrink-0">
+          {/* Fixed Bottom Input Bar above the keyboard: Emoji, GIF, Attach, Mic, Rounded Field, Colorful Send */}
+          <div className="wavelink-chat-input-bar p-2 sm:p-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] shrink-0">
             {/* Popover Emoji Picker */}
             {showEmojiPicker && (
-              <div className="absolute bottom-20 left-2 right-2 sm:right-auto sm:w-80 p-3 bg-white border border-[#EFECE6] rounded-2xl shadow-xl z-30 grid grid-cols-6 sm:grid-cols-8 gap-2">
+              <div className="absolute bottom-20 left-2 right-2 sm:right-auto sm:w-80 p-3 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-2xl z-30 grid grid-cols-6 sm:grid-cols-8 gap-2">
                 {EMOJI_LIST.map((em) => (
                   <button
                     key={em}
@@ -3546,7 +4565,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       handleInputTextChange(inputText + em);
                       setShowEmojiPicker(false);
                     }}
-                    className="min-h-[40px] text-lg p-1.5 hover:scale-125 transition-transform rounded-lg hover:bg-[#FAF7F2]"
+                    className="min-h-[40px] text-lg p-1.5 hover:scale-125 transition-transform rounded-xl hover:bg-[var(--bg-subtle)] cursor-pointer"
                   >
                     {em}
                   </button>
@@ -3556,15 +4575,15 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
             {/* Popover GIF Picker */}
             {showGifPicker && (
-              <div className="absolute bottom-20 left-2 right-2 sm:left-12 sm:right-auto sm:w-72 p-3 bg-white border border-[#EFECE6] rounded-2xl shadow-xl z-30 max-h-60 overflow-y-auto">
-                <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#EFECE6]">
-                  <span className="text-xs font-bold text-[#1C1917]">
+              <div className="absolute bottom-20 left-2 right-2 sm:left-12 sm:right-auto sm:w-72 p-3 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-2xl z-30 max-h-60 overflow-y-auto">
+                <div className="flex items-center justify-between pb-2 mb-2 border-b border-[var(--border-hairline)]">
+                  <span className="text-xs font-extrabold text-[var(--text-primary)]">
                     Pick a GIF
                   </span>
                   <button
                     type="button"
                     onClick={() => setShowGifPicker(false)}
-                    className="text-[#57534E] hover:text-[#1C1917] p-1"
+                    className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] p-1 cursor-pointer"
                   >
                     <X size={14} />
                   </button>
@@ -3575,14 +4594,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       key={g.title}
                       type="button"
                       onClick={() => handleSendMessage(g.url)}
-                      className="rounded-xl overflow-hidden hover:opacity-90 transition group border border-[#EFECE6]"
+                      className="rounded-2xl overflow-hidden hover:opacity-90 transition border border-[var(--border-hairline)] cursor-pointer"
                     >
                       <img
                         src={g.url}
                         alt={g.title}
                         className="h-20 w-full object-cover"
                       />
-                      <span className="text-[10px] font-medium text-[#57534E] truncate block py-1 px-1.5 bg-[#FAF7F2]">
+                      <span className="text-[10px] font-semibold text-[var(--text-secondary)] truncate block py-1 px-1.5 bg-[var(--bg-subtle)]">
                         {g.title}
                       </span>
                     </button>
@@ -3592,18 +4611,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             )}
 
             {isBlockedFromAdminChat ? (
-              <div className="p-3.5 bg-[#FAF7F2] rounded-2xl border border-[#EFECE6] flex items-center justify-between flex-wrap gap-3">
+              <div className="p-3.5 bg-[var(--bg-subtle)] rounded-2xl border border-[var(--border-hairline)] flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-3">
                   <div className="p-2.5 rounded-2xl bg-amber-500 text-white shadow-2xs shrink-0">
                     <Lock size={18} />
                   </div>
                   <div>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <span className="font-extrabold text-xs sm:text-sm text-[#1C1917]">
-                        Direct Messaging with Admin is a Pro Feature
-                      </span>
-                    </div>
-                    <p className="text-xs text-[#57534E] mt-0.5">
+                    <span className="font-extrabold text-xs sm:text-sm text-[var(--text-primary)] block">
+                      Direct Messaging with Admin is a Pro Feature
+                    </span>
+                    <p className="text-xs text-[var(--text-secondary)] mt-0.5">
                       Try WaveLink Pro to message or call the Platform Administrator directly.
                     </p>
                   </div>
@@ -3612,117 +4629,119 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 <button
                   type="button"
                   onClick={() => setShowPaymentModal(true)}
-                  className="min-h-[44px] py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-white font-extrabold text-xs flex items-center gap-2 shadow-xs transition active:scale-95 shrink-0"
+                  className="min-h-[44px] py-2.5 px-4 rounded-2xl text-white font-extrabold text-xs flex items-center gap-2 shadow-xs transition active:scale-95 shrink-0 cursor-pointer"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
                 >
                   <Star size={14} className="fill-white" />
                   <span>Try Pro</span>
                 </button>
               </div>
             ) : isRecordingVoice ? (
-              <div className="flex items-center justify-between gap-2 sm:gap-3 p-2 rounded-2xl bg-[#FAF7F2] border border-rose-200 animate-in fade-in duration-150">
+              <div className="flex items-center justify-between gap-2 sm:gap-3 p-2 rounded-3xl bg-[var(--bg-subtle)] border border-rose-400/50 animate-in fade-in duration-150">
                 <div className="flex items-center gap-2.5 min-w-0">
-                  <span className="relative flex h-3 w-3 shrink-0 ml-1">
+                  <span className="relative flex h-3 w-3 shrink-0 ml-1.5">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
                     <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-600" />
                   </span>
-                  <span className="text-xs sm:text-sm font-extrabold text-[#1C1917] truncate">
-                    Recording voice note...
+                  <span className="text-xs sm:text-sm font-extrabold text-[var(--text-primary)] truncate">
+                    Recording...
                   </span>
-                  <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-lg bg-white border border-[#E7E2DA] text-rose-600 tabular-nums shrink-0">
+                  <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-rose-500 tabular-nums shrink-0">
                     {formatVoiceDuration(recordingSeconds)}
                   </span>
-                  <div className="hidden sm:flex items-center gap-1 px-1" aria-hidden="true">
-                    <span className="w-1 h-3 bg-[#2563EB] rounded-full animate-pulse" />
-                    <span className="w-1 h-5 bg-[#0D9488] rounded-full animate-pulse [animation-delay:150ms]" />
-                    <span className="w-1 h-2.5 bg-[#2563EB] rounded-full animate-pulse [animation-delay:300ms]" />
-                    <span className="w-1 h-4 bg-[#0D9488] rounded-full animate-pulse [animation-delay:75ms]" />
-                    <span className="w-1 h-3 bg-[#2563EB] rounded-full animate-pulse [animation-delay:225ms]" />
-                  </div>
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex items-center gap-1.5 shrink-0">
                   <button
                     type="button"
                     onClick={cancelVoiceRecording}
-                    className="min-h-[42px] px-3 rounded-xl bg-white hover:bg-rose-50 border border-[#E7E2DA] text-xs font-bold text-rose-600 flex items-center gap-1.5 transition"
+                    className="min-h-[42px] px-3 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-xs font-bold text-rose-500 flex items-center gap-1 transition cursor-pointer"
                     title="Cancel recording"
                   >
-                    <Trash2 size={15} />
+                    <Trash2 size={14} />
                     <span>Cancel</span>
                   </button>
                   <button
                     type="button"
                     onClick={stopVoiceRecording}
-                    className="min-h-[42px] px-3.5 rounded-xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-xs font-extrabold text-white flex items-center gap-1.5 shadow-2xs transition active:scale-95"
-                    title="Stop and preview voice note"
+                    className="min-h-[42px] px-3.5 rounded-2xl text-xs font-extrabold text-white flex items-center gap-1.5 shadow-xs transition active:scale-95 cursor-pointer"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                    title="Finish recording"
                   >
-                    <Square size={14} className="fill-white" />
-                    <span>Done &amp; Preview</span>
+                    <Square size={13} className="fill-white" />
+                    <span>Done</span>
                   </button>
                 </div>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5 sm:gap-2 w-full min-w-0">
-                {/* Media Picker Button (From Phone/Folders) */}
+              <div className="flex items-center gap-1 sm:gap-1.5 w-full min-w-0">
                 <input
                   type="file"
                   ref={chatFileRef}
                   onChange={handleChatFileSelect}
                   accept="image/*,video/*"
+                  multiple
                   className="hidden"
                 />
-                <button
-                  type="button"
-                  onClick={() => chatFileRef.current?.click()}
-                  className="min-w-[44px] min-h-[44px] rounded-2xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] flex items-center justify-center transition shrink-0"
-                  title="Attach photo or video from device"
-                >
-                  <UploadCloud size={18} className="text-[#2563EB]" />
-                </button>
 
-                {/* Voice Note Recorder Button (MediaRecorder API) */}
-                <button
-                  type="button"
-                  onClick={startVoiceRecording}
-                  className="min-w-[44px] min-h-[44px] rounded-2xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] flex items-center justify-center transition shrink-0"
-                  title="Record a voice note"
-                >
-                  <Mic size={18} className="text-rose-600" />
-                </button>
-
-                {/* Emoji button */}
+                {/* Emoji Button */}
                 <button
                   type="button"
                   onClick={() => {
                     setShowEmojiPicker((p) => !p);
                     setShowGifPicker(false);
                   }}
-                  className="min-w-[44px] min-h-[44px] rounded-2xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-[#1C1917] flex items-center justify-center transition shrink-0"
-                  title="Add Emoji"
+                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                  title="Emoji"
+                  aria-label="Add Emoji"
                 >
-                  <Smile size={18} className="text-[#0D9488]" />
+                  <Smile size={18} className="text-[var(--accent-primary)]" />
                 </button>
 
-                {/* GIF button (visible on >= 640px so 360px mobile input box has generous width) */}
+                {/* GIF Button */}
                 <button
                   type="button"
                   onClick={() => {
                     setShowGifPicker((p) => !p);
                     setShowEmojiPicker(false);
                   }}
-                  className="hidden sm:flex min-w-[44px] min-h-[44px] px-2.5 rounded-2xl bg-[#FAF7F2] hover:bg-[#EFECE6] border border-[#EFECE6] text-xs font-extrabold text-[#1C1917] items-center justify-center transition shrink-0"
-                  title="Add GIF"
+                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[11px] font-black text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                  title="GIF"
+                  aria-label="Add GIF"
                 >
                   GIF
                 </button>
 
-                {/* Large, Easy-to-Tap Text Input Field (16px minimum to prevent mobile zoom) */}
-                <input
+                {/* Attach Photos/Video Button */}
+                <button
+                  type="button"
+                  onClick={() => chatFileRef.current?.click()}
+                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                  title="Attach photos or video"
+                  aria-label="Attach photos or video"
+                >
+                  <ImageIcon size={18} className="text-[var(--accent-secondary)]" />
+                </button>
+
+                {/* Rounded Message Input Field (Enter to send, Shift+Enter for new line) */}
+                <textarea
                   ref={chatInputRef}
-                  type="text"
+                  rows={1}
+                  data-chat-input="true"
                   value={inputText}
                   onChange={(e) => handleInputTextChange(e.target.value)}
                   onFocus={() => {
                     isInputFocusedRef.current = true;
+                    window.dispatchEvent(
+                      new CustomEvent('wavelink:chat-input-focus', {
+                        detail: { focused: true }
+                      })
+                    );
                     window.setTimeout(() => {
                       window.visualViewport?.dispatchEvent(new Event('resize'));
                       if (messagesListRef.current) {
@@ -3732,6 +4751,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   }}
                   onBlur={() => {
                     isInputFocusedRef.current = false;
+                    window.dispatchEvent(
+                      new CustomEvent('wavelink:chat-input-focus', {
+                        detail: { focused: false }
+                      })
+                    );
                     if (isCurrentlyTypingRef.current) {
                       broadcastTypingStatus(false);
                     }
@@ -3740,33 +4764,355 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                     }, 120);
                   }}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleSendMessage();
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSendMessage();
+                    }
                   }}
                   placeholder={
                     activeGroup
                       ? `Message ${activeGroup.name}...`
                       : directRecipient
-                      ? `Message ${directRecipient.displayName}...`
-                      : 'Write a message...'
+                      ? `Message ${directRecipient.displayName.split(' ')[0]}...`
+                      : 'Message...'
                   }
-                  className="flex-1 min-w-0 min-h-[44px] py-2.5 px-3 rounded-2xl bg-[#FAF7F2] border border-[#D6D3CD] text-base text-[#1C1917] placeholder-[#57534E] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/20 transition"
+                  className="flex-1 min-w-0 min-h-[44px] max-h-28 py-2.5 px-3.5 rounded-3xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 resize-none leading-snug transition"
                 />
 
-                {/* Send Button — Primary action in chat thread */}
+                {/* Voice Note Mic Button */}
+                <button
+                  type="button"
+                  onClick={startVoiceRecording}
+                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-rose-400 border border-[var(--border-hairline)] text-rose-500 flex items-center justify-center transition shrink-0 cursor-pointer"
+                  title="Record voice note"
+                  aria-label="Record voice note"
+                >
+                  <Mic size={18} />
+                </button>
+
+                {/* Colorful Gradient Send Button */}
                 <button
                   type="button"
                   onClick={() => handleSendMessage()}
                   disabled={!inputText.trim() && !chatMediaUrl}
-                  className="min-w-[44px] min-h-[44px] rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-bold disabled:opacity-40 hover:opacity-95 shadow-xs active:scale-95 transition flex items-center justify-center shrink-0"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                  className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-2xl text-white font-bold disabled:opacity-40 hover:opacity-95 shadow-sm active:scale-95 transition flex items-center justify-center shrink-0 cursor-pointer"
                   title="Send message"
+                  aria-label="Send message"
                 >
                   <Send size={18} />
                 </button>
               </div>
             )}
           </div>
+            </>
+          )}
         </div>
+
+        {/* =====================================================================
+            SCREEN 3: DESKTOP RIGHT COLUMN (300-340px, shown ONLY at >= 1280px)
+            Profile card with large avatar, bio, Mute & Block buttons,
+            Shared Photos & Files, and People Grid of suggested/online users
+           ===================================================================== */}
+        {showDesktopRightPanel && (
+          <aside className="wavelink-chat-right-panel border-l border-[var(--border-hairline)] bg-[var(--bg-surface)] p-4 space-y-5">
+            {/* 1. Active Recipient or Group Profile Card */}
+            {directRecipient ? (
+              <div className="p-4 rounded-3xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex flex-col items-center text-center gap-3">
+                <div
+                  className="relative p-[2.5px] rounded-full shadow-xs"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  <Avatar
+                    uid={directRecipient.id}
+                    src={
+                      directRecipient.photoURL ||
+                      `https://api.dicebear.com/7.x/shapes/svg?seed=${directRecipient.id}`
+                    }
+                    alt={directRecipient.displayName}
+                    fallbackName={directRecipient.displayName}
+                    size={80}
+                    showStatus={!isChattingWithSupportBot}
+                    onlyWhenVisible={false}
+                    targetProfile={directRecipient}
+                    imageClassName="border-2 border-[var(--bg-surface)]"
+                  />
+                  {isChattingWithSupportBot && (
+                    <span
+                      className="absolute bottom-0.5 right-0.5 w-4 h-4 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                      title="24/7 Assistant"
+                    />
+                  )}
+                </div>
+
+                <div className="min-w-0 w-full space-y-1">
+                  <div className="flex items-center justify-center">
+                    <CrystalBadge
+                      email={directRecipient.email}
+                      name={directRecipient.displayName}
+                      isPro={directRecipient.isPro}
+                      hasBlueStar={directRecipient.hasBlueStar || directRecipient.isPro}
+                      isSubAdmin={directRecipient.isSubAdmin || directRecipient.role === 'sub_admin'}
+                      size="md"
+                    />
+                  </div>
+                  {directRecipientStatusText && (
+                    <p
+                      className={`text-xs font-extrabold inline-flex items-center gap-1.5 ${
+                        isChattingWithSupportBot || directRecipientPresence.status === 'online'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isChattingWithSupportBot || directRecipientPresence.status === 'online'
+                            ? 'bg-[#22c55e] animate-pulse'
+                            : 'bg-[#ef4444]'
+                        }`}
+                      />
+                      <span>{directRecipientStatusText}</span>
+                    </p>
+                  )}
+                  <p className="text-xs text-[var(--text-secondary)] line-clamp-3 leading-relaxed">
+                    {directRecipient.bio ||
+                      (directRecipient.interests && directRecipient.interests.length > 0
+                        ? directRecipient.interests.join(' • ')
+                        : 'WaveLink Community Member')}
+                  </p>
+                </div>
+
+                {directRecipient.interests && directRecipient.interests.length > 0 && (
+                  <div className="flex flex-wrap justify-center gap-1.5">
+                    {directRecipient.interests.slice(0, 4).map((tag) => (
+                      <span
+                        key={tag}
+                        className="px-2.5 py-0.5 rounded-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[10px] font-bold text-[var(--text-secondary)]"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Mute & Block Quick Actions */}
+                <div className="grid grid-cols-2 gap-2 w-full pt-1">
+                  <button
+                    type="button"
+                    onClick={() => activeChannel && toggleMuteChannel(activeChannel)}
+                    className={`min-h-[38px] px-3 py-1.5 rounded-2xl border text-xs font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                      isActiveChannelMuted
+                        ? 'bg-amber-500/15 border-amber-400/50 text-amber-600 dark:text-amber-300'
+                        : 'bg-[var(--bg-surface)] border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {isActiveChannelMuted ? <BellOff size={14} /> : <Bell size={14} />}
+                    <span>{isActiveChannelMuted ? 'Muted' : 'Mute'}</span>
+                  </button>
+
+                  {!isChattingWithSupportBot &&
+                  !isSuperAdminEmail(directRecipient.email, directRecipient.role) ? (
+                    <button
+                      type="button"
+                      onClick={() => toggleBlockUser(directRecipient.id)}
+                      className={`min-h-[38px] px-3 py-1.5 rounded-2xl border text-xs font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                        isRecipientBlocked
+                          ? 'bg-rose-600 border-rose-600 text-white'
+                          : 'bg-[var(--bg-surface)] border-[var(--border-hairline)] hover:border-rose-400 hover:text-rose-600 text-[var(--text-primary)]'
+                      }`}
+                    >
+                      <Ban size={14} />
+                      <span>{isRecipientBlocked ? 'Unblock' : 'Block'}</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onOpenCall('voice', {
+                          id: directRecipient.id,
+                          name: directRecipient.displayName,
+                          photoURL: directRecipient.photoURL
+                        })
+                      }
+                      className="min-h-[38px] px-3 py-1.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <PhoneCall size={14} className="text-emerald-500" />
+                      <span>Call</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : activeGroup ? (
+              <div className="p-4 rounded-3xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex flex-col items-center text-center gap-2.5">
+                <div
+                  className="p-[2.5px] rounded-2xl"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  <img
+                    src={activeGroup.logoUrl || PRESET_LOGOS[0].url}
+                    alt={activeGroup.name}
+                    className="w-18 h-18 rounded-[14px] object-cover bg-[var(--bg-surface)]"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <h4 className="font-extrabold text-sm text-[var(--text-primary)]">
+                    {activeGroup.name}
+                  </h4>
+                  <p className="text-xs text-[var(--text-secondary)] line-clamp-2">
+                    {activeGroup.description || `${activeGroup.memberIds?.length || 1} members`}
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 w-full pt-1">
+                  <button
+                    type="button"
+                    onClick={() => activeChannel && toggleMuteChannel(activeChannel)}
+                    className="min-h-[38px] px-3 py-1.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    {isActiveChannelMuted ? <BellOff size={14} /> : <Bell size={14} />}
+                    <span>{isActiveChannelMuted ? 'Muted' : 'Mute'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsGroupInfoOpen(true)}
+                    className="min-h-[38px] px-3 py-1.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Info size={14} className="text-[var(--accent-primary)]" />
+                    <span>Members</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 rounded-3xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-center space-y-1.5">
+                <p className="text-xs font-extrabold text-[var(--text-primary)]">
+                  Conversation Details
+                </p>
+                <p className="text-xs text-[var(--text-secondary)]">
+                  Select a person or group to view their profile, shared photos, and files.
+                </p>
+              </div>
+            )}
+
+            {/* 2. Shared Photos & Files in Current Chat */}
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
+                  Shared Photos &amp; Files ({sharedPhotosInChat.length + sharedFilesInChat.length})
+                </span>
+              </div>
+
+              {sharedPhotosInChat.length === 0 && sharedFilesInChat.length === 0 ? (
+                <div className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-center">
+                  <p className="text-xs text-[var(--text-secondary)]">
+                    Photos, videos and voice notes shared in this chat will appear here.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2.5">
+                  {sharedPhotosInChat.length > 0 && (
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {sharedPhotosInChat.slice(0, 6).map((url, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => setLightboxPhotoUrl(url)}
+                          className="aspect-square rounded-xl overflow-hidden border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] transition cursor-pointer"
+                        >
+                          <img src={url} alt="Shared" className="w-full h-full object-cover" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {sharedFilesInChat.length > 0 && (
+                    <div className="space-y-1.5">
+                      {sharedFilesInChat.slice(0, 4).map((file) => (
+                        <a
+                          key={file.id}
+                          href={file.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="p-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] flex items-center gap-2.5 text-xs transition"
+                        >
+                          <div className="w-8 h-8 rounded-xl bg-[var(--bg-surface)] flex items-center justify-center text-[var(--accent-primary)] shrink-0">
+                            <FileText size={15} />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="font-bold text-[var(--text-primary)] truncate">
+                              {file.type}
+                            </p>
+                            <p className="text-[10px] text-[var(--text-secondary)] truncate">
+                              By {file.senderName}
+                            </p>
+                          </div>
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 3. People Grid of Suggested / Online Users */}
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
+                  People ({Math.min(allMembers.length, 6)})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setConvoFilter('people')}
+                  className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline cursor-pointer"
+                >
+                  See all
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {allMembers.slice(0, 6).map((person) => (
+                  <ChatPersonGridCard
+                    key={`desk_person_${person.id}`}
+                    person={person}
+                    language={language === 'sw' ? 'sw' : 'en'}
+                    compact={true}
+                    onSelect={handleOpenMemberChat}
+                  />
+                ))}
+              </div>
+            </div>
+          </aside>
+        )}
       </div>
+
+      {/* Lightbox Modal for Shared Chat Photos */}
+      {lightboxPhotoUrl && (
+        <div
+          onClick={() => setLightboxPhotoUrl(null)}
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4"
+        >
+          <button
+            type="button"
+            onClick={() => setLightboxPhotoUrl(null)}
+            className="absolute top-4 right-4 min-w-[44px] min-h-[44px] rounded-full bg-white/15 hover:bg-white/25 text-white flex items-center justify-center cursor-pointer"
+            aria-label="Close photo preview"
+          >
+            <X size={20} />
+          </button>
+          <img
+            src={lightboxPhotoUrl}
+            alt="Full size shared photo"
+            onClick={(e) => e.stopPropagation()}
+            className="max-w-full max-h-[85dvh] rounded-3xl object-contain shadow-2xl"
+          />
+        </div>
+      )}
 
       {/* ========================================================
           MODAL 1: CREATE NEW GROUP
@@ -3922,13 +5268,17 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           }`}
                         >
                           <div className="flex items-center gap-2.5">
-                            <img
+                            <Avatar
+                              uid={member.id}
                               src={
                                 member.photoURL ||
                                 `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
                               }
                               alt={member.displayName}
-                              className="w-7 h-7 rounded-full object-cover"
+                              fallbackName={member.displayName}
+                              size={28}
+                              showStatus={member.id !== SUPPORT_BOT_ID}
+                              targetProfile={member}
                             />
                             <div>
                               <span className="font-bold text-[#1C1917] block">
@@ -4202,13 +5552,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         className="flex items-center justify-between p-2.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-xs"
                       >
                         <div className="flex items-center gap-2.5">
-                          <img
+                          <Avatar
+                            uid={mId}
                             src={
                               photo ||
                               `https://api.dicebear.com/7.x/shapes/svg?seed=${mId}`
                             }
                             alt={name}
-                            className="w-8 h-8 rounded-full object-cover ring-1 ring-[#2563EB]/20"
+                            fallbackName={name}
+                            size={32}
+                            showStatus={mId !== SUPPORT_BOT_ID}
+                            targetProfile={userObj}
+                            className="ring-1 ring-[#2563EB]/20 rounded-full"
                           />
                           <div>
                             <span className="font-bold text-[#1C1917] block">

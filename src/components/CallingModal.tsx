@@ -37,6 +37,7 @@ import {
 } from 'firebase/firestore';
 import { sendWelinkChatMessage } from '../services/geminiService';
 import { sendNotification } from '../services/notificationService';
+import { Avatar } from './Avatar';
 
 interface LegacyChatContact {
   id: string;
@@ -1283,16 +1284,21 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         <header className="wavelink-call-header">
           <div className="flex items-center justify-between gap-3 w-full">
             <div className="flex items-center gap-2.5 min-w-0">
-              <img
+              <Avatar
+                uid={resolvedRecipientId}
                 src={resolvedRecipientAvatar}
                 alt={resolvedRecipientName}
-                className="w-9 h-9 rounded-full object-cover border border-cyan-500/40 shrink-0"
+                fallbackName={resolvedRecipientName}
+                size={36}
+                showStatus={true}
+                onlyWhenVisible={false}
+                ringClassName="border border-cyan-500/40"
               />
               <div className="min-w-0">
                 <h2 className="font-bold text-base truncate leading-tight">
                   {resolvedRecipientName}
                 </h2>
-                <div className="flex items-center gap-1.5 text-xs font-semibold text-cyan-400 lg:text-[#0D9488]">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-cyan-400 lg:text-cyan-300">
                   <span
                     className={`w-2 h-2 rounded-full shrink-0 ${
                       callState === 'connected'
@@ -1355,7 +1361,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           </div>
         </header>
 
-        {/* STAGE: Full-screen remote video + 100x140 top-right PIP on phones; Side-by-side on desktop (>=1024px) */}
+        {/* STAGE: Full-screen remote video + floating PIP in the corner */}
         <div className="wavelink-call-stage">
           {/* Remote Participant Pane */}
           <div className="wavelink-call-remote-pane">
@@ -1381,10 +1387,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                         <div className="absolute -inset-2 rounded-full bg-cyan-500/30 animate-pulse" />
                       </>
                     )}
-                  <img
+                  <Avatar
+                    uid={resolvedRecipientId}
                     src={resolvedRecipientAvatar}
                     alt={resolvedRecipientName}
-                    className="relative w-24 h-24 lg:w-32 lg:h-32 rounded-full object-cover border-2 border-cyan-400/60 shadow-2xl"
+                    fallbackName={resolvedRecipientName}
+                    size={96}
+                    showStatus={true}
+                    onlyWhenVisible={false}
+                    ringClassName="border-2 border-cyan-400/60 shadow-2xl"
                   />
                 </div>
 
@@ -1433,13 +1444,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             )}
 
             {/* Desktop participant label */}
-            <div className="hidden lg:flex items-center gap-2 absolute bottom-4 left-4 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold text-white">
+            <div className="hidden lg:flex items-center gap-2 absolute top-4 left-4 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold text-white">
               <Radio className="w-3.5 h-3.5 text-cyan-400" />
               <span>{resolvedRecipientName}</span>
             </div>
           </div>
 
-          {/* Local Camera Pane: 100x140px PIP in top-right corner on phones; side-by-side second column on desktop */}
+          {/* Local Camera Pane: 100x140px PIP in top-right corner on phones; floating box in bottom-right corner on desktop */}
           <div className="wavelink-call-local-pip">
             <video
               ref={localVideoRef}
@@ -1453,22 +1464,28 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             {(isVideoOff || normalizedMode === 'voice') && (
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/95 text-slate-400 p-2 text-center">
                 {resolvedUserAvatar ? (
-                  <img
+                  <Avatar
+                    uid={resolvedUserId}
                     src={resolvedUserAvatar}
                     alt={resolvedUserName}
-                    className="w-10 h-10 lg:w-20 lg:h-20 rounded-full object-cover border border-slate-700"
+                    fallbackName={resolvedUserName}
+                    size={44}
+                    showStatus={true}
+                    onlyWhenVisible={false}
+                    targetProfile={userProfile}
+                    ringClassName="border border-slate-700"
                   />
                 ) : (
-                  <VideoOff className="w-6 h-6 lg:w-10 lg:h-10 text-slate-500" />
+                  <VideoOff className="w-6 h-6 lg:w-7 lg:h-7 text-slate-500" />
                 )}
-                <span className="hidden lg:inline text-xs font-medium text-slate-400 mt-2">
+                <span className="hidden lg:inline text-[11px] font-medium text-slate-400 mt-1.5">
                   {isVideoOff ? 'Camera Off' : 'Voice Mode'}
                 </span>
               </div>
             )}
-            <div className="hidden lg:flex items-center gap-2 absolute bottom-4 left-4 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold text-white">
-              <span>You ({resolvedUserName})</span>
-              {isMuted && <MicOff className="w-3.5 h-3.5 text-rose-400" />}
+            <div className="hidden lg:flex items-center gap-1.5 absolute bottom-2 left-2.5 px-2.5 py-1 rounded-lg bg-slate-950/80 backdrop-blur-md border border-slate-800/80 text-[11px] font-semibold text-white">
+              <span>You</span>
+              {isMuted && <MicOff className="w-3 h-3 text-rose-400" />}
             </div>
           </div>
         </div>

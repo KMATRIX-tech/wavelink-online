@@ -7,6 +7,7 @@ import { toggleFollowUser } from '../services/notificationService';
 import { CrystalBadge } from './CrystalBadge';
 import { PostBody } from './PostBody';
 import { triggerHaptic } from '../utils/haptics';
+import { Avatar } from './Avatar';
 import {
   X,
   User,
@@ -337,13 +338,19 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
               <div className="space-y-5">
                 {/* Profile Identity Card */}
                 <div className="flex items-start gap-4">
-                  <img
+                  <Avatar
+                    uid={item.user.id}
                     src={
                       item.user.photoURL ||
                       `https://api.dicebear.com/7.x/shapes/svg?seed=${item.user.id}`
                     }
                     alt={item.user.displayName || item.user.username}
-                    className="w-16 h-16 rounded-2xl object-cover ring-2 ring-teal-500/20 shadow-xs shrink-0"
+                    fallbackName={item.user.displayName || item.user.username}
+                    size={64}
+                    showStatus={true}
+                    onlyWhenVisible={false}
+                    targetProfile={item.user}
+                    ringClassName="ring-2 ring-teal-500/20 shadow-xs"
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5 flex-wrap">
@@ -527,13 +534,18 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
                     }}
                     className="flex items-center gap-3 cursor-pointer group"
                   >
-                    <img
+                    <Avatar
+                      uid={item.post.authorId}
                       src={
                         item.post.authorPhotoURL ||
                         `https://api.dicebear.com/7.x/shapes/svg?seed=${item.post.authorId || item.post.id}`
                       }
                       alt={item.post.authorName}
-                      className="w-11 h-11 rounded-2xl object-cover ring-2 ring-blue-500/20 shadow-xs"
+                      fallbackName={item.post.authorName}
+                      size={44}
+                      showStatus={true}
+                      onlyWhenVisible={false}
+                      ringClassName="ring-2 ring-blue-500/20 shadow-xs"
                     />
                     <div>
                       <div className="flex items-center gap-1.5">

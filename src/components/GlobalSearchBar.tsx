@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { CrystalBadge } from './CrystalBadge';
 import { QuickSearchPreviewDrawer, QuickPreviewItem } from './QuickSearchPreviewDrawer';
+import { Avatar } from './Avatar';
 import { triggerHaptic } from '../utils/haptics';
 
 interface GlobalSearchBarProps {
@@ -380,10 +381,15 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
                       className="p-2 rounded-xl hover:bg-slate-50 transition cursor-pointer flex items-center justify-between gap-3 group"
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
-                        <img
+                        <Avatar
+                          uid={u.id}
                           src={u.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${u.id}`}
-                          alt="Avatar"
-                          className="w-9 h-9 rounded-full object-cover ring-1 ring-teal-500/20 shrink-0"
+                          alt={u.displayName || 'Avatar'}
+                          fallbackName={u.displayName || u.username}
+                          size={36}
+                          showStatus={true}
+                          targetProfile={u}
+                          className="ring-1 ring-teal-500/20 rounded-full"
                         />
                         <div className="min-w-0">
                           <div className="flex items-center gap-1.5 truncate">

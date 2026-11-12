@@ -264,6 +264,9 @@ export function scoreCreatorByInterests(
   return score;
 }
 
+import { APPEARANCE_THEMES, useTheme } from '../context/ThemeContext';
+import { Palette } from 'lucide-react';
+
 interface InterestPickerModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -282,6 +285,7 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
   const { currentUser, userProfile, updateUserProfile, showGlobalToast } = useAuth();
   const { language, t } = useLanguage();
   const { countryCode, setCountryCode } = useAfricanRegion(userProfile);
+  const { activeTheme, setPreviewTheme, saveAppearanceTheme } = useTheme();
 
   const seedList = initialSelected.length > 0 ? initialSelected : initialInterests;
   const [selected, setSelected] = useState<string[]>(() =>
@@ -290,6 +294,7 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
       : getSavedUserInterests(currentUser?.uid, userProfile?.interests)
   );
   const [pickedCountry, setPickedCountry] = useState<AfricanCountryCode>(countryCode);
+  const [pickedTheme, setPickedTheme] = useState(activeTheme);
   const [isSaving, setIsSaving] = useState(false);
 
   if (!isOpen) return null;
@@ -305,12 +310,20 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
     setCountryCode(code);
   };
 
+  const handlePreviewTheme = (themeId: typeof activeTheme) => {
+    setPickedTheme(themeId);
+    setPreviewTheme(themeId);
+  };
+
   const handleSkip = () => {
+    setPreviewTheme(null);
     if (currentUser?.uid) {
       markInterestPickerCompletedLocal(currentUser.uid, selected);
+      void saveAppearanceTheme(pickedTheme);
       updateUserProfile({
         interestsCompleted: true,
-        countryCode: pickedCountry
+        countryCode: pickedCountry,
+        appearanceTheme: pickedTheme
       }).catch(() => {});
     }
     onClose();
@@ -321,19 +334,21 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
     setIsSaving(true);
     try {
       setCountryCode(pickedCountry);
+      await saveAppearanceTheme(pickedTheme);
       if (currentUser?.uid) {
         markInterestPickerCompletedLocal(currentUser.uid, selected);
         await updateUserProfile({
           interests: selected,
           interestsCompleted: true,
-          countryCode: pickedCountry
+          countryCode: pickedCountry,
+          appearanceTheme: pickedTheme
         });
       }
       if (onSaved) onSaved(selected);
       showGlobalToast(
         language === 'sw'
-          ? 'Karibu! Nchi na mambo unayopenda yamehifadhiwa! ✨'
-          : 'Karibu! Your country and interests have been saved! ✨'
+          ? 'Karibu! Nchi, muonekano na mambo unayopenda yamehifadhiwa! ✨'
+          : 'Karibu! Your country, theme, and interests have been saved! ✨'
       );
       onClose();
     } catch {
@@ -346,42 +361,95 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
   const canSave = selected.length >= 3;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-950/60 backdrop-blur-xs animate-fade-in">
-      <div className="w-full max-w-xl bg-white border border-stone-200 rounded-3xl overflow-hidden shadow-2xl max-h-[92dvh] flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-stone-950/60 backdrop-blur-xs animate-fade-in">
+      <div className="w-full max-w-xl bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] rounded-3xl overflow-hidden shadow-2xl max-h-[92dvh] flex flex-col">
         <div className="kitenge-border-strip shrink-0" />
-        <div className="p-5 sm:p-7 space-y-5 overflow-y-auto">
+        <div className="p-4 sm:p-6 space-y-4 overflow-y-auto">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200 text-[11px] font-extrabold uppercase tracking-wider">
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-teal-500/15 text-[#0D9488] border border-teal-500/30 text-[11px] font-extrabold uppercase tracking-wider">
                 <Compass size={13} />
                 <span>{t('interests.modal_badge')}</span>
               </span>
-              <h2 className="text-xl sm:text-2xl font-extrabold text-stone-900 mt-2 tracking-tight">
+              <h2 className="text-lg sm:text-2xl font-extrabold mt-2 tracking-tight">
                 {t('interests.modal_title')}
               </h2>
-              <p className="text-xs sm:text-sm text-stone-600 mt-1 leading-relaxed">
+              <p className="text-xs sm:text-sm text-[var(--text-secondary)] mt-1 leading-relaxed">
                 {t('interests.modal_subtitle')}
               </p>
             </div>
             <button
               type="button"
               onClick={handleSkip}
-              className="p-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-500 hover:text-stone-900 transition shrink-0 cursor-pointer"
+              className="p-2 rounded-xl bg-[var(--bg-subtle)] hover:opacity-80 text-[var(--text-secondary)] transition shrink-0 cursor-pointer"
               title={t('interests.skip_for_now')}
             >
               <X size={16} />
             </button>
           </div>
 
+          {/* Post-Signup Theme & Background Chooser with Live Preview */}
+          <div className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2.5">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <span className="text-xs font-extrabold flex items-center gap-1.5">
+                <Palette size={14} className="text-[#2563EB]" />
+                <span>
+                  {language === 'sw'
+                    ? 'Chagua Muonekano na Mandhari (Hakikisho la Moja kwa Moja)'
+                    : 'Choose Your Theme & Background (Live Preview)'}
+                </span>
+              </span>
+              <span className="text-[10px] font-bold text-[#0D9488]">
+                {language === 'sw' ? 'Bure kwa Kila Mtu' : 'Free for Everyone'}
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5">
+              {APPEARANCE_THEMES.map((themeItem) => {
+                const isSelected = pickedTheme === themeItem.id;
+                return (
+                  <button
+                    key={themeItem.id}
+                    type="button"
+                    onClick={() => handlePreviewTheme(themeItem.id)}
+                    className={`min-h-[48px] px-2.5 py-2 rounded-2xl border text-left transition flex items-center justify-between gap-1.5 cursor-pointer ${
+                      isSelected
+                        ? 'ring-2 ring-[#2563EB] border-[#2563EB] shadow-xs'
+                        : 'border-stone-300/50 opacity-90 hover:opacity-100'
+                    }`}
+                    style={{
+                      background: themeItem.previewGradient,
+                      color: themeItem.previewText
+                    }}
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-sm shrink-0">{themeItem.emoji}</span>
+                      <span className="text-[11px] font-extrabold truncate">
+                        {language === 'sw' ? themeItem.nameSw : themeItem.name}
+                      </span>
+                    </div>
+                    {isSelected && (
+                      <span
+                        className="w-4 h-4 rounded-full flex items-center justify-center text-white shrink-0"
+                        style={{ backgroundColor: themeItem.previewAccent }}
+                      >
+                        <Check size={10} strokeWidth={3} />
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {/* Country & Region Picker with Flags */}
-          <div className="p-3.5 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] space-y-2.5">
+          <div className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2.5">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-extrabold text-stone-800 flex items-center gap-1.5">
+              <span className="text-xs font-extrabold flex items-center gap-1.5">
                 <Globe size={14} className="text-[#0D9488]" />
                 <span>
                   {language === 'sw'
-                    ? 'Chagua Nchi na Kanda Yako (Kwa ukurasa wa Za Nyumbani)'
-                    : 'Your Country & Region (For Local Feed & Currency)'}
+                    ? 'Chagua Nchi na Kanda Yako'
+                    : 'Your Country & Region'}
                 </span>
               </span>
             </div>
@@ -396,7 +464,7 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
                     className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 whitespace-nowrap transition cursor-pointer shrink-0 ${
                       active
                         ? 'bg-[#0D9488] text-white shadow-2xs'
-                        : 'bg-white border border-stone-200 text-stone-700 hover:border-teal-400'
+                        : 'bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] hover:border-teal-400'
                     }`}
                   >
                     <span>{c.flag}</span>
@@ -408,76 +476,77 @@ export const InterestPickerModal: React.FC<InterestPickerModalProps> = ({
           </div>
 
           {/* Grid of 13 African Content Categories */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-          {INTEREST_CATALOG.map((item) => {
-            const isPicked = selected.includes(item.id);
-            const label = language === 'sw' ? item.labelSw : item.labelEn;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => toggleInterest(item.id)}
-                className={`min-h-[54px] p-3 rounded-2xl border text-left transition flex items-center justify-between gap-2 cursor-pointer active:scale-95 ${
-                  isPicked
-                    ? 'bg-blue-50/90 border-[#2563EB] text-[#1D4ED8] shadow-2xs ring-2 ring-[#2563EB]/20'
-                    : 'bg-stone-50/80 hover:bg-stone-100/80 border-stone-200/90 text-stone-800'
-                }`}
-              >
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-lg shrink-0">{item.emoji}</span>
-                  <div className="min-w-0">
-                    <span className="text-xs sm:text-sm font-extrabold block truncate">
-                      {label}
-                    </span>
-                    <span className="text-[10px] text-stone-500 block truncate">
-                      {item.hashtags[0]}
-                    </span>
-                  </div>
-                </div>
-                <div
-                  className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition ${
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {INTEREST_CATALOG.map((item) => {
+              const isPicked = selected.includes(item.id);
+              const label = language === 'sw' ? item.labelSw : item.labelEn;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => toggleInterest(item.id)}
+                  className={`min-h-[52px] p-2.5 rounded-2xl border text-left transition flex items-center justify-between gap-2 cursor-pointer active:scale-95 ${
                     isPicked
-                      ? 'bg-[#2563EB] text-white'
-                      : 'border border-stone-300 bg-white'
+                      ? 'bg-blue-500/15 border-[#2563EB] text-[var(--text-primary)] shadow-2xs ring-2 ring-[#2563EB]/20'
+                      : 'bg-[var(--bg-subtle)] border-[var(--border-hairline)] text-[var(--text-primary)]'
                   }`}
                 >
-                  {isPicked && <Check size={12} strokeWidth={3} />}
-                </div>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-lg shrink-0">{item.emoji}</span>
+                    <div className="min-w-0">
+                      <span className="text-xs font-extrabold block truncate">
+                        {label}
+                      </span>
+                      <span className="text-[10px] text-[var(--text-secondary)] block truncate">
+                        {item.hashtags[0]}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition ${
+                      isPicked
+                        ? 'bg-[#2563EB] text-white'
+                        : 'border border-stone-300 bg-white'
+                    }`}
+                  >
+                    {isPicked && <Check size={12} strokeWidth={3} />}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Progress & Actions */}
+          <div className="pt-2 border-t border-[var(--border-hairline)] flex flex-col sm:flex-row items-center justify-between gap-3">
+            <div className="text-xs font-bold text-[var(--text-secondary)]">
+              <span className={canSave ? 'text-[#0D9488]' : 'text-[#2563EB]'}>
+                {selected.length}
+              </span>{' '}
+              {t('interests.selected_count')}
+            </div>
+
+            <div className="flex items-center gap-2.5 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={handleSkip}
+                className="min-h-[44px] flex-1 sm:flex-initial px-4 py-2.5 rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] font-bold text-xs transition cursor-pointer"
+              >
+                {t('interests.skip_for_now')}
               </button>
-            );
-          })}
-        </div>
-
-        {/* Progress & Actions */}
-        <div className="pt-2 border-t border-stone-100 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="text-xs font-bold text-stone-600">
-            <span className={canSave ? 'text-[#0D9488]' : 'text-[#2563EB]'}>
-              {selected.length}
-            </span>{' '}
-            {t('interests.selected_count')}
+              <button
+                type="button"
+                disabled={!canSave || isSaving}
+                onClick={handleSave}
+                className="min-h-[44px] flex-1 sm:flex-initial px-5 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm transition active:scale-95 cursor-pointer"
+              >
+                <Sparkles size={14} />
+                <span>{isSaving ? '...' : t('interests.save_continue')}</span>
+              </button>
+            </div>
           </div>
-
-          <div className="flex items-center gap-2.5 w-full sm:w-auto">
-            <button
-              type="button"
-              onClick={handleSkip}
-              className="min-h-[44px] flex-1 sm:flex-initial px-4 py-2.5 rounded-2xl bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold text-xs transition cursor-pointer"
-            >
-              {t('interests.skip_for_now')}
-            </button>
-            <button
-              type="button"
-              disabled={!canSave || isSaving}
-              onClick={handleSave}
-              className="min-h-[44px] flex-1 sm:flex-initial px-5 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm transition active:scale-95 cursor-pointer"
-            >
-              <Sparkles size={14} />
-              <span>{isSaving ? '...' : t('interests.save_continue')}</span>
-            </button>
-          </div>
-        </div>
         </div>
       </div>
     </div>
   );
 };
+

@@ -56,9 +56,17 @@ export function setDataSaverPreference(enabled: boolean): void {
       document.documentElement.removeAttribute('data-saver');
     }
   }
-  window.dispatchEvent(
-    new CustomEvent('wavelink:data-saver-changed', { detail: { enabled } })
-  );
+  if (typeof window !== 'undefined') {
+    setTimeout(() => {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('wavelink:data-saver-changed', { detail: { enabled } })
+        );
+      } catch {
+        // ignore
+      }
+    }, 0);
+  }
 }
 
 /**
@@ -73,6 +81,29 @@ export function getEstimatedDataSavedBytes(): number {
   } catch {
     return 0;
   }
+}
+
+let pendingBytesUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingBytesToDispatch = 0;
+
+function scheduleBytesUpdateEvent(bytes: number): void {
+  if (typeof window === 'undefined') return;
+  pendingBytesToDispatch = bytes;
+  if (pendingBytesUpdateTimer !== null) return;
+  // Defer notification out of the active React render phase to prevent
+  // 'Cannot update a component while rendering a different component' errors.
+  pendingBytesUpdateTimer = setTimeout(() => {
+    pendingBytesUpdateTimer = null;
+    try {
+      window.dispatchEvent(
+        new CustomEvent('wavelink:data-saved-updated', {
+          detail: { bytes: pendingBytesToDispatch }
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }, 10);
 }
 
 /**
@@ -95,9 +126,7 @@ export function recordDataSavedBytes(bytes: number, mediaKey?: string): number {
   } catch {
     // ignore
   }
-  window.dispatchEvent(
-    new CustomEvent('wavelink:data-saved-updated', { detail: { bytes: next } })
-  );
+  scheduleBytesUpdateEvent(next);
   return next;
 }
 
@@ -212,20 +241,20 @@ export function useDataSaver() {
   useEffect(() => {
     const handleSaverChange = (e: Event) => {
       const detail = (e as CustomEvent<{ enabled: boolean }>).detail;
-      if (detail && typeof detail.enabled === 'boolean') {
-        setDataSaverState(detail.enabled);
-      } else {
-        setDataSaverState(isDataSaverEnabled());
-      }
+      const next =
+        detail && typeof detail.enabled === 'boolean'
+          ? detail.enabled
+          : isDataSaverEnabled();
+      setDataSaverState((prev) => (prev !== next ? next : prev));
     };
 
     const handleBytesChange = (e: Event) => {
       const detail = (e as CustomEvent<{ bytes: number }>).detail;
-      if (detail && typeof detail.bytes === 'number') {
-        setSavedBytes(detail.bytes);
-      } else {
-        setSavedBytes(getEstimatedDataSavedBytes());
-      }
+      const next =
+        detail && typeof detail.bytes === 'number'
+          ? detail.bytes
+          : getEstimatedDataSavedBytes();
+      setSavedBytes((prev) => (prev !== next ? next : prev));
     };
 
     const handleConnChange = () => {

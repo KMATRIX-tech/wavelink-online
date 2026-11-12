@@ -12,6 +12,7 @@ import {
 } from 'firebase/firestore';
 import { Spark, SparkViewerEntry, SparkLikeEntry } from '../types';
 import { CrystalBadge } from './CrystalBadge';
+import { Avatar } from './Avatar';
 import { sendNotification, toggleFollowUser } from '../services/notificationService';
 import {
   resolveVideoUrl,
@@ -857,30 +858,21 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
           {/* Creator Row: Avatar with Wave-Ring Border + Name + 'Posted 3h ago' | Pause, Sound & Three-Dot Menu */}
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2.5 min-w-0">
-              {/* Creator Avatar with WaveLink Teal/Blue Wave-Ring Border */}
+              {/* Creator Avatar with WaveLink Teal/Blue Wave-Ring Border + Realtime Presence */}
               <div className="relative shrink-0 p-[2px] rounded-full bg-gradient-to-tr from-[#0D9488] via-[#06B6D4] to-[#2563EB] shadow-[0_0_12px_rgba(13,148,136,0.45)]">
-                <img
+                <Avatar
+                  uid={currentSpark.authorId}
                   src={
                     currentSpark.authorPhotoURL ||
                     `https://api.dicebear.com/7.x/shapes/svg?seed=${currentSpark.authorId}`
                   }
                   alt={currentSpark.authorName}
-                  className="w-9 h-9 rounded-full object-cover bg-[#071324] ring-1 ring-[#071324]"
+                  fallbackName={currentSpark.authorName}
+                  size={36}
+                  showStatus={true}
+                  onlyWhenVisible={false}
+                  imageClassName="ring-1 ring-[#071324]"
                 />
-                {/* Tiny Wave Crest Accent on Avatar Ring */}
-                <span
-                  className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-gradient-to-tr from-[#0D9488] to-[#2563EB] border border-[#071324] flex items-center justify-center"
-                  aria-hidden="true"
-                >
-                  <svg className="w-2 h-2 text-white" viewBox="0 0 16 16" fill="none">
-                    <path
-                      d="M2 9.5C4 7.5 6 7.5 8 9.5C10 11.5 12 11.5 14 9.5"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                </span>
               </div>
 
               <div className="min-w-0">
@@ -1288,10 +1280,13 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
                       key={item.id}
                       className="flex items-start gap-2.5 p-3 rounded-2xl bg-white/5 border border-teal-400/15"
                     >
-                      <img
+                      <Avatar
+                        uid={item.userId}
                         src={item.userAvatar}
                         alt={item.userName}
-                        className="w-7 h-7 rounded-full object-cover shrink-0"
+                        fallbackName={item.userName}
+                        size={28}
+                        showStatus={true}
                       />
                       <div className="min-w-0 flex-1">
                         <p className="text-xs font-bold text-teal-200">{item.userName}</p>
@@ -1404,13 +1399,17 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
                         className="flex items-center justify-between gap-2.5 p-2.5 rounded-2xl bg-white/5 border border-teal-400/15"
                       >
                         <div className="flex items-center gap-2.5 min-w-0">
-                          <img
+                          <Avatar
+                            uid={viewer.userId}
                             src={
                               viewer.photoURL ||
                               `https://api.dicebear.com/7.x/shapes/svg?seed=${viewer.userId}`
                             }
                             alt={viewer.name}
-                            className="w-9 h-9 rounded-full object-cover ring-2 ring-[#0D9488]/50 shrink-0"
+                            fallbackName={viewer.name}
+                            size={36}
+                            showStatus={true}
+                            className="ring-2 ring-[#0D9488]/50 rounded-full"
                           />
                           <div className="min-w-0">
                             <p className="text-xs font-bold text-white truncate">{viewer.name}</p>

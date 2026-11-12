@@ -1,0 +1,37 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "status": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid === $uid",
+        ".validate": "newData.hasChildren(['state', 'lastChanged']) && (newData.child('state').val() === 'online' || newData.child('state').val() === 'offline') && newData.child('lastChanged').isNumber() && !newData.hasChild('location') && !newData.hasChild('ip') && !newData.hasChild('device')",
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
+    "connections": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid",
+        "$connectionId": {
+          ".validate": "!newData.exists() || newData.isBoolean()"
+        }
+      }
+    },
+    "typing": {
+      "$conversationId": {
+        ".read": "auth != null && (($conversationId.beginsWith('dm_') && $conversationId.contains(auth.uid)) || !$conversationId.beginsWith('dm_'))",
+        "$uid": {
+          ".write": "auth != null && auth.uid === $uid && (($conversationId.beginsWith('dm_') && $conversationId.contains(auth.uid)) || !$conversationId.beginsWith('dm_'))",
+          ".validate": "!newData.exists() || (newData.hasChildren(['isTyping', 'lastChanged']) && newData.child('isTyping').isBoolean() && newData.child('lastChanged').isNumber())",
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    }
+  }
+}

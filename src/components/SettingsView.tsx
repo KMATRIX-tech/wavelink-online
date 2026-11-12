@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAuth, DAILY_REWARD_SCHEDULE, getLocalDateKey } from '../context/AuthContext';
 import { useTheme, APPEARANCE_THEMES } from '../context/ThemeContext';
 import { useLanguage } from '../context/LanguageContext';
+import { useSimpleMode } from '../context/SimpleModeContext';
 import { useDataSaver } from '../services/dataSaverService';
 import { INTEREST_CATALOG } from './InterestPickerModal';
 import {
@@ -24,7 +25,12 @@ import {
   AfricanCountryCode,
   EastAfricanCurrency,
   PanAfricanLanguageCode,
-  KangaPatternFrame
+  KangaPatternFrame,
+  Post,
+  Spark,
+  UserProfile,
+  CallRecipient,
+  StoryHighlightItem
 } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { SupportDeskView } from './SupportDeskView';
@@ -67,25 +73,80 @@ import {
   Lightbulb,
   UserPlus,
   Bell,
-  BarChart3
+  BarChart3,
+  Compass,
+  ArrowLeft,
+  ArrowUpRight,
+  Bookmark,
+  Camera,
+  Flag,
+  Grid,
+  Heart,
+  Layers,
+  MessageCircle,
+  MoreVertical,
+  Pin,
+  Play,
+  Settings,
+  Share2,
+  Tag,
+  UserCheck,
+  Video
 } from 'lucide-react';
 import { NotificationSettingsPanel } from './NotificationSettingsPanel';
 
-import { inviteFriends } from '../utils/share.js';
+import { inviteFriends, sharePost } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
 import { compressImage } from '../utils/mediaStorage';
 import { validateStrongPassword } from '../utils/security';
-import { db, formatEmailVerificationError, extractSafeFirebaseAuthCode } from '../firebase';
-import { collection, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
+import {
+  db,
+  formatEmailVerificationError,
+  extractSafeFirebaseAuthCode,
+  fetchUserProfileCached,
+  getCachedUserProfile,
+  setCachedUserProfile
+} from '../firebase';
+import {
+  collection,
+  doc,
+  getDocs,
+  deleteDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  limit,
+  setDoc,
+  where
+} from 'firebase/firestore';
 import { UpgradeFeedbackItem, UpgradeCategory } from '../types';
 import { recordUpgradeFeedback } from '../services/upgradeFeedbackService';
 
+import { ThemePickerPanel } from './ThemePickerPanel';
+import { ProfileCoverBanner, ProfileCoverModal } from './ProfileCoverModal';
+import { Avatar } from './Avatar';
+import { usePresence } from '../context/PresenceContext';
+import { formatPresenceSubtitle } from '../utils/presenceFormat';
+import {
+  FollowersListModal,
+  ProfileBadgesRow,
+  ProfilePostViewerModal,
+  StoryHighlightsBar
+} from './ProfileSocialModals';
+
 interface SettingsViewProps {
   onOpenAdminPanel?: () => void;
+  viewedUserId?: string | null;
+  onSelectUserProfile?: (userId: string | null) => void;
+  onStartChatWithUser?: (userId: string) => void;
+  onStartCallWithUser?: (recipient: CallRecipient, callType: 'voice' | 'video') => void;
 }
 
 type SettingsSection =
   | 'profile'
+  | 'edit_profile'
+  | 'settings_hub'
+  | 'appearance'
   | 'stats'
   | 'notifications'
   | 'privacy'
@@ -95,10 +156,13 @@ type SettingsSection =
   | 'support'
   | 'upgrades';
 
+type ProfileContentTab = 'posts' | 'reels' | 'saved' | 'tagged';
+
 const DEFAULT_PRIVACY_SETTINGS: UserPrivacySettings = {
   profileVisibility: 'public',
   showOnlineStatus: true,
   showLastSeen: true,
+  onlineStatusAudience: 'everyone',
   allowDirectMessages: 'everyone',
   allowCalls: 'everyone',
   sparkVisibility: 'everyone',
@@ -193,8 +257,8 @@ const AGREEMENT_SECTIONS: {
         body: 'WaveLink never sells or rents your personal information, email address, or phone number to third-party data brokers or external advertisers.'
       },
       {
-        heading: 'Private Messaging & Calls',
-        body: 'Direct messages and WebRTC voice/video calls are protected by strict access rules. You can customize who can message you, call you, or see your online status at any time in Privacy Settings.'
+        heading: 'Private Messaging, Calls & Presence',
+        body: 'Direct messages and WebRTC voice/video calls are protected by strict access rules. Online presence (online/offline + lastChanged) and ephemeral typing indicators use Firebase Realtime Database with zero GPS, IP, or device tracking. You can turn off your online status, hide last seen, or restrict it to Close Friends Only at any time in Privacy Settings.'
       },
       {
         heading: 'Your Data Control Rights',
@@ -204,7 +268,13 @@ const AGREEMENT_SECTIONS: {
   }
 ];
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) => {
+export const SettingsView: React.FC<SettingsViewProps> = ({
+  onOpenAdminPanel,
+  viewedUserId,
+  onSelectUserProfile,
+  onStartChatWithUser,
+  onStartCallWithUser
+}) => {
   const {
     currentUser,
     userProfile,
@@ -212,7 +282,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
     isSubAdmin,
     adminCheckFailedReason,
     isProEffective,
+    isVerified,
     updateUserProfile,
+    toggleSavePost,
+    reportContent,
     changeUserPassword,
     sendPasswordReset,
     sendVerificationEmail,
@@ -222,6 +295,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   } = useAuth();
   const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
   const { language, setLanguage, t } = useLanguage();
+  const { isSimpleMode, toggleSimpleMode } = useSimpleMode();
   const { enabled: isDataSaverOn, setEnabled: setDataSaverOn, formattedSaved } = useDataSaver();
   const {
     countryCode,
@@ -242,10 +316,203 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   const activePatternFrame: KangaPatternFrame = userProfile?.patternFrame || 'none';
   const isKangaBgEnabled = Boolean(userProfile?.kangaBackgroundEnabled);
 
+  // Viewed user profile support (own profile vs viewing another person's profile)
+  const [internalViewedUserId, setInternalViewedUserId] = useState<string | null>(
+    viewedUserId || null
+  );
+  useEffect(() => {
+    setInternalViewedUserId(viewedUserId || null);
+  }, [viewedUserId]);
+
+  const effectiveTargetUid =
+    internalViewedUserId && internalViewedUserId !== currentUser?.uid
+      ? internalViewedUserId
+      : currentUser?.uid || '';
+  const isOwnProfile = !internalViewedUserId || internalViewedUserId === currentUser?.uid;
+
+  const [viewedOtherProfile, setViewedOtherProfile] = useState<UserProfile | null>(null);
+  const [isLoadingOtherProfile, setIsLoadingOtherProfile] = useState<boolean>(false);
+
+  // Read target profile once and cache in memory
+  useEffect(() => {
+    if (isOwnProfile || !effectiveTargetUid) {
+      setViewedOtherProfile(null);
+      return;
+    }
+    let cancelled = false;
+    const cached = getCachedUserProfile(effectiveTargetUid);
+    if (cached) {
+      setViewedOtherProfile(cached);
+    } else {
+      setIsLoadingOtherProfile(true);
+    }
+
+    fetchUserProfileCached(effectiveTargetUid)
+      .then((fetched) => {
+        if (!cancelled && fetched) {
+          setViewedOtherProfile(fetched);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingOtherProfile(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOwnProfile, effectiveTargetUid]);
+
+  const activeProfile: UserProfile | null = isOwnProfile ? userProfile : viewedOtherProfile;
+
+  // Profile redesign interactive states
+  const [activeProfileTab, setActiveProfileTab] = useState<ProfileContentTab>('posts');
+  const [isBioExpanded, setIsBioExpanded] = useState<boolean>(false);
+  const [isCoverModalOpen, setIsCoverModalOpen] = useState<boolean>(false);
+  const [followersModalTab, setFollowersModalTab] = useState<'followers' | 'following' | null>(null);
+  const [isOtherMenuOpen, setIsOtherMenuOpen] = useState<boolean>(false);
+  const [selectedViewerPostId, setSelectedViewerPostId] = useState<string | null>(null);
+
+  // Person's Posts, Saved Posts, Tagged Posts, Active 24h Sparks, and Follower IDs
+  const [userPosts, setUserPosts] = useState<Post[]>([]);
+  const [savedPostsList, setSavedPostsList] = useState<Post[]>([]);
+  const [taggedPostsList, setTaggedPostsList] = useState<Post[]>([]);
+  const [activeUserSparks, setActiveUserSparks] = useState<Spark[]>([]);
+  const [followerUserIds, setFollowerUserIds] = useState<string[]>([]);
+  const [isLoadingPosts, setIsLoadingPosts] = useState<boolean>(true);
+  const [visiblePostsCount, setVisiblePostsCount] = useState<number>(12);
+  const postsGridSectionRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Load person's posts, followers, and active 24h Sparks with cleanup
+  useEffect(() => {
+    if (!effectiveTargetUid) {
+      setUserPosts([]);
+      setIsLoadingPosts(false);
+      return;
+    }
+    let cancelled = false;
+    setIsLoadingPosts(true);
+    setVisiblePostsCount(12);
+
+    const loadProfileContent = async () => {
+      try {
+        // 1. Fetch user's posts
+        const postsQ = query(
+          collection(db, 'posts'),
+          where('authorId', '==', effectiveTargetUid),
+          limit(48)
+        );
+        const postsSnap = await getDocs(postsQ);
+        if (!cancelled) {
+          const list = postsSnap.docs
+            .map((d) => ({ id: d.id, ...d.data() } as Post))
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          setUserPosts(list);
+        }
+
+        // 2. Fetch followers for this user
+        const followsQ = query(
+          collection(db, 'follows'),
+          where('targetUserId', '==', effectiveTargetUid),
+          limit(100)
+        );
+        const followsSnap = await getDocs(followsQ);
+        if (!cancelled) {
+          const fIds = followsSnap.docs
+            .map((d) => String(d.data().followerId || ''))
+            .filter(Boolean);
+          setFollowerUserIds(Array.from(new Set(fIds)));
+        }
+
+        // 3. Fetch active 24h Sparks for this user
+        const sparksQ = query(
+          collection(db, 'sparks'),
+          where('authorId', '==', effectiveTargetUid),
+          limit(12)
+        );
+        const sparksSnap = await getDocs(sparksQ);
+        if (!cancelled) {
+          const nowMs = Date.now();
+          const sparks = sparksSnap.docs
+            .map((d) => ({ id: d.id, ...d.data() } as Spark))
+            .filter((sp) => !sp.expiresAt || new Date(sp.expiresAt).getTime() > nowMs)
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          setActiveUserSparks(sparks);
+        }
+
+        // 4. Fetch recent community posts where @username is mentioned/tagged
+        const targetHandle = (
+          (isOwnProfile ? userProfile?.username : viewedOtherProfile?.username) || ''
+        )
+          .trim()
+          .toLowerCase();
+        if (targetHandle) {
+          const recentQ = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(40));
+          const recentSnap = await getDocs(recentQ);
+          if (!cancelled) {
+            const cleanHandle = targetHandle.startsWith('@') ? targetHandle : `@${targetHandle}`;
+            const tagged = recentSnap.docs
+              .map((d) => ({ id: d.id, ...d.data() } as Post))
+              .filter(
+                (p) =>
+                  p.authorId !== effectiveTargetUid &&
+                  typeof p.content === 'string' &&
+                  p.content.toLowerCase().includes(cleanHandle)
+              );
+            setTaggedPostsList(tagged);
+          }
+        } else if (!cancelled) {
+          setTaggedPostsList([]);
+        }
+      } catch {
+        // Offline or cached fallback
+      } finally {
+        if (!cancelled) setIsLoadingPosts(false);
+      }
+    };
+
+    loadProfileContent();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveTargetUid, isOwnProfile, userProfile?.username, viewedOtherProfile?.username]);
+
+  // Load saved posts when on own profile and Saved tab is selected
+  useEffect(() => {
+    if (!isOwnProfile || activeProfileTab !== 'saved') return;
+    const savedIds = userProfile?.savedPostIds || [];
+    if (savedIds.length === 0) {
+      setSavedPostsList([]);
+      return;
+    }
+    let cancelled = false;
+    const loadSaved = async () => {
+      try {
+        const recentSnap = await getDocs(
+          query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(60))
+        );
+        if (cancelled) return;
+        const matched = recentSnap.docs
+          .map((d) => ({ id: d.id, ...d.data() } as Post))
+          .filter((p) => savedIds.includes(p.id));
+        setSavedPostsList(matched);
+      } catch {
+        // ignore
+      }
+    };
+    loadSaved();
+    return () => {
+      cancelled = true;
+    };
+  }, [isOwnProfile, activeProfileTab, userProfile?.savedPostIds]);
+
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>(() => {
     if (typeof window !== 'undefined') {
       const requested = localStorage.getItem('wavelink_settings_initial_section');
-      if (requested === 'notifications' || requested === 'stats') {
+      if (
+        requested === 'notifications' ||
+        requested === 'stats' ||
+        requested === 'appearance'
+      ) {
         localStorage.removeItem('wavelink_settings_initial_section');
         return requested;
       }
@@ -727,335 +994,1011 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
   const activeAgreementDoc =
     AGREEMENT_SECTIONS.find((s) => s.id === termsAgreement.selectedSection) || AGREEMENT_SECTIONS[0];
 
-  return (
-    <div className="w-full max-w-3xl mx-auto py-4 sm:py-6 px-3 sm:px-6 space-y-5 sm:space-y-6 overflow-x-hidden">
-      {/* User Profile Card */}
-      <div
-        className={`bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-5 ${
-          isKangaBgEnabled ? 'kanga-pattern-subtle' : ''
-        }`}
-      >
-        <div className="flex items-start justify-between flex-wrap gap-4">
-          <div className="flex items-center gap-3.5 sm:gap-4 min-w-0">
-            <div className="relative shrink-0">
-              <img
-                src={
-                  photoURL ||
-                  userProfile?.photoURL ||
-                  `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
-                }
-                alt="Profile Avatar"
-                className={`w-16 h-16 sm:w-20 sm:h-20 rounded-full object-cover ${
-                  activePatternFrame !== 'none'
-                    ? getKangaFrameClass(activePatternFrame)
-                    : isProUser && proBorderEffect !== 'none'
-                    ? borderOptions.find((b) => b.id === proBorderEffect)?.ringClass
-                    : 'ring-2 ring-[#2563EB]/20'
-                }`}
-              />
-              <span
-                className="absolute -bottom-1 -right-1 text-xs leading-none bg-white rounded-full px-1 py-0.5 shadow-xs border border-stone-200"
-                title={activeCountryMeta.nameEn}
-              >
-                {activeCountryMeta.flag}
+  // Derived profile display values (supports both Own Profile and Viewed Other User Profile)
+  const displayedName = isOwnProfile
+    ? userProfile?.displayName || displayName || currentUser?.displayName || 'Waver'
+    : activeProfile?.displayName || 'WaveLink Member';
+  const rawHandle = isOwnProfile
+    ? userProfile?.username || username || '@waver'
+    : activeProfile?.username || '@waver';
+  const displayedUsername = rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`;
+  const displayedBio = isOwnProfile
+    ? userProfile?.bio || bio || 'Connecting on WaveLink 🌊'
+    : activeProfile?.bio || 'Connecting on WaveLink 🌊';
+  const displayedAvatar = isOwnProfile
+    ? photoURL ||
+      userProfile?.photoURL ||
+      `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
+    : activeProfile?.photoURL ||
+      `https://api.dicebear.com/7.x/shapes/svg?seed=${effectiveTargetUid || 'user'}`;
+
+  const isDisplayedUserPro = isOwnProfile
+    ? isProUser
+    : Boolean(
+        activeProfile?.isPro ||
+          activeProfile?.hasBlueStar ||
+          activeProfile?.isVerifiedByAdmin ||
+          activeProfile?.role === 'admin' ||
+          activeProfile?.role === 'super_admin' ||
+          activeProfile?.role === 'sub_admin' ||
+          activeProfile?.isSubAdmin
+      );
+
+  const isDisplayedUserVerified = isOwnProfile
+    ? Boolean(isVerified || isProUser)
+    : Boolean(
+        activeProfile?.hasBlueStar ||
+          activeProfile?.isVerifiedByAdmin ||
+          activeProfile?.proBadge === 'verified' ||
+          activeProfile?.role === 'admin' ||
+          activeProfile?.role === 'super_admin'
+      );
+
+  const viewedPresence = usePresence(effectiveTargetUid || undefined, activeProfile);
+  const isDisplayedUserOnline = viewedPresence.status === 'online';
+  const profilePresenceSubtitle =
+    viewedPresence.status === 'online' || viewedPresence.status === 'offline'
+      ? formatPresenceSubtitle({
+          isOnline: viewedPresence.status === 'online',
+          lastChanged: viewedPresence.lastChanged,
+          lastSeenIso: activeProfile?.lastSeenAt || activeProfile?.lastSeen,
+          language: language === 'sw' ? 'sw' : 'en',
+          showLastSeen: viewedPresence.canShowLastSeen
+        })
+      : '';
+
+  const hasActiveStoryRing = activeUserSparks.length > 0;
+  const displayedWavePoints = isOwnProfile
+    ? totalWavePoints
+    : activeProfile?.wavePoints ?? activeProfile?.points ?? 0;
+  const displayedFollowingIds = isOwnProfile
+    ? userProfile?.followingIds || []
+    : activeProfile?.followingIds || [];
+  const myFollowingIds = userProfile?.followingIds || [];
+  const isFollowingViewedUser = Boolean(
+    !isOwnProfile && effectiveTargetUid && myFollowingIds.includes(effectiveTargetUid)
+  );
+  const myCloseFriendIds = userProfile?.closeFriendIds || [];
+  const isViewedUserCloseFriend = Boolean(
+    !isOwnProfile && effectiveTargetUid && myCloseFriendIds.includes(effectiveTargetUid)
+  );
+  const handleToggleCloseFriend = async (targetUid: string) => {
+    if (!currentUser || !targetUid || targetUid === currentUser.uid) return;
+    const currentCloseFriends = userProfile?.closeFriendIds || [];
+    const exists = currentCloseFriends.includes(targetUid);
+    const nextCloseFriends = exists
+      ? currentCloseFriends.filter((id) => id !== targetUid)
+      : [...currentCloseFriends, targetUid];
+    try {
+      await updateUserProfile({ closeFriendIds: nextCloseFriends });
+      setInviteToast({
+        message: !exists
+          ? language === 'sw'
+            ? 'Ameongezwa kwenye Marafiki wa Karibu!'
+            : 'Added to Close Friends!'
+          : language === 'sw'
+          ? 'Ameondolewa kwenye Marafiki wa Karibu.'
+          : 'Removed from Close Friends.',
+        type: 'success'
+      });
+      setTimeout(() => setInviteToast(null), 2600);
+    } catch {
+      // ignore offline
+    }
+  };
+  const isViewedUserBlocked = Boolean(
+    !isOwnProfile &&
+      effectiveTargetUid &&
+      (userProfile?.blockedUserIds || []).includes(effectiveTargetUid)
+  );
+
+  // Private account check when viewing another user's profile
+  const isViewedAccountPrivateAndLocked = Boolean(
+    !isOwnProfile &&
+      !isAdmin &&
+      activeProfile?.privacySettings?.profileVisibility === 'private' &&
+      !isFollowingViewedUser
+  );
+
+  // Follow / Unfollow handler
+  const handleToggleFollowUser = async (targetUid: string, targetDisplayName?: string) => {
+    if (!currentUser || !targetUid || targetUid === currentUser.uid) return;
+    const currentList = userProfile?.followingIds || [];
+    const alreadyFollowing = currentList.includes(targetUid);
+    const nextFollowing = alreadyFollowing
+      ? currentList.filter((id) => id !== targetUid)
+      : [...currentList, targetUid];
+
+    try {
+      await updateUserProfile({ followingIds: nextFollowing });
+      const followDocId = `${currentUser.uid}_${targetUid}`;
+      if (alreadyFollowing) {
+        await deleteDoc(doc(db, 'follows', followDocId)).catch(() => {});
+        if (targetUid === effectiveTargetUid) {
+          setFollowerUserIds((prev) => prev.filter((id) => id !== currentUser.uid));
+        }
+      } else {
+        await setDoc(
+          doc(db, 'follows', followDocId),
+          {
+            id: followDocId,
+            followerId: currentUser.uid,
+            followerName: userProfile?.displayName || currentUser.displayName || 'Waver',
+            targetUserId: targetUid,
+            targetUserName: targetDisplayName || displayedName,
+            createdAt: new Date().toISOString()
+          },
+          { merge: true }
+        ).catch(() => {});
+        if (targetUid === effectiveTargetUid) {
+          setFollowerUserIds((prev) => Array.from(new Set([...prev, currentUser.uid])));
+        }
+      }
+    } catch {
+      // ignore offline
+    }
+  };
+
+  // Share Profile handler
+  const handleShareProfile = async () => {
+    const profileUrl =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/?user=${encodeURIComponent(displayedUsername)}`
+        : 'https://wavelink.app';
+    try {
+      const res = await sharePost({
+        title: `${displayedName} (${displayedUsername}) on WaveLink`,
+        text: `${displayedName} (${displayedUsername}) — ${displayedBio}`,
+        url: profileUrl
+      });
+      if (res?.method === 'clipboard') {
+        setInviteToast({
+          message:
+            language === 'sw'
+              ? 'Kiungo cha wasifu kimenakiliwa!'
+              : 'Profile link copied to clipboard!',
+          type: 'success'
+        });
+        setTimeout(() => setInviteToast(null), 3000);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // Pin / Unpin Post handler
+  const handleTogglePinPost = async (postId: string) => {
+    if (!isOwnProfile) return;
+    const nextPinned = userProfile?.pinnedPostId === postId ? '' : postId;
+    await updateUserProfile({ pinnedPostId: nextPinned });
+    setInviteToast({
+      message: nextPinned
+        ? language === 'sw'
+          ? 'Chapisho limebandikwa juu ya wasifu wako!'
+          : 'Post pinned to top of your profile!'
+        : language === 'sw'
+        ? 'Chapisho limeondolewa juu.'
+        : 'Post unpinned.',
+      type: 'success'
+    });
+    setTimeout(() => setInviteToast(null), 2600);
+  };
+
+  // Save custom cover handler (Pro only)
+  const handleSaveCustomCover = async (coverData: {
+    coverType: UserProfile['coverType'];
+    coverPresetId?: UserProfile['coverPresetId'];
+    coverImageUrl?: string;
+  }) => {
+    await updateUserProfile({
+      coverType: coverData.coverType,
+      coverPresetId: coverData.coverPresetId,
+      coverImageUrl: coverData.coverImageUrl
+    });
+    setInviteToast({
+      message:
+        language === 'sw' ? 'Jalada la wasifu limehifadhiwa!' : 'Profile cover updated!',
+      type: 'success'
+    });
+    setTimeout(() => setInviteToast(null), 2600);
+  };
+
+  // Compute sorted posts for active tab (Pinned post always first on Posts tab)
+  const pinnedPostId = activeProfile?.pinnedPostId || '';
+  const sortedUserPosts = [...userPosts].sort((a, b) => {
+    if (pinnedPostId) {
+      if (a.id === pinnedPostId && b.id !== pinnedPostId) return -1;
+      if (b.id === pinnedPostId && a.id !== pinnedPostId) return 1;
+    }
+    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  });
+
+  const userReelsList = sortedUserPosts.filter(
+    (p) => Boolean(p.videoUrl) || p.mediaType === 'video'
+  );
+
+  const currentTabPosts: Post[] =
+    activeProfileTab === 'posts'
+      ? sortedUserPosts
+      : activeProfileTab === 'reels'
+      ? userReelsList
+      : activeProfileTab === 'saved'
+      ? savedPostsList
+      : taggedPostsList;
+
+  const paginatedTabPosts = currentTabPosts.slice(0, visiblePostsCount);
+
+  // Reusable Reference Menu Cards (shown below header on mobile, and in right side panel on desktop >= 1280px)
+  const renderReferenceMenuCards = () => {
+    if (!isOwnProfile) {
+      return (
+        <div className="space-y-3">
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 space-y-3">
+            <h3 className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
+              {language === 'sw' ? 'Tuzo na Beji' : 'Badges & Achievements'}
+            </h3>
+            <ProfileBadgesRow
+              profile={activeProfile}
+              isProEffective={isDisplayedUserPro}
+              isVerifiedEffective={isDisplayedUserVerified}
+              language={language === 'sw' ? 'sw' : 'en'}
+            />
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              setInternalViewedUserId(null);
+              onSelectUserProfile?.(null);
+            }}
+            className="wavelink-profile-menu-row"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary)]/15 text-[var(--accent-primary)] flex items-center justify-center shrink-0">
+                <ArrowLeft size={18} />
+              </div>
+              <div>
+                <span className="text-sm font-extrabold text-[var(--text-primary)] block">
+                  {language === 'sw' ? 'Rudi kwenye Wasifu Wangu' : 'Back to My Profile'}
+                </span>
+                <span className="text-xs text-[var(--text-secondary)] block">
+                  {language === 'sw' ? 'Fungua mipangilio na machapisho yako' : 'Manage your own profile & settings'}
+                </span>
+              </div>
+            </div>
+            <span className="wavelink-profile-menu-arrow">
+              <ChevronRight size={16} />
+            </span>
+          </button>
+        </div>
+      );
+    }
+
+    const menuItems = [
+      {
+        id: 'edit_profile',
+        icon: <User size={18} className="text-[#2563EB]" />,
+        iconBg: 'bg-blue-500/15 border-blue-500/25',
+        label: language === 'sw' ? 'Hariri wasifu' : 'Edit profile',
+        onClick: () => setActiveSettingsSection('edit_profile')
+      },
+      {
+        id: 'wavepoints',
+        icon: <Coins size={18} className="text-amber-500" />,
+        iconBg: 'bg-amber-500/15 border-amber-500/25',
+        label:
+          language === 'sw'
+            ? `WavePoints zangu na mfululizo (${ currentStreak }d)`
+            : `My WavePoints & check-in streak`,
+        onClick: () => setIsDailyRewardModalOpen(true)
+      },
+      {
+        id: 'saved_posts',
+        icon: <Bookmark size={18} className="text-[#0D9488]" />,
+        iconBg: 'bg-teal-500/15 border-teal-500/25',
+        label: language === 'sw' ? 'Machapisho yaliyohifadhiwa' : 'Saved posts',
+        onClick: () => {
+          setActiveSettingsSection('profile');
+          setActiveProfileTab('saved');
+          postsGridSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      },
+      {
+        id: 'themes',
+        icon: <Palette size={18} className="text-purple-500" />,
+        iconBg: 'bg-purple-500/15 border-purple-500/25',
+        label: language === 'sw' ? 'Mandhari na muonekano' : 'Themes and backgrounds',
+        onClick: () => setActiveSettingsSection('appearance')
+      },
+      {
+        id: 'privacy',
+        icon: <Lock size={18} className="text-emerald-500" />,
+        iconBg: 'bg-emerald-500/15 border-emerald-500/25',
+        label: language === 'sw' ? 'Faragha na usalama' : 'Privacy and security',
+        onClick: () => setActiveSettingsSection('privacy')
+      },
+      {
+        id: 'settings',
+        icon: <Settings size={18} className="text-sky-500" />,
+        iconBg: 'bg-sky-500/15 border-sky-500/25',
+        label: language === 'sw' ? 'Mipangilio' : 'Settings',
+        onClick: () => setActiveSettingsSection('settings_hub')
+      },
+      {
+        id: 'help',
+        icon: <HelpCircle size={18} className="text-rose-500" />,
+        iconBg: 'bg-rose-500/15 border-rose-500/25',
+        label: language === 'sw' ? 'Msaada' : 'Help',
+        onClick: () => setActiveSettingsSection('support')
+      }
+    ];
+
+    return (
+      <div className="space-y-3">
+        {/* 1. Highlight Card in Brand Accent Gradient */}
+        <button
+          type="button"
+          onClick={() => setActiveSettingsSection('pro')}
+          className="wavelink-profile-pro-highlight"
+        >
+          <div className="flex items-center gap-3.5 min-w-0">
+            <div className="w-11 h-11 rounded-2xl bg-white/20 backdrop-blur-xs border border-white/30 flex items-center justify-center shrink-0">
+              <Crown size={21} className="text-amber-200" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="font-extrabold text-sm sm:text-base text-white truncate">
+                  {isProUser
+                    ? language === 'sw'
+                      ? 'Manufaa Yako ya WaveLink Pro'
+                      : 'Explore WaveLink Pro Perks'
+                    : language === 'sw'
+                    ? 'Chunguza WaveLink Pro'
+                    : 'Explore WaveLink Pro'}
+                </span>
+                <span className="px-2 py-0.5 rounded-full bg-white/20 text-[10px] font-black uppercase tracking-wider text-white">
+                  {isProUser ? 'Active' : 'Go Pro'}
+                </span>
+              </div>
+              <span className="text-xs text-white/90 block truncate mt-0.5">
+                {isProUser
+                  ? language === 'sw'
+                    ? 'Majalada maalum, video za sekunde 90 na beji ya Pro'
+                    : 'Custom covers, 90s HD video reels & Pro badge active'
+                  : language === 'sw'
+                  ? 'Fungua majalada maalum, beji ya Pro na picha za AI'
+                  : 'Unlock custom covers, Pro badge & 90s HD video reels'}
               </span>
             </div>
-
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <CrystalBadge
-                  userId={currentUser?.uid}
-                  email={currentUser?.email}
-                  name={userProfile?.displayName || displayName || 'Waver'}
-                  isPro={isProUser}
-                  hasBlueStar={isProUser}
-                  isSubAdmin={isSubAdmin}
-                  weeklyWinnerUntil={userProfile?.weeklyWinnerUntil}
-                  size="md"
-                  showAdminTag={isAdmin}
-                />
-                <span className="text-xs font-mono font-bold text-[#2563EB] bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-200/70">
-                  {userProfile?.username || username}
-                </span>
-              </div>
-              <p className="text-base sm:text-sm text-[#78716C] mt-1 max-w-xl break-words">
-                {userProfile?.bio || bio || 'Connecting on WaveLink 🌊'}
-              </p>
-              {currentUser?.email && (
-                <p className="text-[11px] text-[#78716C] mt-0.5 font-medium truncate">{currentUser.email}</p>
-              )}
-            </div>
           </div>
+          <span className="w-9 h-9 rounded-full bg-white text-[var(--accent-primary)] flex items-center justify-center shrink-0 shadow-sm">
+            <ArrowUpRight size={18} />
+          </span>
+        </button>
 
-          {/* WavePoints, Streak & Quick Log Out Button */}
-          <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto">
+        {/* 2. Stack of Rounded Menu Rows (min-height 56px, short labels, icon + label + small arrow) */}
+        <div className="wavelink-profile-menu-stack">
+          {menuItems.map((item) => (
             <button
+              key={item.id}
               type="button"
-              onClick={() => setIsDailyRewardModalOpen(true)}
-              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-2 text-xs font-bold text-[#1C1917] hover:border-amber-300 transition"
+              onClick={item.onClick}
+              className="wavelink-profile-menu-row"
             >
-              <Coins size={15} className="text-[#D97706]" />
-              <span>{totalWavePoints.toLocaleString()} pts</span>
-              <span className="text-[#0D9488]">(+{todayBonus})</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setIsDailyRewardModalOpen(true)}
-              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-1.5 text-xs font-bold text-[#1C1917] hover:border-blue-300 transition"
-            >
-              <Flame size={15} className="text-[#D97706]" />
-              <span>{currentStreak}d streak</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleInviteFriends}
-              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1.5 text-xs font-bold transition active:scale-95"
-              title="Invite Friends to WaveLink via WhatsApp"
-            >
-              <UserPlus size={14} className="text-emerald-600" />
-              <span>Invite Friends</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleLogOut}
-              disabled={isLoggingOut}
-              className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1.5 text-xs font-extrabold transition active:scale-95 disabled:opacity-50"
-              title="Log Out of WaveLink"
-            >
-              <LogOut size={14} />
-              <span>{isLoggingOut ? 'Logging out...' : 'Log Out'}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Quiet Navigation Rows: WaveLink Pro & Admin Panel (only for admins) */}
-        <div className="space-y-2.5 pt-2 border-t border-[var(--border-hairline)]">
-          {/* Invite Friends on WhatsApp Row */}
-          <button
-            type="button"
-            onClick={handleInviteFriends}
-            className="w-full min-h-[54px] px-4 py-3 rounded-2xl bg-emerald-50/70 hover:bg-emerald-100/70 border border-emerald-200/80 flex items-center justify-between gap-3 transition text-left"
-          >
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
-                <UserPlus size={17} />
-              </div>
-              <div>
-                <span className="text-sm font-bold text-[#1C1917] block">Invite Friends to WaveLink</span>
-                <span className="text-xs text-emerald-800 block">
-                  Share your link directly on WhatsApp or social apps to grow your circle
-                </span>
-              </div>
-            </div>
-            <ChevronRight size={18} className="text-emerald-700 shrink-0" />
-          </button>
-          {/* Quiet WaveLink Pro Row */}
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection(activeSettingsSection === 'pro' ? 'profile' : 'pro')}
-            className="w-full min-h-[54px] px-4 py-3 rounded-2xl bg-[var(--bg-subtle)] hover:bg-teal-50/50 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left"
-          >
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-teal-50 text-[#0D9488] border border-teal-200/70 flex items-center justify-center shrink-0">
-                <Crown size={17} />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-bold text-[#1C1917]">WaveLink Pro</span>
-                  {isProUser && (
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
-                      Active
-                    </span>
-                  )}
+              <div className="flex items-center gap-3 min-w-0">
+                <div
+                  className={`w-9 h-9 rounded-xl border flex items-center justify-center shrink-0 ${item.iconBg}`}
+                >
+                  {item.icon}
                 </div>
-                <span className="text-xs text-[#78716C] block">
-                  {isProUser
-                    ? 'All themes, Pro badge, and extra daily AI images unlocked'
-                    : 'All light themes, Pro profile badge, and more daily AI images'}
+                <span className="font-extrabold text-sm text-[var(--text-primary)] truncate">
+                  {item.label}
                 </span>
               </div>
-            </div>
-            <ChevronRight size={18} className="text-[#78716C] shrink-0" />
-          </button>
+              <span className="wavelink-profile-menu-arrow">
+                <ChevronRight size={16} />
+              </span>
+            </button>
+          ))}
 
-          {/* Admin Panel Row — Visible to Admin accounts or Owner session needing re-verification */}
+          {/* Admin Panel quick row if admin */}
           {(isAdmin ||
             adminCheckFailedReason === 'owner sign-in not used' ||
             adminCheckFailedReason === 'session needs refresh') &&
             onOpenAdminPanel && (
+              <button
+                type="button"
+                onClick={onOpenAdminPanel}
+                className="wavelink-profile-menu-row"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shrink-0">
+                    <ShieldCheck size={18} />
+                  </div>
+                  <span className="font-extrabold text-sm text-[var(--text-primary)] truncate">
+                    {language === 'sw' ? 'Dashibodi ya Admin' : 'Admin Panel'}
+                  </span>
+                </div>
+                <span className="wavelink-profile-menu-arrow">
+                  <ChevronRight size={16} />
+                </span>
+              </button>
+            )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="wavelink-profile-shell">
+      {/* =====================================================================
+          1. REDESIGNED PROFILE HEADER (Mobile < 1024px & Desktop >= 1024px)
+      ===================================================================== */}
+      <section
+        className={`wavelink-profile-header-card ${
+          isKangaBgEnabled ? 'kanga-pattern-subtle' : ''
+        }`}
+      >
+        {/* Top Cover Image (180px on mobile, 232px on desktop) with soft gradient fade */}
+        <ProfileCoverBanner
+          profile={activeProfile}
+          activeTheme={appearanceTheme}
+          isOwnProfile={isOwnProfile}
+          isProUser={isProUser}
+          language={language === 'sw' ? 'sw' : 'en'}
+          onOpenCoverPicker={() => setIsCoverModalOpen(true)}
+          onOpenUpgradePro={() => setActiveSettingsSection('pro')}
+        />
+
+        {/* Back to My Profile banner when viewing another person's profile */}
+        {!isOwnProfile && (
+          <div className="px-4 pt-2 flex items-center justify-between">
             <button
               type="button"
-              onClick={onOpenAdminPanel}
-              className="w-full min-h-[54px] px-4 py-3 rounded-2xl bg-blue-50/70 hover:bg-blue-100/70 border border-blue-200/80 flex items-center justify-between gap-3 transition text-left"
+              onClick={() => {
+                setInternalViewedUserId(null);
+                onSelectUserProfile?.(null);
+              }}
+              className="min-h-[38px] px-3 py-1.5 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-extrabold text-[var(--text-primary)] inline-flex items-center gap-1.5 cursor-pointer"
             >
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shrink-0">
-                  <ShieldCheck size={17} />
-                </div>
-                <div>
-                  <span className="text-sm font-bold text-[#1C1917] block">Admin Panel</span>
-                  <span className="text-xs text-[#78716C] block">
-                    Activity dashboard, complaints, banning users, and admin-only updates group
-                  </span>
-                </div>
-              </div>
-              <ChevronRight size={18} className="text-[#2563EB] shrink-0" />
+              <ArrowLeft size={14} />
+              <span>{language === 'sw' ? 'Wasifu Wangu' : 'My Profile'}</span>
             </button>
-          )}
-          {/* Phase 5: Private Creator Stats Row */}
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection(activeSettingsSection === 'stats' ? 'profile' : 'stats')}
-            className="w-full min-h-[54px] px-4 py-3 rounded-2xl bg-teal-50/70 hover:bg-teal-100/70 border border-teal-200/80 flex items-center justify-between gap-3 transition text-left cursor-pointer"
-          >
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-[#0D9488] text-white flex items-center justify-center shrink-0">
-                <BarChart3 size={17} />
+          </div>
+        )}
+
+        <div className="wavelink-profile-header-inner">
+          {/* Avatar overlapping bottom of cover with story ring & realtime RTDB presence dot */}
+          <div className="wavelink-profile-top-bar">
+            <div className="relative">
+              <div
+                className={`wavelink-profile-avatar-ring ${
+                  hasActiveStoryRing ? 'wavelink-profile-avatar-ring--story' : ''
+                } ${
+                  activePatternFrame !== 'none' && isOwnProfile
+                    ? getKangaFrameClass(activePatternFrame)
+                    : ''
+                }`}
+              >
+                <Avatar
+                  uid={effectiveTargetUid || undefined}
+                  src={displayedAvatar}
+                  alt={displayedName}
+                  fallbackName={displayedName}
+                  size="2xl"
+                  showStatus={true}
+                  onlyWhenVisible={false}
+                  targetProfile={activeProfile}
+                  priority={true}
+                  className="!w-full !h-full"
+                  imageClassName="border-[3px] border-[var(--bg-surface)]"
+                />
               </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-bold text-[#1C1917]">{t('stats.title')}</span>
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-white text-[#0D9488] border border-teal-200">
-                    {t('stats.privateBadge')}
-                  </span>
+
+              {/* Country flag badge */}
+              <span
+                className="absolute -bottom-1 -left-1 z-20 text-xs leading-none bg-[var(--bg-surface)] rounded-full px-1.5 py-0.5 shadow-xs border border-[var(--border-hairline)]"
+                title={activeCountryMeta.nameEn}
+              >
+                {getAfricanCountryMeta(activeProfile?.countryCode || activeCountryCode).flag}
+              </span>
+            </div>
+          </div>
+
+          {/* Identity, Bio (3 lines max + "more"), Stats Row, Badges, and Action Buttons */}
+          <div className="wavelink-profile-identity-col">
+            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h1 className="text-xl sm:text-2xl font-extrabold text-[var(--text-primary)] tracking-tight truncate">
+                    {displayedName}
+                  </h1>
+
+                  {/* Verified Tick */}
+                  {isDisplayedUserVerified && (
+                    <span
+                      className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-[#2563EB] text-white shrink-0 shadow-2xs"
+                      title={language === 'sw' ? 'Akaunti Imethibitishwa' : 'Verified Account'}
+                    >
+                      <Check size={12} strokeWidth={3} />
+                    </span>
+                  )}
+
+                  {/* Pro Badge */}
+                  {isDisplayedUserPro && (
+                    <span className="px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[11px] font-black uppercase tracking-wider inline-flex items-center gap-1 shadow-2xs">
+                      <Crown size={11} />
+                      <span>Pro</span>
+                    </span>
+                  )}
+
+                  {isOwnProfile && isAdmin && (
+                    <CrystalBadge
+                      userId={currentUser?.uid}
+                      email={currentUser?.email}
+                      name={displayedName}
+                      isPro={isProUser}
+                      hasBlueStar={isProUser}
+                      isSubAdmin={isSubAdmin}
+                      weeklyWinnerUntil={userProfile?.weeklyWinnerUntil}
+                      size="sm"
+                      showAdminTag={true}
+                    />
+                  )}
                 </div>
-                <span className="text-xs text-[#57534E] block">
-                  {t('stats.subtitle')}
-                </span>
+
+                {/* @username + Realtime Online / Last seen status */}
+                <div className="flex items-center gap-2 flex-wrap mt-0.5">
+                  <span className="text-xs sm:text-sm font-mono font-bold text-[var(--accent-primary)]">
+                    {displayedUsername}
+                  </span>
+                  {profilePresenceSubtitle && (
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                        isDisplayedUserOnline
+                          ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 border-emerald-500/25'
+                          : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-hairline)]'
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full shrink-0 ${
+                          isDisplayedUserOnline ? 'bg-[#22c55e]' : 'bg-[#ef4444]'
+                        }`}
+                      />
+                      <span>{profilePresenceSubtitle}</span>
+                    </span>
+                  )}
+                  {hasActiveStoryRing && (
+                    <span className="text-[11px] font-bold text-[#0D9488] bg-teal-500/10 px-2 py-0.5 rounded-full">
+                      ● {activeUserSparks.length} {language === 'sw' ? 'Spark Mpya' : 'Active Spark'}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Action Buttons: Own Profile vs Other Person's Profile */}
+              <div className="wavelink-profile-actions-row lg:w-auto">
+                {isOwnProfile ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setActiveSettingsSection(
+                          activeSettingsSection === 'edit_profile' ? 'profile' : 'edit_profile'
+                        )
+                      }
+                      className="flex-1 sm:flex-initial min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 shadow-xs transition active:scale-95 cursor-pointer"
+                    >
+                      <User size={15} />
+                      <span>{language === 'sw' ? 'Hariri wasifu' : 'Edit profile'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleShareProfile}
+                      className="flex-1 sm:flex-initial min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:opacity-90 text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+                    >
+                      <Share2 size={15} className="text-[var(--accent-primary)]" />
+                      <span>{language === 'sw' ? 'Shiriki wasifu' : 'Share profile'}</span>
+                    </button>
+
+                    {isProUser && (
+                      <button
+                        type="button"
+                        onClick={() => setIsCoverModalOpen(true)}
+                        title={language === 'sw' ? 'Badili Jalada la Pro' : 'Change Pro Cover'}
+                        className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Camera size={15} className="text-amber-500" />
+                        <span className="hidden sm:inline">
+                          {language === 'sw' ? 'Jalada' : 'Cover'}
+                        </span>
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleFollowUser(effectiveTargetUid, displayedName)}
+                      className={`flex-1 sm:flex-initial min-h-[44px] px-5 py-2 rounded-2xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer ${
+                        isFollowingViewedUser
+                          ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)]'
+                          : 'bg-[var(--accent-primary)] text-white shadow-xs'
+                      }`}
+                    >
+                      {isFollowingViewedUser ? (
+                        <>
+                          <UserCheck size={16} />
+                          <span>{language === 'sw' ? 'Unafuata' : 'Following'}</span>
+                        </>
+                      ) : (
+                        <>
+                          <UserPlus size={16} />
+                          <span>{language === 'sw' ? 'Fuata' : 'Follow'}</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (onStartChatWithUser && effectiveTargetUid) {
+                          onStartChatWithUser(effectiveTargetUid);
+                        } else if (effectiveTargetUid) {
+                          window.dispatchEvent(
+                            new CustomEvent('wavelink:start-chat', {
+                              detail: { userId: effectiveTargetUid }
+                            })
+                          );
+                        }
+                      }}
+                      className="flex-1 sm:flex-initial min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+                    >
+                      <MessageCircle size={16} className="text-[var(--accent-primary)]" />
+                      <span>{language === 'sw' ? 'Ujumbe' : 'Message'}</span>
+                    </button>
+
+                    {/* Call Icon Button */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (onStartCallWithUser && effectiveTargetUid) {
+                          onStartCallWithUser(
+                            {
+                              id: effectiveTargetUid,
+                              name: displayedName,
+                              username: displayedUsername,
+                              photoURL: displayedAvatar
+                            },
+                            'voice'
+                          );
+                        } else if (onStartChatWithUser && effectiveTargetUid) {
+                          onStartChatWithUser(effectiveTargetUid);
+                        }
+                      }}
+                      aria-label={`Call ${displayedName}`}
+                      title={language === 'sw' ? 'Piga Simu' : 'Voice / Video Call'}
+                      className="min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] flex items-center justify-center transition active:scale-95 cursor-pointer"
+                    >
+                      <PhoneCall size={16} className="text-[#0D9488]" />
+                    </button>
+
+                    {/* More Menu: Block & Report */}
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setIsOtherMenuOpen((prev) => !prev)}
+                        aria-label="More profile actions"
+                        className="min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] flex items-center justify-center transition cursor-pointer"
+                      >
+                        <MoreVertical size={16} />
+                      </button>
+
+                      {isOtherMenuOpen && (
+                        <div className="absolute right-0 mt-2 w-52 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-30 space-y-1">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              setIsOtherMenuOpen(false);
+                              if (effectiveTargetUid) {
+                                await handleToggleCloseFriend(effectiveTargetUid);
+                              }
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-xl hover:bg-emerald-500/10 text-[var(--text-primary)] text-xs font-extrabold flex items-center gap-2 text-left cursor-pointer"
+                          >
+                            <Heart
+                              size={14}
+                              className={
+                                isViewedUserCloseFriend
+                                  ? 'text-emerald-500 fill-emerald-500'
+                                  : 'text-emerald-600'
+                              }
+                            />
+                            <span>
+                              {isViewedUserCloseFriend
+                                ? language === 'sw'
+                                  ? 'Ondoa Rafiki wa Karibu'
+                                  : 'Close Friend ✓'
+                                : language === 'sw'
+                                ? 'Ongeza Rafiki wa Karibu'
+                                : 'Add to Close Friends'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              setIsOtherMenuOpen(false);
+                              if (effectiveTargetUid) {
+                                await toggleBlockUser(effectiveTargetUid);
+                              }
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-xl hover:bg-rose-500/10 text-rose-600 text-xs font-extrabold flex items-center gap-2 text-left cursor-pointer"
+                          >
+                            <Ban size={14} />
+                            <span>
+                              {isViewedUserBlocked
+                                ? language === 'sw'
+                                  ? 'Ondoa Kizuizi (Unblock)'
+                                  : 'Unblock User'
+                                : language === 'sw'
+                                ? 'Zuia Akaunti (Block)'
+                                : 'Block User'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              setIsOtherMenuOpen(false);
+                              if (effectiveTargetUid) {
+                                await reportContent({
+                                  targetType: 'user',
+                                  targetId: effectiveTargetUid,
+                                  targetAuthorId: effectiveTargetUid,
+                                  targetSummary: `${displayedName} (${displayedUsername})`,
+                                  reason: 'Reported profile from user profile menu'
+                                });
+                              }
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-xl hover:bg-amber-500/10 text-amber-600 text-xs font-extrabold flex items-center gap-2 text-left cursor-pointer"
+                          >
+                            <Flag size={14} />
+                            <span>
+                              {language === 'sw' ? 'Ripoti Akaunti' : 'Report Account'}
+                            </span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
             </div>
-            <ChevronRight size={18} className="text-[#0D9488] shrink-0" />
-          </button>
-        </div>
 
-        {/* Section Switcher Navigation */}
-        <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-9 gap-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] p-1.5 text-xs font-semibold">
+            {/* Bio (3 lines max with "more" toggle) */}
+            <div className="max-w-2xl">
+              <p
+                className={`text-sm text-[var(--text-primary)] leading-relaxed break-words ${
+                  !isBioExpanded ? 'line-clamp-3' : ''
+                }`}
+              >
+                {displayedBio}
+              </p>
+              {(displayedBio.length > 120 || displayedBio.split('\n').length > 3) && (
+                <button
+                  type="button"
+                  onClick={() => setIsBioExpanded((prev) => !prev)}
+                  className="text-xs font-extrabold text-[var(--accent-primary)] mt-0.5 hover:underline cursor-pointer"
+                >
+                  {isBioExpanded
+                    ? language === 'sw'
+                      ? 'ficha'
+                      : 'less'
+                    : language === 'sw'
+                    ? '...zaidi'
+                    : '...more'}
+                </button>
+              )}
+            </div>
+
+            {/* Row of Stats: Posts, Followers, Following, WavePoints */}
+            <div className="wavelink-profile-stats-row">
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveSettingsSection('profile');
+                  setActiveProfileTab('posts');
+                  postsGridSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+                className="wavelink-profile-stat-item cursor-pointer"
+              >
+                <span className="text-base sm:text-lg font-extrabold text-[var(--text-primary)]">
+                  {userPosts.length.toLocaleString()}
+                </span>
+                <span className="text-[11px] font-bold text-[var(--text-secondary)]">
+                  {language === 'sw' ? 'Machapisho' : 'Posts'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setFollowersModalTab('followers')}
+                className="wavelink-profile-stat-item cursor-pointer"
+              >
+                <span className="text-base sm:text-lg font-extrabold text-[var(--text-primary)]">
+                  {followerUserIds.length.toLocaleString()}
+                </span>
+                <span className="text-[11px] font-bold text-[var(--text-secondary)]">
+                  {language === 'sw' ? 'Wafuasi' : 'Followers'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setFollowersModalTab('following')}
+                className="wavelink-profile-stat-item cursor-pointer"
+              >
+                <span className="text-base sm:text-lg font-extrabold text-[var(--text-primary)]">
+                  {displayedFollowingIds.length.toLocaleString()}
+                </span>
+                <span className="text-[11px] font-bold text-[var(--text-secondary)]">
+                  {language === 'sw' ? 'Anaowafuata' : 'Following'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (isOwnProfile) setIsDailyRewardModalOpen(true);
+                }}
+                className="wavelink-profile-stat-item cursor-pointer"
+              >
+                <span className="text-base sm:text-lg font-extrabold text-amber-500 flex items-center gap-1">
+                  <Coins size={14} className="shrink-0" />
+                  {displayedWavePoints.toLocaleString()}
+                </span>
+                <span className="text-[11px] font-bold text-[var(--text-secondary)]">
+                  WavePoints
+                </span>
+              </button>
+            </div>
+
+            {/* Badges & Achievements Row (with tap tooltips explaining how each was earned) */}
+            <ProfileBadgesRow
+              profile={activeProfile}
+              isProEffective={isDisplayedUserPro}
+              isVerifiedEffective={isDisplayedUserVerified}
+              language={language === 'sw' ? 'sw' : 'en'}
+            />
+          </div>
+        </div>
+      </section>
+
+      {/* Sub-Section Back Navigation Bar when inside a specific Settings view */}
+      {activeSettingsSection !== 'profile' && (
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-3 sm:p-4 flex items-center justify-between gap-3 flex-wrap">
           <button
             type="button"
             onClick={() => setActiveSettingsSection('profile')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'profile'
-                ? 'bg-[#2563EB] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
+            className="min-h-[42px] px-4 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:opacity-90 text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold inline-flex items-center gap-2 cursor-pointer"
           >
-            <User size={14} />
-            <span>{t('nav.profile')}</span>
+            <ArrowLeft size={15} />
+            <span>{language === 'sw' ? 'Rudi kwenye Wasifu' : 'Back to Profile'}</span>
           </button>
 
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('stats')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'stats'
-                ? 'bg-[#0D9488] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <BarChart3 size={14} />
-            <span>{t('nav.analytics')}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('notifications')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'notifications'
-                ? 'bg-[#2563EB] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <Bell size={14} />
-            <span>{language === 'sw' ? 'Arifa' : 'Alerts'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('upgrades')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'upgrades'
-                ? 'bg-amber-600 text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <Lightbulb size={14} />
-            <span>Ideas ({upgradesList.length})</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('privacy')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'privacy'
-                ? 'bg-[#2563EB] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <Lock size={14} />
-            <span>{language === 'sw' ? 'Faragha' : 'Privacy'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('security')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'security'
-                ? 'bg-[#2563EB] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <KeyRound size={14} />
-            <span>{language === 'sw' ? 'Nenosiri' : 'Password'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('terms')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'terms'
-                ? 'bg-[#0D9488] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <FileText size={14} />
-            <span>{language === 'sw' ? 'Masharti' : 'Terms'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('pro')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'pro'
-                ? 'bg-[#0D9488] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <Crown size={14} />
-            <span>Pro</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveSettingsSection('support')}
-            className={`min-h-[42px] px-3 py-2 rounded-xl transition flex items-center justify-center gap-1.5 whitespace-nowrap ${
-              activeSettingsSection === 'support'
-                ? 'bg-[#2563EB] text-white shadow-2xs font-bold'
-                : 'text-[#78716C] hover:text-[#1C1917]'
-            }`}
-          >
-            <HelpCircle size={14} />
-            <span>{t('settings.support')}</span>
-          </button>
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+            {(
+              [
+                { id: 'edit_profile', label: language === 'sw' ? 'Hariri' : 'Edit Profile' },
+                { id: 'appearance', label: language === 'sw' ? 'Mandhari' : 'Themes' },
+                { id: 'privacy', label: language === 'sw' ? 'Faragha' : 'Privacy' },
+                { id: 'security', label: language === 'sw' ? 'Nenosiri' : 'Password' },
+                { id: 'notifications', label: language === 'sw' ? 'Arifa' : 'Alerts' },
+                { id: 'stats', label: language === 'sw' ? 'Takwimu' : 'Stats' },
+                { id: 'pro', label: 'Pro' },
+                { id: 'settings_hub', label: language === 'sw' ? 'Mipangilio' : 'All Settings' },
+                { id: 'support', label: language === 'sw' ? 'Msaada' : 'Help' }
+              ] as { id: SettingsSection; label: string }[]
+            ).map((sec) => (
+              <button
+                key={sec.id}
+                type="button"
+                onClick={() => setActiveSettingsSection(sec.id)}
+                className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-extrabold whitespace-nowrap transition cursor-pointer ${
+                  activeSettingsSection === sec.id
+                    ? 'bg-[var(--accent-primary)] text-white'
+                    : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)]'
+                }`}
+              >
+                {sec.label}
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       <DailyRewardModal
         isOpen={isDailyRewardModalOpen}
         onClose={() => setIsDailyRewardModalOpen(false)}
       />
+
+      <ProfileCoverModal
+        isOpen={isCoverModalOpen}
+        onClose={() => setIsCoverModalOpen(false)}
+        isProUser={isProUser}
+        currentCoverType={userProfile?.coverType}
+        currentPresetId={userProfile?.coverPresetId}
+        currentCoverImageUrl={userProfile?.coverImageUrl}
+        language={language === 'sw' ? 'sw' : 'en'}
+        onSaveCover={handleSaveCustomCover}
+        onOpenUpgradePro={() => setActiveSettingsSection('pro')}
+      />
+
+      <FollowersListModal
+        isOpen={Boolean(followersModalTab)}
+        initialTab={followersModalTab || 'followers'}
+        onClose={() => setFollowersModalTab(null)}
+        followerIds={followerUserIds}
+        followingIds={displayedFollowingIds}
+        myFollowingIds={myFollowingIds}
+        currentUserId={currentUser?.uid}
+        language={language === 'sw' ? 'sw' : 'en'}
+        onToggleFollow={handleToggleFollowUser}
+        onSelectUserProfile={(uid) => {
+          setInternalViewedUserId(uid);
+          onSelectUserProfile?.(uid);
+          setActiveSettingsSection('profile');
+        }}
+        onStartChatWithUser={onStartChatWithUser}
+      />
+
+      <ProfilePostViewerModal
+        isOpen={Boolean(selectedViewerPostId)}
+        posts={currentTabPosts}
+        initialPostId={selectedViewerPostId}
+        onClose={() => setSelectedViewerPostId(null)}
+        currentUserId={currentUser?.uid}
+        pinnedPostId={pinnedPostId}
+        savedPostIds={userProfile?.savedPostIds || []}
+        isOwnProfile={isOwnProfile}
+        language={language === 'sw' ? 'sw' : 'en'}
+        onTogglePinPost={handleTogglePinPost}
+        onToggleSavePost={toggleSavePost}
+        onPostUpdated={(updated) => {
+          setUserPosts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+        }}
+      />
+
+      {/* =====================================================================
+          SECTION: APPEARANCE (THEMES & BACKGROUNDS)
+      ===================================================================== */}
+      {activeSettingsSection === 'appearance' && (
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-5">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-blue-500/15 text-[#2563EB] border border-blue-500/25 flex items-center justify-center shrink-0">
+                <Palette size={20} />
+              </div>
+              <div>
+                <h2 className="font-extrabold text-[var(--text-primary)] text-base sm:text-lg">
+                  {language === 'sw'
+                    ? 'Muonekano na Mandhari (Themes & Backgrounds)'
+                    : 'Appearance • Themes & Backgrounds'}
+                </h2>
+                <p className="text-xs text-[var(--text-secondary)]">
+                  {language === 'sw'
+                    ? 'Chagua muonekano wowote bure. Hakikisha moja kwa moja kabla ya kuhifadhi.'
+                    : 'Anyone can pick any theme for free. Tap to live-preview across the app before saving.'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <ThemePickerPanel />
+        </div>
+      )}
 
       {/* =====================================================================
           SECTION: PHASE 5 PRIVATE CREATOR STATS (7 & 30 DAYS)
@@ -1417,13 +2360,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               {[
                 {
                   key: 'showOnlineStatus' as const,
-                  title: 'Show Online Status Indicator',
-                  desc: 'Let community members see a green dot when you are active on WaveLink.'
+                  title: 'Show my online status',
+                  desc: 'Let friends see a green dot when you are online (default ON). Like WhatsApp, turning this off also hides other users’ online status and last seen from you.'
                 },
                 {
                   key: 'showLastSeen' as const,
-                  title: 'Show Last Seen Timestamp in Messages',
-                  desc: 'Display when you were last active in Direct Message headers.'
+                  title: 'Show last seen timestamp',
+                  desc: 'Display when you were last active (e.g. "Last seen 5 min ago") in chat headers and your profile.'
                 },
                 {
                   key: 'showReadReceipts' as const,
@@ -1468,6 +2411,89 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
                   </div>
                 );
               })}
+
+              {/* Online Status Audience Selector (Everyone / Close Friends Only / Nobody) */}
+              {privacySettings.showOnlineStatus && (
+                <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-3">
+                  <div>
+                    <span className="text-xs sm:text-sm font-bold text-[#1C1917] block">
+                      Who can see my online status &amp; last seen
+                    </span>
+                    <span className="text-[11px] text-[#78716C] block mt-0.5">
+                      Choose between everyone, only your Close Friends list, or nobody. Blocked users never see your status.
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    {(
+                      [
+                        { id: 'everyone', label: 'Everyone' },
+                        { id: 'close_friends', label: 'Close Friends Only' },
+                        { id: 'nobody', label: 'Nobody' }
+                      ] as const
+                    ).map((opt) => {
+                      const activeAud =
+                        (privacySettings.onlineStatusAudience || 'everyone') === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() =>
+                            setPrivacySettings((prev) => ({
+                              ...prev,
+                              onlineStatusAudience: opt.id
+                            }))
+                          }
+                          className={`min-h-[40px] px-3 py-2 rounded-xl text-xs font-extrabold border transition cursor-pointer ${
+                            activeAud
+                              ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                              : 'bg-white text-[#57534E] border-[var(--border-hairline)]'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Close Friends picker from cached followed accounts (0 extra Firestore reads) */}
+                  {(privacySettings.onlineStatusAudience || 'everyone') === 'close_friends' && (
+                    <div className="pt-2 border-t border-[var(--border-hairline)] space-y-2">
+                      <span className="text-[11px] font-extrabold text-[#1C1917] block">
+                        Close Friends ({myCloseFriendIds.length}) — tap to toggle
+                      </span>
+                      {myFollowingIds.length === 0 ? (
+                        <p className="text-[11px] text-[#78716C]">
+                          Follow friends first or open their profile menu → Add to Close Friends.
+                        </p>
+                      ) : (
+                        <div className="flex flex-wrap gap-1.5">
+                          {myFollowingIds.slice(0, 24).map((fUid) => {
+                            const cached = getCachedUserProfile(fUid);
+                            const isSelected = myCloseFriendIds.includes(fUid);
+                            const label =
+                              cached?.displayName || cached?.username || `Friend (${fUid.slice(0, 6)})`;
+                            return (
+                              <button
+                                key={fUid}
+                                type="button"
+                                onClick={() => handleToggleCloseFriend(fUid)}
+                                className={`px-2.5 py-1 rounded-full text-[11px] font-bold border transition cursor-pointer ${
+                                  isSelected
+                                    ? 'bg-emerald-500/15 text-emerald-700 border-emerald-500/40'
+                                    : 'bg-white text-[#57534E] border-[var(--border-hairline)]'
+                                }`}
+                              >
+                                {isSelected ? '✓ ' : '+ '}
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Blocked Users Management */}
@@ -1480,7 +2506,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
               </div>
               {(userProfile?.blockedUserIds || []).length === 0 ? (
                 <p className="text-[11px] text-[#78716C]">
-                  You have not blocked any accounts. You can block or report users from any post or direct message.
+                  You have not blocked any accounts. Blocked users never see your online status or last seen.
                 </p>
               ) : (
                 <div className="space-y-2">
@@ -2054,7 +3080,297 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
         />
       )}
 
+      {/* =====================================================================
+          MAIN REDESIGNED PROFILE BODY (when activeSettingsSection === 'profile'):
+          - Mobile (< 1024px): Reference Menu Cards + Story Highlights + Tabs + 3-Col Posts Grid
+          - Desktop (>= 1024px): Two-column layout (Posts grid on left max 720px, Side panel on right at >= 1280px)
+      ===================================================================== */}
       {activeSettingsSection === 'profile' && (
+        <div className="wavelink-profile-desktop-body">
+          {/* Mobile & Tablet (< 1280px) Menu Cards above the posts grid so they are immediately accessible */}
+          <div className="xl:hidden">{renderReferenceMenuCards()}</div>
+
+          {/* Left Column on Desktop (Main Posts Column, max-width 720px) */}
+          <div ref={postsGridSectionRef} className="wavelink-profile-main-col">
+            {/* Story Highlights Row */}
+            <StoryHighlightsBar
+              profile={activeProfile}
+              activeSparks={activeUserSparks}
+              isOwnProfile={isOwnProfile}
+              language={language === 'sw' ? 'sw' : 'en'}
+              onSaveHighlights={async (nextHighlights: StoryHighlightItem[]) => {
+                await updateUserProfile({ storyHighlights: nextHighlights });
+              }}
+            />
+
+            {/* Profile Content Tabs: Posts, Reels, Saved (own profile only), Tagged */}
+            <div
+              role="tablist"
+              aria-label="Profile posts tabs"
+              className="grid grid-cols-3 sm:grid-cols-4 gap-1.5 p-1.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xs"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeProfileTab === 'posts'}
+                onClick={() => {
+                  setActiveProfileTab('posts');
+                  setVisiblePostsCount(12);
+                }}
+                className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  activeProfileTab === 'posts'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                <Grid size={15} />
+                <span>{language === 'sw' ? 'Machapisho' : 'Posts'}</span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeProfileTab === 'reels'}
+                onClick={() => {
+                  setActiveProfileTab('reels');
+                  setVisiblePostsCount(12);
+                }}
+                className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  activeProfileTab === 'reels'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                <Video size={15} />
+                <span>Reels</span>
+              </button>
+
+              {isOwnProfile && (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeProfileTab === 'saved'}
+                  onClick={() => {
+                    setActiveProfileTab('saved');
+                    setVisiblePostsCount(12);
+                  }}
+                  className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    activeProfileTab === 'saved'
+                      ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <Bookmark size={15} />
+                  <span>{language === 'sw' ? 'Zilizohifadhiwa' : 'Saved'}</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeProfileTab === 'tagged'}
+                onClick={() => {
+                  setActiveProfileTab('tagged');
+                  setVisiblePostsCount(12);
+                }}
+                className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  activeProfileTab === 'tagged'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                <Tag size={15} />
+                <span>{language === 'sw' ? 'Zilizotajwa' : 'Tagged'}</span>
+              </button>
+            </div>
+
+            {/* Posts Grid / Private Lock / Loading Skeleton / Empty State */}
+            {isViewedAccountPrivateAndLocked ? (
+              <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-3">
+                <div className="w-14 h-14 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--accent-primary)] flex items-center justify-center mx-auto">
+                  <Lock size={24} />
+                </div>
+                <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                  {language === 'sw' ? 'Akaunti Hii ni ya Faragha' : 'This Account is Private'}
+                </h3>
+                <p className="text-xs sm:text-sm text-[var(--text-secondary)] max-w-sm mx-auto">
+                  {language === 'sw'
+                    ? `Mfuateni ${displayedName} ili kuona picha, video na machapisho yake.`
+                    : `Follow ${displayedName} to see their photos, reels, and community posts.`}
+                </p>
+              </div>
+            ) : isLoadingPosts || isLoadingOtherProfile ? (
+              <div className="wavelink-profile-posts-grid">
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((item) => (
+                  <div
+                    key={item}
+                    className="wavelink-profile-post-tile animate-pulse bg-[var(--bg-subtle)]"
+                  />
+                ))}
+              </div>
+            ) : paginatedTabPosts.length === 0 ? (
+              <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-3">
+                <div className="w-14 h-14 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-secondary)] flex items-center justify-center mx-auto">
+                  {activeProfileTab === 'reels' ? (
+                    <Video size={24} />
+                  ) : activeProfileTab === 'saved' ? (
+                    <Bookmark size={24} />
+                  ) : activeProfileTab === 'tagged' ? (
+                    <Tag size={24} />
+                  ) : (
+                    <Grid size={24} />
+                  )}
+                </div>
+                <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                  {activeProfileTab === 'reels'
+                    ? language === 'sw'
+                      ? 'Bado hakuna Reels'
+                      : 'No reels yet'
+                    : activeProfileTab === 'saved'
+                    ? language === 'sw'
+                      ? 'Bado hakuna machapisho yaliyohifadhiwa'
+                      : 'No saved posts yet'
+                    : activeProfileTab === 'tagged'
+                    ? language === 'sw'
+                      ? 'Bado hakuna machapisho uliyotajwa'
+                      : 'No tagged posts yet'
+                    : language === 'sw'
+                    ? 'Bado hakuna machapisho'
+                    : 'No posts yet'}
+                </h3>
+                <p className="text-xs text-[var(--text-secondary)] max-w-sm mx-auto">
+                  {isOwnProfile
+                    ? language === 'sw'
+                      ? 'Machapisho, picha na video unazoshiriki zitaonekana hapa.'
+                      : 'Photos, videos, and moments you share will appear here in your profile grid.'
+                    : language === 'sw'
+                    ? `${displayedName} bado hajachapisha chochote hapa.`
+                    : `${displayedName} hasn't shared any posts in this tab yet.`}
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="wavelink-profile-posts-grid">
+                  {paginatedTabPosts.map((post) => {
+                    const isPinned = pinnedPostId === post.id && activeProfileTab === 'posts';
+                    const isVideo = Boolean(post.videoUrl) || post.mediaType === 'video';
+                    const images =
+                      Array.isArray(post.imageUrls) && post.imageUrls.length > 0
+                        ? post.imageUrls
+                        : post.imageUrl
+                        ? [post.imageUrl]
+                        : [];
+                    const isMultiPhoto = images.length > 1;
+                    const thumbSrc = post.thumbnailUrl || images[0] || '';
+                    const viewOrLikeCount = post.viewsCount || post.likesCount || 0;
+
+                    return (
+                      <button
+                        key={post.id}
+                        type="button"
+                        onClick={() => setSelectedViewerPostId(post.id)}
+                        className="wavelink-profile-post-tile group text-left"
+                      >
+                        {thumbSrc ? (
+                          <img
+                            src={thumbSrc}
+                            alt={post.content?.slice(0, 40) || 'Post thumbnail'}
+                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            loading="lazy"
+                          />
+                        ) : isVideo && post.videoUrl ? (
+                          <video
+                            src={post.videoUrl}
+                            muted
+                            playsInline
+                            preload="metadata"
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <div className="w-full h-full p-2.5 sm:p-3.5 bg-gradient-to-br from-[var(--bg-subtle)] to-[var(--bg-surface)] flex flex-col justify-between">
+                            <p className="text-[11px] sm:text-xs font-bold text-[var(--text-primary)] line-clamp-4 leading-snug">
+                              {post.content || 'WaveLink Post'}
+                            </p>
+                            <span className="text-[10px] font-mono text-[var(--text-secondary)]">
+                              {new Date(post.createdAt).toLocaleDateString([], {
+                                month: 'short',
+                                day: 'numeric'
+                              })}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* Top-Left Pinned Badge */}
+                        {isPinned && (
+                          <span
+                            className="absolute top-2 left-2 z-10 px-2 py-0.5 rounded-full bg-amber-500 text-white text-[10px] font-extrabold inline-flex items-center gap-1 shadow-md"
+                            title={language === 'sw' ? 'Chapisho Lililobandikwa' : 'Pinned post'}
+                          >
+                            <Pin size={10} />
+                            <span className="hidden sm:inline">Pinned</span>
+                          </span>
+                        )}
+
+                        {/* Top-Right Multi-Photo Stack Icon */}
+                        {isMultiPhoto && (
+                          <span
+                            className="absolute top-2 right-2 z-10 w-6 h-6 rounded-lg bg-black/60 text-white backdrop-blur-xs flex items-center justify-center"
+                            title={`${images.length} photos`}
+                          >
+                            <Layers size={13} />
+                          </span>
+                        )}
+
+                        {/* Bottom-Left Video Play Icon + View/Like Count */}
+                        {isVideo && (
+                          <span className="absolute bottom-2 left-2 z-10 px-2 py-0.5 rounded-full bg-black/65 text-white text-[10px] font-extrabold inline-flex items-center gap-1 backdrop-blur-xs">
+                            <Play size={10} className="fill-white" />
+                            <span>{viewOrLikeCount.toLocaleString()}</span>
+                          </span>
+                        )}
+
+                        {/* Hover Stats Overlay */}
+                        <div className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-3 text-white text-xs font-extrabold">
+                          <span className="inline-flex items-center gap-1">
+                            <Heart size={14} className="fill-white" />
+                            {(post.likesCount || 0).toLocaleString()}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <MessageCircle size={14} className="fill-white" />
+                            {(post.commentsCount || 0).toLocaleString()}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Pagination: Load 12 tiles at first, and more on tap */}
+                {currentTabPosts.length > visiblePostsCount && (
+                  <div className="pt-2 text-center">
+                    <button
+                      type="button"
+                      onClick={() => setVisiblePostsCount((prev) => prev + 12)}
+                      className="min-h-[44px] px-6 py-2.5 rounded-2xl bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold transition cursor-pointer"
+                    >
+                      {language === 'sw'
+                        ? `Onyesha Machapisho Zaidi (${currentTabPosts.length - visiblePostsCount} yaliyosalia)`
+                        : `Load More Posts (${currentTabPosts.length - visiblePostsCount} more)`}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Right Column on Wide Desktop (>= 1280px): Side Panel with Pro Highlight Card, Menu Cards, Badges & WavePoints */}
+          <aside className="hidden xl:flex wavelink-profile-side-col">
+            {renderReferenceMenuCards()}
+          </aside>
+        </div>
+      )}
+
+      {(activeSettingsSection === 'settings_hub' || activeSettingsSection === 'edit_profile') && (
         <div className="space-y-6">
           {/* Quick Settings Shortcuts Card (Terms, Privacy, Password, Log Out) */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-xs space-y-3">
@@ -2149,110 +3465,116 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
             </div>
           </div>
 
-          {/* Appearance Section: 4 Light Themes saved to Firestore */}
-          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-amber-50 text-[#D97706] border border-amber-200/80 flex items-center justify-center">
-                  <Palette size={18} />
+          {/* Simple Mode (Hali Rahisi) Switch Card */}
+          <div className="bg-[var(--bg-surface)] border-2 border-blue-200/90 dark:border-blue-900/60 rounded-3xl p-6 shadow-sm space-y-4">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div className="flex items-start gap-3 min-w-0 flex-1">
+                <div className="w-10 h-10 rounded-2xl bg-blue-100 dark:bg-blue-950/60 text-[#2563EB] flex items-center justify-center shrink-0 mt-0.5">
+                  <Sparkles size={20} />
                 </div>
-                <div>
-                  <h3 className="font-extrabold text-[#1C1917] text-base">
-                    Appearance
-                  </h3>
-                  <p className="text-xs text-[#78716C]">
-                    Choose a warm, light theme. Saved to your profile across all your devices.
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="font-extrabold text-[#1C1917] dark:text-stone-100 text-base sm:text-lg">
+                      {language === 'sw' ? 'Hali Rahisi (Simple Mode)' : 'Simple Mode'}
+                    </h3>
+                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-blue-100 text-[#2563EB]">
+                      {isSimpleMode ? 'Active' : 'Off'}
+                    </span>
+                  </div>
+                  <p className="text-xs sm:text-sm text-stone-600 dark:text-stone-300 mt-1 leading-relaxed">
+                    {language === 'sw'
+                      ? 'Inafanya maandishi na vitufe kuwa vikubwa zaidi, inaficha vipengele ngumu kama Pro na changamoto, na inaweka Mwanzo, Ujumbe, Taarifa na Wasifu tu. Inafaa sana kwa wazazi na matumizi mepesi bila usumbufu.'
+                      : 'Makes text and buttons larger, hides advanced items (Pro, points, and challenges), and keeps only Home, Messages, Notifications, and Profile. Perfect for parents and easy everyday browsing.'}
                   </p>
                 </div>
               </div>
+
+              {/* Large iOS-style Toggle Button */}
+              <button
+                type="button"
+                role="switch"
+                aria-checked={isSimpleMode}
+                onClick={toggleSimpleMode}
+                className={`relative inline-flex h-8 w-16 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                  isSimpleMode ? 'bg-[#2563EB]' : 'bg-stone-300 dark:bg-stone-700'
+                }`}
+              >
+                <span className="sr-only">Toggle Simple Mode</span>
+                <span
+                  aria-hidden="true"
+                  className={`pointer-events-none inline-block h-7 w-7 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                    isSimpleMode ? 'translate-x-8' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+
+          {/* Friendly Help & Tour Card */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-teal-50 dark:bg-teal-950/60 text-[#0D9488] flex items-center justify-center shrink-0">
+                <HelpCircle size={20} />
+              </div>
+              <div>
+                <h3 className="font-extrabold text-[#1C1917] dark:text-stone-100 text-base">
+                  {language === 'sw' ? 'Msaada na Mwongozo' : 'Help & Beginner Guides'}
+                </h3>
+                <p className="text-xs text-stone-500 dark:text-stone-400">
+                  {language === 'sw' ? 'Jifunze kutumia WaveLink kwa urahisi au muulize msaidizi wetu.' : 'Friendly guidance, short answers, and our 3-step tour.'}
+                </p>
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {APPEARANCE_THEMES.map((item) => {
-                const isSelected = appearanceTheme === item.id;
-                const isLocked = item.proOnly && !isProUser && !isAdmin;
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent('wavelink:open-tour'))}
+                className="min-h-[48px] p-3.5 rounded-2xl bg-blue-50/80 hover:bg-blue-100 text-[#2563EB] font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer border border-blue-200/80"
+              >
+                <Compass size={18} />
+                <span>{language === 'sw' ? 'Nionyeshe Jinsi ya Kutumia (Tour)' : 'Show me around (Quick Tour)'}</span>
+              </button>
 
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => handleSelectAppearanceTheme(item.id, item.proOnly)}
-                    className={`min-h-[68px] p-4 rounded-2xl border text-left transition flex items-center justify-between gap-3 ${
-                      isSelected
-                        ? 'border-[#2563EB] bg-[var(--bg-subtle)] ring-2 ring-[#2563EB]/15'
-                        : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="flex items-center -space-x-1.5 shrink-0">
-                        <span
-                          className="w-6 h-6 rounded-full border border-stone-300 shadow-2xs"
-                          style={{ backgroundColor: item.previewBg }}
-                        />
-                        <span
-                          className="w-6 h-6 rounded-full border border-white shadow-2xs"
-                          style={{ backgroundColor: item.previewAccent }}
-                        />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-sm font-bold text-[#1C1917]">{item.name}</span>
-                          {item.proOnly ? (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
-                              Pro
-                            </span>
-                          ) : (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-stone-100 text-[#78716C]">
-                              Free
-                            </span>
-                          )}
-                        </div>
-                        <span className="text-xs text-[#78716C] block truncate">
-                          {item.description}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="shrink-0">
-                      {isSelected ? (
-                        <span className="w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center">
-                          <Check size={13} />
-                        </span>
-                      ) : isLocked ? (
-                        <span className="text-[11px] font-bold text-[#0D9488]">Try Pro</span>
-                      ) : null}
-                    </div>
-                  </button>
-                );
-              })}
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent('wavelink:open-help'))}
+                className="min-h-[48px] p-3.5 rounded-2xl bg-teal-50/80 hover:bg-teal-100 text-[#0D9488] font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer border border-teal-200/80"
+              >
+                <HelpCircle size={18} />
+                <span>{language === 'sw' ? 'Msaada na Maswali (Help & FAQs)' : 'Help & Friendly Answers'}</span>
+              </button>
             </div>
+          </div>
 
-            {/* Gentle inline Try Pro note (never a blocking popup) */}
-            {gentleProNote && (
-              <div className="p-3.5 rounded-2xl bg-teal-50/80 border border-teal-200 text-xs text-[#1C1917] flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
-                  <Sparkles size={15} className="text-[#0D9488] shrink-0" />
-                  <span>{gentleProNote}</span>
+          {/* Appearance Section on Profile: 9 Selectable Themes with Live Preview saved to Firestore */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-blue-500/15 text-[#2563EB] border border-blue-500/25 flex items-center justify-center">
+                  <Palette size={18} />
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setActiveSettingsSection('pro')}
-                    className="px-3 py-1.5 rounded-xl bg-[#0D9488] text-white font-bold text-xs hover:bg-teal-700 transition"
-                  >
-                    Try Pro
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setGentleProNote(null)}
-                    className="p-1 text-[#78716C] hover:text-[#1C1917]"
-                    aria-label="Close note"
-                  >
-                    <X size={14} />
-                  </button>
+                <div>
+                  <h3 className="font-extrabold text-[var(--text-primary)] text-base">
+                    {language === 'sw' ? 'Muonekano na Mandhari' : 'Appearance & Themes'}
+                  </h3>
+                  <p className="text-xs text-[var(--text-secondary)]">
+                    {language === 'sw'
+                      ? 'Chagua muonekano wowote bure na uhakiki kabla ya kuhifadhi.'
+                      : 'Choose any theme for free with live preview. Saved across all your devices.'}
+                  </p>
                 </div>
               </div>
-            )}
+              <button
+                type="button"
+                onClick={() => setActiveSettingsSection('appearance')}
+                className="min-h-[40px] px-3 py-1.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-bold text-[#2563EB] hover:opacity-90 transition cursor-pointer"
+              >
+                {language === 'sw' ? 'Fungua Muonekano Kamili' : 'Open Full Appearance'}
+              </button>
+            </div>
+
+            <ThemePickerPanel />
           </div>
 
           {/* Phase 1: Data Saver Mode Card */}
@@ -2695,13 +4017,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenAdminPanel }) 
 
             <form onSubmit={handleSaveProfile} className="space-y-4">
               <div className="flex items-center gap-4 p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
-                <img
+                <Avatar
+                  uid={currentUser?.uid}
                   src={
                     photoURL ||
                     `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                   }
                   alt="Avatar"
-                  className="w-16 h-16 rounded-full object-cover ring-2 ring-[#2563EB]/20"
+                  fallbackName={displayName}
+                  size={64}
+                  showStatus={true}
+                  onlyWhenVisible={false}
+                  targetProfile={userProfile}
+                  className="ring-2 ring-[#2563EB]/20 rounded-full"
                 />
                 <div className="flex-1 space-y-1.5">
                   <span className="text-xs font-bold text-[#1C1917] block">

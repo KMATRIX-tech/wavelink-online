@@ -142,10 +142,42 @@ service cloud.firestore {
         isValidOptionalString(data, 'username', 50) &&
         isValidOptionalString(data, 'bio', 500) &&
         isValidOptionalString(data, 'email', 160) &&
-        isValidOptionalString(data, 'photoURL', 150000);
+        isValidOptionalString(data, 'photoURL', 150000) &&
+        isValidOptionalString(data, 'coverImageUrl', 4096) &&
+        isValidOptionalString(data, 'coverPresetId', 80) &&
+        isValidOptionalString(data, 'coverType', 32) &&
+        isValidOptionalString(data, 'pinnedPostId', 160) &&
+        (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:image/.*'));
     }
 
-    // Protect RBAC, contact verification flags, Pro status, badges, and points from unauthorized client self-escalation
+    // Check if the authenticated user is a Pro member, verified by Admin, or an Admin
+    function isUserProOrAdmin() {
+      return isAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isPro', false) == true ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('hasBlueStar', false) == true ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isVerifiedByAdmin', false) == true
+        )
+      );
+    }
+
+    // Enforce that custom profile cover fields can only be set or changed by Pro/Admin users
+    function isSafeCustomCoverWrite(incoming, existing) {
+      return isUserProOrAdmin() || (
+        (!('coverImageUrl' in incoming) ||
+          (existing != null && 'coverImageUrl' in existing && incoming.coverImageUrl == existing.coverImageUrl) ||
+          incoming.coverImageUrl == '') &&
+        (!('coverPresetId' in incoming) ||
+          (existing != null && 'coverPresetId' in existing && incoming.coverPresetId == existing.coverPresetId) ||
+          incoming.coverPresetId == 'theme-default') &&
+        (!('coverType' in incoming) ||
+          (existing != null && 'coverType' in existing && incoming.coverType == existing.coverType) ||
+          incoming.coverType == 'default')
+      );
+    }
+
+    // Protect RBAC, contact verification flags, Pro status, custom covers, badges, and points from unauthorized client self-escalation
     // Enforce that no user can create or complete a user profile without a verified email in Firebase Auth
     function isSafeUserProfileCreate(userId) {
       let data = request.resource.data;
@@ -156,6 +188,10 @@ service cloud.firestore {
         (!('role' in data) || data.role == 'user' || isSuperAdmin()) &&
         (!('isSubAdmin' in data) || data.isSubAdmin == false || isSuperAdmin()) &&
         (!('isBot' in data) || data.isBot == false) &&
+        (!('isPro' in data) || data.isPro == false || isAdmin()) &&
+        (!('hasBlueStar' in data) || data.hasBlueStar == false || isAdmin()) &&
+        (!('isVerifiedByAdmin' in data) || data.isVerifiedByAdmin == false || isAdmin()) &&
+        isSafeCustomCoverWrite(data, null) &&
         // Email verification must match Firebase Auth token email_verified; phone verification is disabled
         (!('emailVerified' in data) || data.emailVerified == isEmailVerified()) &&
         (!('phoneVerified' in data) || data.phoneVerified == false) &&
@@ -171,10 +207,15 @@ service cloud.firestore {
         isEmailVerified() &&
         isValidUserProfilePayload(incoming) &&
         (!('uid' in incoming) || incoming.uid == userId) &&
-        // Block non-admins from editing their own role or sub-admin status
+        // Block non-admins from editing their own role, sub-admin status, or Pro/Verification flags
         (!('role' in incoming) || (existing != null && incoming.role == existing.role) || incoming.role == 'user') &&
         (!('isSubAdmin' in incoming) || (existing != null && incoming.isSubAdmin == existing.isSubAdmin) || incoming.isSubAdmin == false) &&
+        (!('isPro' in incoming) || (existing != null && 'isPro' in existing && incoming.isPro == existing.isPro) || incoming.isPro == false) &&
+        (!('hasBlueStar' in incoming) || (existing != null && 'hasBlueStar' in existing && incoming.hasBlueStar == existing.hasBlueStar) || incoming.hasBlueStar == false) &&
+        (!('isVerifiedByAdmin' in incoming) || (existing != null && 'isVerifiedByAdmin' in existing && incoming.isVerifiedByAdmin == existing.isVerifiedByAdmin) || incoming.isVerifiedByAdmin == false) &&
         (!('isBot' in incoming) || incoming.isBot == false) &&
+        // Block non-Pro users from setting or modifying custom cover fields (coverImageUrl, coverPresetId, coverType)
+        isSafeCustomCoverWrite(incoming, existing) &&
         // Email verification must match Firebase Auth token email_verified; phone verification is disabled
         (!('emailVerified' in incoming) || incoming.emailVerified == isEmailVerified() || (existing != null && 'emailVerified' in existing && incoming.emailVerified == existing.emailVerified)) &&
         (!('phoneVerified' in incoming) || (existing != null && 'phoneVerified' in existing && incoming.phoneVerified == existing.phoneVerified) || incoming.phoneVerified == false) &&
@@ -332,7 +373,14 @@ service cloud.firestore {
         allow update: if isSignedIn() &&
           isValidCommentPayload(request.resource.data) &&
           areImmutableFieldsUnchanged(['authorId', 'postId', 'createdAt']) &&
-          (resource.data.authorId == request.auth.uid || isAdmin());
+          (
+            resource.data.authorId == request.auth.uid ||
+            isAdmin() ||
+            (
+              areImmutableFieldsUnchanged(['content']) &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions', 'reactionCounts', 'updatedAt'])
+            )
+          );
         allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
       }
 
@@ -348,14 +396,6 @@ service cloud.firestore {
     }
 
     // Validate Spark payload: never allow base64 video in Firestore, enforce caption size, and enforce 60s Free / 90s Pro duration limits
-    function isUserProOrAdmin() {
-      return isAdmin() || (
-        isSignedIn() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isPro == true
-      );
-    }
-
     function isValidSparkPayload() {
       let data = request.resource.data;
       return ('authorId' in data) && data.authorId is string && data.authorId.size() <= 128 &&

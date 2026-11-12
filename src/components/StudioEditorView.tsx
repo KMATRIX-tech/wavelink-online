@@ -16,12 +16,14 @@ import {
   formatVideoUploadError,
   handleFirestoreError,
   OperationType,
+  getCachedUserProfile,
 } from '../firebase';
 import { uploadImageToCloudinary } from '../utils/mediaStorage';
 import {
   enqueueVideoUploadJob,
   clearFailedVideoAndStudioDrafts,
 } from '../services/videoUploadQueue';
+import { savePostDocument } from '../services/postService';
 import { SongSelectorModal } from './SongSelectorModal';
 import { OnlineSong, Post } from '../types';
 import {
@@ -1650,10 +1652,13 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
         }
       : {};
 
-    const authorName = currentUser.displayName || 'Creator';
-    const authorUsername = `@${authorName.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'creator'}`;
+    const cachedProfile = getCachedUserProfile(currentUser.uid);
+    const authorName = cachedProfile?.displayName || currentUser.displayName || 'Creator';
+    const authorUsername =
+      cachedProfile?.username ||
+      `@${authorName.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'creator'}`;
     const authorPhotoURL = sanitizeAvatarUrlForFirestore(
-      currentUser.photoURL,
+      cachedProfile?.photoURL || currentUser.photoURL,
       currentUser.uid
     );
 
@@ -1815,14 +1820,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
         createdAt: new Date().toISOString(),
       };
 
-      const cleanedPost = cleanFirestoreData(postPayload);
-      await setDoc(doc(db, 'posts', postId), cleanedPost);
-
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('wavelink:video-post-created', { detail: postPayload })
-        );
-      }
+      await savePostDocument(postPayload);
 
       setUploadProgress(100);
       setUploadStatusText('Published to WaveLink!');

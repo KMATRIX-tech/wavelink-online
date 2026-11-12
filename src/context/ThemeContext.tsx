@@ -1,213 +1,387 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
-import { ThemeMode, AppearanceTheme } from '../types';
+import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import { AppearanceTheme } from '../types';
+import { useAuth } from './AuthContext';
 
-export interface AppearanceThemeOption {
+export interface AppearanceThemeMetadata {
   id: AppearanceTheme;
   name: string;
+  nameSw: string;
   description: string;
+  descriptionSw: string;
+  emoji: string;
+  isDark: boolean;
+  proOnly: boolean;
   previewBg: string;
+  previewCard: string;
+  previewText: string;
   previewAccent: string;
   previewSecondary: string;
-  proOnly: boolean;
+  previewGradient: string;
 }
 
-export const APPEARANCE_THEMES: AppearanceThemeOption[] = [
+export const APPEARANCE_THEMES: AppearanceThemeMetadata[] = [
   {
-    id: 'savanna',
-    name: 'Savanna',
-    description: 'Warm golden acacia & Serengeti sand with crisp dark text',
-    previewBg: '#FCF9F0',
-    previewAccent: '#B45309',
-    previewSecondary: '#0D9488',
+    id: 'ocean',
+    name: 'Ocean Waves',
+    nameSw: 'Mawimbi ya Bahari',
+    description: 'WaveLink default — crisp ocean breeze with signature blue & teal waves',
+    descriptionSw: 'Chaguo kuu la WaveLink — rangi za buluu na kijani cha bahari',
+    emoji: '🌊',
+    isDark: false,
     proOnly: false,
-  },
-  {
-    id: 'zanzibar',
-    name: 'Zanzibar Sea',
-    description: 'Coastal turquoise & Indian Ocean breeze with clean readable contrast',
-    previewBg: '#F2FAFC',
-    previewAccent: '#0284C7',
-    previewSecondary: '#0D9488',
-    proOnly: false,
-  },
-  {
-    id: 'kilimanjaro',
-    name: 'Kilimanjaro Sunrise',
-    description: 'Crisp alpine morning light & warm terracotta highland tones',
-    previewBg: '#FDF8F4',
-    previewAccent: '#C2410C',
-    previewSecondary: '#2563EB',
-    proOnly: false,
-  },
-  {
-    id: 'classic',
-    name: 'Classic',
-    description: 'White and warm cream with friendly blue & teal accents',
-    previewBg: '#FAF7F2',
+    previewBg: '#F0F7FF',
+    previewCard: '#FFFFFF',
+    previewText: '#0F172A',
     previewAccent: '#2563EB',
     previewSecondary: '#0D9488',
-    proOnly: false,
+    previewGradient: 'linear-gradient(135deg, #E0F2FE 0%, #F0FDFA 55%, #EFF6FF 100%)'
   },
   {
-    id: 'sunrise',
-    name: 'Sunrise',
-    description: 'Warm cream and sunny gold highlights',
-    previewBg: '#FEFBF3',
-    previewAccent: '#D97706',
-    previewSecondary: '#EAB308',
+    id: 'hearts',
+    name: 'Hearts',
+    nameSw: 'Mioyo ya Waridi',
+    description: 'Soft pastel pink canvas with gentle floating hearts & rose accents',
+    descriptionSw: 'Rangi laini ya waridi yenye mioyo inayoelea kwa upole',
+    emoji: '💖',
+    isDark: false,
     proOnly: false,
+    previewBg: '#FFF1F5',
+    previewCard: '#FFFFFF',
+    previewText: '#3B0A1E',
+    previewAccent: '#E11D48',
+    previewSecondary: '#EC4899',
+    previewGradient: 'linear-gradient(135deg, #FFE4EC 0%, #FFF1F5 50%, #FCE7F3 100%)'
+  },
+  {
+    id: 'midnight',
+    name: 'Midnight Black',
+    nameSw: 'Usiku wa Manane',
+    description: 'Sleek carbon-fiber dark surface with crisp high-contrast silver & blue',
+    descriptionSw: 'Muonekano mweusi wa kisasa wenye maandishi yanayosomeka vizuri',
+    emoji: '🖤',
+    isDark: true,
+    proOnly: false,
+    previewBg: '#090D16',
+    previewCard: '#131B2E',
+    previewText: '#F8FAFC',
+    previewAccent: '#3B82F6',
+    previewSecondary: '#14B8A6',
+    previewGradient: 'linear-gradient(135deg, #090D16 0%, #111827 55%, #1E293B 100%)'
+  },
+  {
+    id: 'neon',
+    name: 'Neon Gaming',
+    nameSw: 'Neon ya Michezo',
+    description: 'Cyberpunk arena with electric cyan, neon magenta & glowing grid lines',
+    descriptionSw: 'Muonekano wa michezo wenye mwanga wa neon ya samawati na zambarau',
+    emoji: '🎮',
+    isDark: true,
+    proOnly: false,
+    previewBg: '#070913',
+    previewCard: '#121629',
+    previewText: '#F0FDF4',
+    previewAccent: '#06B6D4',
+    previewSecondary: '#EC4899',
+    previewGradient: 'linear-gradient(135deg, #070913 0%, #16113A 55%, #082F49 100%)'
+  },
+  {
+    id: 'camo',
+    name: 'Camo',
+    nameSw: 'Kombati ya Msitu',
+    description: 'Tactical woodland olive & ranger green with warm sand readability',
+    descriptionSw: 'Muonekano wa kijani cha msitu na mchanga wenye maandishi wazi',
+    emoji: '🌿',
+    isDark: true,
+    proOnly: false,
+    previewBg: '#141E15',
+    previewCard: '#1E2D20',
+    previewText: '#F4F7F2',
+    previewAccent: '#22C55E',
+    previewSecondary: '#D97706',
+    previewGradient: 'linear-gradient(135deg, #141E15 0%, #233324 50%, #2B3A28 100%)'
   },
   {
     id: 'sunset',
     name: 'Sunset',
-    description: 'Soft peach, warm orange and gentle coral pink',
-    previewBg: '#FFF7F4',
+    nameSw: 'Machweo ya Jua',
+    description: 'Warm golden-hour horizon with coral, peach & amber sunbeams',
+    descriptionSw: 'Rangi za machweo ya jua zenye joto la chungwa na dhahabu',
+    emoji: '🌅',
+    isDark: false,
+    proOnly: false,
+    previewBg: '#FFF5F0',
+    previewCard: '#FFFFFF',
+    previewText: '#2A120A',
     previewAccent: '#EA580C',
     previewSecondary: '#E11D48',
-    proOnly: true,
+    previewGradient: 'linear-gradient(135deg, #FFEDD5 0%, #FFE4E6 55%, #FEF3C7 100%)'
   },
   {
-    id: 'river',
-    name: 'River',
-    description: 'Refreshing teal, aqua and soft seafoam green',
-    previewBg: '#F2FBF9',
-    previewAccent: '#0D9488',
-    previewSecondary: '#0284C7',
-    proOnly: true,
+    id: 'flowers',
+    name: 'Flowers',
+    nameSw: 'Bustani ya Maua',
+    description: 'Fresh botanical garden with delicate blossom petals & sage leaves',
+    descriptionSw: 'Bustani tulivu yenye maua maridadi na kijani laini',
+    emoji: '🌸',
+    isDark: false,
+    proOnly: false,
+    previewBg: '#FDF8FF',
+    previewCard: '#FFFFFF',
+    previewText: '#1E1B2E',
+    previewAccent: '#DB2777',
+    previewSecondary: '#0D9488',
+    previewGradient: 'linear-gradient(135deg, #FCE7F3 0%, #F3E8FF 50%, #ECFDF5 100%)'
   },
+  {
+    id: 'racing',
+    name: 'Racing',
+    nameSw: 'Mbio za Magari',
+    description: 'Motorsport asphalt with checkered flag motif & nitro crimson stripes',
+    descriptionSw: 'Muonekano wa mbio za magari wenye mistari myeusi na myekundu',
+    emoji: '🏎️',
+    isDark: true,
+    proOnly: false,
+    previewBg: '#0C0D12',
+    previewCard: '#181A24',
+    previewText: '#F8FAFC',
+    previewAccent: '#EF4444',
+    previewSecondary: '#F59E0B',
+    previewGradient: 'linear-gradient(135deg, #0C0D12 0%, #1F1218 55%, #181A24 100%)'
+  },
+  {
+    id: 'galaxy',
+    name: 'Galaxy',
+    nameSw: 'Anga ya Nyota',
+    description: 'Deep cosmic nebula with twinkling starlight, violet & indigo aurora',
+    descriptionSw: 'Anga ya mbali yenye nyota zinazong’aa na rangi za zambarau',
+    emoji: '🌌',
+    isDark: true,
+    proOnly: false,
+    previewBg: '#08071B',
+    previewCard: '#141233',
+    previewText: '#F5F3FF',
+    previewAccent: '#8B5CF6',
+    previewSecondary: '#06B6D4',
+    previewGradient: 'linear-gradient(135deg, #08071B 0%, #1E1B4B 50%, #311042 100%)'
+  }
 ];
 
-interface ThemeContextType {
-  theme: ThemeMode;
-  setTheme: (theme: ThemeMode) => void;
-  toggleDarkMode: () => void;
-  isDark: boolean;
-  appearanceTheme: AppearanceTheme;
-  setAppearanceTheme: (next: AppearanceTheme) => void;
-  isBatterySaver: boolean;
-  setBatterySaver: (enabled: boolean) => void;
+const VALID_THEMES: AppearanceTheme[] = [
+  'ocean',
+  'hearts',
+  'midnight',
+  'neon',
+  'camo',
+  'sunset',
+  'flowers',
+  'racing',
+  'galaxy',
+  'classic',
+  'savanna',
+  'zanzibar',
+  'kilimanjaro',
+  'river',
+  'sunrise'
+];
+
+const DARK_THEMES = new Set<AppearanceTheme>([
+  'midnight',
+  'neon',
+  'camo',
+  'racing',
+  'galaxy'
+]);
+
+export function isDarkAppearanceTheme(theme: AppearanceTheme): boolean {
+  return DARK_THEMES.has(theme);
 }
 
-const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
+export function normalizeAppearanceTheme(raw?: string | null): AppearanceTheme {
+  if (!raw) return 'ocean';
+  if (raw === 'classic' || raw === 'zanzibar' || raw === 'river') {
+    return 'ocean';
+  }
+  if (raw === 'savanna' || raw === 'kilimanjaro' || raw === 'sunrise') {
+    return 'sunset';
+  }
+  if (VALID_THEMES.includes(raw as AppearanceTheme)) {
+    return raw as AppearanceTheme;
+  }
+  return 'ocean';
+}
 
-const APPEARANCE_STORAGE_KEY = 'wavelink_appearance_theme_v1';
-const THEME_MODE_STORAGE_KEY = 'wavelink_theme_mode_v1';
-export const BATTERY_SAVER_STORAGE_KEY = 'wavelink_battery_saver_v1';
+interface ThemeContextType {
+  theme: 'light' | 'dark';
+  appearanceTheme: AppearanceTheme;
+  previewTheme: AppearanceTheme | null;
+  activeTheme: AppearanceTheme;
+  isDarkTheme: boolean;
+  setAppearanceTheme: (theme: AppearanceTheme) => void;
+  setPreviewTheme: (theme: AppearanceTheme | null) => void;
+  saveAppearanceTheme: (theme: AppearanceTheme) => Promise<void>;
+  toggleTheme: () => void;
+  isBatterySaver: boolean;
+  setBatterySaver: (enabled: boolean) => void;
+  toggleBatterySaver: () => void;
+  isLiteMode: boolean;
+  setLiteMode: (enabled: boolean) => void;
+  toggleLiteMode: () => void;
+}
 
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setThemeState] = useState<ThemeMode>(() => {
-    try {
-      const saved = localStorage.getItem(THEME_MODE_STORAGE_KEY);
-      if (saved === 'dark' || saved === 'light') return saved;
-    } catch {
-      // default to light
-    }
-    return 'light';
-  });
-  const isDark = theme === 'dark';
+const ThemeContext = createContext<ThemeContextType>({
+  theme: 'light',
+  appearanceTheme: 'ocean',
+  previewTheme: null,
+  activeTheme: 'ocean',
+  isDarkTheme: false,
+  setAppearanceTheme: () => {},
+  setPreviewTheme: () => {},
+  saveAppearanceTheme: async () => {},
+  toggleTheme: () => {},
+  isBatterySaver: false,
+  setBatterySaver: () => {},
+  toggleBatterySaver: () => {},
+  isLiteMode: false,
+  setLiteMode: () => {},
+  toggleLiteMode: () => {},
+});
+
+export const useTheme = () => useContext(ThemeContext);
+
+export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { userProfile, updateUserProfile } = useAuth();
 
   const [appearanceTheme, setAppearanceThemeState] = useState<AppearanceTheme>(() => {
-    const saved = localStorage.getItem(APPEARANCE_STORAGE_KEY) as AppearanceTheme | null;
-    if (
-      saved &&
-      ['classic', 'savanna', 'zanzibar', 'kilimanjaro', 'sunset', 'river', 'sunrise'].includes(saved)
-    ) {
-      return saved;
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('wavelink_appearance_theme');
+      if (saved) {
+        return normalizeAppearanceTheme(saved);
+      }
     }
-    return 'classic';
+    return 'ocean';
   });
+
+  const [previewTheme, setPreviewThemeState] = useState<AppearanceTheme | null>(null);
 
   const [isBatterySaver, setIsBatterySaverState] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(BATTERY_SAVER_STORAGE_KEY) === 'true';
-    } catch {
-      return false;
-    }
-  });
-
-  useEffect(() => {
-    const root = document.documentElement;
-    const body = document.body;
-
-    if (isDark) {
-      root.classList.add('dark');
-      body?.classList.add('dark');
-      root.setAttribute('data-theme', 'dark');
-      root.style.colorScheme = 'dark';
-    } else {
-      root.classList.remove('dark');
-      body?.classList.remove('dark');
-      root.setAttribute('data-theme', appearanceTheme);
-      root.style.colorScheme = 'light';
-    }
-
-    try {
-      localStorage.setItem(APPEARANCE_STORAGE_KEY, appearanceTheme);
-      localStorage.setItem(THEME_MODE_STORAGE_KEY, theme);
-    } catch {
-      // ignore storage errors
-    }
-  }, [appearanceTheme, isDark, theme]);
-
-  useEffect(() => {
-    const root = document.documentElement;
-    if (isBatterySaver) {
-      root.setAttribute('data-battery-saver', 'true');
-    } else {
-      root.removeAttribute('data-battery-saver');
-    }
-    try {
-      localStorage.setItem(BATTERY_SAVER_STORAGE_KEY, isBatterySaver ? 'true' : 'false');
-    } catch {
-      // ignore storage errors
-    }
     if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('wavelink:battery-saver-changed', { detail: { enabled: isBatterySaver } })
+      return (
+        localStorage.getItem('wavelink_lite_mode') === 'true' ||
+        localStorage.getItem('wavelink_battery_saver') === 'true'
       );
     }
+    return false;
+  });
+
+  // Sync from user profile in Firestore when loaded
+  useEffect(() => {
+    if (userProfile?.appearanceTheme) {
+      const normalized = normalizeAppearanceTheme(userProfile.appearanceTheme);
+      setAppearanceThemeState(normalized);
+      localStorage.setItem('wavelink_appearance_theme', normalized);
+    }
+  }, [userProfile?.appearanceTheme]);
+
+  const activeTheme: AppearanceTheme = previewTheme || appearanceTheme;
+  const isDarkTheme = isDarkAppearanceTheme(activeTheme);
+
+  // Apply active theme (saved or live preview) to <html> immediately
+  useEffect(() => {
+    const root = window.document.documentElement;
+    root.setAttribute('data-theme', activeTheme);
+    root.setAttribute('data-theme-mode', isDarkTheme ? 'dark' : 'light');
+    if (isDarkTheme) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [activeTheme, isDarkTheme]);
+
+  useEffect(() => {
+    const root = window.document.documentElement;
+    if (isBatterySaver) {
+      root.setAttribute('data-battery-saver', 'true');
+      root.setAttribute('data-lite-mode', 'true');
+    } else {
+      root.removeAttribute('data-battery-saver');
+      root.removeAttribute('data-lite-mode');
+    }
+    localStorage.setItem('wavelink_battery_saver', isBatterySaver ? 'true' : 'false');
+    localStorage.setItem('wavelink_lite_mode', isBatterySaver ? 'true' : 'false');
   }, [isBatterySaver]);
 
-  const setAppearanceTheme = (next: AppearanceTheme) => {
-    if (['classic', 'savanna', 'zanzibar', 'kilimanjaro', 'sunset', 'river', 'sunrise'].includes(next)) {
-      setAppearanceThemeState(next);
-    }
-  };
+  const setAppearanceTheme = useCallback((nextTheme: AppearanceTheme) => {
+    const normalized = normalizeAppearanceTheme(nextTheme);
+    setPreviewThemeState(null);
+    setAppearanceThemeState(normalized);
+    localStorage.setItem('wavelink_appearance_theme', normalized);
+  }, []);
+
+  const setPreviewTheme = useCallback((nextPreview: AppearanceTheme | null) => {
+    setPreviewThemeState(nextPreview ? normalizeAppearanceTheme(nextPreview) : null);
+  }, []);
+
+  const saveAppearanceTheme = useCallback(
+    async (nextTheme: AppearanceTheme) => {
+      const normalized = normalizeAppearanceTheme(nextTheme);
+      setPreviewThemeState(null);
+      setAppearanceThemeState(normalized);
+      localStorage.setItem('wavelink_appearance_theme', normalized);
+      try {
+        await updateUserProfile({ appearanceTheme: normalized });
+      } catch (err) {
+        console.error('Failed to save appearanceTheme to Firestore:', err);
+      }
+    },
+    [updateUserProfile]
+  );
+
+  const toggleTheme = useCallback(() => {
+    const order: AppearanceTheme[] = [
+      'ocean',
+      'hearts',
+      'midnight',
+      'neon',
+      'camo',
+      'sunset',
+      'flowers',
+      'racing',
+      'galaxy'
+    ];
+    const nextIndex = (order.indexOf(appearanceTheme) + 1) % order.length;
+    const next = order[nextIndex];
+    void saveAppearanceTheme(next);
+  }, [appearanceTheme, saveAppearanceTheme]);
 
   const setBatterySaver = (enabled: boolean) => {
-    setIsBatterySaverState(Boolean(enabled));
+    setIsBatterySaverState(enabled);
   };
 
-  const setTheme = (nextTheme: ThemeMode) => {
-    if (nextTheme === 'dark' || nextTheme === 'light') {
-      setThemeState(nextTheme);
-    }
-  };
-
-  const toggleDarkMode = () => {
-    setThemeState((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  const toggleBatterySaver = () => {
+    setIsBatterySaverState((prev) => !prev);
   };
 
   return (
     <ThemeContext.Provider
       value={{
-        theme,
-        setTheme,
-        toggleDarkMode,
-        isDark,
+        theme: isDarkTheme ? 'dark' : 'light',
         appearanceTheme,
+        previewTheme,
+        activeTheme,
+        isDarkTheme,
         setAppearanceTheme,
+        setPreviewTheme,
+        saveAppearanceTheme,
+        toggleTheme,
         isBatterySaver,
         setBatterySaver,
+        toggleBatterySaver,
+        isLiteMode: isBatterySaver,
+        setLiteMode: setBatterySaver,
+        toggleLiteMode: toggleBatterySaver,
       }}
     >
       {children}
     </ThemeContext.Provider>
   );
-}
-
-export function useTheme() {
-  const ctx = useContext(ThemeContext);
-  if (!ctx) throw new Error('useTheme must be used within ThemeProvider');
-  return ctx;
-}
+};

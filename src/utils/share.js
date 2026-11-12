@@ -189,9 +189,139 @@ export async function inviteFriends(customMessage) {
   // 2. WhatsApp fallback
   try {
     const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(defaultMessage)}`;
-    window.open(whatsappUrl, '_blank', 'noopener,noreferrer');
+    const link = document.createElement('a');
+    link.href = whatsappUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
     return { success: true, method: 'whatsapp' };
   } catch (err) {
     throw new Error(err?.message || "Couldn't open WhatsApp");
   }
 }
+
+/**
+ * Returns the canonical share URL for a post (?post=ID)
+ * @param {object|string} postOrId - Post object or post ID
+ * @returns {string}
+ */
+export function getPostShareUrl(postOrId) {
+  const postId = typeof postOrId === 'string' ? postOrId : postOrId?.id || '';
+  return `${APP_URL}/?post=${encodeURIComponent(postId)}`;
+}
+
+/**
+ * Opens an external share URL safely via a temporary anchor element
+ * @param {string} url
+ */
+function openExternalShareLink(url) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+/**
+ * Shares a post to a specific platform (WhatsApp, Telegram, Facebook, X, Messenger, Instagram, Reddit, SMS, or More via Web Share API)
+ * @param {'whatsapp'|'telegram'|'facebook'|'x'|'messenger'|'instagram'|'reddit'|'sms'|'more'} platform
+ * @param {object} post
+ * @returns {Promise<{ success: boolean, method: string, copiedFallback?: boolean }>}
+ */
+export async function sharePostToPlatform(platform, post) {
+  if (!post) {
+    throw new Error('Post data is missing');
+  }
+  const postUrl = getPostShareUrl(post);
+  const author = post.authorName || 'a creator';
+  const snippet = post.content ? post.content.trim().slice(0, 100) : 'Check out this wave on WaveLink';
+  const shareTitle = `WaveLink Post by ${author}`;
+  const shareText = `Check out this wave by ${author} on WaveLink: "${snippet}"`;
+  const combinedText = `${shareText}\n${postUrl}`;
+
+  if (platform === 'more') {
+    if (typeof navigator !== 'undefined' && navigator.share) {
+      try {
+        await navigator.share({
+          title: shareTitle,
+          text: shareText,
+          url: postUrl
+        });
+        return { success: true, method: 'web_share' };
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          return { success: false, method: 'cancelled' };
+        }
+      }
+    }
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      await navigator.clipboard.writeText(postUrl);
+      return { success: true, method: 'clipboard', copiedFallback: true };
+    }
+  }
+
+  switch (platform) {
+    case 'whatsapp': {
+      openExternalShareLink(`https://wa.me/?text=${encodeURIComponent(combinedText)}`);
+      return { success: true, method: 'whatsapp' };
+    }
+    case 'telegram': {
+      openExternalShareLink(
+        `https://t.me/share/url?url=${encodeURIComponent(postUrl)}&text=${encodeURIComponent(shareText)}`
+      );
+      return { success: true, method: 'telegram' };
+    }
+    case 'facebook': {
+      openExternalShareLink(
+        `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(postUrl)}&quote=${encodeURIComponent(shareText)}`
+      );
+      return { success: true, method: 'facebook' };
+    }
+    case 'x': {
+      openExternalShareLink(
+        `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}&url=${encodeURIComponent(postUrl)}`
+      );
+      return { success: true, method: 'x' };
+    }
+    case 'messenger': {
+      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+        try {
+          await navigator.clipboard.writeText(postUrl);
+        } catch {
+          // ignore clipboard error
+        }
+      }
+      openExternalShareLink(`https://www.messenger.com/`);
+      return { success: true, method: 'messenger', copiedFallback: true };
+    }
+    case 'instagram': {
+      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+        try {
+          await navigator.clipboard.writeText(postUrl);
+        } catch {
+          // ignore clipboard error
+        }
+      }
+      openExternalShareLink(`https://www.instagram.com/`);
+      return { success: true, method: 'instagram', copiedFallback: true };
+    }
+    case 'reddit': {
+      openExternalShareLink(
+        `https://www.reddit.com/submit?url=${encodeURIComponent(postUrl)}&title=${encodeURIComponent(shareTitle)}`
+      );
+      return { success: true, method: 'reddit' };
+    }
+    case 'sms': {
+      openExternalShareLink(`sms:?&body=${encodeURIComponent(combinedText)}`);
+      return { success: true, method: 'sms' };
+    }
+    default: {
+      return sharePost(post);
+    }
+  }
+}
+

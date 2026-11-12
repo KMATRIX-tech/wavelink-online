@@ -7,6 +7,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LanguageProvider, useLanguage } from './context/LanguageContext';
+import { PresenceProvider } from './context/PresenceContext';
 import { db, testConnection } from './firebase';
 import { collection, query, where, limit, onSnapshot, updateDoc, doc, getDoc } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
@@ -15,6 +16,7 @@ import { ActiveTab, CallRecipient } from './types';
 import { AuthPage } from './components/AuthPage';
 import { TopHeader } from './components/TopHeader';
 import { Sidebar } from './components/Sidebar';
+import { RightSidebar } from './components/RightSidebar';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { WarningBanner } from './components/WarningBanner';
 import { BannedView } from './components/BannedView';
@@ -38,7 +40,11 @@ import { VideoUploadProgressChip } from './components/VideoUploadProgressChip';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { validateFrontendEnvironment } from './utils/envValidation';
 import { setDataSaverPreference } from './services/dataSaverService';
-import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle } from 'lucide-react';
+import { SimpleModeProvider } from './context/SimpleModeContext';
+import { FirstTimeTourModal } from './components/FirstTimeTourModal';
+import { HelpModal } from './components/HelpModal';
+import { CelebrationBanner } from './components/CelebrationBanner';
+import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 
 interface IncomingCallData {
@@ -100,10 +106,19 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     initialOffer?: any;
   } | null>(null);
   const [selectedHashtag, setSelectedHashtag] = useState<string | null>(null);
+  const [viewedProfileUserId, setViewedProfileUserId] = useState<string | null>(null);
   const [isWelinkOpen, setIsWelinkOpen] = useState(false);
   const [welinkInitialMode, setWelinkInitialMode] = useState<'chat' | 'image' | 'voice'>('chat');
   const [unreadNotificationIds, setUnreadNotificationIds] = useState<string[]>([]);
   const [showInterestPicker, setShowInterestPicker] = useState<boolean>(false);
+  const [isTourOpen, setIsTourOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('wavelink_tour_completed') !== '1';
+    } catch {
+      return false;
+    }
+  });
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
 
   const ringtoneStopRef = useRef<(() => void) | null>(null);
   const handledCallIdsRef = useRef<Set<string>>(new Set());
@@ -196,6 +211,9 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
   const setActiveTab = (tab: ActiveTab) => {
     triggerHaptic(tab === 'studio' ? 'medium' : 'tab');
+    if (tab === 'settings') {
+      setViewedProfileUserId(null);
+    }
     setActiveTabState(tab);
     try {
       localStorage.setItem('wavelink_last_active_tab', tab);
@@ -234,7 +252,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       }
     };
     const handleGlobalMention = (e: Event) => {
-      const detail = (e as CustomEvent<string | { handle?: string; username?: string }>).detail;
+      const detail = (e as CustomEvent<string | { userId?: string; handle?: string; username?: string }>).detail;
+      if (typeof detail === 'object' && detail?.userId) {
+        setViewedProfileUserId(detail.userId);
+        setActiveTabState('settings');
+        return;
+      }
       const mention = typeof detail === 'string' ? detail : detail?.handle || detail?.username || '';
       if (mention) {
         const query = mention.startsWith('@') ? mention : `@${mention}`;
@@ -257,6 +280,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     const handleOpenInterestPicker = () => {
       setShowInterestPicker(true);
     };
+    const handleOpenTourEvent = () => {
+      setIsTourOpen(true);
+    };
+    const handleOpenHelpEvent = () => {
+      setIsHelpOpen(true);
+    };
     window.addEventListener('wavelink:hashtag', handleGlobalHashtag);
     window.addEventListener('wavelink:navigate-tag', handleGlobalHashtag);
     window.addEventListener('wavelink:mention', handleGlobalMention);
@@ -264,6 +293,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     window.addEventListener('wavelink:start-chat', handleGlobalChat);
     window.addEventListener('wavelink:navigate-tab', handleGlobalNavigateTab);
     window.addEventListener('wavelink:open-interest-picker', handleOpenInterestPicker);
+    window.addEventListener('wavelink:open-tour', handleOpenTourEvent);
+    window.addEventListener('wavelink:open-help', handleOpenHelpEvent);
     return () => {
       window.removeEventListener('wavelink:hashtag', handleGlobalHashtag);
       window.removeEventListener('wavelink:navigate-tag', handleGlobalHashtag);
@@ -272,6 +303,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       window.removeEventListener('wavelink:start-chat', handleGlobalChat);
       window.removeEventListener('wavelink:navigate-tab', handleGlobalNavigateTab);
       window.removeEventListener('wavelink:open-interest-picker', handleOpenInterestPicker);
+      window.removeEventListener('wavelink:open-tour', handleOpenTourEvent);
+      window.removeEventListener('wavelink:open-help', handleOpenHelpEvent);
     };
   }, []);
 
@@ -790,10 +823,34 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
             />
           )}
           {activeTab === 'studio' && (
-            <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
+            <div className="wavelink-page-desktop-container">
+              <div className="wavelink-page-desktop-row">
+                <div className="wavelink-page-desktop-center">
+                  <StudioEditorView onNavigateToFeed={() => setActiveTab('feed')} />
+                </div>
+                <RightSidebar
+                  onNavigateTab={(tab) => setActiveTab(tab)}
+                  onSelectHashtag={(tag) => {
+                    setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
+                    setActiveTab('feed');
+                  }}
+                />
+              </div>
+            </div>
           )}
           {activeTab === 'videos' && (
-            <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
+            <div className="wavelink-reels-desktop-row">
+              <div className="wavelink-reels-desktop-center">
+                <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
+              </div>
+              <RightSidebar
+                onNavigateTab={(tab) => setActiveTab(tab)}
+                onSelectHashtag={(tag) => {
+                  setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
+                  setActiveTab('feed');
+                }}
+              />
+            </div>
           )}
           {activeTab === 'announcements' && <AnnouncementsView />}
           {activeTab === 'chat' && (
@@ -817,7 +874,15 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
             </AdminGuard>
           )}
           {activeTab === 'settings' && (
-            <SettingsView onOpenAdminPanel={() => setActiveTab('admin')} />
+            <div className="wavelink-page-desktop-container">
+              <SettingsView
+                onOpenAdminPanel={() => setActiveTab('admin')}
+                viewedUserId={viewedProfileUserId}
+                onSelectUserProfile={(uid) => setViewedProfileUserId(uid)}
+                onStartChatWithUser={handleStartChatWithUser}
+                onStartCallWithUser={(recipient, callType) => handleOpenCall(callType, recipient)}
+              />
+            </div>
           )}
         </main>
       </div>
@@ -843,6 +908,19 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         setActiveTab={setActiveTab}
         hasUnreadNotifications={unreadNotificationIds.length > 0}
       />
+
+      {/* Single Floating Assistant Button (opens WELINK AI Assistant or Live Talk) */}
+      {!isWelinkOpen && !activeCall && (
+        <button
+          type="button"
+          onClick={() => handleOpenWelink('chat')}
+          aria-label="Open WELINK AI Assistant"
+          title="WELINK AI Assistant"
+          className="fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 h-12 w-12 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-lg hover:shadow-xl hover:scale-105 transition-all active:scale-95 cursor-pointer group"
+        >
+          <Sparkles size={20} className="transition-transform group-hover:rotate-12" />
+        </button>
+      )}
 
       {/* WELINK AI Assistant Drawer */}
       <WelinkAssistantDrawer
@@ -917,6 +995,23 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           onClose={() => setActiveCall(null)}
         />
       )}
+
+      {/* Celebration Toast Banner for Milestones */}
+      <CelebrationBanner />
+
+      {/* 3-Step First-Time Welcome Tour Modal */}
+      <FirstTimeTourModal
+        isOpen={isTourOpen}
+        onClose={() => setIsTourOpen(false)}
+      />
+
+      {/* Friendly Help & Answers Modal */}
+      <HelpModal
+        isOpen={isHelpOpen}
+        onClose={() => setIsHelpOpen(false)}
+        onOpenWelink={handleOpenWelink}
+        onOpenTour={() => setIsTourOpen(true)}
+      />
     </div>
   );
 }
@@ -978,11 +1073,15 @@ export default function App() {
   return (
     <ErrorBoundary>
       <LanguageProvider>
-        <ThemeProvider>
-          <AuthProvider>
-            <RootAppContent />
-          </AuthProvider>
-        </ThemeProvider>
+        <AuthProvider>
+          <PresenceProvider>
+            <ThemeProvider>
+              <SimpleModeProvider>
+                <RootAppContent />
+              </SimpleModeProvider>
+            </ThemeProvider>
+          </PresenceProvider>
+        </AuthProvider>
       </LanguageProvider>
     </ErrorBoundary>
   );

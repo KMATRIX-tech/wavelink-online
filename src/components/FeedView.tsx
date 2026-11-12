@@ -39,6 +39,7 @@ import {
   orderBy,
   onSnapshot,
   getDocs,
+  getDoc,
   startAfter,
   doc,
   setDoc,
@@ -52,10 +53,12 @@ import {
   type DocumentData
 } from 'firebase/firestore';
 import { Post, PostComment, Announcement, ReactionType, UserProfile } from '../types';
+import { savePostDocument } from '../services/postService';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { CrystalBadge } from './CrystalBadge';
 import { VideoPlayer } from './VideoPlayer';
 import { PostBody } from './PostBody';
+import { Avatar } from './Avatar';
 import { SongPlayerCard } from './SongPlayerCard';
 import { SparkTray } from './SparkTray';
 import { AdsterraAdBanner } from './AdsterraAdBanner';
@@ -63,6 +66,8 @@ import { shouldShowAds } from './AdsterraManager';
 import { RichEventCard } from './RichEventCard';
 import { ImageLightboxModal, LightboxState } from './ImageLightboxModal';
 import { AddToHomeScreenHintCard } from './PWAInstallButton';
+import { CommentsSheet } from './CommentsSheet';
+import { ShareSheet } from './ShareSheet';
 import {
   ThumbsUp,
   Heart,
@@ -111,8 +116,13 @@ import {
   RotateCcw,
   Trophy,
   Globe,
-  RefreshCw
+  RefreshCw,
+  Smile,
+  MoreHorizontal
 } from 'lucide-react';
+import { sendWelinkChatMessage } from '../services/geminiService';
+import { getCachedWelinkResponse, setCachedWelinkResponse } from '../services/welinkCache';
+import { triggerCelebration } from './CelebrationBanner';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { CreatorTipModal } from './CreatorTipModal';
 import { PostBoostModal } from './PostBoostModal';
@@ -351,6 +361,19 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [postNotice, setPostNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
+  const [isFeelingPickerOpen, setIsFeelingPickerOpen] = useState(false);
+  const [selectedFeeling, setSelectedFeeling] = useState<{ labelEn: string; labelSw: string; emoji: string } | null>(null);
+
+  const FEELING_OPTIONS = [
+    { labelEn: 'Blessed', labelSw: 'Mwenye Baraka', emoji: '🙏' },
+    { labelEn: 'Happy', labelSw: 'Mwenye Furaha', emoji: '😊' },
+    { labelEn: 'Loved', labelSw: 'Mwenye Kupendwa', emoji: '❤️' },
+    { labelEn: 'Grateful', labelSw: 'Mwenye Shukrani', emoji: '🤲' },
+    { labelEn: 'Celebrating', labelSw: 'Kusherehekea', emoji: '🎉' },
+    { labelEn: 'Excited', labelSw: 'Mwenye Shauku', emoji: '🌟' },
+    { labelEn: 'Relaxed', labelSw: 'Kutulia', emoji: '🌴' },
+    { labelEn: 'Motivated', labelSw: 'Mwenye Nguvu', emoji: '💪' },
+  ];
 
   // Monetization modals, Post Detail reader & Multi-Spark post sharing
   const [tippingPost, setTippingPost] = useState<Post | null>(null);
@@ -364,15 +387,93 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [feedReadProgress, setFeedReadProgress] = useState<number>(0);
   const [consumedPostsCount, setConsumedPostsCount] = useState<number>(0);
   const [preloadedDimensions, setPreloadedDimensions] = useState<Record<string, PreloadedMediaInfo>>({});
+  const [visibleFeedPostIds, setVisibleFeedPostIds] = useState<string[]>([]);
 
-  // Comments state: map of postId -> PostComment[]
+  // Comments & Share Sheet state
   const [expandedComments, setExpandedComments] = useState<Record<string, boolean>>({});
   const [commentsMap, setCommentsMap] = useState<Record<string, PostComment[]>>({});
   const [commentInput, setCommentInput] = useState<Record<string, string>>({});
+  const [activeCommentsPost, setActiveCommentsPost] = useState<Post | null>(null);
+  const [activeSharePost, setActiveSharePost] = useState<Post | null>(null);
+  const [openPostMenuId, setOpenPostMenuId] = useState<string | null>(null);
+  const [activeAiInfoPost, setActiveAiInfoPost] = useState<Post | null>(null);
+  const [aiInfoSummaryMap, setAiInfoSummaryMap] = useState<
+    Record<string, { loading: boolean; text: string; tags: string[] }>
+  >({});
   const [carouselIndices, setCarouselIndices] = useState<Record<string, number>>({});
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [toastNotice, setToastNotice] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const toastTimeoutRef = useRef<any>(null);
+
+  // Open AI Info glass sheet & load WELINK AI summary ONLY on tap (zero Firestore reads)
+  const handleOpenAiInfo = async (post: Post) => {
+    setActiveAiInfoPost(post);
+    if (aiInfoSummaryMap[post.id]?.text || aiInfoSummaryMap[post.id]?.loading) {
+      return;
+    }
+
+    const extractedTags = Array.from(
+      new Set((post.content || '').match(/#[a-zA-Z0-9_]+/g) || ['#WaveLink', '#EastAfrica'])
+    ).slice(0, 5);
+
+    const cacheKey = `ai_post_summary_${post.id}_${language}`;
+    const cached = await getCachedWelinkResponse(cacheKey);
+    if (cached?.reply) {
+      setAiInfoSummaryMap((prev) => ({
+        ...prev,
+        [post.id]: { loading: false, text: cached.reply, tags: extractedTags },
+      }));
+      return;
+    }
+
+    setAiInfoSummaryMap((prev) => ({
+      ...prev,
+      [post.id]: { loading: true, text: '', tags: extractedTags },
+    }));
+
+    const mediaKind =
+      post.videoUrl || post.hasVideoChunks || post.mediaType === 'video'
+        ? 'video wave'
+        : post.imageUrl || post.imageUrls?.length
+        ? 'photo wave'
+        : 'community wave';
+    const rawCaption = (post.content || '').trim();
+    const prompt =
+      language === 'sw'
+        ? `Fupisha kwa sentensi 2 fupi na za kirafiki kuhusu ${mediaKind} hii iliyochapishwa na ${post.authorName}${post.locationTag ? ` (${post.locationTag})` : ''}: "${rawCaption || 'Chapisho la video/picha kwenye WaveLink'}".`
+        : `Give a warm, concise 2-sentence summary and cultural context for this ${mediaKind} by ${post.authorName}${post.locationTag ? ` (${post.locationTag})` : ''}: "${rawCaption || 'Visual wave shared on WaveLink'}".`;
+
+    try {
+      const res = await sendWelinkChatMessage({
+        messages: [{ role: 'user', text: prompt }],
+      });
+      const cleanText =
+        res?.reply?.trim() ||
+        (language === 'sw'
+          ? `${post.authorName} ameshiriki ${mediaKind} kwenye WaveLink${rawCaption ? `: "${rawCaption.slice(0, 140)}"` : '.'}`
+          : `${post.authorName} shared a ${mediaKind} on WaveLink${rawCaption ? `: "${rawCaption.slice(0, 140)}"` : '.'}`);
+      await setCachedWelinkResponse({
+        key: cacheKey,
+        userScope: currentUser?.uid || userProfile?.id || 'guest',
+        prompt,
+        reply: cleanText,
+        model: res?.model || 'gemini-3.8-flash',
+      });
+      setAiInfoSummaryMap((prev) => ({
+        ...prev,
+        [post.id]: { loading: false, text: cleanText, tags: extractedTags },
+      }));
+    } catch {
+      const fallbackText =
+        language === 'sw'
+          ? `${post.authorName} ameshiriki ${mediaKind} kwenye WaveLink${rawCaption ? `: "${rawCaption.slice(0, 140)}"` : '.'}`
+          : `${post.authorName} shared a ${mediaKind} on WaveLink${rawCaption ? `: "${rawCaption.slice(0, 140)}"` : '.'}`;
+      setAiInfoSummaryMap((prev) => ({
+        ...prev,
+        [post.id]: { loading: false, text: fallbackText, tags: extractedTags },
+      }));
+    }
+  };
 
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
     if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
@@ -391,36 +492,32 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  const handleSharePost = async (post: Post) => {
-    try {
-      const res = await sharePost(post);
-      if (res?.method !== 'cancelled') {
-        showToast(language === 'sw' ? 'Imeshirikiwa!' : 'Shared!', 'success');
-        // Phase 4: Record verified anti-spam share on the post (max 1 share counted per user per post)
-        if (currentUser && !post.isSponsored && post.id) {
-          const existingSharedBy = Array.isArray(post.sharedBy) ? post.sharedBy : [];
-          if (!existingSharedBy.includes(currentUser.uid)) {
-            const nextSharedBy = [...existingSharedBy, currentUser.uid];
-            const nextSharesCount = Math.max((post.sharesCount || 0) + 1, nextSharedBy.length);
-            updateDoc(doc(db, 'posts', post.id), {
-              sharedBy: arrayUnion(currentUser.uid),
-              sharesCount: nextSharesCount
-            }).catch(() => {});
-            getAuthHeaders()
-              .then((headers) =>
-                fetch('/api/challenges/record-share', {
-                  method: 'POST',
-                  headers,
-                  body: JSON.stringify({ postId: post.id })
-                })
-              )
-              .catch(() => {});
-          }
-        }
-      }
-    } catch (err: any) {
-      showToast(err?.message || "Couldn't share", 'error');
-    }
+  const handleSharePost = (post: Post) => {
+    setActiveSharePost(post);
+  };
+
+  const handleCommentCountChange = (postId: string, newCount: number) => {
+    setPosts((prev) =>
+      prev.map((p) => (p.id === postId ? { ...p, commentsCount: newCount } : p))
+    );
+    setActiveCommentsPost((prev) =>
+      prev && prev.id === postId ? { ...prev, commentsCount: newCount } : prev
+    );
+    setFocusedPost((prev) =>
+      prev && prev.id === postId ? { ...prev, commentsCount: newCount } : prev
+    );
+  };
+
+  const handleShareCountChange = (postId: string, newCount: number) => {
+    setPosts((prev) =>
+      prev.map((p) => (p.id === postId ? { ...p, sharesCount: newCount } : p))
+    );
+    setActiveSharePost((prev) =>
+      prev && prev.id === postId ? { ...prev, sharesCount: newCount } : prev
+    );
+    setFocusedPost((prev) =>
+      prev && prev.id === postId ? { ...prev, sharesCount: newCount } : prev
+    );
   };
 
   // Reaction animation & optimistic state
@@ -509,6 +606,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
     try {
       await updateUserProfile({ followingIds: nextFollowing });
       if (!isAlreadyFollowing) {
+        triggerCelebration('follow');
         await setDoc(doc(db, 'follows', `${currentUser.uid}_${targetUser.id}`), {
           followerId: currentUser.uid,
           followingId: targetUser.id,
@@ -600,9 +698,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Initial load on mount
+  // Initial load on mount + deep-link support for shared ?post=ID URLs
   useEffect(() => {
     loadInitialPosts();
+
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const sharedPostId = params.get('post');
+      if (sharedPostId) {
+        getDoc(doc(db, 'posts', sharedPostId))
+          .then((snap) => {
+            if (snap.exists()) {
+              const sharedPost = { id: snap.id, ...snap.data() } as Post;
+              setPosts((prev) => [sharedPost, ...prev.filter((p) => p.id !== sharedPost.id)]);
+              setFocusedPost(sharedPost);
+            }
+          })
+          .catch(() => {});
+      }
+    }
 
     const handleVideoPostCreated = (ev: Event) => {
       const created = (ev as CustomEvent<Post>)?.detail;
@@ -634,6 +748,64 @@ export const FeedView: React.FC<FeedViewProps> = ({
     observer.observe(trigger);
     return () => observer.disconnect();
   }, [hasMorePosts, isLoadingMore, isLoading, lastVisibleDoc]);
+
+  // Subscribe to RTDB presence ONLY for the 1–3 feed posts currently visible on screen
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof IntersectionObserver === 'undefined') {
+      setVisibleFeedPostIds(posts.slice(0, 3).map((p) => p.id));
+      return;
+    }
+
+    const ratioByPostId = new Map<string, number>();
+    let rafId: number | null = null;
+
+    const flushVisibleTopThree = () => {
+      rafId = null;
+      const topIds = Array.from(ratioByPostId.entries())
+        .filter(([, ratio]) => ratio > 0.05)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([id]) => id);
+
+      setVisibleFeedPostIds((prev) => {
+        if (prev.length === topIds.length && prev.every((id, idx) => id === topIds[idx])) {
+          return prev;
+        }
+        return topIds;
+      });
+    };
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          const postId = (entry.target as HTMLElement).getAttribute('data-post-id');
+          if (!postId) return;
+          if (entry.isIntersecting) {
+            ratioByPostId.set(postId, entry.intersectionRatio || 0.1);
+          } else {
+            ratioByPostId.delete(postId);
+          }
+        });
+        if (!rafId) {
+          rafId = window.requestAnimationFrame(flushVisibleTopThree);
+        }
+      },
+      { threshold: [0, 0.15, 0.4, 0.7] }
+    );
+
+    const observeTimer = window.setTimeout(() => {
+      const elements = document.querySelectorAll<HTMLElement>(
+        'article[data-wave-feed-item="true"][data-post-id]'
+      );
+      elements.forEach((el) => observer.observe(el));
+    }, 60);
+
+    return () => {
+      window.clearTimeout(observeTimer);
+      if (rafId) window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [posts, feedMode, internalFilterTag]);
 
   // Fetch announcements for pinned banner and right sidebar: load once with limit(5)
   useEffect(() => {
@@ -756,6 +928,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
     const isCurrentlyActive = active[type];
 
     if (!isCurrentlyActive) {
+      triggerCelebration('like');
       setFloatingBursts((prev) => ({ ...prev, [animKey]: Date.now() }));
       setTimeout(() => {
         setFloatingBursts((prev) => {
@@ -823,6 +996,21 @@ export const FeedView: React.FC<FeedViewProps> = ({
       heart: nextHearts.length,
       fire: nextFires.length
     };
+
+    // Instant optimistic update on feed posts
+    setPosts((prev) =>
+      prev.map((p) =>
+        p.id === rawPost.id
+          ? {
+              ...p,
+              reactions: updatedReactions,
+              reactionCounts: updatedReactionCounts,
+              likes: nextHearts,
+              likesCount: nextHearts.length
+            }
+          : p
+      )
+    );
 
     try {
       await updateDoc(doc(db, 'posts', rawPost.id), {
@@ -1055,6 +1243,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
         setUploadProgress(94);
       }
 
+      const feelingTag = selectedFeeling
+        ? ` — ${language === 'sw' ? 'anajihisi ' + selectedFeeling.labelSw : 'feeling ' + selectedFeeling.labelEn} ${selectedFeeling.emoji}`
+        : '';
+
       const newPost: Post = {
         id: postId,
         authorId: currentUser.uid,
@@ -1062,7 +1254,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
         authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
         authorUsername: userProfile?.username || `@${emailPrefix}`,
         authorPhotoURL: safeAuthorPhotoURL,
-        content: sanitizeUserText(inlineContent, 2000),
+        content: sanitizeUserText(`${inlineContent.trim()}${feelingTag}`, 2000),
         imageUrl: finalImageUrl,
         mediaType: finalMediaType,
         videoWidth: finalWidth,
@@ -1077,10 +1269,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
         createdAt: new Date().toISOString()
       };
 
-      // Validate < 900 KB & zero base64/data URLs, and create the Firestore document ONLY after upload succeeds
-      const cleanedNewPost = cleanFirestoreData(newPost);
-      await setDoc(doc(db, 'posts', postId), cleanedNewPost);
+      // Validate < 900 KB & zero base64/data URLs, and create the Firestore document with timeout and server fallback
+      await savePostDocument(newPost);
       setUploadProgress(100);
+
+      // Trigger first-time celebration animation for new post
+      triggerCelebration('post');
 
       // Show the newly created post at the top of the feed after upload + Firestore creation succeed
       setPosts((prev) => [newPost, ...prev.filter((p) => p.id !== postId)]);
@@ -1089,24 +1283,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
       setInlineContent('');
       setInlineMediaFile(null);
       setInlineMediaPreview(null);
+      setSelectedFeeling(null);
       setPostNotice({
         type: 'success',
         text:
           finalMediaType === 'image'
-            ? 'Photo wave uploaded to Cloudinary & published to the feed!'
-            : 'Wave published to the community feed!'
+            ? (language === 'sw' ? 'Picha yako imechapishwa kwenye ukurasa!' : 'Your photo wave is live on the feed!')
+            : (language === 'sw' ? 'Ujumbe wako umechapishwa!' : 'Your wave is live on the community feed!')
       });
       setTimeout(() => setPostNotice(null), 4000);
     } catch (err) {
       console.error('Post creation error:', err);
-      const formatted = formatVideoUploadError(err, {
-        fileSize: inlineMediaFile?.size,
-        maxAllowedSeconds: maxVideoSeconds,
-        isProUser: isProTier,
-      });
       setPostNotice({
         type: 'error',
-        text: formatted || 'Could not publish wave. Tap Retry to upload the file again from your browser.'
+        text:
+          language === 'sw'
+            ? 'Kuna hitilafu imetokea, hebu jaribu tena.'
+            : "Something went wrong, let's try again."
       });
     } finally {
       setIsSubmittingPost(false);
@@ -1114,7 +1307,77 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Reusable Reaction Bar Group (Like 👍, Heart ❤️, Fire 🔥) with real-time counters & click animations
+  // Compute overlapping avatars & "Liked by Name & others" from in-memory feed/reaction data (zero extra Firestore reads)
+  const getLikedByInfo = (post: Post) => {
+    const { likeUsers, heartUsers, fireUsers, counts } = getReactionData(post);
+    const allReactors = Array.from(new Set([...heartUsers, ...likeUsers, ...fireUsers]));
+    const totalReactions = Math.max(counts.total, allReactors.length);
+
+    // Build a quick lookup from already-loaded posts & suggestedMembers in memory
+    const knownProfiles = new Map<string, { name: string; avatar: string }>();
+    if (currentUser?.uid) {
+      knownProfiles.set(currentUser.uid, {
+        name: userProfile?.displayName || currentUser.displayName || 'You',
+        avatar:
+          userProfile?.photoURL ||
+          currentUser.photoURL ||
+          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+      });
+    }
+    posts.forEach((p) => {
+      if (p.authorId && p.authorName && !knownProfiles.has(p.authorId)) {
+        knownProfiles.set(p.authorId, {
+          name: p.authorName.split(' ')[0] || p.authorName,
+          avatar:
+            p.authorPhotoURL ||
+            `https://api.dicebear.com/7.x/shapes/svg?seed=${p.authorId}`,
+        });
+      }
+    });
+    suggestedMembers.forEach((m) => {
+      if (m.id && m.displayName && !knownProfiles.has(m.id)) {
+        knownProfiles.set(m.id, {
+          name: m.displayName.split(' ')[0] || m.displayName,
+          avatar:
+            m.photoURL ||
+            `https://api.dicebear.com/7.x/shapes/svg?seed=${m.id}`,
+        });
+      }
+    });
+
+    const matchedUsers = allReactors
+      .map((uid) => knownProfiles.get(uid))
+      .filter((u): u is { name: string; avatar: string } => Boolean(u));
+
+    const firstLikerName =
+      matchedUsers[0]?.name ||
+      (totalReactions > 0
+        ? suggestedMembers[0]?.displayName?.split(' ')[0] ||
+          post.authorName.split(' ')[0] ||
+          'Waver'
+        : null);
+
+    const avatarList: string[] = [];
+    matchedUsers.slice(0, 2).forEach((u) => avatarList.push(u.avatar));
+    if (avatarList.length < 2 && totalReactions > 0) {
+      const fallbackSeeds = [
+        allReactors[0] || `${post.id}_a`,
+        allReactors[1] || `${post.id}_b`,
+      ];
+      while (avatarList.length < Math.min(2, Math.max(1, totalReactions))) {
+        const seed = fallbackSeeds[avatarList.length] || `${post.id}_${avatarList.length}`;
+        avatarList.push(`https://api.dicebear.com/7.x/shapes/svg?seed=${seed}`);
+      }
+    }
+
+    return {
+      totalReactions,
+      firstLikerName,
+      avatars: avatarList.slice(0, 2),
+    };
+  };
+
+  // Reusable Glass Pill Reaction Bar Group (Heart ❤️ primary + Like 👍 + Fire 🔥) with spring animation & glow
   const renderReactionBar = (post: Post) => {
     const { counts, active } = getReactionData(post);
     const likeAnim = animatingReactions[`${post.id}_like`];
@@ -1125,52 +1388,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
     const heartBurst = floatingBursts[`${post.id}_heart`];
     const fireBurst = floatingBursts[`${post.id}_fire`];
 
-    return (
-      <div className="inline-flex items-center gap-1.5 bg-[#F8FAFC] p-1 rounded-2xl border border-slate-200/80">
-        {/* LIKE (ThumbsUp) */}
-        <button
-          type="button"
-          onClick={() => handleToggleReaction(post, 'like')}
-          title="Like Wave"
-          aria-label={`Like post (${counts.like})`}
-          className={`relative flex items-center gap-1.5 py-1.5 px-2.5 sm:px-3 rounded-xl transition-all duration-200 select-none active:scale-90 ${
-            active.like
-              ? 'bg-[#3B82F6]/12 text-[#3B82F6] font-extrabold ring-1 ring-[#3B82F6]/30 shadow-2xs'
-              : 'text-slate-600 hover:bg-white hover:text-[#3B82F6]'
-          }`}
-        >
-          {likeBurst && (
-            <span
-              key={likeBurst}
-              className="pointer-events-none absolute -top-1 left-1/2 text-sm animate-reaction-float z-20"
-            >
-              👍
-            </span>
-          )}
-          <ThumbsUp
-            size={15}
-            className={`transition-transform ${likeAnim ? 'animate-reaction-like' : ''} ${
-              active.like ? 'fill-[#3B82F6] text-[#3B82F6]' : ''
-            }`}
-          />
-          <span className="font-mono tabular-numbers text-xs">{counts.like}</span>
-        </button>
+    const primaryHeartCount = Math.max(counts.heart, counts.total);
+    const isHeartOrLikeActive = active.heart || active.like;
 
-        {/* HEART (Love) */}
+    return (
+      <div className="inline-flex items-center gap-2 flex-wrap">
+        {/* PRIMARY HEART GLASS PILL (Heart + Count with spring animation and rose glow on press) */}
         <button
           type="button"
           onClick={() => handleToggleReaction(post, 'heart')}
-          title="Love Wave"
-          aria-label={`Love post (${counts.heart})`}
-          className={`relative flex items-center gap-1.5 py-1.5 px-2.5 sm:px-3 rounded-xl transition-all duration-200 select-none active:scale-90 ${
-            active.heart
-              ? 'bg-rose-500/12 text-rose-600 font-extrabold ring-1 ring-rose-500/30 shadow-2xs'
-              : 'text-slate-600 hover:bg-white hover:text-rose-600'
+          title={language === 'sw' ? 'Penda chapisho' : 'Love wave'}
+          aria-label={`Like post (${primaryHeartCount})`}
+          className={`wavelink-glass-action-pill relative min-h-[40px] px-3.5 py-1.5 rounded-full inline-flex items-center gap-1.5 text-xs font-extrabold select-none cursor-pointer transition-transform active:scale-95 ${
+            isHeartOrLikeActive ? 'wavelink-glass-action-pill--heart-active' : ''
           }`}
         >
-          {heartBurst && (
+          {(heartBurst || likeBurst) && (
             <span
-              key={heartBurst}
+              key={heartBurst || likeBurst}
               className="pointer-events-none absolute -top-1 left-1/2 text-sm animate-reaction-float z-20"
             >
               ❤️
@@ -1178,41 +1413,47 @@ export const FeedView: React.FC<FeedViewProps> = ({
           )}
           <Heart
             size={15}
-            className={`transition-transform ${heartAnim ? 'animate-reaction-heart' : ''} ${
-              active.heart ? 'fill-rose-600 text-rose-600' : ''
+            className={`transition-transform ${
+              heartAnim || likeAnim ? 'animate-reaction-heart' : ''
+            } ${
+              isHeartOrLikeActive
+                ? 'fill-[#F43F5E] text-[#F43F5E] drop-shadow-[0_0_8px_rgba(244,63,94,0.65)]'
+                : 'text-[#F43F5E]'
             }`}
           />
-          <span className="font-mono tabular-numbers text-xs">{counts.heart}</span>
+          <span className="font-mono tabular-nums">
+            {primaryHeartCount.toLocaleString()}
+          </span>
         </button>
 
-        {/* FIRE (Hype) */}
-        <button
-          type="button"
-          onClick={() => handleToggleReaction(post, 'fire')}
-          title="Fire Wave"
-          aria-label={`Fire post (${counts.fire})`}
-          className={`relative flex items-center gap-1.5 py-1.5 px-2.5 sm:px-3 rounded-xl transition-all duration-200 select-none active:scale-90 ${
-            active.fire
-              ? 'bg-orange-500/12 text-orange-600 font-extrabold ring-1 ring-orange-500/30 shadow-2xs'
-              : 'text-slate-600 hover:bg-white hover:text-orange-500'
-          }`}
-        >
-          {fireBurst && (
-            <span
-              key={fireBurst}
-              className="pointer-events-none absolute -top-1 left-1/2 text-sm animate-reaction-float z-20"
-            >
-              🔥
-            </span>
-          )}
-          <Flame
-            size={15}
-            className={`transition-transform ${fireAnim ? 'animate-reaction-fire' : ''} ${
-              active.fire ? 'fill-orange-500 text-orange-600' : ''
+        {/* FIRE (Hype) Glass Pill */}
+        {counts.fire > 0 || active.fire ? (
+          <button
+            type="button"
+            onClick={() => handleToggleReaction(post, 'fire')}
+            title="Fire Wave"
+            aria-label={`Fire post (${counts.fire})`}
+            className={`wavelink-glass-action-pill relative min-h-[40px] px-3 py-1.5 rounded-full inline-flex items-center gap-1 text-xs font-extrabold select-none cursor-pointer transition-transform active:scale-95 ${
+              active.fire ? 'ring-1 ring-orange-400/60 text-orange-500' : ''
             }`}
-          />
-          <span className="font-mono tabular-numbers text-xs">{counts.fire}</span>
-        </button>
+          >
+            {fireBurst && (
+              <span
+                key={fireBurst}
+                className="pointer-events-none absolute -top-1 left-1/2 text-sm animate-reaction-float z-20"
+              >
+                🔥
+              </span>
+            )}
+            <Flame
+              size={14}
+              className={`transition-transform ${fireAnim ? 'animate-reaction-fire' : ''} ${
+                active.fire ? 'fill-orange-500 text-orange-500' : 'text-orange-500'
+              }`}
+            />
+            <span className="font-mono tabular-nums">{counts.fire}</span>
+          </button>
+        ) : null}
       </div>
     );
   };
@@ -1463,402 +1704,88 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Feed Mode & Local Country Tab Bar (All Waves | Local Country First | Following | Trending) */}
-          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-1.5 shadow-2xs space-y-2">
-            <div className="flex items-center justify-between gap-1.5 flex-wrap">
-              <div className="flex items-center gap-1 flex-1 overflow-x-auto scrollbar-none">
+          {/* Clean Segmented Control for All, Local, Following, and Trending */}
+          <div className="w-full bg-stone-100 dark:bg-stone-800/80 p-1 rounded-2xl flex items-center justify-between gap-1 shadow-2xs">
+            <div className="flex items-center gap-1 flex-1 min-w-0">
+              <button
+                type="button"
+                onClick={() => setFeedMode('all')}
+                className={`flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate ${
+                  feedMode === 'all'
+                    ? 'bg-white dark:bg-stone-700 text-[#1C1917] dark:text-stone-100 shadow-2xs'
+                    : 'text-stone-600 dark:text-stone-300 hover:text-stone-900'
+                }`}
+              >
+                {t('feed.tabAll')}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setFeedMode('local')}
+                className={`flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate flex items-center justify-center gap-1.5 ${
+                  feedMode === 'local'
+                    ? 'bg-white dark:bg-stone-700 text-[#0D9488] shadow-2xs'
+                    : 'text-stone-600 dark:text-stone-300 hover:text-stone-900'
+                }`}
+                title={t('feed.localBannerDesc')}
+              >
+                <span>{activeCountryMeta.flag}</span>
+                <span>{t('feed.tabLocal')}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setFeedMode('following')}
+                className={`flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate ${
+                  feedMode === 'following'
+                    ? 'bg-white dark:bg-stone-700 text-[#1C1917] dark:text-stone-100 shadow-2xs'
+                    : 'text-stone-600 dark:text-stone-300 hover:text-stone-900'
+                }`}
+              >
+                {t('feed.tabFollowing')}
+              </button>
+
+              {onNavigateTab && (
                 <button
                   type="button"
-                  onClick={() => setFeedMode('all')}
-                  className={`py-2 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
-                    feedMode === 'all'
-                      ? 'bg-[#2563EB] text-white shadow-2xs'
-                      : 'bg-[var(--bg-subtle)] text-[#1C1917] hover:bg-blue-50 hover:text-[#2563EB]'
-                  }`}
+                  onClick={() => onNavigateTab('trending')}
+                  className="flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs text-stone-600 dark:text-stone-300 hover:text-[#2563EB] transition cursor-pointer text-center truncate"
                 >
-                  <Waves size={14} />
-                  <span>{t('feed.tabAll')}</span>
+                  {t('nav.trending_short')}
                 </button>
-
-                {/* Local Tab: Shows posts from the user's country first */}
-                <button
-                  type="button"
-                  onClick={() => setFeedMode('local')}
-                  className={`py-2 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
-                    feedMode === 'local'
-                      ? 'bg-[#0D9488] text-white shadow-2xs'
-                      : 'bg-[var(--bg-subtle)] text-[#1C1917] hover:bg-teal-50 hover:text-[#0D9488]'
-                  }`}
-                  title={t('feed.localBannerDesc')}
-                >
-                  <span className="text-sm leading-none">{activeCountryMeta.flag}</span>
-                  <span>
-                    {t('feed.tabLocal')} ({activeCountryCode})
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setFeedMode('following')}
-                  className={`py-2 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
-                    feedMode === 'following'
-                      ? 'bg-[#2563EB] text-white shadow-2xs'
-                      : 'bg-[var(--bg-subtle)] text-[#1C1917] hover:bg-blue-50 hover:text-[#2563EB]'
-                  }`}
-                >
-                  <span>{t('feed.tabFollowing')}</span>
-                </button>
-
-                {onNavigateTab && (
-                  <button
-                    type="button"
-                    onClick={() => onNavigateTab('trending')}
-                    className="py-2 px-3 rounded-xl bg-[var(--bg-subtle)] hover:bg-teal-50 text-[#1C1917] hover:text-[#0D9488] font-extrabold text-xs flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer"
-                  >
-                    <Trophy size={14} className="text-[#0D9488]" />
-                    <span>{t('nav.trending')}</span>
-                  </button>
-                )}
-              </div>
-
-              <div className="flex items-center gap-1.5 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setShowCountryPickerBar((prev) => !prev)}
-                  className="px-2.5 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200/80 text-[11px] font-extrabold flex items-center gap-1 transition cursor-pointer"
-                  title="Pick Country & Region"
-                >
-                  <span>{activeCountryMeta.flag}</span>
-                  <span className="hidden sm:inline">
-                    {language === 'sw' ? activeCountryMeta.nameSw : activeCountryMeta.nameEn}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => window.dispatchEvent(new CustomEvent('wavelink:open-interest-picker'))}
-                  className="px-2.5 py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 text-[11px] font-extrabold flex items-center gap-1 shrink-0 transition cursor-pointer"
-                  title={t('interests.editButton')}
-                >
-                  <Sparkles size={12} />
-                  <span className="hidden xs:inline">{t('interests.editButton')}</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Expandable Country & Region Picker Bar (or when Local Tab is active) */}
-            {(showCountryPickerBar || feedMode === 'local') && (
-              <div className="p-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2 animate-in fade-in">
-                <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <div className="text-[11px] font-extrabold text-[#1C1917] flex items-center gap-1.5">
-                    <span>{activeCountryMeta.flag}</span>
-                    <span>
-                      {t('feed.localBannerTitle')}:{' '}
-                      <span className="text-[#0D9488]">
-                        {language === 'sw' ? activeCountryMeta.nameSw : activeCountryMeta.nameEn}
-                      </span>{' '}
-                      ({activeCountryMeta.regionLabel})
-                    </span>
-                  </div>
-                  <span className="text-[10px] font-semibold text-[#57534E]">
-                    {t('feed.localBannerDesc')}
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
-                  {AFRICAN_COUNTRIES.map((c) => {
-                    const isSelected = c.code === activeCountryCode;
-                    return (
-                      <button
-                        key={c.code}
-                        type="button"
-                        onClick={() => {
-                          setCountryCode(c.code);
-                          updateUserProfile({
-                            countryCode: c.code,
-                            preferredCurrency: c.defaultCurrency
-                          }).catch(() => {});
-                        }}
-                        className={`px-2.5 py-1.5 rounded-xl text-[11px] font-bold flex items-center gap-1.5 shrink-0 border transition cursor-pointer ${
-                          isSelected
-                            ? 'bg-[#0D9488] text-white border-[#0D9488] shadow-2xs'
-                            : 'bg-white text-[#1C1917] border-stone-200 hover:border-teal-300'
-                        }`}
-                      >
-                        <span>{c.flag}</span>
-                        <span>{language === 'sw' ? c.nameSw : c.nameEn}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Friendly East African Local Greeting (Habari & Karibu) + Optional Subtle Kanga/Kitenge Accent */}
-          <div
-            className={`pt-2 pb-2 px-3 rounded-2xl border border-[var(--border-hairline)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-              userProfile?.kangaBackgroundEnabled
-                ? 'kanga-pattern-subtle bg-[var(--bg-surface)]'
-                : 'bg-[var(--bg-surface)]'
-            }`}
-          >
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-50 text-[#0D9488] border border-teal-200/80 text-[10px] font-extrabold">
-                  <span>{activeCountryMeta.flag}</span>
-                  <span>
-                    {language === 'sw' ? activeCountryMeta.greetingSw : activeCountryMeta.greetingEn}
-                  </span>
-                </span>
-                {activePanLangMeta && activePanLangMeta.code !== 'en' && activePanLangMeta.code !== 'sw' && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200/80 text-[10px] font-extrabold">
-                    <span>{activePanLangMeta.flag}</span>
-                    <span>
-                      {activePanLangMeta.nativeName}: {activePanLangMeta.greeting}
-                    </span>
-                  </span>
-                )}
-              </div>
-              <h1 className="wavelink-fluid-h1 font-extrabold text-[#1C1917] tracking-tight break-words">
-                {(() => {
-                  const hour = new Date().getHours();
-                  const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Rafiki';
-                  const timeGreeting =
-                    hour < 12
-                      ? t('feed.greetingMorning')
-                      : hour < 18
-                      ? t('feed.greetingAfternoon')
-                      : t('feed.greetingEvening');
-                  return `${timeGreeting}, ${name} 👋`;
-                })()}
-              </h1>
-              <p className="text-base sm:text-sm text-[#57534E] mt-0.5 font-medium">
-                {t('feed.welcomeBack')}
-              </p>
-            </div>
-
-            {onOpenWelink && (
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => onOpenWelink('voice')}
-                  className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-teal-50 hover:bg-teal-100 text-[#0D9488] border border-teal-200/80 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition active:scale-95"
-                  title="Talk Live by Voice with WELINK"
-                >
-                  <Mic size={15} className="text-[#0D9488]" />
-                  <span>{t('header.liveTalk')}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onOpenWelink('chat')}
-                  className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] font-bold text-xs flex items-center gap-2 shadow-2xs transition active:scale-95"
-                  title="Open WELINK AI Guide"
-                >
-                  <Sparkles size={15} className="text-[#0D9488]" />
-                  <span>{t('header.welinkAi')}</span>
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* Skippable First-Time Welcome Flow with Phase 1 Data Saver & Phase 2 Language Switch */}
-          {showWelcomeFlow && (
-            <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-2xs space-y-4">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-50 text-[#0D9488] border border-teal-200">
-                    {t('welcome.badge')}
-                  </span>
-                  <h2 className="text-base sm:text-lg font-extrabold text-[#1C1917] mt-1">
-                    {t('welcome.title')}
-                  </h2>
-                  <p className="text-xs text-[#78716C] mt-0.5">
-                    {t('welcome.subtitle')}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleDismissWelcome}
-                  className="px-3 py-1.5 rounded-xl text-xs font-semibold text-[#78716C] hover:text-[#1C1917] hover:bg-[var(--bg-subtle)] transition"
-                >
-                  {t('welcome.skip')}
-                </button>
-              </div>
-
-              {/* Phase 1 & Phase 2 First-Time Welcome Switches: Data Saver & Swahili/English */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                <div className="p-3.5 rounded-2xl bg-teal-50/60 border border-teal-200/80 flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <Zap size={14} className="text-[#0D9488] shrink-0" />
-                      <span className="text-xs font-extrabold text-[#1C1917]">
-                        {t('datasaver.welcomeTitle')}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-[#57534E] mt-0.5">
-                      {t('datasaver.welcomeDesc')} ({t('datasaver.savedEstimate')}: {formattedSaved})
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={isDataSaverOn}
-                    onClick={() => {
-                      const next = !isDataSaverOn;
-                      setDataSaverOn(next);
-                      updateUserProfile({ dataSaverEnabled: next }).catch(() => {});
-                    }}
-                    className={`w-12 h-7 rounded-full transition-colors p-1 shrink-0 cursor-pointer ${
-                      isDataSaverOn ? 'bg-[#0D9488]' : 'bg-stone-300'
-                    }`}
-                  >
-                    <span
-                      className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                        isDataSaverOn ? 'translate-x-5' : 'translate-x-0'
-                      }`}
-                    />
-                  </button>
-                </div>
-
-                <div className="p-3.5 rounded-2xl bg-blue-50/50 border border-blue-200/80 flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <Globe size={14} className="text-[#2563EB] shrink-0" />
-                      <span className="text-xs font-extrabold text-[#1C1917]">
-                        {t('lang.title')}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-[#57534E] mt-0.5">
-                      {t('lang.subtitle')}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setLanguage('en');
-                        updateUserProfile({ language: 'en' }).catch(() => {});
-                      }}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-extrabold transition cursor-pointer ${
-                        language === 'en'
-                          ? 'bg-[#2563EB] text-white'
-                          : 'bg-white text-[#57534E] border border-stone-200'
-                      }`}
-                    >
-                      EN
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setLanguage('sw');
-                        updateUserProfile({ language: 'sw' }).catch(() => {});
-                      }}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-extrabold transition cursor-pointer ${
-                        language === 'sw'
-                          ? 'bg-[#0D9488] text-white'
-                          : 'bg-white text-[#57534E] border border-stone-200'
-                      }`}
-                    >
-                      SW
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {isLoadingSuggested ? (
-                <SuggestedMembersSkeleton count={3} />
-              ) : (
-                suggestedMembers.length > 0 && (
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                    {suggestedMembers.map((member) => {
-                      const isFollowing = followedIds.includes(member.id);
-                      return (
-                        <div
-                          key={member.id}
-                          className="p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-2"
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <img
-                              src={
-                                member.photoURL ||
-                                `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
-                              }
-                              alt={member.displayName}
-                              className="w-9 h-9 rounded-full object-cover shrink-0"
-                            />
-                            <div className="min-w-0">
-                              <span className="text-xs font-bold text-[#1C1917] block truncate">
-                                {member.displayName || 'Community Member'}
-                              </span>
-                              <span className="text-[10px] text-[#78716C] block truncate">
-                                {member.username || '@member'}
-                              </span>
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => handleFollowMember(member)}
-                            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition shrink-0 ${
-                              isFollowing
-                                ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
-                                : 'bg-[#2563EB] text-white hover:bg-[#1D4ED8]'
-                            }`}
-                          >
-                            {isFollowing ? t('welcome.following') : t('welcome.follow')}
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )
               )}
-
-              <div className="flex items-center justify-between pt-1 flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setInlineContent(
-                      language === 'sw'
-                        ? 'Habari zenu wote! Nimefurahi kujiunga na WaveLink 👋'
-                        : 'Hello everyone! Happy to be here on WaveLink 👋'
-                    );
-                    handleDismissWelcome();
-                  }}
-                  className="text-xs font-bold text-[#2563EB] hover:underline"
-                >
-                  {t('welcome.writeFirstWave')}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDismissWelcome}
-                  className="text-xs text-[#78716C] hover:text-[#1C1917]"
-                >
-                  {t('welcome.done')}
-                </button>
-              </div>
             </div>
-          )}
+          </div>
 
-          {/* Friendly Daily Check-In Card (stacks vertically on narrow screens) */}
-          <div className="w-full max-w-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-4 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-start sm:items-center gap-3 min-w-0">
-              <div className="w-10 h-10 rounded-2xl bg-amber-50 text-[#D97706] border border-amber-200/70 flex items-center justify-center shrink-0">
-                <Flame size={18} />
+          {/* Slim Greeting Row with Daily Check-In Button inside */}
+          <div className="w-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl px-3.5 py-2 shadow-2xs flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-xl bg-amber-50 dark:bg-amber-950/40 text-[#D97706] border border-amber-200/70 dark:border-amber-800/60 flex items-center justify-center shrink-0">
+                <Flame size={16} />
               </div>
               <div className="min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-base sm:text-sm font-bold text-[#1C1917]">
-                    {t('feed.dailyCheckIn')}
-                  </span>
-                  <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-50 text-[#D97706] border border-amber-200/80">
+                <div className="flex items-center gap-1.5">
+                  <h2 className="text-xs sm:text-sm font-extrabold text-[#1C1917] dark:text-stone-100 truncate">
+                    {(() => {
+                      const hour = new Date().getHours();
+                      const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Rafiki';
+                      const timeGreeting =
+                        hour < 12
+                          ? t('feed.greetingMorning')
+                          : hour < 18
+                          ? t('feed.greetingAfternoon')
+                          : t('feed.greetingEvening');
+                      return `${timeGreeting}, ${name} 👋`;
+                    })()}
+                  </h2>
+                  <span className="text-[10px] font-bold text-[#D97706] bg-amber-50 dark:bg-amber-950/40 px-1.5 py-0.2 rounded-md shrink-0">
                     {Math.max(1, userProfile?.loginStreak ?? 1)}d
                   </span>
                 </div>
-                <p className="text-sm sm:text-xs text-[#78716C] break-words">
+                <p className="text-[11px] text-[#78716C] dark:text-stone-400 truncate hidden xs:block">
                   {checkInDoneToday
-                    ? `${t('feed.checkedInToday')} • ${(userProfile?.wavePoints ?? 10).toLocaleString()} WavePoints`
-                    : `${t('feed.tapToCheckIn')} • ${(userProfile?.wavePoints ?? 10).toLocaleString()} pts`}
+                    ? `${t('feed.checkedInToday')} · ${(userProfile?.wavePoints ?? 15).toLocaleString()} pts`
+                    : `${t('feed.tapToCheckIn')} · +15 WavePoints`}
                 </p>
               </div>
             </div>
@@ -1867,15 +1794,49 @@ export const FeedView: React.FC<FeedViewProps> = ({
               type="button"
               onClick={handleDailyCheckIn}
               disabled={checkInDoneToday}
-              className={`min-h-[44px] w-full sm:w-auto px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${
+              className={`min-h-[34px] px-3 py-1 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer ${
                 checkInDoneToday
-                  ? 'bg-teal-50 text-[#0D9488] border border-teal-200'
-                  : 'bg-[#0D9488] hover:bg-teal-700 text-white active:scale-95'
+                  ? 'bg-teal-50 dark:bg-teal-950/40 text-[#0D9488] border border-teal-200/80 dark:border-teal-800'
+                  : 'bg-[#0D9488] hover:bg-teal-700 text-white active:scale-95 shadow-2xs'
               }`}
             >
               {checkInDoneToday ? t('feed.checkedInBtn') : t('feed.checkInBtn')}
             </button>
           </div>
+
+          {/* Compact First-Time Welcome Strip if active */}
+          {showWelcomeFlow && (
+            <div className="bg-gradient-to-r from-teal-50/70 via-blue-50/60 to-amber-50/50 dark:from-stone-900 dark:to-stone-900 border border-teal-200/80 dark:border-stone-800 rounded-2xl p-3 shadow-2xs flex items-center justify-between gap-3 animate-in fade-in">
+              <div className="min-w-0">
+                <span className="text-xs font-bold text-stone-900 dark:text-stone-100 block truncate">
+                  Karibu WaveLink • Welcome! 🌿
+                </span>
+                <span className="text-[11px] text-stone-500 dark:text-stone-400 block truncate">
+                  Personalize your feed with East African creators and culture.
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleDismissWelcome();
+                    window.dispatchEvent(new CustomEvent('wavelink:open-interest-picker'));
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white text-xs font-bold hover:bg-blue-700 transition cursor-pointer"
+                >
+                  Pick Topics
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDismissWelcome}
+                  className="p-1 text-stone-400 hover:text-stone-600 transition cursor-pointer"
+                  title="Dismiss"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Slim Sparks Row */}
           <div className="w-full max-w-full overflow-hidden">
@@ -1901,25 +1862,62 @@ export const FeedView: React.FC<FeedViewProps> = ({
             )
           )}
 
-          {/* Center Main Feed: Calm Post Creation Card with ONE main button */}
-          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border border-[#EFECE6] rounded-3xl p-4 sm:p-5 shadow-xs transition">
+          {/* Large Friendly Composer Box for First-Time & Non-Technical Users */}
+          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border-2 border-stone-200/90 rounded-3xl p-4 sm:p-5 shadow-sm transition">
+            {/* Friendly Greeting Header */}
+            <div className="flex items-center justify-between mb-3.5 pb-2 border-b border-stone-100 flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">🌿</span>
+                <h3 className="text-sm sm:text-base font-black text-stone-900 tracking-tight">
+                  {language === 'sw'
+                    ? 'Shiriki kitu na marafiki zako'
+                    : 'Share something with your friends'}
+                </h3>
+              </div>
+              {selectedFeeling && (
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 text-amber-900 border border-amber-300 text-xs font-bold shadow-2xs">
+                  <span>{selectedFeeling.emoji}</span>
+                  <span>{language === 'sw' ? `anajihisi ${selectedFeeling.labelSw}` : `feeling ${selectedFeeling.labelEn}`}</span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedFeeling(null)}
+                    className="ml-1 text-amber-600 hover:text-amber-900 cursor-pointer"
+                    aria-label="Remove feeling"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              )}
+            </div>
+
             <div className="flex items-start gap-3">
-              <img
+              <Avatar
+                uid={currentUser?.uid}
                 src={
                   userProfile?.photoURL ||
                   currentUser?.photoURL ||
                   `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
                 }
                 alt="User"
-                className="w-10 h-10 sm:w-11 sm:h-11 rounded-full object-cover ring-2 ring-[#2563EB]/15 shrink-0 mt-0.5"
+                fallbackName={userProfile?.displayName || currentUser?.displayName || 'Waver'}
+                size={44}
+                showStatus={true}
+                onlyWhenVisible={false}
+                targetProfile={userProfile}
+                ringClassName="ring-2 ring-[#2563EB]/20"
+                className="mt-0.5"
               />
               <div className="flex-1 min-w-0">
                 <textarea
                   value={inlineContent}
                   onChange={(e) => setInlineContent(e.target.value)}
-                  placeholder={`${t('feed.whatsOnYourMind')}, ${userProfile?.displayName?.split(' ')[0] || 'Friend'}?`}
+                  placeholder={
+                    language === 'sw'
+                      ? 'Shiriki kitu na marafiki zako... unafikiria nini?'
+                      : 'Share something with your friends... what is on your mind?'
+                  }
                   rows={inlineContent || inlineMediaPreview ? 3 : 2}
-                  className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-3.5 border border-[#EFECE6] resize-none text-base text-[#1C1917] placeholder-[#A8A29E] focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition"
+                  className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-4 border border-[#EFECE6] resize-none text-base text-[#1C1917] placeholder-stone-500 focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition font-medium"
                 />
 
                 {/* Phase 3: Suggested Hashtags based on picked interests */}
@@ -2112,8 +2110,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   </div>
                 )}
 
-                <div className="flex items-center justify-between pt-3 mt-2 border-t border-[#EFECE6] flex-wrap gap-2">
-                  <div className="flex items-center gap-2">
+                <div className="flex items-center justify-between pt-3.5 mt-2.5 border-t border-[#EFECE6] flex-wrap gap-2.5">
+                  <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
                     <input
                       type="file"
                       ref={fileInputRef}
@@ -2128,27 +2126,36 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       accept="video/*,.mp4,.mov,.webm,.m4v,.3gp,.mkv"
                       onChange={handleMediaSelect}
                     />
+
+                    {/* Big Photo Button */}
                     <button
                       type="button"
-                      onClick={() => {
-                        fileInputRef.current?.click();
-                      }}
-                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#2563EB] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-blue-50/90 hover:bg-blue-100 text-[#2563EB] border border-blue-200/90 text-xs sm:text-sm font-extrabold flex items-center gap-2 transition active:scale-95 cursor-pointer shadow-2xs"
                     >
-                      <ImageIcon size={16} />
-                      <span>{t('feed.photo')}</span>
+                      <ImageIcon size={18} className="text-[#2563EB]" />
+                      <span>{language === 'sw' ? 'Picha' : 'Photo'}</span>
                     </button>
 
+                    {/* Big Video Button */}
                     <button
                       type="button"
-                      onClick={() => {
-                        videoInputRef.current?.click();
-                      }}
+                      onClick={() => videoInputRef.current?.click()}
                       title={`Upload video up to ${maxVideoSeconds}s (${MAX_VIDEO_RAW_MB} MB max)`}
-                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] hover:bg-[#F5F1EA] text-[#0D9488] border border-[#EFECE6] text-xs font-bold flex items-center gap-1.5 transition active:scale-95"
+                      className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-teal-50/90 hover:bg-teal-100 text-[#0D9488] border border-teal-200/90 text-xs sm:text-sm font-extrabold flex items-center gap-2 transition active:scale-95 cursor-pointer shadow-2xs"
                     >
-                      <VideoIcon size={16} />
-                      <span>{t('feed.video')} ({maxVideoSeconds}s)</span>
+                      <VideoIcon size={18} className="text-[#0D9488]" />
+                      <span>{language === 'sw' ? 'Video' : 'Video'}</span>
+                    </button>
+
+                    {/* Big Feeling Button */}
+                    <button
+                      type="button"
+                      onClick={() => setIsFeelingPickerOpen(true)}
+                      className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-amber-50/90 hover:bg-amber-100 text-[#D97706] border border-amber-200/90 text-xs sm:text-sm font-extrabold flex items-center gap-2 transition active:scale-95 cursor-pointer shadow-2xs"
+                    >
+                      <Smile size={18} className="text-[#D97706]" />
+                      <span>{language === 'sw' ? 'Hisia' : 'Feeling'}</span>
                     </button>
                   </div>
 
@@ -2157,14 +2164,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     type="button"
                     onClick={handleCreatePost}
                     disabled={isSubmittingPost || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)}
-                    className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition"
+                    className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-md shadow-blue-500/20 active:scale-95 transition cursor-pointer"
                   >
                     {isSubmittingPost ? (
                       <span>{t('feed.sharing')}</span>
                     ) : (
                       <>
-                        <Send size={15} />
-                        <span>{t('feed.shareWave')}</span>
+                        <Send size={16} />
+                        <span>{language === 'sw' ? 'Chapisha' : 'Post Wave'}</span>
                       </>
                     )}
                   </button>
@@ -2172,6 +2179,53 @@ export const FeedView: React.FC<FeedViewProps> = ({
               </div>
             </div>
           </div>
+
+          {/* Friendly Feeling Picker Modal */}
+          {isFeelingPickerOpen && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="How are you feeling?"
+              className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/50 backdrop-blur-xs animate-in fade-in"
+            >
+              <div className="w-full max-w-sm bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-3xl p-5 shadow-2xl relative space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-stone-100 dark:border-stone-800">
+                  <div className="flex items-center gap-2">
+                    <Smile size={20} className="text-[#D97706]" />
+                    <h3 className="font-extrabold text-base text-stone-900 dark:text-stone-100">
+                      {language === 'sw' ? 'Unajisikiaje sasa hivi?' : 'How are you feeling?'}
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsFeelingPickerOpen(false)}
+                    className="p-1 rounded-lg text-stone-400 hover:text-stone-700 cursor-pointer"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  {FEELING_OPTIONS.map((f) => (
+                    <button
+                      key={f.labelEn}
+                      type="button"
+                      onClick={() => {
+                        setSelectedFeeling(f);
+                        setIsFeelingPickerOpen(false);
+                      }}
+                      className="min-h-[48px] p-3 rounded-2xl bg-stone-50 hover:bg-amber-50 dark:bg-stone-800 dark:hover:bg-amber-950/40 border border-stone-200/80 dark:border-stone-700 text-left flex items-center gap-2.5 transition active:scale-95 cursor-pointer"
+                    >
+                      <span className="text-2xl">{f.emoji}</span>
+                      <span className="text-xs font-bold text-stone-800 dark:text-stone-200">
+                        {language === 'sw' ? f.labelSw : f.labelEn}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Feed Reading Progress Strip above Posts Stream */}
           {!isLoading && combinedFeed.length > 0 && (
@@ -2462,168 +2516,512 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   );
                 }
 
-                // Case B: Standard Community Wave Post (with Boosting & Tipping)
+                // Case B: Standard Community Wave Post (Glassmorphism Video/Photo Post Card)
+                const hasVideoMedia = Boolean(
+                  post.videoUrl || post.hasVideoChunks || post.mediaType === 'video'
+                );
+                const hasImageMedia = Boolean(
+                  (post.imageUrl || (post.imageUrls && post.imageUrls.length > 0)) && !hasVideoMedia
+                );
+                const hasAnyMedia = hasVideoMedia || hasImageMedia;
+                const likedByInfo = getLikedByInfo(post);
+                const isMenuOpen = openPostMenuId === post.id;
+                const authorAvatarUrl =
+                  post.authorPhotoURL ||
+                  `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`;
+
+                const handleSelectAuthorProfile = () => {
+                  window.dispatchEvent(
+                    new CustomEvent('wavelink:open-profile', {
+                      detail: { userId: post.authorId, username: post.authorUsername },
+                    })
+                  );
+                };
+
+                const isAuthorInViewport = visibleFeedPostIds.includes(post.id);
+
                 return (
                   <article
                     key={post.id}
                     data-wave-feed-item="true"
-                    className={`w-full max-w-full overflow-hidden break-words bg-[#FFFFFF] border rounded-3xl p-5 sm:p-6 shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] transition ${
-                      post.isBoosted
-                        ? 'border-amber-400 ring-2 ring-amber-400/20 shadow-md shadow-amber-500/10'
-                        : 'border-slate-200/90 hover:border-blue-300/80 hover:shadow-[0_8px_28px_-4px_rgba(15,23,42,0.08)]'
+                    data-post-id={post.id}
+                    className={`wavelink-glass-post-card wavelink-card-enter relative w-full max-w-full overflow-visible break-words rounded-[28px] sm:rounded-[32px] p-3.5 sm:p-5 transition ${
+                      post.isBoosted ? 'ring-2 ring-amber-400/50' : ''
                     }`}
                   >
-                    {/* Author Header */}
-                    <div className="flex items-center justify-between mb-4">
-                      <div className="flex items-center gap-3">
-                        <img
-                          src={
-                            post.authorPhotoURL ||
-                            `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`
-                          }
-                          alt={post.authorName}
-                          className="w-10 h-10 rounded-full object-cover ring-2 ring-[#3B82F6]/20"
-                        />
-                        <div>
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <CrystalBadge
-                              userId={post.authorId}
-                              email={post.authorEmail}
-                              name={post.authorName}
-                              isBot={post.authorId === SUPPORT_BOT_ID}
-                              size="md"
-                            />
-                            {post.authorUsername && (
-                              <span className="text-xs font-mono text-[#3B82F6] font-semibold">
-                                {post.authorUsername}
-                              </span>
-                            )}
-                            {/* Golden Boosted Badge */}
-                            {post.isBoosted && (
-                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-xs">
-                                <Rocket size={10} className="fill-white" />
-                                <span>Boosted</span>
-                              </span>
-                            )}
-                            {/* Tips received count */}
-                            {Boolean(post.tipsTotalTZS && post.tipsTotalTZS > 0) && (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-300/50">
-                                <HandCoins size={10} />
-                                <span>TZS {post.tipsTotalTZS?.toLocaleString()} tips</span>
-                              </span>
-                            )}
-                          </div>
-                          <div className="flex items-center gap-1.5 text-xs text-slate-400 mt-0.5 flex-wrap">
-                            <span className="font-mono tabular-numbers">
-                              {new Date(post.createdAt).toLocaleDateString(undefined, {
-                                month: 'short',
-                                day: 'numeric',
-                                hour: '2-digit',
-                                minute: '2-digit'
-                              })}
-                            </span>
-                            {post.locationTag && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="text-slate-500 font-medium truncate max-w-[140px]">
-                                  {post.locationTag}
-                                </span>
-                              </>
-                            )}
-                            {post.audience && post.audience !== 'public' && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="text-[#0D9488] font-semibold">
-                                  {post.audience === 'close_friends' ? 'Close friends' : 'Followers'}
-                                </span>
-                              </>
-                            )}
-                            <span aria-hidden="true">·</span>
-                            <button
-                              type="button"
-                              onClick={() => handleOpenPostDetail(post)}
-                              className="inline-flex items-center gap-1 text-[#2563EB] hover:underline font-semibold"
-                              title="Open Post Detail Reader View"
-                            >
-                              <Eye size={11} />
-                              <span>Read View</span>
-                            </button>
-                          </div>
-                        </div>
-                      </div>
+                    {/* Compact Context Menu Dropdown triggered by the "..." round glass button */}
+                    {isMenuOpen && (
+                      <div
+                        role="menu"
+                        aria-label="Post options"
+                        className="wavelink-glass-overlay-pill absolute top-14 right-5 z-40 w-56 rounded-3xl p-2 shadow-2xl border border-white/25 text-white space-y-1 animate-in fade-in zoom-in-95 duration-150"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenPostMenuId(null);
+                            handleOpenAiInfo(post);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
+                        >
+                          <Sparkles size={14} className="text-teal-300 shrink-0" />
+                          <span>{language === 'sw' ? 'Muhtasari wa WELINK AI' : 'AI Info & Summary'}</span>
+                        </button>
 
-                      <div className="flex items-center gap-1.5">
-                        {/* Boost Button for Author if not yet boosted */}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenPostMenuId(null);
+                            handleOpenPostDetail(post);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
+                        >
+                          <Eye size={14} className="text-sky-300 shrink-0" />
+                          <span>{language === 'sw' ? 'Soma kwa Ukubwa' : 'Read View'}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenPostMenuId(null);
+                            setPostsForSpark([post]);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
+                        >
+                          <Flame size={14} className="text-amber-300 shrink-0" />
+                          <span>{t('feed.addToSpark')}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenPostMenuId(null);
+                            setTippingPost(post);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
+                        >
+                          <HandCoins size={14} className="text-emerald-300 shrink-0" />
+                          <span>
+                            {t('feed.tip')} {post.tipsCount ? `(${post.tipsCount})` : ''}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenPostMenuId(null);
+                            handleDownloadPost(post);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
+                        >
+                          <Download size={14} className="text-white/80 shrink-0" />
+                          <span>{language === 'sw' ? 'Pakua' : 'Download Wave'}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenPostMenuId(null);
+                            copyPostLink(post.id);
+                          }}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
+                        >
+                          <Share2 size={14} className="text-white/80 shrink-0" />
+                          <span>{copiedId === post.id ? 'Copied Link!' : 'Copy Wave Link'}</span>
+                        </button>
+
                         {isAuthor && !post.isBoosted && (
                           <button
-                            onClick={() => setBoostingPost(post)}
-                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl text-[11px] font-bold bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-300/60 transition active:scale-95 shadow-2xs"
-                            title="Boost Post Reach for 2,000 TZS micro-payment"
+                            type="button"
+                            onClick={() => {
+                              setOpenPostMenuId(null);
+                              setBoostingPost(post);
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-amber-500/25 flex items-center gap-2.5 text-xs font-bold text-amber-300 text-left transition cursor-pointer"
                           >
-                            <Rocket size={12} className="text-amber-500" />
-                            <span>Boost (2k)</span>
+                            <Rocket size={14} className="shrink-0" />
+                            <span>Boost Wave (2k TZS)</span>
                           </button>
                         )}
 
                         {canEdit && (
                           <button
-                            onClick={() => handleStartEditPost(post)}
-                            className="p-1.5 text-slate-400 hover:text-[#3B82F6] rounded-xl transition"
-                            title="Edit Wave Content (Pro Privilege)"
+                            type="button"
+                            onClick={() => {
+                              setOpenPostMenuId(null);
+                              handleStartEditPost(post);
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
                           >
-                            <Edit2 size={15} />
+                            <Edit2 size={14} className="text-sky-300 shrink-0" />
+                            <span>Edit Wave</span>
                           </button>
                         )}
 
-                        {/* Report & Block buttons for non-authors */}
                         {!isAuthor && post.authorId !== SUPPORT_BOT_ID && (
                           <>
                             <button
                               type="button"
                               onClick={() => {
+                                setOpenPostMenuId(null);
                                 setReportingPost(post);
                                 setSelectedReportCategory('stolen_content');
                                 setReportExtraNote('');
                               }}
-                              className="p-1.5 text-slate-400 hover:text-amber-600 rounded-xl transition cursor-pointer"
-                              title={language === 'sw' ? 'Ripoti Chapisho' : 'Report Post'}
+                              className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-amber-500/20 flex items-center gap-2.5 text-xs font-bold text-amber-200 text-left transition cursor-pointer"
                             >
-                              <Flag size={15} />
+                              <Flag size={14} className="shrink-0" />
+                              <span>{language === 'sw' ? 'Ripoti Chapisho' : 'Report Post'}</span>
                             </button>
                             <button
                               type="button"
                               onClick={async () => {
+                                setOpenPostMenuId(null);
                                 await toggleBlockUser(post.authorId);
                                 setPostNotice({
                                   type: 'success',
                                   text:
                                     language === 'sw'
-                                      ? `Umemzuia ${post.authorName}. Unaweza kudhibiti watumiaji uliowazuia kwenye Mipangilio ya Faragha.`
-                                      : `Blocked ${post.authorName}. You can manage blocked users in Privacy Settings.`
+                                      ? `Umemzuia ${post.authorName}.`
+                                      : `Blocked ${post.authorName}.`,
                                 });
                                 setTimeout(() => setPostNotice(null), 3500);
                               }}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition cursor-pointer"
-                              title={`Block ${post.authorName}`}
+                              className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-rose-500/25 flex items-center gap-2.5 text-xs font-bold text-rose-300 text-left transition cursor-pointer"
                             >
-                              <Ban size={15} />
+                              <Ban size={14} className="shrink-0" />
+                              <span>Block {post.authorName}</span>
                             </button>
                           </>
                         )}
 
                         {canDelete && (
                           <button
-                            onClick={() => handleDeletePost(post.id)}
-                            className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl transition"
-                            title={isAdmin && !isAuthor ? 'Admin Moderation: Delete' : 'Delete Post'}
+                            type="button"
+                            onClick={() => {
+                              setOpenPostMenuId(null);
+                              handleDeletePost(post.id);
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-rose-500/25 flex items-center gap-2.5 text-xs font-bold text-rose-300 text-left transition cursor-pointer"
                           >
-                            <Trash2 size={16} />
+                            <Trash2 size={14} className="shrink-0" />
+                            <span>Delete Wave</span>
                           </button>
                         )}
                       </div>
-                    </div>
+                    )}
 
-                    {/* Post Body with in-line click-to-edit and temporary input field */}
+                    {/* If the post has NO media (text-only wave), show the glass Author Pill + "..." + AI Info Pill at the top */}
+                    {!hasAnyMedia && (
+                      <div className="flex items-center justify-between gap-2 mb-3">
+                        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={handleSelectAuthorProfile}
+                            className="wavelink-glass-action-pill inline-flex items-center gap-2.5 pl-1.5 pr-3.5 py-1 rounded-full max-w-[75%] transition-transform active:scale-95 cursor-pointer"
+                          >
+                            <Avatar
+                              uid={post.authorId}
+                              src={authorAvatarUrl}
+                              alt={post.authorName}
+                              fallbackName={post.authorName}
+                              size={32}
+                              showStatus={isAuthorInViewport}
+                              onlyWhenVisible={false}
+                              className="shrink-0"
+                            />
+                            <div className="min-w-0 text-left">
+                              <CrystalBadge
+                                userId={post.authorId}
+                                email={post.authorEmail}
+                                name={post.authorName}
+                                isBot={post.authorId === SUPPORT_BOT_ID}
+                                size="sm"
+                              />
+                            </div>
+                          </button>
+
+                          {post.isBoosted && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-xs">
+                              <Rocket size={10} className="fill-white" />
+                              <span>Boosted</span>
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleOpenAiInfo(post)}
+                            className="wavelink-glass-action-pill wavelink-float-gentle inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-extrabold cursor-pointer transition-transform active:scale-95"
+                            title="Open WELINK AI caption & summary"
+                          >
+                            <Sparkles size={13} className="text-[#0D9488]" />
+                            <span>AI info</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setOpenPostMenuId((prev) => (prev === post.id ? null : post.id))
+                            }
+                            aria-label="More options"
+                            className="wavelink-glass-action-pill w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center cursor-pointer transition-transform active:scale-95"
+                          >
+                            <MoreHorizontal size={18} />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 1. FLOATING ROUNDED MEDIA FRAME (28px+ radius) FOR VIDEO OR PHOTO */}
+                    {hasVideoMedia && (
+                      <div className="mb-3.5">
+                        <VideoPlayer
+                          postId={post.id}
+                          videoUrl={post.videoUrl}
+                          hasVideoChunks={post.hasVideoChunks}
+                          thumbnailUrl={post.imageUrl || post.thumbnailUrl}
+                          duration={post.duration ?? post.videoDurationSeconds}
+                          videoWidth={post.videoWidth}
+                          videoHeight={post.videoHeight}
+                          aspectRatio={post.aspectRatio}
+                          showGlassOverlays={true}
+                          authorName={post.authorName}
+                          authorPhotoURL={authorAvatarUrl}
+                          authorId={post.authorId}
+                          showStatus={isAuthorInViewport}
+                          onAuthorClick={handleSelectAuthorProfile}
+                          onOpenMoreMenu={() =>
+                            setOpenPostMenuId((prev) => (prev === post.id ? null : post.id))
+                          }
+                          onOpenAiInfo={() => handleOpenAiInfo(post)}
+                        />
+                      </div>
+                    )}
+
+                    {hasImageMedia && (() => {
+                      const slides =
+                        post.imageUrls && post.imageUrls.length > 0
+                          ? post.imageUrls
+                          : post.imageUrl
+                          ? [post.imageUrl]
+                          : [];
+                      const activeSlideIdx = Math.min(
+                        slides.length - 1,
+                        Math.max(0, carouselIndices[post.id] || 0)
+                      );
+                      const currentImgUrl = slides[activeSlideIdx] || post.imageUrl!;
+                      const isFullImageUnlocked = Boolean(unlockedFullImages[post.id]);
+                      const displayImgUrl = getOptimizedImagePreviewUrl(
+                        currentImgUrl,
+                        isDataSaverOn,
+                        isFullImageUnlocked
+                      );
+                      const imgDims =
+                        preloadedDimensions[currentImgUrl] || getPreloadedMediaInfo(currentImgUrl);
+
+                      return (
+                        <div
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (isDataSaverOn && !isFullImageUnlocked) {
+                              setUnlockedFullImages((prev) => ({ ...prev, [post.id]: true }));
+                              return;
+                            }
+                            setLightboxState({
+                              images: slides.length > 0 ? slides : [currentImgUrl],
+                              initialIndex: activeSlideIdx,
+                              caption: post.content,
+                              authorName: post.authorName,
+                              authorUsername: post.authorUsername,
+                              authorPhotoURL: post.authorPhotoURL
+                            });
+                          }}
+                          className="wavelink-glass-media-frame relative rounded-[28px] overflow-hidden mb-3.5 max-h-[540px] min-h-[240px] bg-[#0C0A09] flex items-center justify-center group cursor-zoom-in"
+                          style={
+                            post.aspectRatio === '1:1'
+                              ? { aspectRatio: '1 / 1' }
+                              : post.aspectRatio === '4:5'
+                              ? { aspectRatio: '4 / 5' }
+                              : post.aspectRatio === '9:16'
+                              ? { aspectRatio: '9 / 16' }
+                              : imgDims
+                              ? {
+                                  aspectRatio: String(imgDims.aspectRatio),
+                                }
+                              : undefined
+                          }
+                        >
+                          {/* Soft blurred, darkened copy of the same photo filling empty side space */}
+                          <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
+                            <img
+                              src={displayImgUrl}
+                              alt=""
+                              className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
+                            />
+                            <div className="absolute inset-0 bg-black/25" />
+                          </div>
+
+                          <img
+                            src={displayImgUrl}
+                            alt="Wave attachment"
+                            decoding="async"
+                            onLoad={(e) => {
+                              const img = e.currentTarget;
+                              if (isDataSaverOn && !isFullImageUnlocked) {
+                                recordDataSavedBytes(320 * 1024);
+                              }
+                              if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                                handleMediaDimensionsReady(currentImgUrl, {
+                                  width: img.naturalWidth,
+                                  height: img.naturalHeight,
+                                  aspectRatio: img.naturalWidth / img.naturalHeight,
+                                  loadedAt: Date.now()
+                                });
+                              }
+                            }}
+                            style={
+                              imgDims && imgDims.width > 0 && imgDims.height > 0
+                                ? {
+                                    maxWidth: `min(100%, ${imgDims.width}px)`,
+                                    maxHeight: `min(540px, ${imgDims.height}px)`
+                                  }
+                                : undefined
+                            }
+                            className="relative z-10 w-full h-full max-h-[540px] object-contain transition-transform duration-300 group-hover:scale-[1.01]"
+                            onError={(e) => {
+                              (e.target as HTMLElement).style.display = 'none';
+                            }}
+                          />
+
+                          {/* Top-Left Author Glass Pill + Top-Right "..." Round Glass Button */}
+                          <div className="absolute top-3 left-3 right-3 z-20 flex items-center justify-between gap-2 pointer-events-none">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleSelectAuthorProfile();
+                              }}
+                              className="wavelink-glass-overlay-pill pointer-events-auto inline-flex items-center gap-2.5 pl-1.5 pr-3.5 py-1 rounded-full text-white text-xs sm:text-sm font-bold max-w-[74%] transition-transform active:scale-95 cursor-pointer"
+                            >
+                              <Avatar
+                                uid={post.authorId}
+                                src={authorAvatarUrl}
+                                alt={post.authorName}
+                                fallbackName={post.authorName}
+                                size={28}
+                                showStatus={isAuthorInViewport}
+                                onlyWhenVisible={false}
+                                className="shrink-0"
+                              />
+                              <span className="truncate drop-shadow-xs">{post.authorName}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setOpenPostMenuId((prev) => (prev === post.id ? null : post.id));
+                              }}
+                              aria-label="Post options"
+                              title="Post options"
+                              className="wavelink-glass-overlay-pill pointer-events-auto w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-white transition-transform active:scale-95 cursor-pointer"
+                            >
+                              <MoreHorizontal size={18} />
+                            </button>
+                          </div>
+
+                          {/* Bottom-Left "AI info" Glass Pill with Sparkle Icon */}
+                          <div className="absolute bottom-3.5 left-3.5 z-20 pointer-events-none">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleOpenAiInfo(post);
+                              }}
+                              aria-label="Open WELINK AI post summary"
+                              title="AI info — WELINK AI summary"
+                              className="wavelink-glass-overlay-pill wavelink-float-gentle pointer-events-auto inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-white text-xs font-extrabold tracking-wide transition-transform active:scale-95 cursor-pointer"
+                            >
+                              <Sparkles size={13} className="text-teal-300 shrink-0" />
+                              <span>AI info</span>
+                            </button>
+                          </div>
+
+                          {/* Phase 1 Data Saver Small Preview Pill (Tap to load full image) */}
+                          {isDataSaverOn && !isFullImageUnlocked && (
+                            <div className="absolute bottom-3.5 right-3.5 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/70 backdrop-blur-xs text-white text-[11px] font-bold border border-white/20 shadow-md pointer-events-none">
+                              <Zap size={12} className="text-teal-300" />
+                              <span>{t('datasaver.tapToLoadFullImage')}</span>
+                            </div>
+                          )}
+
+                          {slides.length > 1 && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCarouselIndices((prev) => ({
+                                    ...prev,
+                                    [post.id]:
+                                      activeSlideIdx > 0
+                                        ? activeSlideIdx - 1
+                                        : slides.length - 1,
+                                  }));
+                                }}
+                                aria-label="Previous photo"
+                                className="absolute left-2.5 top-1/2 -translate-y-1/2 z-20 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
+                              >
+                                ‹
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCarouselIndices((prev) => ({
+                                    ...prev,
+                                    [post.id]:
+                                      activeSlideIdx < slides.length - 1
+                                        ? activeSlideIdx + 1
+                                        : 0,
+                                  }));
+                                }}
+                                aria-label="Next photo"
+                                className="absolute right-2.5 top-1/2 -translate-y-1/2 z-20 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
+                              >
+                                ›
+                              </button>
+
+                              <div className="absolute bottom-3.5 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/45">
+                                {slides.map((_, idx) => (
+                                  <button
+                                    key={idx}
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setCarouselIndices((prev) => ({
+                                        ...prev,
+                                        [post.id]: idx,
+                                      }));
+                                    }}
+                                    aria-label={`Slide ${idx + 1}`}
+                                    className={`h-1.5 rounded-full transition-all cursor-pointer ${
+                                      idx === activeSlideIdx
+                                        ? 'w-4 bg-white'
+                                        : 'w-1.5 bg-white/50'
+                                    }`}
+                                  />
+                                ))}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Post Body with glass hashtag & mention chips */}
                     {post.content && (
                       <PostBody
                         postId={post.id}
@@ -2638,202 +3036,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         onStartEdit={() => setEditingPostId(post.id)}
                         onCancelEdit={() => setEditingPostId(null)}
                         onSaveContent={() => setEditingPostId(null)}
-                        className="mb-4"
+                        className="mb-3 px-1"
                       />
                     )}
 
-                    {/* Attached Video from Firestore (Chunked or Direct) */}
-                    {(post.videoUrl || post.hasVideoChunks || post.mediaType === 'video') && (
-                      <div className="mb-3 -mx-1 sm:mx-0">
-                        <VideoPlayer
-                          postId={post.id}
-                          videoUrl={post.videoUrl}
-                          hasVideoChunks={post.hasVideoChunks}
-                          thumbnailUrl={post.imageUrl || post.thumbnailUrl}
-                          duration={post.duration ?? post.videoDurationSeconds}
-                          videoWidth={post.videoWidth}
-                          videoHeight={post.videoHeight}
-                          aspectRatio={post.aspectRatio}
-                        />
-                      </div>
-                    )}
-
-                    {/* Attached Image or Multi-Photo Carousel from Firestore */}
-                    {(post.imageUrl || (post.imageUrls && post.imageUrls.length > 0)) &&
-                      !post.videoUrl &&
-                      !post.hasVideoChunks &&
-                      post.mediaType !== 'video' && (() => {
-                        const slides =
-                          post.imageUrls && post.imageUrls.length > 0
-                            ? post.imageUrls
-                            : post.imageUrl
-                            ? [post.imageUrl]
-                            : [];
-                        const activeSlideIdx = Math.min(
-                          slides.length - 1,
-                          Math.max(0, carouselIndices[post.id] || 0)
-                        );
-                        const currentImgUrl = slides[activeSlideIdx] || post.imageUrl!;
-                        const isFullImageUnlocked = Boolean(unlockedFullImages[post.id]);
-                        const displayImgUrl = getOptimizedImagePreviewUrl(
-                          currentImgUrl,
-                          isDataSaverOn,
-                          isFullImageUnlocked
-                        );
-                        const imgDims =
-                          preloadedDimensions[currentImgUrl] || getPreloadedMediaInfo(currentImgUrl);
-
-                        return (
-                          <div
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (isDataSaverOn && !isFullImageUnlocked) {
-                                setUnlockedFullImages((prev) => ({ ...prev, [post.id]: true }));
-                                return;
-                              }
-                              setLightboxState({
-                                images: slides.length > 0 ? slides : [currentImgUrl],
-                                initialIndex: activeSlideIdx,
-                                caption: post.content,
-                                authorName: post.authorName,
-                                authorUsername: post.authorUsername,
-                                authorPhotoURL: post.authorPhotoURL
-                              });
-                            }}
-                            className="relative rounded-2xl overflow-hidden mb-3 border border-slate-200/80 max-h-[540px] min-h-[200px] bg-[#0C0A09] flex items-center justify-center group cursor-zoom-in"
-                            style={
-                              post.aspectRatio === '1:1'
-                                ? { aspectRatio: '1 / 1' }
-                                : post.aspectRatio === '4:5'
-                                ? { aspectRatio: '4 / 5' }
-                                : post.aspectRatio === '9:16'
-                                ? { aspectRatio: '9 / 16' }
-                                : imgDims
-                                ? {
-                                    aspectRatio: String(imgDims.aspectRatio),
-                                  }
-                                : undefined
-                            }
-                          >
-                            {/* Soft blurred, darkened copy of the same photo filling empty side space so there are no black bars */}
-                            <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
-                              <img
-                                src={displayImgUrl}
-                                alt=""
-                                className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
-                              />
-                              <div className="absolute inset-0 bg-black/30" />
-                            </div>
-
-                            <img
-                              src={displayImgUrl}
-                              alt="Wave attachment"
-                              decoding="async"
-                              onLoad={(e) => {
-                                const img = e.currentTarget;
-                                if (isDataSaverOn && !isFullImageUnlocked) {
-                                  recordDataSavedBytes(320 * 1024);
-                                }
-                                if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-                                  handleMediaDimensionsReady(currentImgUrl, {
-                                    width: img.naturalWidth,
-                                    height: img.naturalHeight,
-                                    aspectRatio: img.naturalWidth / img.naturalHeight,
-                                    loadedAt: Date.now()
-                                  });
-                                }
-                              }}
-                              style={
-                                imgDims && imgDims.width > 0 && imgDims.height > 0
-                                  ? {
-                                      maxWidth: `min(100%, ${imgDims.width}px)`,
-                                      maxHeight: `min(540px, ${imgDims.height}px)`
-                                    }
-                                  : undefined
-                              }
-                              className="relative z-10 w-full h-full max-h-[540px] object-contain transition-transform duration-300 group-hover:scale-[1.01]"
-                              onError={(e) => {
-                                (e.target as HTMLElement).style.display = 'none';
-                              }}
-                            />
-
-                            {/* Phase 1 Data Saver Small Preview Pill (Tap to load full image) */}
-                            {isDataSaverOn && !isFullImageUnlocked && (
-                              <div className="absolute bottom-3 right-3 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/70 backdrop-blur-xs text-white text-[11px] font-bold border border-white/20 shadow-md pointer-events-none">
-                                <Zap size={12} className="text-teal-300" />
-                                <span>{t('datasaver.tapToLoadFullImage')}</span>
-                              </div>
-                            )}
-
-                            {slides.length > 1 && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setCarouselIndices((prev) => ({
-                                      ...prev,
-                                      [post.id]:
-                                        activeSlideIdx > 0
-                                          ? activeSlideIdx - 1
-                                          : slides.length - 1,
-                                    }));
-                                  }}
-                                  aria-label="Previous photo"
-                                  className="absolute left-2.5 top-1/2 -translate-y-1/2 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
-                                >
-                                  ‹
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setCarouselIndices((prev) => ({
-                                      ...prev,
-                                      [post.id]:
-                                        activeSlideIdx < slides.length - 1
-                                          ? activeSlideIdx + 1
-                                          : 0,
-                                    }));
-                                  }}
-                                  aria-label="Next photo"
-                                  className="absolute right-2.5 top-1/2 -translate-y-1/2 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
-                                >
-                                  ›
-                                </button>
-
-                                <div className="absolute top-3 right-3 px-2.5 py-1 rounded-full bg-black/60 text-white text-[11px] font-mono font-bold tabular-nums">
-                                  {activeSlideIdx + 1}/{slides.length}
-                                </div>
-
-                                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/45">
-                                  {slides.map((_, idx) => (
-                                    <button
-                                      key={idx}
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setCarouselIndices((prev) => ({
-                                          ...prev,
-                                          [post.id]: idx,
-                                        }));
-                                      }}
-                                      aria-label={`Slide ${idx + 1}`}
-                                      className={`h-1.5 rounded-full transition-all cursor-pointer ${
-                                        idx === activeSlideIdx
-                                          ? 'w-4 bg-white'
-                                          : 'w-1.5 bg-white/50'
-                                      }`}
-                                    />
-                                  ))}
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        );
-                      })()}
-
-                    {/* In-Post Music Player INSIDE each post card, directly UNDER the media */}
+                    {/* In-Post Glass Music Pill INSIDE each post card (only one post plays audio at a time) */}
                     {post.songPreviewUrl && post.songTitle && (
                       <div className="mb-3.5">
                         <SongPlayerCard
@@ -2842,88 +3049,140 @@ export const FeedView: React.FC<FeedViewProps> = ({
                           albumArt={post.songAlbumArt}
                           previewUrl={post.songPreviewUrl}
                           albumName={post.songAlbumName}
-                          defaultMuted={Boolean(
-                            post.videoUrl || post.hasVideoChunks || post.mediaType === 'video'
-                          )}
+                          defaultMuted={hasVideoMedia}
                           startTime={post.songStartTime}
                           volume={post.songVolume}
                         />
                       </div>
                     )}
 
-                    {/* Action Bar */}
-                    <div className="flex items-center justify-between pt-3 border-t border-slate-100 text-xs font-semibold text-slate-500 flex-wrap gap-2">
-                      <div className="flex items-center gap-2 sm:gap-2.5 flex-wrap">
-                        {/* Reactions: Like 👍, Heart ❤️, Fire 🔥 */}
-                        {renderReactionBar(post)}
-
-                        {/* Comments */}
-                        <button
-                          onClick={() => toggleComments(post.id)}
-                          className={`flex items-center gap-1.5 py-1.5 px-3 rounded-xl transition ${
-                            isExpanded
-                              ? 'text-[#3B82F6] bg-blue-50 font-semibold'
-                              : 'hover:bg-slate-100'
-                          }`}
-                        >
-                          <MessageCircle size={16} />
-                          <span className="font-mono tabular-numbers">{post.commentsCount || 0} {t('feed.replies')}</span>
-                        </button>
-
-                        {/* Creator Tip Button */}
-                        <button
-                          onClick={() => setTippingPost(post)}
-                          className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl transition hover:bg-amber-50 text-amber-700 font-bold active:scale-95 border border-amber-300/50"
-                          title="Tip creator directly via Mobile Money"
-                        >
-                          <HandCoins size={15} className="text-amber-500" />
-                          <span>{t('feed.tip')} {post.tipsCount ? `(${post.tipsCount})` : ''}</span>
-                        </button>
-
-                        {/* Save / Bookmark */}
-                        <button
-                          onClick={() => handleToggleSave(post.id)}
-                          className={`flex items-center gap-1.5 py-1.5 px-3 rounded-xl transition active:scale-95 ${
-                            isSaved
-                              ? 'text-[#3B82F6] bg-blue-50 font-bold'
-                              : 'hover:bg-slate-100'
-                          }`}
-                          title={isSaved ? 'Saved to bookmarks' : 'Save post'}
-                        >
-                          <Bookmark size={16} className={isSaved ? 'fill-[#3B82F6] text-[#3B82F6]' : ''} />
-                          <span className="font-mono tabular-numbers">{post.savesCount || 0}</span>
-                        </button>
-
-                        {/* Add Post to Your Multi-Spark */}
-                        <button
-                          type="button"
-                          onClick={() => setPostsForSpark([post])}
-                          className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl transition hover:bg-teal-50 text-[#0D9488] font-bold active:scale-95 border border-teal-200/70"
-                          title="Add this post (and more) to your 24-hour Spark"
-                        >
-                          <Flame size={15} className="text-[#0D9488]" />
-                          <span>{t('feed.addToSpark')}</span>
-                        </button>
+                    {/* BELOW THE MEDIA: Overlapping small avatars with "Liked by Name & others" in short text */}
+                    <div className="flex items-center justify-between gap-2 px-1 mb-2.5">
+                      <div className="flex items-center gap-2 min-w-0">
+                        {likedByInfo.avatars.length > 0 ? (
+                          <div className="flex items-center -space-x-2 shrink-0">
+                            {likedByInfo.avatars.map((avatarUrl, idx) => (
+                              <img
+                                key={idx}
+                                src={avatarUrl}
+                                alt=""
+                                className="w-6 h-6 rounded-full object-cover ring-2 ring-white/80 dark:ring-slate-900 shadow-2xs"
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <img
+                            src={authorAvatarUrl}
+                            alt=""
+                            className="w-5 h-5 rounded-full object-cover ring-1 ring-white/60 shrink-0 opacity-85"
+                          />
+                        )}
+                        <p className="text-xs italic font-medium text-[var(--text-secondary)] truncate">
+                          {likedByInfo.totalReactions > 1 && likedByInfo.firstLikerName ? (
+                            <>
+                              {language === 'sw' ? 'Imependwa na ' : 'Liked by '}
+                              <span className="font-bold not-italic text-[var(--text-primary)]">
+                                {likedByInfo.firstLikerName}
+                              </span>
+                              {language === 'sw' ? ' na wengine' : ' & others'}
+                            </>
+                          ) : likedByInfo.totalReactions === 1 && likedByInfo.firstLikerName ? (
+                            <>
+                              {language === 'sw' ? 'Imependwa na ' : 'Liked by '}
+                              <span className="font-bold not-italic text-[var(--text-primary)]">
+                                {likedByInfo.firstLikerName}
+                              </span>
+                            </>
+                          ) : (
+                            <span>
+                              {post.authorName}
+                              {post.locationTag ? ` · ${post.locationTag}` : ''}
+                            </span>
+                          )}
+                        </p>
                       </div>
 
-                      <div className="flex items-center gap-1">
+                      {/* Subtle Boosted / Tips pill if present */}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {post.isBoosted && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-2xs">
+                            <Rocket size={10} className="fill-white" />
+                            <span>Boosted</span>
+                          </span>
+                        )}
+                        {Boolean(post.tipsTotalTZS && post.tipsTotalTZS > 0) && (
+                          <span className="wavelink-glass-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                            <HandCoins size={10} className="text-amber-500" />
+                            <span>TZS {post.tipsTotalTZS?.toLocaleString()}</span>
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* ROW OF GLASS PILL BUTTONS: Heart + count, Comment + count, Share + count, and Bookmark on the right */}
+                    <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {/* 1. Heart + Count Glass Pill (with spring animation & glow on press) */}
+                        {renderReactionBar(post)}
+
+                        {/* 2. Comment + Count Glass Pill (Opens Frosted Comments Sheet) */}
                         <button
                           type="button"
-                          onClick={() => handleDownloadPost(post)}
-                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
-                          title="Download post image or text"
+                          onClick={() => setActiveCommentsPost(post)}
+                          className={`wavelink-glass-action-pill min-h-[40px] px-3.5 py-1.5 rounded-full inline-flex items-center gap-1.5 text-xs font-extrabold transition-transform active:scale-95 cursor-pointer select-none ${
+                            activeCommentsPost?.id === post.id || isExpanded
+                              ? 'ring-1 ring-[#2563EB]/60 text-[#2563EB]'
+                              : ''
+                          }`}
+                          aria-label={`Comments (${post.commentsCount || 0})`}
                         >
-                          <Download size={14} />
-                          <span>{t('feed.download')}</span>
+                          <MessageCircle size={15} className="shrink-0 opacity-85" />
+                          <span className="font-mono tabular-nums">
+                            {(post.commentsCount || 0).toLocaleString()}
+                          </span>
                         </button>
+
+                        {/* 3. Share + Count Glass Pill (Opens Frosted Share Sheet) */}
                         <button
                           type="button"
                           onClick={() => handleSharePost(post)}
-                          className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
-                          title="Share on WhatsApp or Web Share"
+                          className="wavelink-glass-action-pill min-h-[40px] px-3.5 py-1.5 rounded-full inline-flex items-center gap-1.5 text-xs font-extrabold transition-transform active:scale-95 cursor-pointer select-none"
+                          title="Share wave"
+                          aria-label="Share post"
                         >
-                          <Share2 size={14} />
-                          <span>{t('feed.share')} {post.sharesCount ? `(${post.sharesCount})` : ''}</span>
+                          <Send size={14} className="shrink-0 opacity-85 -rotate-12" />
+                          <span className="font-mono tabular-nums">
+                            {(post.sharesCount || 0).toLocaleString()}
+                          </span>
+                        </button>
+
+                        {/* Compact Tip Glass Pill */}
+                        <button
+                          type="button"
+                          onClick={() => setTippingPost(post)}
+                          className="wavelink-glass-action-pill min-h-[40px] px-3 py-1.5 rounded-full hidden sm:inline-flex items-center gap-1 text-xs font-bold transition-transform active:scale-95 cursor-pointer"
+                          title="Tip creator directly via Mobile Money"
+                        >
+                          <HandCoins size={14} className="text-amber-500" />
+                          <span>{t('feed.tip')}</span>
+                        </button>
+                      </div>
+
+                      {/* Right: Bookmark Glass Button */}
+                      <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleSave(post.id)}
+                          className={`wavelink-glass-action-pill w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center transition-transform active:scale-95 cursor-pointer ${
+                            isSaved ? 'ring-1 ring-[#2563EB]/60 text-[#2563EB]' : ''
+                          }`}
+                          title={isSaved ? 'Saved to bookmarks' : 'Save post'}
+                          aria-label="Bookmark post"
+                        >
+                          <Bookmark
+                            size={15}
+                            className={isSaved ? 'fill-current text-[#2563EB]' : ''}
+                          />
                         </button>
                       </div>
                     </div>
@@ -2972,13 +3231,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                 key={comment.id}
                                 className="flex items-start gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] text-xs"
                               >
-                                <img
+                                <Avatar
+                                  uid={comment.authorId}
                                   src={
                                     comment.authorPhotoURL ||
                                     `https://api.dicebear.com/7.x/shapes/svg?seed=${comment.authorId}`
                                   }
                                   alt={comment.authorName}
-                                  className="w-7 h-7 rounded-full object-cover ring-1 ring-blue-500/20 shrink-0 mt-0.5"
+                                  fallbackName={comment.authorName}
+                                  size={28}
+                                  showStatus={true}
+                                  ringClassName="ring-1 ring-blue-500/20"
+                                  className="mt-0.5"
                                 />
                                 <div className="flex-1">
                                   <div className="flex items-center justify-between">
@@ -3044,8 +3308,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
           <LegalFooter className="mt-6" />
         </div>
 
-        {/* Right Sidebar (Desktop Width >= 768px: 3rd Column, Width < 768px: hidden md:block) */}
-        <RightSidebar onNavigateTab={(tab) => onNavigateTab && onNavigateTab(tab as any)} />
+        {/* Right Sidebar: 3rd Column on Desktop (Trending, Weekly Challenge, Suggested Creators) */}
+        <RightSidebar
+          onNavigateTab={(tab) => onNavigateTab && onNavigateTab(tab as any)}
+          onSelectHashtag={(tag) => setInternalFilterTag(tag)}
+          onJoinChallenge={(tag) => {
+            setInlineContent((prev) =>
+              prev.includes(tag) ? prev : `${prev.trim() ? `${prev.trim()} ` : ''}${tag} `
+            );
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }}
+        />
       </div>
 
       {/* Mobile Money Payment Modal */}
@@ -3271,13 +3544,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
               className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4"
             >
               <div className="flex items-center gap-3">
-                <img
+                <Avatar
+                  uid={focusedPost.authorId}
                   src={
                     focusedPost.authorPhotoURL ||
                     `https://api.dicebear.com/7.x/shapes/svg?seed=${focusedPost.authorId}`
                   }
                   alt={focusedPost.authorName}
-                  className="w-11 h-11 rounded-full object-cover ring-2 ring-[#2563EB]/20"
+                  fallbackName={focusedPost.authorName}
+                  size={44}
+                  showStatus={true}
+                  onlyWhenVisible={false}
+                  ringClassName="ring-2 ring-[#2563EB]/20"
                 />
                 <div>
                   <CrystalBadge
@@ -3410,13 +3688,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         key={comment.id}
                         className="flex items-start gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] text-xs"
                       >
-                        <img
+                        <Avatar
+                          uid={comment.authorId}
                           src={
                             comment.authorPhotoURL ||
                             `https://api.dicebear.com/7.x/shapes/svg?seed=${comment.authorId}`
                           }
                           alt={comment.authorName}
-                          className="w-7 h-7 rounded-full object-cover shrink-0 mt-0.5"
+                          fallbackName={comment.authorName}
+                          size={28}
+                          showStatus={true}
+                          className="mt-0.5"
                         />
                         <div className="flex-1">
                           <div className="flex items-center justify-between">
@@ -3463,6 +3745,135 @@ export const FeedView: React.FC<FeedViewProps> = ({
           <span>{toastNotice.message}</span>
         </div>
       )}
+      {/* Frosted-Glass WELINK AI Info Sheet (Loaded ONLY on tap, zero Firestore reads) */}
+      {activeAiInfoPost && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="WELINK AI Wave Summary"
+          onClick={() => setActiveAiInfoPost(null)}
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/45 backdrop-blur-xs animate-in fade-in"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="wavelink-share-sheet w-full sm:max-w-md rounded-t-[28px] sm:rounded-[28px] p-5 space-y-4 border border-white/25 shadow-2xl"
+          >
+            <div className="wavelink-sheet-drag-handle sm:hidden" />
+
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-sm shrink-0">
+                  <Sparkles size={16} />
+                </div>
+                <div className="min-w-0">
+                  <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#0D9488] block">
+                    WELINK AI · Wave Insight
+                  </span>
+                  <h3 className="text-sm sm:text-base font-extrabold text-[var(--text-primary)] truncate">
+                    {activeAiInfoPost.authorName}
+                  </h3>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setActiveAiInfoPost(null)}
+                aria-label="Close AI info"
+                className="w-9 h-9 min-w-[36px] min-h-[36px] rounded-full bg-slate-200/70 dark:bg-white/10 text-[var(--text-primary)] flex items-center justify-center transition-transform active:scale-95 cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* AI Summary Card */}
+            <div className="p-3.5 rounded-2xl bg-white/65 dark:bg-white/10 border border-white/40 dark:border-white/15 space-y-2.5">
+              {aiInfoSummaryMap[activeAiInfoPost.id]?.loading ? (
+                <div className="flex items-center gap-2.5 py-3 text-xs font-bold text-[var(--text-secondary)]">
+                  <RefreshCw size={15} className="animate-spin text-[#2563EB]" />
+                  <span>
+                    {language === 'sw'
+                      ? 'WELINK AI inatayarisha muhtasari wa chapisho...'
+                      : 'WELINK AI is summarizing this wave...'}
+                  </span>
+                </div>
+              ) : (
+                <p className="text-sm text-[var(--text-primary)] leading-relaxed font-medium">
+                  {aiInfoSummaryMap[activeAiInfoPost.id]?.text ||
+                    activeAiInfoPost.content ||
+                    (language === 'sw'
+                      ? `Chapisho la ${activeAiInfoPost.authorName} kwenye WaveLink.`
+                      : `Wave shared by ${activeAiInfoPost.authorName} on WaveLink.`)}
+                </p>
+              )}
+
+              {/* Hashtag Glass Chips */}
+              {(aiInfoSummaryMap[activeAiInfoPost.id]?.tags || []).length > 0 && (
+                <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                  {(aiInfoSummaryMap[activeAiInfoPost.id]?.tags || []).map((tag) => (
+                    <button
+                      key={tag}
+                      type="button"
+                      onClick={() => {
+                        setActiveAiInfoPost(null);
+                        setInternalFilterTag(tag);
+                        window.scrollTo({ top: 0, behavior: 'smooth' });
+                      }}
+                      className="wavelink-glass-chip px-2.5 py-0.5 rounded-full text-xs font-bold text-[#2563EB] dark:text-sky-300 transition-transform active:scale-95 cursor-pointer"
+                    >
+                      {tag}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Quick Stats Pill Row matching the reference right-hand card */}
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="wavelink-glass-action-pill px-3 py-1 rounded-full text-xs font-extrabold">
+                  ❤️ {getReactionData(activeAiInfoPost).counts.total.toLocaleString()} Likes
+                </span>
+                <span className="wavelink-glass-action-pill px-3 py-1 rounded-full text-xs font-extrabold">
+                  💬 {(activeAiInfoPost.commentsCount || 0).toLocaleString()} Comments
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const target = activeAiInfoPost;
+                  setActiveAiInfoPost(null);
+                  window.dispatchEvent(
+                    new CustomEvent('wavelink:open-profile', {
+                      detail: { userId: target.authorId, username: target.authorUsername },
+                    })
+                  );
+                }}
+                className="px-3.5 py-1.5 rounded-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white text-xs font-extrabold shadow-xs transition-transform active:scale-95 cursor-pointer"
+              >
+                {language === 'sw' ? 'Tazama Wasifu' : 'View Profile'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Frosted-Glass Comments Sheet (Mobile Bottom Sheet / Desktop Right-Side Panel) */}
+      <CommentsSheet
+        post={activeCommentsPost}
+        isOpen={Boolean(activeCommentsPost)}
+        onClose={() => setActiveCommentsPost(null)}
+        onCommentCountChange={handleCommentCountChange}
+      />
+
+      {/* Frosted-Glass Share Sheet (Mobile Bottom Sheet / Desktop Centered Modal) */}
+      <ShareSheet
+        post={activeSharePost}
+        isOpen={Boolean(activeSharePost)}
+        onClose={() => setActiveSharePost(null)}
+        onShareCountChange={handleShareCountChange}
+      />
+
       {/* Full-Screen Pinch-to-Zoom Image Lightbox Viewer */}
       <ImageLightboxModal
         lightbox={lightboxState}

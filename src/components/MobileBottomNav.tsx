@@ -1,11 +1,12 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { ActiveTab } from '../types';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
 import { triggerHaptic } from '../utils/haptics';
+import { Avatar } from './Avatar';
 import {
   Home,
-  Film,
+  Compass,
   Plus,
   MessageSquare,
   User
@@ -15,151 +16,265 @@ interface MobileBottomNavProps {
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
   hasUnreadNotifications?: boolean;
+  unreadChatCount?: number;
 }
 
 export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   activeTab,
   setActiveTab,
-  hasUnreadNotifications = false
+  hasUnreadNotifications = false,
+  unreadChatCount = 0
 }) => {
   const { userProfile, currentUser } = useAuth();
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
+  const [liveUnreadChat, setLiveUnreadChat] = useState<number>(unreadChatCount);
+  const [isTypingInChat, setIsTypingInChat] = useState<boolean>(false);
+  const [isHiddenOnScrollDown, setIsHiddenOnScrollDown] = useState<boolean>(false);
+
+  useEffect(() => {
+    setIsHiddenOnScrollDown(false);
+  }, [activeTab]);
+
+  useEffect(() => {
+    setLiveUnreadChat((prev) => Math.max(prev, unreadChatCount));
+  }, [unreadChatCount]);
+
+  useEffect(() => {
+    const handleUnreadChatEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ count?: number }>;
+      if (typeof custom.detail?.count === 'number') {
+        setLiveUnreadChat(custom.detail.count);
+      }
+    };
+
+    const handleChatInputFocusEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ focused?: boolean }>;
+      if (typeof custom.detail?.focused === 'boolean') {
+        setIsTypingInChat(custom.detail.focused);
+      }
+    };
+
+    const handleFeedScrollDirection = (e: Event) => {
+      const dir = (e as CustomEvent<{ direction?: 'up' | 'down' }>).detail?.direction;
+      if (dir === 'down') {
+        setIsHiddenOnScrollDown(true);
+      } else if (dir === 'up') {
+        setIsHiddenOnScrollDown(false);
+      }
+    };
+
+    const handleFocusIn = (e: FocusEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const isInput =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable;
+      if (
+        isInput &&
+        (target.closest('.wavelink-chat-input-bar') ||
+          target.closest('.wavelink-reel-comment-bar') ||
+          target.getAttribute('data-chat-input') === 'true')
+      ) {
+        setIsTypingInChat(true);
+      }
+    };
+
+    const handleFocusOut = (e: FocusEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (
+        target.closest('.wavelink-chat-input-bar') ||
+        target.closest('.wavelink-reel-comment-bar') ||
+        target.getAttribute('data-chat-input') === 'true'
+      ) {
+        setTimeout(() => {
+          const active = document.activeElement as HTMLElement | null;
+          const stillInInput =
+            active &&
+            (active.closest('.wavelink-chat-input-bar') ||
+              active.closest('.wavelink-reel-comment-bar') ||
+              active.getAttribute('data-chat-input') === 'true');
+          if (!stillInInput) {
+            setIsTypingInChat(false);
+          }
+        }, 80);
+      }
+    };
+
+    window.addEventListener('wavelink:unread-chat-count', handleUnreadChatEvent);
+    window.addEventListener('wavelink:chat-input-focus', handleChatInputFocusEvent);
+    window.addEventListener('wavelink:feed-scroll-direction', handleFeedScrollDirection);
+    document.addEventListener('focusin', handleFocusIn);
+    document.addEventListener('focusout', handleFocusOut);
+
+    return () => {
+      window.removeEventListener('wavelink:unread-chat-count', handleUnreadChatEvent);
+      window.removeEventListener('wavelink:chat-input-focus', handleChatInputFocusEvent);
+      window.removeEventListener('wavelink:feed-scroll-direction', handleFeedScrollDirection);
+      document.removeEventListener('focusin', handleFocusIn);
+      document.removeEventListener('focusout', handleFocusOut);
+    };
+  }, []);
+
+  const effectiveUnreadChat = Math.max(liveUnreadChat, unreadChatCount);
+  const shouldHideNav = isTypingInChat || isHiddenOnScrollDown;
 
   const navItems: {
     id: ActiveTab;
-    label: string;
-    icon: (active: boolean) => React.ReactNode;
-    activeColor: string;
-    isPrimaryAction?: boolean;
+    ariaLabel: string;
+    isCenterCreate?: boolean;
+    badgeCount?: number;
     showDot?: boolean;
+    renderIcon: (active: boolean) => React.ReactNode;
   }[] = [
     {
       id: 'feed',
-      label: t('nav.home'),
-      activeColor: 'text-[#2563EB]',
+      ariaLabel: t('nav.home') || 'Home',
       showDot: hasUnreadNotifications,
-      icon: (active) => (
+      renderIcon: (active) => (
         <Home
           size={22}
-          strokeWidth={active ? 2.5 : 1.8}
-          className={active ? 'text-[#2563EB]' : 'text-[#78716C]'}
+          strokeWidth={active ? 2.6 : 2}
+          className="transition-transform duration-300"
         />
       )
     },
     {
       id: 'videos',
-      label: t('nav.reels'),
-      activeColor: 'text-[#F43F5E]',
-      icon: (active) => (
-        <Film
+      ariaLabel: language === 'sw' ? 'Gundua na Reels' : 'Explore & Reels',
+      renderIcon: (active) => (
+        <Compass
           size={22}
-          strokeWidth={active ? 2.5 : 1.8}
-          className={active ? 'text-[#F43F5E]' : 'text-[#78716C]'}
+          strokeWidth={active ? 2.6 : 2}
+          className="transition-transform duration-300"
         />
       )
     },
     {
       id: 'studio',
-      label: t('nav.create'),
-      isPrimaryAction: true,
-      activeColor: 'text-[#0D9488]',
-      icon: () => <Plus size={24} strokeWidth={2.5} className="text-white" />
+      ariaLabel: t('nav.create') || 'Create',
+      isCenterCreate: true,
+      renderIcon: (active) => (
+        <Plus
+          size={26}
+          strokeWidth={2.8}
+          className={`transition-transform duration-300 ${active ? 'rotate-90' : ''}`}
+        />
+      )
     },
     {
       id: 'chat',
-      label: t('nav.chat'),
-      activeColor: 'text-[#0284C7]',
-      icon: (active) => (
+      ariaLabel: t('nav.chat') || 'Chat',
+      badgeCount: effectiveUnreadChat,
+      renderIcon: (active) => (
         <MessageSquare
           size={22}
-          strokeWidth={active ? 2.5 : 1.8}
-          className={active ? 'text-[#0284C7]' : 'text-[#78716C]'}
+          strokeWidth={active ? 2.6 : 2}
+          className="transition-transform duration-300"
         />
       )
     },
     {
       id: 'settings',
-      label: t('nav.profile'),
-      activeColor: 'text-[#D97706]',
-      icon: (active) => (
-        <div className="relative">
-          {userProfile?.photoURL || currentUser?.photoURL ? (
-            <img
-              src={userProfile?.photoURL || currentUser?.photoURL || ''}
+      ariaLabel: t('nav.profile') || 'Profile',
+      renderIcon: (active) => {
+        const avatarUrl = userProfile?.photoURL || currentUser?.photoURL;
+        if (avatarUrl) {
+          return (
+            <Avatar
+              uid={currentUser?.uid}
+              src={avatarUrl}
               alt="Profile"
-              className={`w-6 h-6 rounded-full object-cover transition ring-2 ${
-                active ? 'ring-[#D97706]' : 'ring-transparent'
-              }`}
+              fallbackName={userProfile?.displayName || currentUser?.displayName || 'Waver'}
+              size={24}
+              showStatus={true}
+              onlyWhenVisible={false}
+              targetProfile={userProfile}
+              ringClassName={
+                active ? 'ring-2 ring-stone-950 scale-105 transition-all' : 'ring-1 ring-white/40 transition-all'
+              }
             />
-          ) : (
-            <User
-              size={22}
-              strokeWidth={active ? 2.5 : 1.8}
-              className={active ? 'text-[#D97706]' : 'text-[#78716C]'}
-            />
-          )}
-        </div>
-      )
+          );
+        }
+        return (
+          <User
+            size={22}
+            strokeWidth={active ? 2.6 : 2}
+            className="transition-transform duration-300"
+          />
+        );
+      }
     }
   ];
 
-  const handleNavClick = (id: ActiveTab, isPrimary?: boolean) => {
-    triggerHaptic(isPrimary ? 'medium' : 'tab');
+  const handleNavClick = (id: ActiveTab, isCenter?: boolean) => {
+    triggerHaptic(isCenter ? 'medium' : 'tab');
     setActiveTab(id);
   };
 
   return (
     <nav
-      className="wavelink-mobile-bottom-nav lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-[var(--bg-surface)]/95 backdrop-blur-md border-t border-[var(--border-hairline)] pb-[env(safe-area-inset-bottom,0px)] shadow-[0_-2px_12px_rgba(28,25,23,0.04)]"
-      aria-label="Main Navigation"
+      aria-label="Mobile Navigation"
+      className={`wavelink-mobile-bottom-nav md:hidden fixed left-3 right-3 bottom-3 z-40 pointer-events-none transition-all duration-300 ease-out ${
+        shouldHideNav
+          ? 'translate-y-24 opacity-0'
+          : 'translate-y-0 opacity-100'
+      }`}
+      style={{
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)'
+      }}
     >
-      <div className="flex items-center justify-between min-h-[4rem] w-full max-w-xl mx-auto px-2 sm:px-3">
+      <div className="wavelink-glass-pill-nav wavelink-float-gentle pointer-events-auto mx-auto max-w-[23rem] rounded-full px-3 py-1.5 flex items-center justify-between gap-1">
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
-
-          if (item.isPrimaryAction) {
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => handleNavClick(item.id, true)}
-                className="flex flex-col items-center justify-center min-w-[52px] min-h-[48px] -mt-3.5 group active:scale-95 transition-transform"
-                title="Create Wave or Reel"
-                aria-label="Create new Wave or Reel"
-              >
-                <div className="w-11 h-11 rounded-2xl bg-[#0D9488] hover:bg-[#0f766e] flex items-center justify-center shadow-md shadow-[#0D9488]/25 transition">
-                  {item.icon(isActive)}
-                </div>
-                <span className="text-[11px] font-bold mt-0.5 text-[#0D9488]">
-                  {item.label}
-                </span>
-              </button>
-            );
-          }
+          const isCreate = Boolean(item.isCenterCreate);
 
           return (
             <button
               key={item.id}
               type="button"
-              onClick={() => handleNavClick(item.id, false)}
-              className={`flex-1 flex flex-col items-center justify-center py-1.5 transition-colors relative min-w-[44px] min-h-[48px] ${
-                isActive ? item.activeColor : 'text-[#78716C] hover:text-[#1C1917]'
-              }`}
-              aria-label={item.label}
+              onClick={() => handleNavClick(item.id, isCreate)}
+              aria-label={item.ariaLabel}
+              title={item.ariaLabel}
               aria-current={isActive ? 'page' : undefined}
+              className="relative flex items-center justify-center min-w-[48px] min-h-[48px] rounded-full select-none cursor-pointer transition-transform duration-200 active:scale-95 focus:outline-none"
             >
-              <div className="relative flex items-center justify-center">
-                {item.icon(isActive)}
-                {item.showDot && (
-                  <span
-                    className="absolute -top-0.5 -right-1.5 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-white"
-                    title="New reaction or reply"
-                  />
-                )}
-              </div>
-              <span className={`text-[11px] mt-1 tracking-tight ${isActive ? 'font-bold' : 'font-medium'}`}>
-                {item.label}
+              {/* Animated White Circular Highlight behind active icon, or Soft Glowing Pastel Gradient Circle for Centre Create "+" */}
+              <span
+                aria-hidden="true"
+                className={`flex items-center justify-center rounded-full transition-all duration-300 ease-out ${
+                  isCreate
+                    ? `w-13 h-13 wavelink-nav-pastel-create text-slate-950 ${
+                        isActive ? 'scale-105 ring-2 ring-white' : 'hover:scale-105'
+                      }`
+                    : isActive
+                    ? 'w-11 h-11 bg-white text-[#0F172A] shadow-[0_6px_20px_rgba(255,255,255,0.35)] scale-100'
+                    : 'w-11 h-11 bg-transparent text-white/80 hover:text-white hover:bg-white/10 scale-95'
+                }`}
+              >
+                {item.renderIcon(isActive)}
               </span>
+
+              {/* Unread Badge on Chat */}
+              {typeof item.badgeCount === 'number' && item.badgeCount > 0 && (
+                <span
+                  className="absolute top-1 right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-[#F43F5E] text-white text-[10px] font-extrabold flex items-center justify-center ring-2 ring-[#0F172A] shadow-xs"
+                  aria-label={`${item.badgeCount} unread messages`}
+                >
+                  {item.badgeCount > 99 ? '99+' : item.badgeCount}
+                </span>
+              )}
+
+              {/* Subtle Activity Dot on Home if unread notifications */}
+              {!item.badgeCount && item.showDot && (
+                <span
+                  className="absolute top-2 right-2.5 w-2 h-2 rounded-full bg-[#14B8A6] ring-2 ring-[#0F172A]"
+                  aria-hidden="true"
+                />
+              )}
+
+              <span className="sr-only">{item.ariaLabel}</span>
             </button>
           );
         })}

@@ -19,6 +19,7 @@ import { CrystalBadge, registerActiveWeeklyWinner } from './CrystalBadge';
 import { sendNotification } from '../services/notificationService';
 import { INTEREST_CATALOG } from './InterestPickerModal';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
+import { Avatar } from './Avatar';
 import {
   AFRICAN_COUNTRIES,
   DEFAULT_CREATOR_SPOTLIGHT,
@@ -708,13 +709,17 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
         <div className="kitenge-border-strip" />
         <div className="p-5 sm:p-6 flex flex-col md:flex-row md:items-center justify-between gap-4 kanga-pattern-subtle">
           <div className="flex items-start sm:items-center gap-4 min-w-0">
-            <img
+            <Avatar
+              uid={spotlight.userId}
               src={
                 spotlight.photoURL ||
                 `https://api.dicebear.com/7.x/shapes/svg?seed=${spotlight.userId}`
               }
               alt={spotlight.displayName}
-              className="w-14 h-14 sm:w-16 sm:h-16 rounded-full object-cover shrink-0 kanga-avatar-frame--gold"
+              fallbackName={spotlight.displayName}
+              size={60}
+              showStatus={true}
+              ringClassName="kanga-avatar-frame--gold"
             />
             <div className="min-w-0 space-y-1">
               <div className="flex items-center gap-2 flex-wrap">
@@ -1052,15 +1057,17 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
                         #{idx + 1}
                       </div>
 
-                      <img
+                      <Avatar
+                        uid={entry.userId}
                         src={
                           entry.photoURL ||
                           `https://api.dicebear.com/7.x/shapes/svg?seed=${entry.userId}`
                         }
                         alt={entry.name}
-                        className={`w-10 h-10 rounded-full object-cover shrink-0 ${
-                          isFirst ? 'ring-2 ring-amber-400' : 'ring-1 ring-stone-200'
-                        }`}
+                        fallbackName={entry.name}
+                        size={40}
+                        showStatus={true}
+                        ringClassName={isFirst ? 'ring-2 ring-amber-400' : 'ring-1 ring-stone-200'}
                       />
 
                       <div className="min-w-0">
@@ -1138,13 +1145,16 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <img
+                    <Avatar
+                      uid={post.authorId}
                       src={
                         post.authorPhotoURL ||
                         `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`
                       }
                       alt={post.authorName}
-                      className="w-8 h-8 rounded-full object-cover shrink-0"
+                      fallbackName={post.authorName}
+                      size={32}
+                      showStatus={true}
                     />
                     <div className="min-w-0">
                       <CrystalBadge
