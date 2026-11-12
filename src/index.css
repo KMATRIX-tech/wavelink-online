@@ -1153,8 +1153,7 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     outline-offset: 2px;
   }
 
-  /* Desktop Call Layout: Large centered panel with remote video filling it,
-     local camera as a floating box in the corner, and call controls centered at the bottom */
+  /* Desktop Call Layout (>= 1024px): Clean non-overlapping header, side-by-side remote & self video panes, centered bottom controls */
   .wavelink-call-overlay {
     padding: 1.25rem;
     background-color: rgba(9, 13, 22, 0.78);
@@ -1173,29 +1172,36 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     border-radius: 1.75rem;
     border: 1px solid rgba(255, 255, 255, 0.14);
     box-shadow: 0 28px 60px -12px rgba(0, 0, 0, 0.65);
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
   }
 
   .wavelink-call-header {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
+    position: relative;
+    top: auto;
+    left: auto;
+    right: auto;
+    flex-shrink: 0;
     z-index: 30;
-    padding: 1.125rem 1.5rem;
-    background: linear-gradient(to bottom, rgba(9, 13, 22, 0.86), rgba(9, 13, 22, 0));
+    padding: 1rem 1.5rem;
+    background: rgba(9, 13, 22, 0.94);
     color: #FFFFFF;
-    border-bottom: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   }
 
   .wavelink-call-stage {
     position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
     width: 100%;
-    height: 100%;
-    padding: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    height: auto;
+    padding: 1rem 1.5rem;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+    align-items: stretch;
+    justify-items: stretch;
     background-color: #090D16;
     overflow: hidden;
   }
@@ -1204,37 +1210,40 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     position: relative;
     width: 100%;
     height: 100%;
-    border-radius: 0;
-    background-color: #090D16;
-    border: none;
+    min-height: 0;
+    border-radius: 1.25rem;
+    background-color: #111827;
+    border: 1px solid rgba(255, 255, 255, 0.12);
     overflow: hidden;
   }
 
   .wavelink-call-local-pip {
-    position: absolute;
+    position: relative;
     top: auto;
-    bottom: 5.75rem;
-    right: 1.5rem;
-    width: clamp(11rem, 17vw, 14.5rem);
-    aspect-ratio: 16 / 10;
-    height: auto;
+    right: auto;
+    bottom: auto;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    aspect-ratio: auto;
     border-radius: 1.25rem;
-    border: 2px solid rgba(255, 255, 255, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     background-color: #111827;
-    box-shadow: 0 18px 38px rgba(0, 0, 0, 0.55);
-    z-index: 25;
+    box-shadow: none;
+    z-index: 10;
     overflow: hidden;
   }
 
   .wavelink-call-controls-bar {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
+    position: relative;
+    bottom: auto;
+    left: auto;
+    right: auto;
+    flex-shrink: 0;
     z-index: 30;
-    padding: 1.125rem 1.5rem;
-    background: linear-gradient(to top, rgba(9, 13, 22, 0.92), rgba(9, 13, 22, 0));
-    border-top: none;
+    padding: 1rem 1.5rem;
+    background: rgba(9, 13, 22, 0.94);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
     justify-content: center;
     align-items: center;
     gap: 1.125rem;

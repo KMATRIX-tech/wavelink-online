@@ -10,8 +10,6 @@ import {
   SwitchCamera,
   RotateCcw,
   Sparkles,
-  Wifi,
-  AlertCircle,
   Loader2,
   Shield,
   Radio,
@@ -38,6 +36,11 @@ import {
 import { sendWelinkChatMessage } from '../services/geminiService';
 import { sendNotification } from '../services/notificationService';
 import { Avatar } from './Avatar';
+import {
+  buildIceServersFromEnv,
+  extractIceCandidateInfo,
+  logTurnEnvStartupWarning
+} from '../utils/webrtcConfig';
 
 interface LegacyChatContact {
   id: string;
@@ -76,59 +79,6 @@ interface TranscriptEntry {
   timestamp: string;
 }
 
-const isPlaceholderValue = (val?: string): boolean => {
-  if (!val) return true;
-  const trimmed = val.trim();
-  return (
-    !trimmed ||
-    trimmed === 'YOUR_TURN_USERNAME' ||
-    trimmed === 'YOUR_TURN_CREDENTIAL' ||
-    trimmed.startsWith('YOUR_')
-  );
-};
-
-const buildIceServersFromEnv = (): RTCIceServer[] => {
-  const rawTurnUrls = (
-    (import.meta.env.VITE_TURN_URLS as string | undefined) ||
-    (import.meta.env.VITE_TURN_URL as string | undefined) ||
-    ''
-  ).trim();
-  const rawTurnUsername = (import.meta.env.VITE_TURN_USERNAME as string | undefined)?.trim();
-  const rawTurnCredential = (import.meta.env.VITE_TURN_CREDENTIAL as string | undefined)?.trim();
-
-  const turnUrls = rawTurnUrls
-    ? rawTurnUrls
-        .split(',')
-        .map((u) => u.trim())
-        .filter(Boolean)
-    : [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-        'turns:openrelay.metered.ca:443?transport=tcp',
-      ];
-
-  const turnUsername = isPlaceholderValue(rawTurnUsername)
-    ? 'openrelayproject'
-    : rawTurnUsername!;
-  const turnCredential = isPlaceholderValue(rawTurnCredential)
-    ? 'openrelayproject'
-    : rawTurnCredential!;
-
-  return [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
-    {
-      urls: turnUrls,
-      username: turnUsername,
-      credential: turnCredential,
-    },
-  ];
-};
-
 export const CallingModal: React.FC<CallingModalProps> = ({
   onClose,
   initialType,
@@ -161,17 +111,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     contact?.avatar ||
     `https://api.dicebear.com/7.x/shapes/svg?seed=${resolvedRecipientId}`;
 
-  const resolvedIsIncoming =
+  const initialIsIncoming =
     typeof isInitiator === 'boolean' ? !isInitiator : Boolean(propIsIncoming);
+
+  // Track effective call role so Retry can cleanly start a fresh outgoing call even from callee side
+  const [effectiveIsIncoming, setEffectiveIsIncoming] = useState<boolean>(initialIsIncoming);
 
   const normalizedMode: 'video' | 'voice' =
     initialType === 'voice' || legacyCallType === 'audio' ? 'voice' : 'video';
 
   const [callState, setCallState] = useState<CallLifecycleState>(
-    resolvedIsIncoming ? 'connecting' : 'ringing'
+    initialIsIncoming ? 'connecting' : 'ringing'
   );
   const [statusMessage, setStatusMessage] = useState<string>(
-    resolvedIsIncoming ? 'Connecting...' : 'Ringing...'
+    initialIsIncoming ? 'Connecting...' : 'Ringing...'
   );
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
@@ -199,21 +152,25 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
 
-  // Candidate queues & deduplication sets
+  // Candidate queues, ordering flags & diagnostics
   const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const pendingLocalCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const isCallDocReadyRef = useRef<boolean>(resolvedIsIncoming);
+  const isCallDocReadyRef = useRef<boolean>(initialIsIncoming);
+  const hasRemoteDescriptionRef = useRef<boolean>(false);
   const addedCandidateIdsRef = useRef<Set<string>>(new Set());
+  const gatheredCandidateTypesRef = useRef<Set<string>>(new Set());
+  const gatheredRelayCandidateRef = useRef<boolean>(false);
 
   // Offer/Answer deduplication & ICE restart counters
   const lastAppliedAnswerSdpRef = useRef<string | null>(null);
   const lastProcessedOfferSdpRef = useRef<string | null>(null);
+  const lastIceRestartRequestRef = useRef<string | null>(null);
   const iceRestartCountRef = useRef<number>(0);
   const isRestartingIceRef = useRef<boolean>(false);
   const disconnectedTimerRef = useRef<number | null>(null);
 
   const isCleaningUpRef = useRef(false);
-  const callStateRef = useRef<CallLifecycleState>(resolvedIsIncoming ? 'connecting' : 'ringing');
+  const callStateRef = useRef<CallLifecycleState>(initialIsIncoming ? 'connecting' : 'ringing');
 
   // Stable refs for props so parent re-renders never tear down the active WebRTC call
   const onCloseRef = useRef(onClose);
@@ -272,7 +229,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   }, []);
 
   const cleanupWebRTC = useCallback(() => {
-    console.log('[WaveLink WebRTC] Cleaning up tracks, peer connection, and listeners');
+    console.log('[CALL] Cleaning up tracks, peer connection, and Firestore listeners');
     clearTimers();
 
     if (callDocUnsubRef.current) {
@@ -288,18 +245,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       try {
         pcRef.current.ontrack = null;
         pcRef.current.onicecandidate = null;
+        pcRef.current.onicegatheringstatechange = null;
         pcRef.current.onconnectionstatechange = null;
         pcRef.current.oniceconnectionstatechange = null;
+        pcRef.current.onsignalingstatechange = null;
         pcRef.current.getSenders().forEach((sender) => {
           try {
-            pcRef.current?.removeTrack(sender);
+            sender.track?.stop();
           } catch {
             // ignore
           }
         });
         pcRef.current.close();
       } catch (err) {
-        console.warn('[WaveLink WebRTC] Error closing peer connection:', err);
+        console.warn('[CALL] Error closing peer connection:', err);
       }
       pcRef.current = null;
     }
@@ -339,8 +298,12 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     pendingIceCandidatesRef.current = [];
     pendingLocalCandidatesRef.current = [];
     addedCandidateIdsRef.current.clear();
+    gatheredCandidateTypesRef.current.clear();
+    gatheredRelayCandidateRef.current = false;
+    hasRemoteDescriptionRef.current = false;
     lastAppliedAnswerSdpRef.current = null;
     lastProcessedOfferSdpRef.current = null;
+    lastIceRestartRequestRef.current = null;
     iceRestartCountRef.current = 0;
     isRestartingIceRef.current = false;
     setHasRemoteVideoTrack(false);
@@ -450,36 +413,40 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   useEffect(() => {
     let isCancelled = false;
     isCleaningUpRef.current = false;
-    isCallDocReadyRef.current = resolvedIsIncoming;
+    isCallDocReadyRef.current = effectiveIsIncoming;
 
-    const startConnectionTimer = (label: string) => {
-      if (connectionTimeoutRef.current) {
-        window.clearTimeout(connectionTimeoutRef.current);
+    logTurnEnvStartupWarning();
+
+    const logFinalFailure = (reason: string) => {
+      const typesList = Array.from(gatheredCandidateTypesRef.current);
+      const relayMissingNote = !gatheredRelayCandidateRef.current
+        ? ' | TURN server not reachable (no relay candidates gathered)'
+        : '';
+      if (!gatheredRelayCandidateRef.current) {
+        console.error('[CALL] TURN server not reachable — no relay ICE candidates were gathered.');
       }
-      console.log(`[WaveLink WebRTC] Starting 20s connection timeout (${label})`);
-      connectionTimeoutRef.current = window.setTimeout(() => {
-        if (isCancelled) return;
-        if (callStateRef.current !== 'connected') {
-          console.warn(
-            '[WaveLink WebRTC] 20s connection timeout expired; state never became connected'
-          );
-          updateLifecycleState('failed', 'Connection failed');
-        }
-      }, 20000);
+      console.error(
+        `[CALL] Final reason for failure: ${reason} | gatheredCandidateTypes=[${
+          typesList.length > 0 ? typesList.join(', ') : 'none'
+        }]${relayMissingNote}`
+      );
     };
 
     const drainQueuedIceCandidates = async (pc: RTCPeerConnection) => {
-      if (!pc.remoteDescription || !pc.remoteDescription.type) return;
+      if (!hasRemoteDescriptionRef.current || !pc.remoteDescription || !pc.remoteDescription.type) {
+        return;
+      }
       if (pendingIceCandidatesRef.current.length === 0) return;
 
       const queued = [...pendingIceCandidatesRef.current];
       pendingIceCandidatesRef.current = [];
-      console.log(`[WaveLink WebRTC] Draining ${queued.length} queued remote ICE candidate(s)`);
+      console.log(`[CALL] Draining ${queued.length} queued remote ICE candidate(s)`);
       for (const candidate of queued) {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          console.log('[CALL] Queued remote ICE candidate added');
         } catch (err) {
-          console.warn('[WaveLink WebRTC] Failed to add queued ICE candidate:', err);
+          console.warn('[CALL] Failed to add queued remote ICE candidate:', err);
         }
       }
     };
@@ -488,19 +455,46 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       cleanupWebRTC();
       setCallDuration(0);
 
-      // 1. Resolve STUN + TURN servers (env vars + server endpoint)
-      let iceServers = buildIceServersFromEnv();
+      console.log(
+        `[CALL] Starting call setup (role=${
+          effectiveIsIncoming ? 'callee' : 'caller'
+        }, mode=${normalizedMode}, callId=${activeCallId}, attempt=${retryAttempt + 1})`
+      );
+
+      // 1. Resolve STUN + TURN servers (Vite env vars take priority; server used if custom configured or client missing env vars)
+      const envConfig = buildIceServersFromEnv();
+      let iceServers = envConfig.iceServers;
+      let resolvedTurnUrls = envConfig.turnUrls;
+
       try {
         const res = await fetch('/api/calls/ice-servers');
         if (res.ok) {
           const data = await res.json();
-          if (Array.isArray(data?.iceServers) && data.iceServers.length > 0) {
-            iceServers = data.iceServers;
+          if (
+            Array.isArray(data?.iceServers) &&
+            data.iceServers.length > 0 &&
+            (!envConfig.hasCustomTurnEnv || data.hasCustomTurnConfig)
+          ) {
+            if (!envConfig.hasCustomTurnEnv) {
+              iceServers = data.iceServers;
+              const turnEntry = data.iceServers.find((s: RTCIceServer) => s.username || s.credential);
+              resolvedTurnUrls = Array.isArray(turnEntry?.urls)
+                ? turnEntry.urls
+                : turnEntry?.urls
+                ? [turnEntry.urls]
+                : [];
+            }
           }
         }
       } catch {
-        // Fallback to client env ICE servers
+        // Fallback cleanly to client env ICE servers
       }
+
+      console.log('[CALL] RTCPeerConnection ICE servers configured:', {
+        hasCustomTurnEnv: envConfig.hasCustomTurnEnv,
+        stunCount: iceServers.filter((s) => !s.username).length,
+        turnUrls: resolvedTurnUrls,
+      });
 
       if (isCancelled) return;
 
@@ -523,19 +517,16 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               : false,
         });
         console.log(
-          '[WaveLink WebRTC] Local media stream acquired:',
+          '[CALL] Local media stream acquired:',
           localStream.getTracks().map((t) => `${t.kind}:${t.label}`)
         );
       } catch (mediaErr) {
-        console.warn(
-          '[WaveLink WebRTC] Primary getUserMedia failed, trying audio-only fallback:',
-          mediaErr
-        );
+        console.warn('[CALL] Primary getUserMedia failed, trying audio-only fallback:', mediaErr);
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           setIsVideoOff(true);
         } catch (audioErr) {
-          console.error('[WaveLink WebRTC] Could not access microphone/camera:', audioErr);
+          console.error('[CALL] Could not access microphone/camera:', audioErr);
         }
       }
 
@@ -573,17 +564,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         localStream.getTracks().forEach((track) => {
           pc.addTrack(track, localStream!);
         });
-        console.log('[WaveLink WebRTC] Local tracks added to RTCPeerConnection before offer/answer');
+        console.log('[CALL] Local tracks added BEFORE createOffer/createAnswer');
+      } else {
+        console.warn('[CALL] Proceeding without local tracks (receive-only fallback)');
       }
 
       // 5. Handle incoming remote tracks (add every track to the single remote MediaStream)
       pc.ontrack = (event: RTCTrackEvent) => {
         console.log(
-          '[WaveLink WebRTC] Track received:',
-          event.track.kind,
-          event.track.id,
-          'streams:',
-          event.streams.length
+          `[CALL] Remote track received: kind=${event.track.kind} id=${event.track.id} streams=${event.streams.length}`
         );
 
         const targetRemoteStream = remoteStreamRef.current || new MediaStream();
@@ -627,24 +616,24 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         db,
         'calls',
         activeCallId,
-        resolvedIsIncoming ? 'calleeCandidates' : 'callerCandidates'
+        effectiveIsIncoming ? 'calleeCandidates' : 'callerCandidates'
       );
       const remoteCandidatesCol = collection(
         db,
         'calls',
         activeCallId,
-        resolvedIsIncoming ? 'callerCandidates' : 'calleeCandidates'
+        effectiveIsIncoming ? 'callerCandidates' : 'calleeCandidates'
       );
 
-      // Helper to perform automatic ICE restart (up to 3 times) when ICE becomes disconnected or failed
+      let startConnectionTimer: (label: string) => void = () => {};
+
+      // Helper to perform automatic ICE restart (up to 3 times) before showing "Connection failed"
       const triggerAutomaticIceRestart = async (reason: string) => {
         if (isCancelled || isCleaningUpRef.current || !pcRef.current) return;
         if (isRestartingIceRef.current) return;
 
         if (iceRestartCountRef.current >= 3) {
-          console.error(
-            `[WaveLink WebRTC] ICE restart limit (3/3) reached after ${reason}. Marking call as failed.`
-          );
+          logFinalFailure(`ICE restart limit (3/3) reached (${reason})`);
           updateLifecycleState('failed', 'Connection failed');
           return;
         }
@@ -654,7 +643,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         const attempt = iceRestartCountRef.current;
 
         console.log(
-          `[WaveLink WebRTC] ICE state is "${reason}" — performing automatic ICE restart (attempt ${attempt}/3)...`
+          `[CALL] ICE restart ${attempt}/3 triggered (reason=${reason}, relayGathered=${gatheredRelayCandidateRef.current})`
         );
 
         if (callStateRef.current !== 'connected') {
@@ -663,15 +652,19 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         startConnectionTimer(`ice-restart-${attempt}`);
 
         try {
-          // Caller initiates the new offer with iceRestart: true; if on receiver side, caller also detects and restarts,
-          // or receiver can push a restart offer if caller hasn't yet.
-          if (!resolvedIsIncoming || attempt > 0) {
+          if (typeof pcRef.current.restartIce === 'function') {
+            pcRef.current.restartIce();
+          }
+
+          if (!effectiveIsIncoming) {
+            // Caller initiates clean ICE-restart offer
             const restartOffer = await pcRef.current.createOffer({
               iceRestart: true,
               offerToReceiveAudio: true,
               offerToReceiveVideo: normalizedMode === 'video',
             });
             await pcRef.current.setLocalDescription(restartOffer);
+            hasRemoteDescriptionRef.current = false;
             lastAppliedAnswerSdpRef.current = null;
 
             await updateDoc(callDocRef, {
@@ -683,12 +676,18 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               iceRestartCount: attempt,
               updatedAt: new Date().toISOString(),
             });
-            console.log(
-              `[WaveLink WebRTC] ICE restart offer (${attempt}/3) created and written to Firestore`
-            );
+            console.log(`[CALL] ICE restart offer (${attempt}/3) created and written to Firestore`);
+          } else {
+            // Callee requests caller to send ICE-restart offer to prevent SDP glare
+            await updateDoc(callDocRef, {
+              iceRestartRequestedAt: new Date().toISOString(),
+              iceRestartReason: reason,
+              updatedAt: new Date().toISOString(),
+            });
+            console.log(`[CALL] Callee requested ICE restart (${attempt}/3) from caller`);
           }
         } catch (err) {
-          console.warn(`[WaveLink WebRTC] ICE restart attempt ${attempt}/3 error:`, err);
+          console.warn(`[CALL] ICE restart attempt ${attempt}/3 failed:`, err);
         } finally {
           window.setTimeout(() => {
             isRestartingIceRef.current = false;
@@ -696,14 +695,49 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         }
       };
 
-      // 6. Monitor PeerConnection and ICE states — ONLY mark 'connected' when genuinely connected
-      const checkConnectionState = () => {
+      startConnectionTimer = (label: string) => {
+        if (connectionTimeoutRef.current) {
+          window.clearTimeout(connectionTimeoutRef.current);
+        }
+        console.log(`[CALL] Starting 20s connection timer (${label})`);
+        connectionTimeoutRef.current = window.setTimeout(() => {
+          if (isCancelled || !pcRef.current) return;
+          if (callStateRef.current !== 'connected') {
+            const currIce = pcRef.current.iceConnectionState;
+            const currConn = pcRef.current.connectionState;
+            console.warn(
+              `[CALL] 20s connection timer expired (${label}) | iceConnectionState=${currIce}, connectionState=${currConn}, relayGathered=${gatheredRelayCandidateRef.current}`
+            );
+            if (!gatheredRelayCandidateRef.current) {
+              console.warn('[CALL] TURN server not reachable (no relay ICE candidates gathered)');
+            }
+            if (iceRestartCountRef.current < 3) {
+              triggerAutomaticIceRestart(`20s-timeout-${label}`);
+            } else {
+              logFinalFailure(`20s timeout after 3 ICE restarts (ice=${currIce}, conn=${currConn})`);
+              updateLifecycleState('failed', 'Connection failed');
+            }
+          }
+        }, 20000);
+      };
+
+      // 6. Monitor ICE gathering, iceConnectionState, and connectionState
+      pc.onicegatheringstatechange = () => {
+        if (!pcRef.current || isCancelled) return;
+        const gathering = pcRef.current.iceGatheringState;
+        console.log(`[CALL] iceGatheringState changed -> ${gathering}`);
+        if (gathering === 'complete' && !gatheredRelayCandidateRef.current) {
+          console.warn('[CALL] TURN server not reachable — ICE gathering completed without any relay candidate.');
+        }
+      };
+
+      const handlePeerStateUpdate = () => {
         if (!pcRef.current || isCancelled) return;
         const connState = pcRef.current.connectionState;
         const iceState = pcRef.current.iceConnectionState;
 
         console.log(
-          `[WaveLink WebRTC] State update -> connectionState: ${connState}, iceConnectionState: ${iceState}`
+          `[CALL] State change -> iceConnectionState=${iceState}, connectionState=${connState}`
         );
 
         if (
@@ -725,7 +759,6 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           }
           isRestartingIceRef.current = false;
 
-          // Check if remote stream already has a video track
           if (
             remoteStreamRef.current &&
             remoteStreamRef.current.getVideoTracks().length > 0
@@ -734,7 +767,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           }
 
           if (callStateRef.current !== 'connected') {
-            console.log('[WaveLink WebRTC] Peer connection established! Starting call timer.');
+            console.log(
+              `[CALL] Peer connection established! Candidate types gathered: [${Array.from(
+                gatheredCandidateTypesRef.current
+              ).join(', ')}]`
+            );
             updateLifecycleState('connected', 'Connected');
           }
         } else if (connState === 'connecting' || iceState === 'checking') {
@@ -742,7 +779,6 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             updateLifecycleState('connecting', 'Connecting...');
           }
         } else if (iceState === 'disconnected') {
-          // Give brief transient network blips 1.5s to self-heal, then auto-restart ICE (up to 3 times)
           if (disconnectedTimerRef.current) {
             window.clearTimeout(disconnectedTimerRef.current);
           }
@@ -750,7 +786,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             if (!pcRef.current || isCancelled) return;
             const currentIce = pcRef.current.iceConnectionState;
             if (currentIce === 'disconnected' || currentIce === 'failed') {
-              triggerAutomaticIceRestart(currentIce);
+              triggerAutomaticIceRestart(`ice-${currentIce}`);
             }
           }, 1500);
         } else if (iceState === 'failed' || connState === 'failed') {
@@ -758,32 +794,46 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             window.clearTimeout(disconnectedTimerRef.current);
             disconnectedTimerRef.current = null;
           }
-          triggerAutomaticIceRestart('failed');
+          triggerAutomaticIceRestart(`state-${iceState === 'failed' ? 'ice-failed' : 'conn-failed'}`);
         }
       };
 
-      pc.onconnectionstatechange = checkConnectionState;
-      pc.oniceconnectionstatechange = checkConnectionState;
+      pc.onconnectionstatechange = handlePeerStateUpdate;
+      pc.oniceconnectionstatechange = handlePeerStateUpdate;
 
-      // 7. Write local ICE candidates to our own subcollection (buffering if call doc isn't created yet)
+      // 7. Gather & write local ICE candidates to our own subcollection
       pc.onicecandidate = async (event: RTCPeerConnectionIceEvent) => {
-        if (!event.candidate || isCancelled) return;
-        const candidateJson = event.candidate.toJSON();
+        if (isCancelled) return;
+        if (!event.candidate) {
+          console.log('[CALL] End of local ICE candidates signaled');
+          if (!gatheredRelayCandidateRef.current) {
+            console.warn('[CALL] TURN server not reachable — no relay candidate gathered.');
+          }
+          return;
+        }
 
+        const candInfo = extractIceCandidateInfo(event.candidate);
+        gatheredCandidateTypesRef.current.add(candInfo.type);
+        if (candInfo.type === 'relay') {
+          gatheredRelayCandidateRef.current = true;
+        }
+
+        console.log(
+          `[CALL] Local ICE candidate gathered: type=${candInfo.type} protocol=${candInfo.protocol} port=${
+            candInfo.port ?? 'n/a'
+          }`
+        );
+
+        const candidateJson = event.candidate.toJSON();
         if (!isCallDocReadyRef.current) {
           pendingLocalCandidatesRef.current.push(candidateJson);
           return;
         }
 
-        console.log(
-          `[WaveLink WebRTC] Local ICE candidate generated -> writing to ${
-            resolvedIsIncoming ? 'calleeCandidates' : 'callerCandidates'
-          }`
-        );
         try {
           await addDoc(localCandidatesCol, candidateJson);
         } catch (err) {
-          console.warn('[WaveLink WebRTC] Failed to write local ICE candidate:', err);
+          console.warn('[CALL] Failed to write local ICE candidate:', err);
         }
       };
 
@@ -792,20 +842,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         const toSend = [...pendingLocalCandidatesRef.current];
         pendingLocalCandidatesRef.current = [];
         console.log(
-          `[WaveLink WebRTC] Flushing ${toSend.length} local ICE candidate(s) to ${
-            resolvedIsIncoming ? 'calleeCandidates' : 'callerCandidates'
+          `[CALL] Flushing ${toSend.length} local ICE candidate(s) to ${
+            effectiveIsIncoming ? 'calleeCandidates' : 'callerCandidates'
           }`
         );
         for (const cand of toSend) {
           try {
             await addDoc(localCandidatesCol, cand);
           } catch (err) {
-            console.warn('[WaveLink WebRTC] Failed to flush local ICE candidate:', err);
+            console.warn('[CALL] Failed to flush local ICE candidate:', err);
           }
         }
       };
 
-      // Helper to subscribe to remote side's ICE candidate subcollection AFTER call doc exists
+      // Subscribe to remote side's ICE candidate subcollection
       const startRemoteCandidatesListener = () => {
         if (remoteCandidatesUnsubRef.current) {
           remoteCandidatesUnsubRef.current();
@@ -824,38 +874,42 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               const currentPc = pcRef.current;
               if (!currentPc) return;
 
-              if (currentPc.remoteDescription && currentPc.remoteDescription.type) {
+              if (
+                hasRemoteDescriptionRef.current &&
+                currentPc.remoteDescription &&
+                currentPc.remoteDescription.type
+              ) {
                 try {
                   await currentPc.addIceCandidate(new RTCIceCandidate(candidateData));
-                  console.log('[WaveLink WebRTC] Added remote ICE candidate immediately');
+                  console.log('[CALL] Remote ICE candidate added immediately');
                 } catch (err) {
-                  console.warn('[WaveLink WebRTC] Error adding remote ICE candidate:', err);
+                  console.warn('[CALL] Error adding remote ICE candidate:', err);
                 }
               } else {
                 console.log(
-                  '[WaveLink WebRTC] Queued remote ICE candidate (waiting for setRemoteDescription)'
+                  '[CALL] Queued remote ICE candidate (waiting for setRemoteDescription)'
                 );
                 pendingIceCandidatesRef.current.push(candidateData);
               }
             });
           },
           (err) => {
-            console.warn('[WaveLink WebRTC] Remote ICE candidates listener error:', err);
+            console.warn('[CALL] Remote ICE candidates listener error:', err);
           }
         );
       };
 
       // 8. Exact Signaling Order through Firestore
-      if (!resolvedIsIncoming) {
-        // STEP 1 (CALLER): Create offer, setLocalDescription, and create the call document with the offer
+      if (!effectiveIsIncoming) {
         updateLifecycleState('ringing', 'Ringing...');
 
         const offer = await pc.createOffer({
           offerToReceiveAudio: true,
           offerToReceiveVideo: normalizedMode === 'video',
         });
+        console.log(`[CALL] Offer created (sdpLength=${offer.sdp?.length || 0})`);
         await pc.setLocalDescription(offer);
-        console.log('[WaveLink WebRTC] Offer created and set as local description');
+        console.log('[CALL] Local description set (offer)');
 
         const nowIso = new Date().toISOString();
         const meta = userMetaRef.current;
@@ -884,9 +938,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           }),
           { merge: true }
         );
-        console.log('[WaveLink WebRTC] Call document created with offer:', activeCallId);
+        console.log('[CALL] Call document written with offer:', activeCallId);
 
-        // Trigger server-side push notification for incoming call
         if (meta.recipientId && meta.recipientId !== meta.userId) {
           sendNotification({
             recipientId: meta.recipientId,
@@ -900,7 +953,6 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           }).catch(() => {});
         }
 
-        // Now that the call document exists in Firestore, flush buffered local candidates and attach remote candidates listener
         isCallDocReadyRef.current = true;
         await flushPendingLocalCandidates();
         startRemoteCandidatesListener();
@@ -909,7 +961,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         ringingTimeoutRef.current = window.setTimeout(async () => {
           if (isCancelled) return;
           if (callStateRef.current === 'ringing') {
-            console.log('[WaveLink WebRTC] 30s ringing timeout -> No answer');
+            console.log('[CALL] 30s ringing timeout -> No answer');
             updateLifecycleState('no-answer', 'No answer');
             try {
               await updateDoc(callDocRef, {
@@ -922,7 +974,6 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           }
         }, 30000);
 
-        // STEP 3 (CALLER): Listen to the call document; when answer appears, call setRemoteDescription once
         callDocUnsubRef.current = onSnapshot(callDocRef, async (snapshot) => {
           const data = snapshot.data();
           if (!data || isCancelled || !pcRef.current) return;
@@ -953,13 +1004,23 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             startConnectionTimer('caller-accepted');
           }
 
+          // Handle ICE restart request initiated by callee
+          if (
+            data.iceRestartRequestedAt &&
+            data.iceRestartRequestedAt !== lastIceRestartRequestRef.current
+          ) {
+            lastIceRestartRequestRef.current = data.iceRestartRequestedAt;
+            console.log('[CALL] Caller received ICE restart request from callee');
+            triggerAutomaticIceRestart('callee-requested');
+          }
+
           if (
             data.answer &&
             data.answer.sdp &&
             data.answer.sdp !== lastAppliedAnswerSdpRef.current
           ) {
             lastAppliedAnswerSdpRef.current = data.answer.sdp;
-            console.log('[WaveLink WebRTC] Answer received from receiver');
+            console.log(`[CALL] Answer received (sdpLength=${data.answer.sdp.length})`);
 
             if (ringingTimeoutRef.current) {
               window.clearTimeout(ringingTimeoutRef.current);
@@ -975,16 +1036,17 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               await pcRef.current.setRemoteDescription(
                 new RTCSessionDescription(data.answer as RTCSessionDescriptionInit)
               );
-              console.log('[WaveLink WebRTC] Caller setRemoteDescription(answer) complete');
+              hasRemoteDescriptionRef.current = true;
+              console.log('[CALL] Caller setRemoteDescription(answer) complete');
               await drainQueuedIceCandidates(pcRef.current);
             } catch (err) {
-              console.error('[WaveLink WebRTC] Caller setRemoteDescription failed:', err);
+              console.error('[CALL] Caller setRemoteDescription(answer) failed:', err);
+              logFinalFailure(`Caller setRemoteDescription failed: ${err instanceof Error ? err.message : String(err)}`);
               updateLifecycleState('failed', 'Connection failed');
             }
           }
         });
       } else {
-        // STEP 2 (RECEIVER): Show "Connecting...", start remote candidate listener, read offer, setRemoteDescription, createAnswer, setLocalDescription, write answer
         updateLifecycleState('connecting', 'Connecting...');
         startConnectionTimer('receiver-accept');
         startRemoteCandidatesListener();
@@ -995,13 +1057,16 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           lastProcessedOfferSdpRef.current = offerSdp.sdp;
 
           try {
-            console.log('[WaveLink WebRTC] Receiver setting remote description from offer');
+            console.log(`[CALL] Offer received by callee (sdpLength=${offerSdp.sdp.length})`);
             await pcRef.current.setRemoteDescription(new RTCSessionDescription(offerSdp));
+            hasRemoteDescriptionRef.current = true;
+            console.log('[CALL] Callee setRemoteDescription(offer) complete');
             await drainQueuedIceCandidates(pcRef.current);
 
             const answer = await pcRef.current.createAnswer();
+            console.log(`[CALL] Answer created (sdpLength=${answer.sdp?.length || 0})`);
             await pcRef.current.setLocalDescription(answer);
-            console.log('[WaveLink WebRTC] Receiver created answer and setLocalDescription');
+            console.log('[CALL] Callee local description set (answer)');
 
             const nowIso = new Date().toISOString();
             await updateDoc(callDocRef, {
@@ -1013,15 +1078,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               acceptedAt: nowIso,
               updatedAt: nowIso,
             });
-            console.log('[WaveLink WebRTC] Receiver wrote answer to call document');
+            console.log('[CALL] Callee wrote answer to call document');
             await flushPendingLocalCandidates();
           } catch (err) {
-            console.error('[WaveLink WebRTC] Receiver failed to answer offer:', err);
+            console.error('[CALL] Callee failed to answer offer:', err);
+            logFinalFailure(`Callee answer creation failed: ${err instanceof Error ? err.message : String(err)}`);
             updateLifecycleState('failed', 'Connection failed');
           }
         };
 
-        // Check initialOffer or read call document immediately
         if (initialOfferRef.current && initialOfferRef.current.sdp) {
           await processOfferAndCreateAnswer(initialOfferRef.current);
         } else {
@@ -1032,11 +1097,10 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               await processOfferAndCreateAnswer(snapData.offer as RTCSessionDescriptionInit);
             }
           } catch (err) {
-            console.warn('[WaveLink WebRTC] Receiver initial getDoc failed:', err);
+            console.warn('[CALL] Callee initial getDoc failed:', err);
           }
         }
 
-        // Listen for initial offer, ICE restart offers, and call termination
         callDocUnsubRef.current = onSnapshot(callDocRef, async (snapshot) => {
           const data = snapshot.data();
           if (!data || isCancelled) return;
@@ -1058,7 +1122,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             data.offer?.sdp &&
             data.offer.sdp !== lastProcessedOfferSdpRef.current
           ) {
-            console.log('[WaveLink WebRTC] Receiver detected new/restarted offer');
+            console.log('[CALL] Callee detected new/restarted offer');
+            hasRemoteDescriptionRef.current = false;
             await processOfferAndCreateAnswer(data.offer as RTCSessionDescriptionInit);
           }
         });
@@ -1066,7 +1131,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     };
 
     initializeCall().catch((err) => {
-      console.error('[WaveLink WebRTC] Fatal call initialization error:', err);
+      logFinalFailure(`Fatal call initialization error: ${err instanceof Error ? err.message : String(err)}`);
       if (!isCancelled) {
         updateLifecycleState('failed', 'Connection failed');
       }
@@ -1080,14 +1145,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     activeCallId,
     cleanupWebRTC,
     clearTimers,
+    effectiveIsIncoming,
     normalizedMode,
-    resolvedIsIncoming,
     retryAttempt,
     updateLifecycleState,
   ]);
 
   const handleEndCall = async () => {
     isCleaningUpRef.current = true;
+    console.log('[CALL] Ending call by user action');
     try {
       await updateDoc(doc(db, 'calls', activeCallId), {
         status: 'ended',
@@ -1102,9 +1168,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   };
 
   const handleRetryCall = async () => {
-    console.log('[WaveLink WebRTC] Retrying call connection...');
+    console.log('[CALL] Retrying call with a fresh peer connection & call session (no page reload)...');
+    isCleaningUpRef.current = true;
+    const oldCallId = activeCallId;
+    cleanupWebRTC();
+
     try {
-      await updateDoc(doc(db, 'calls', activeCallId), {
+      await updateDoc(doc(db, 'calls', oldCallId), {
         status: 'ended',
         updatedAt: new Date().toISOString(),
       });
@@ -1112,15 +1182,12 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       // ignore
     }
 
-    cleanupWebRTC();
-
-    if (!resolvedIsIncoming) {
-      const nextCallId = `call_${resolvedUserId}_${resolvedRecipientId}_${Date.now()}`;
-      setActiveCallId(nextCallId);
-      updateLifecycleState('ringing', 'Ringing...');
-    } else {
-      updateLifecycleState('connecting', 'Connecting...');
-    }
+    const nextCallId = `call_${resolvedUserId}_${resolvedRecipientId}_${Date.now()}`;
+    initialOfferRef.current = undefined;
+    isCleaningUpRef.current = false;
+    setEffectiveIsIncoming(false);
+    setActiveCallId(nextCallId);
+    updateLifecycleState('ringing', 'Ringing...');
     setRetryAttempt((prev) => prev + 1);
   };
 
@@ -1315,15 +1382,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               </div>
             </div>
 
-            {/* Desktop-only badges & secondary actions (hidden on phones so header stays minimal) */}
+            {/* Desktop-only badges & secondary actions (status is NOT repeated here) */}
             <div className="hidden lg:flex items-center gap-2">
               <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-800/80 border border-slate-700/70 text-[11px] font-semibold text-cyan-300">
                 <Shield className="w-3.5 h-3.5 text-cyan-400" />
                 E2E WebRTC
-              </span>
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-800/80 border border-slate-700/70 text-[11px] font-semibold text-slate-300">
-                <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-                {callState === 'connected' ? 'Peer Connected' : statusMessage}
               </span>
               <button
                 type="button"
@@ -1361,7 +1424,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           </div>
         </header>
 
-        {/* STAGE: Full-screen remote video + floating PIP in the corner */}
+        {/* STAGE: Full-screen on mobile with top-right self view; side-by-side panes on desktop */}
         <div className="wavelink-call-stage">
           {/* Remote Participant Pane */}
           <div className="wavelink-call-remote-pane">
@@ -1399,28 +1462,16 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                   />
                 </div>
 
-                {/* On phones (<768px), keep text minimal (only name + call time/status) */}
+                {/* Name only (status text is shown once in the header) */}
                 <h3 className="text-lg lg:text-2xl font-bold text-white mb-1 truncate max-w-[85vw]">
                   {resolvedRecipientName}
                 </h3>
-                <p className="text-sm lg:text-base font-medium text-cyan-300 flex items-center gap-2">
-                  {(callState === 'ringing' || callState === 'connecting') && (
-                    <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
-                  )}
-                  <span>{headerTimeOrStatus}</span>
-                </p>
 
-                {/* Error / Retry state when 20s timeout expires or receiver doesn't answer */}
+                {/* Retry / Close actions when call fails or goes unanswered */}
                 {(callState === 'failed' ||
                   callState === 'no-answer' ||
                   callState === 'declined') && (
                   <div className="mt-5 flex flex-col items-center gap-3 max-w-xs">
-                    <div className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-200 text-xs font-medium">
-                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                      <span>
-                        {callState === 'failed' ? 'Connection failed' : 'No answer'}
-                      </span>
-                    </div>
                     <div className="flex items-center gap-3">
                       <button
                         type="button"
@@ -1443,8 +1494,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               </div>
             )}
 
-            {/* Desktop participant label */}
-            <div className="hidden lg:flex items-center gap-2 absolute top-4 left-4 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold text-white">
+            {/* Desktop participant label positioned cleanly at bottom-left so it never overlaps the header */}
+            <div className="hidden lg:flex items-center gap-2 absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold text-white">
               <Radio className="w-3.5 h-3.5 text-cyan-400" />
               <span>{resolvedRecipientName}</span>
             </div>

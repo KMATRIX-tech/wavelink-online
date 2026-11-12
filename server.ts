@@ -2390,15 +2390,23 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
       !val ||
       val === 'YOUR_TURN_USERNAME' ||
       val === 'YOUR_TURN_CREDENTIAL' ||
-      val.startsWith('YOUR_');
+      val.startsWith('YOUR_') ||
+      val.includes('your-turn-host.example.com');
 
-    const turnUrls = rawTurnUrls
+    const hasCustomTurnConfig =
+      !isPlaceholder(rawTurnUrls) &&
+      !isPlaceholder(rawUsername) &&
+      !isPlaceholder(rawCredential);
+
+    const turnUrls = !isPlaceholder(rawTurnUrls)
       ? rawTurnUrls
           .split(',')
           .map((u) => u.trim())
           .filter(Boolean)
       : [
           'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:80?transport=tcp',
+          'turn:openrelay.metered.ca:3478?transport=udp',
           'turn:openrelay.metered.ca:443',
           'turn:openrelay.metered.ca:443?transport=tcp',
           'turns:openrelay.metered.ca:443?transport=tcp',
@@ -2420,7 +2428,7 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
       },
     ];
 
-    res.json({ success: true, iceServers });
+    res.json({ success: true, hasCustomTurnConfig, iceServers });
   });
 
   // ============================================================================

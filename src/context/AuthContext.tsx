@@ -1488,7 +1488,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         updatePayload.spotlightNote = sanitizeUserText(data.spotlightNote, 200);
       }
       if (data.coverImageUrl !== undefined) {
-        updatePayload.coverImageUrl = sanitizeUserText(data.coverImageUrl, 2048);
+        const cleanCoverUrl = String(data.coverImageUrl || '').trim().slice(0, 2048);
+        updatePayload.coverImageUrl =
+          cleanCoverUrl === '' ||
+          cleanCoverUrl.startsWith('https://') ||
+          cleanCoverUrl.startsWith('http://')
+            ? cleanCoverUrl
+            : '';
       }
       if (data.coverPresetId !== undefined) {
         updatePayload.coverPresetId = data.coverPresetId;

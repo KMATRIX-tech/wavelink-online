@@ -87,6 +87,7 @@ import {
   MoreVertical,
   Pin,
   Play,
+  RotateCcw,
   Settings,
   Share2,
   Tag,
@@ -97,10 +98,17 @@ import { NotificationSettingsPanel } from './NotificationSettingsPanel';
 
 import { inviteFriends, sharePost } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
-import { compressImage } from '../utils/mediaStorage';
+import {
+  compressProfileImageToBlob,
+  deleteOldProfileMediaFromStorage,
+  ProfileStorageUploadError,
+  uploadProfileMediaToFirebaseStorage,
+  validateProfileImageFile
+} from '../utils/mediaStorage';
 import { validateStrongPassword } from '../utils/security';
 import {
   db,
+  formatFirebaseStorageImageError,
   formatEmailVerificationError,
   extractSafeFirebaseAuthCode,
   fetchUserProfileCached,
@@ -565,6 +573,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
+  const [avatarUploadProgress, setAvatarUploadProgress] = useState(0);
+  const [avatarUploadError, setAvatarUploadError] = useState<{
+    message: string;
+    code?: string;
+  } | null>(null);
+  const [lastFailedAvatarFile, setLastFailedAvatarFile] = useState<File | null>(null);
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
   const [inviteToast, setInviteToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
@@ -729,21 +744,79 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  // File upload for profile picture directly from the browser to Cloudinary (preset monarcking72)
+  // File upload for profile picture directly to Firebase Storage (`users/{uid}/avatars/...`)
+  const uploadAvatarFileToFirebase = async (file: File) => {
+    setAvatarUploadError(null);
+    setAvatarUploadProgress(0);
+
+    const validation = validateProfileImageFile(file);
+    if (!validation.valid) {
+      const msg =
+        validation.error || 'Only image files (JPG, PNG, WebP, or GIF) are allowed.';
+      setAvatarUploadError({
+        message: msg,
+        code: validation.errorCode || 'storage/invalid-file-type'
+      });
+      setLastFailedAvatarFile(null);
+      return;
+    }
+
+    if (!currentUser?.uid) {
+      setAvatarUploadError({
+        message: 'Please sign in before uploading a profile photo.',
+        code: 'storage/unauthenticated'
+      });
+      return;
+    }
+
+    setIsUploadingAvatar(true);
+    try {
+      const compressedBlob = await compressProfileImageToBlob(file, {
+        maxWidth: 800,
+        maxHeight: 800,
+        targetMaxBytes: 250 * 1024,
+        mimeType: 'image/jpeg'
+      });
+      const uploaded = await uploadProfileMediaToFirebaseStorage({
+        uid: currentUser.uid,
+        folder: 'avatars',
+        blob: compressedBlob,
+        contentType: 'image/jpeg',
+        onProgress: (pct) => setAvatarUploadProgress(pct)
+      });
+
+      const previousAvatarUrl = userProfile?.photoURL || photoURL;
+      setPhotoURL(uploaded.downloadUrl);
+      await updateUserProfile({ photoURL: uploaded.downloadUrl });
+      setLastFailedAvatarFile(null);
+
+      // Delete old avatar only AFTER Firestore document update succeeds
+      if (previousAvatarUrl && previousAvatarUrl !== uploaded.downloadUrl) {
+        await deleteOldProfileMediaFromStorage(previousAvatarUrl);
+      }
+    } catch (err: any) {
+      if (err instanceof ProfileStorageUploadError) {
+        console.error('[WaveLink Avatar Upload Failed]', {
+          code: err.code,
+          message: err.message,
+          rawError: err
+        });
+        setAvatarUploadError({ message: err.friendlyMessage, code: err.code });
+      } else {
+        const formatted = formatFirebaseStorageImageError(err, { action: 'upload-avatar' });
+        setAvatarUploadError({ message: formatted.friendlyMessage, code: formatted.code });
+      }
+      setLastFailedAvatarFile(file);
+    } finally {
+      setIsUploadingAvatar(false);
+    }
+  };
+
   const handleAvatarFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
     e.target.value = '';
-
-    try {
-      const uploadedUrl = await compressImage(file, 512, 512, 0.88);
-      if (uploadedUrl && uploadedUrl.startsWith('http')) {
-        setPhotoURL(uploadedUrl);
-      }
-    } catch (err) {
-      console.error('Failed to upload profile picture to Cloudinary:', err);
-      setGentleProNote('Could not upload profile picture to Cloudinary. Please check your connection and try again.');
-    }
+    if (!file) return;
+    await uploadAvatarFileToFirebase(file);
   };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
@@ -1190,11 +1263,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     coverPresetId?: UserProfile['coverPresetId'];
     coverImageUrl?: string;
   }) => {
+    const previousCoverUrl = userProfile?.coverImageUrl;
     await updateUserProfile({
       coverType: coverData.coverType,
       coverPresetId: coverData.coverPresetId,
       coverImageUrl: coverData.coverImageUrl
     });
+    if (previousCoverUrl && previousCoverUrl !== coverData.coverImageUrl) {
+      await deleteOldProfileMediaFromStorage(previousCoverUrl);
+    }
     setInviteToast({
       message:
         language === 'sw' ? 'Jalada la wasifu limehifadhiwa!' : 'Profile cover updated!',
@@ -1927,6 +2004,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       <ProfileCoverModal
         isOpen={isCoverModalOpen}
         onClose={() => setIsCoverModalOpen(false)}
+        uid={currentUser?.uid}
         isProUser={isProUser}
         currentCoverType={userProfile?.coverType}
         currentPresetId={userProfile?.coverPresetId}
@@ -4031,20 +4109,59 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   targetProfile={userProfile}
                   className="ring-2 ring-[#2563EB]/20 rounded-full"
                 />
-                <div className="flex-1 space-y-1.5">
+                <div className="flex-1 space-y-2">
                   <span className="text-xs font-bold text-[#1C1917] block">
                     Profile Photo
                   </span>
-                  <label className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold cursor-pointer transition">
+                  <label
+                    className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold transition ${
+                      isUploadingAvatar ? 'opacity-60 pointer-events-none' : 'cursor-pointer'
+                    }`}
+                  >
                     <Upload size={14} />
-                    <span>Upload Photo</span>
+                    <span>
+                      {isUploadingAvatar ? `Uploading (${avatarUploadProgress}%)` : 'Upload Photo'}
+                    </span>
                     <input
                       type="file"
                       accept="image/*"
+                      disabled={isUploadingAvatar}
                       onChange={handleAvatarFileSelect}
                       className="hidden"
                     />
                   </label>
+
+                  {isUploadingAvatar && (
+                    <div className="w-full max-w-xs space-y-1 pt-1">
+                      <div className="w-full h-2 rounded-full bg-black/10 overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-[#2563EB] transition-all duration-200"
+                          style={{ width: `${Math.max(4, avatarUploadProgress)}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {avatarUploadError && (
+                    <div className="p-2.5 rounded-xl bg-rose-500/12 border border-rose-500/30 text-rose-700 text-xs space-y-1.5">
+                      <p className="font-semibold">{avatarUploadError.message}</p>
+                      {avatarUploadError.code && (
+                        <p className="text-[11px] font-mono opacity-80">
+                          Error code: {avatarUploadError.code}
+                        </p>
+                      )}
+                      {lastFailedAvatarFile && !isUploadingAvatar && (
+                        <button
+                          type="button"
+                          onClick={() => uploadAvatarFileToFirebase(lastFailedAvatarFile)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-extrabold transition cursor-pointer"
+                        >
+                          <RotateCcw size={12} />
+                          <span>Retry</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 

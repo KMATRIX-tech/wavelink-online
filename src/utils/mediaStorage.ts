@@ -1,5 +1,9 @@
 import {
+  auth,
   db,
+  storage,
+  resolvedStorageBucket,
+  formatFirebaseStorageImageError,
   getAuthHeaders,
   formatVideoUploadError,
   CLOUDINARY_CLOUD_NAME,
@@ -8,6 +12,12 @@ import {
   CLOUDINARY_IMAGE_UPLOAD_URL
 } from '../firebase';
 import { collection, doc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
+import {
+  ref,
+  uploadBytesResumable,
+  getDownloadURL,
+  deleteObject
+} from 'firebase/storage';
 
 const DB_NAME = 'wavelink_media_db';
 const STORE_NAME = 'videos';
@@ -554,6 +564,310 @@ export function uploadImageToCloudinary(
     if (onProgress) onProgress(5);
     xhr.send(formData);
   });
+}
+
+// ============================================================================
+// FIREBASE STORAGE PROFILE COVER & AVATAR UPLOAD (uploadBytesResumable)
+// - Paths: users/{uid}/covers/... and users/{uid}/avatars/...
+// - Enforces image-only + <= 5 MB max (compresses to ~250-300 KB JPEG)
+// - Waits for getDownloadURL() and deletes old Storage file after Firestore save
+// ============================================================================
+export const MAX_PROFILE_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB hard Storage rule cap
+
+export class ProfileStorageUploadError extends Error {
+  code: string;
+  friendlyMessage: string;
+
+  constructor(friendlyMessage: string, code: string, originalMessage?: string) {
+    super(friendlyMessage || originalMessage || 'Upload failed');
+    this.name = 'ProfileStorageUploadError';
+    this.code = code || 'storage/unknown';
+    this.friendlyMessage = friendlyMessage;
+  }
+}
+
+export function validateProfileImageFile(
+  file: File | Blob | null | undefined
+): { valid: boolean; mimeType: string; error?: string; errorCode?: string } {
+  if (!file || file.size <= 0) {
+    return {
+      valid: false,
+      mimeType: '',
+      error: 'Please select a valid image file.',
+      errorCode: 'storage/empty-file'
+    };
+  }
+
+  const rawType = (file.type || '').split(';')[0].trim().toLowerCase();
+  const fileName = ((file as File).name || '').toLowerCase();
+
+  if (rawType.startsWith('image/')) {
+    return { valid: true, mimeType: rawType };
+  }
+
+  if (/\.(jpe?g|png|webp|gif|heic|heif|avif|bmp)$/i.test(fileName)) {
+    const inferred = fileName.endsWith('.png')
+      ? 'image/png'
+      : fileName.endsWith('.webp')
+      ? 'image/webp'
+      : fileName.endsWith('.gif')
+      ? 'image/gif'
+      : 'image/jpeg';
+    return { valid: true, mimeType: inferred };
+  }
+
+  return {
+    valid: false,
+    mimeType: rawType || 'application/octet-stream',
+    error: 'Only image files (JPG, PNG, WebP, or GIF) are allowed.',
+    errorCode: 'storage/invalid-file-type'
+  };
+}
+
+/**
+ * Compresses an image in the browser to maxWidth x maxHeight (JPEG/WebP),
+ * targeting `targetMaxBytes` (default ~250-300 KB) and strictly enforcing <= 5 MB.
+ */
+export async function compressProfileImageToBlob(
+  file: File | Blob,
+  options: {
+    maxWidth?: number;
+    maxHeight?: number;
+    targetMaxBytes?: number;
+    mimeType?: 'image/jpeg' | 'image/webp';
+  } = {}
+): Promise<Blob> {
+  const maxWidth = options.maxWidth ?? 1600;
+  const maxHeight = options.maxHeight ?? 1600;
+  const targetMaxBytes = options.targetMaxBytes ?? 300 * 1024;
+  const mimeType = options.mimeType ?? 'image/jpeg';
+
+  const check = validateProfileImageFile(file);
+  if (!check.valid) {
+    throw new ProfileStorageUploadError(
+      check.error || 'Only image files are allowed.',
+      check.errorCode || 'storage/invalid-file-type'
+    );
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () =>
+        reject(
+          new ProfileStorageUploadError(
+            'Could not read this image file. Please try a JPG, PNG, or WebP image.',
+            'storage/unreadable-image'
+          )
+        );
+      el.src = objectUrl;
+    });
+
+    let width = Math.max(1, img.naturalWidth || img.width || 800);
+    let height = Math.max(1, img.naturalHeight || img.height || 800);
+
+    if (width > maxWidth || height > maxHeight) {
+      const ratio = Math.min(maxWidth / width, maxHeight / height);
+      width = Math.max(1, Math.round(width * ratio));
+      height = Math.max(1, Math.round(height * ratio));
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      if (file.size <= MAX_PROFILE_IMAGE_UPLOAD_BYTES) {
+        return file;
+      }
+      throw new ProfileStorageUploadError(
+        'Could not prepare image for upload.',
+        'storage/canvas-unavailable'
+      );
+    }
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, width, height);
+
+    let bestBlob: Blob | null = null;
+    for (let quality = 0.86; quality >= 0.42; quality -= 0.08) {
+      // eslint-disable-next-line no-await-in-loop
+      const candidate = await new Promise<Blob | null>((res) =>
+        canvas.toBlob((b) => res(b), mimeType, quality)
+      );
+      if (candidate && candidate.size > 0) {
+        bestBlob = candidate;
+        if (candidate.size <= targetMaxBytes) {
+          break;
+        }
+      }
+    }
+
+    if (!bestBlob) {
+      throw new ProfileStorageUploadError(
+        'Failed to compress selected image.',
+        'storage/compression-failed'
+      );
+    }
+
+    if (bestBlob.size > MAX_PROFILE_IMAGE_UPLOAD_BYTES) {
+      throw new ProfileStorageUploadError(
+        'Compressed image is still larger than the 5 MB limit. Please choose a smaller photo.',
+        'storage/file-too-large'
+      );
+    }
+
+    return bestBlob;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+export async function uploadProfileMediaToFirebaseStorage(params: {
+  uid: string;
+  folder: 'covers' | 'avatars';
+  blob: Blob;
+  contentType?: string;
+  onProgress?: (percentage: number) => void;
+}): Promise<{ downloadUrl: string; storagePath: string; bytes: number }> {
+  const { uid, folder, blob, onProgress } = params;
+
+  if (!uid || !auth.currentUser || auth.currentUser.uid !== uid) {
+    const err = new ProfileStorageUploadError(
+      'Please sign in before uploading an image.',
+      'storage/unauthenticated'
+    );
+    console.error('[WaveLink Firebase Storage Error]', { code: err.code, message: err.message });
+    throw err;
+  }
+
+  if (!storage || !resolvedStorageBucket) {
+    const err = new ProfileStorageUploadError(
+      'Firebase Storage bucket is not configured. Check VITE_FIREBASE_STORAGE_BUCKET and enable Storage in Firebase Console.',
+      'storage/bucket-not-configured'
+    );
+    console.error('[WaveLink Firebase Storage Error]', {
+      code: err.code,
+      bucket: resolvedStorageBucket,
+      message: err.message
+    });
+    throw err;
+  }
+
+  if (!blob || blob.size <= 0) {
+    throw new ProfileStorageUploadError('Selected image is empty.', 'storage/empty-file');
+  }
+
+  if (blob.size > MAX_PROFILE_IMAGE_UPLOAD_BYTES) {
+    throw new ProfileStorageUploadError(
+      'Image exceeds the 5 MB maximum upload size.',
+      'storage/file-too-large'
+    );
+  }
+
+  const resolvedType =
+    (params.contentType || blob.type || 'image/jpeg').split(';')[0].trim().toLowerCase();
+  if (!resolvedType.startsWith('image/')) {
+    throw new ProfileStorageUploadError(
+      'Only image files (JPG, PNG, WebP, GIF) can be uploaded.',
+      'storage/invalid-file-type'
+    );
+  }
+
+  const ext =
+    resolvedType === 'image/webp'
+      ? 'webp'
+      : resolvedType === 'image/png'
+      ? 'png'
+      : resolvedType === 'image/gif'
+      ? 'gif'
+      : 'jpg';
+  const fileName = `${folder === 'covers' ? 'cover' : 'avatar'}_${Date.now()}.${ext}`;
+  const storagePath = `users/${uid}/${folder}/${fileName}`;
+  const storageRef = ref(storage, storagePath);
+
+  try {
+    if (onProgress) onProgress(2);
+    const uploadTask = uploadBytesResumable(storageRef, blob, {
+      contentType: resolvedType,
+      cacheControl: 'public,max-age=31536000'
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      uploadTask.on(
+        'state_changed',
+        (snapshot) => {
+          if (onProgress && snapshot.totalBytes > 0) {
+            const pct = Math.max(
+              2,
+              Math.min(96, Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 95))
+            );
+            onProgress(pct);
+          }
+        },
+        (uploadErr) => {
+          reject(uploadErr);
+        },
+        () => {
+          resolve();
+        }
+      );
+    });
+
+    const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
+    if (onProgress) onProgress(100);
+
+    return {
+      downloadUrl,
+      storagePath,
+      bytes: blob.size
+    };
+  } catch (err) {
+    const formatted = formatFirebaseStorageImageError(err, {
+      path: storagePath,
+      action: `upload-${folder}`
+    });
+    throw new ProfileStorageUploadError(
+      formatted.friendlyMessage,
+      formatted.code,
+      formatted.message
+    );
+  }
+}
+
+/**
+ * Deletes a previously uploaded Firebase Storage profile cover/avatar URL or path.
+ * Safely no-ops for external URLs (DiceBear, Google, Cloudinary, preset URLs) or already-removed files.
+ */
+export async function deleteOldProfileMediaFromStorage(
+  oldUrlOrPath?: string | null
+): Promise<void> {
+  if (!oldUrlOrPath || typeof oldUrlOrPath !== 'string' || !storage) return;
+  const trimmed = oldUrlOrPath.trim();
+  if (!trimmed) return;
+
+  const isFirebaseStorageUrl =
+    trimmed.startsWith('users/') ||
+    trimmed.includes('firebasestorage.googleapis.com') ||
+    trimmed.includes('.firebasestorage.app');
+
+  if (!isFirebaseStorageUrl) return;
+
+  try {
+    const oldRef = ref(storage, trimmed);
+    await deleteObject(oldRef);
+  } catch (err: any) {
+    // Ignore storage/object-not-found or external/permission edge cases cleanly
+    if (err?.code && err.code !== 'storage/object-not-found') {
+      console.warn('[WaveLink Storage] Could not delete previous profile image:', {
+        code: err.code,
+        message: err.message
+      });
+    }
+  }
 }
 
 /**

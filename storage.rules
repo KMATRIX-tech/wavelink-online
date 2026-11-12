@@ -1,0 +1,38 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Deny everything else by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Profile Cover images:
+    // - Any signed-in user can read
+    // - Only the owner (uid) can create, overwrite, or delete inside their own folder
+    // - Strictly images only (image/*) and max 5 MB
+    match /users/{userId}/covers/{fileName} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource != null
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Profile Avatar / Photo images:
+    // - Any signed-in user can read
+    // - Only the owner (uid) can create, overwrite, or delete inside their own folder
+    // - Strictly images only (image/*) and max 5 MB
+    match /users/{userId}/avatars/{fileName} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource != null
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

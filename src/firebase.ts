@@ -9,11 +9,23 @@ import {
   doc,
   getDoc
 } from 'firebase/firestore';
+import { getStorage, type FirebaseStorage } from 'firebase/storage';
 import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
 import type { UserProfile } from './types';
 
-export const firebaseConfig = firebaseAppletConfig;
+const envStorageBucket =
+  typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_STORAGE_BUCKET
+    ? String((import.meta as any).env.VITE_FIREBASE_STORAGE_BUCKET).trim()
+    : '';
+
+export const resolvedStorageBucket: string =
+  envStorageBucket || (firebaseAppletConfig as { storageBucket?: string }).storageBucket || '';
+
+export const firebaseConfig = {
+  ...firebaseAppletConfig,
+  ...(resolvedStorageBucket ? { storageBucket: resolvedStorageBucket } : {})
+};
 
 // Silence transient WebChannel probe warnings so 10s offline fallback checks do not emit false-positive console errors
 setLogLevel('silent');
@@ -43,6 +55,117 @@ try {
 export const db = firestoreDb;
 
 export const auth = getAuth(app);
+
+// ============================================================================
+// FIREBASE STORAGE (Profile Covers & Profile Photos)
+// ============================================================================
+let storageInstance: FirebaseStorage | null = null;
+try {
+  if (resolvedStorageBucket) {
+    const bucketUrl = resolvedStorageBucket.startsWith('gs://')
+      ? resolvedStorageBucket
+      : `gs://${resolvedStorageBucket}`;
+    storageInstance = getStorage(app, bucketUrl);
+  } else {
+    console.warn(
+      '[WaveLink Storage] storageBucket is missing in firebase-applet-config.json and VITE_FIREBASE_STORAGE_BUCKET.'
+    );
+    storageInstance = getStorage(app);
+  }
+} catch (storageInitErr) {
+  console.error('[WaveLink Storage] Initialization failed:', storageInitErr);
+  storageInstance = null;
+}
+
+export const storage = storageInstance;
+
+export function formatFirebaseStorageImageError(
+  error: unknown,
+  context?: { path?: string; action?: string }
+): { code: string; message: string; friendlyMessage: string } {
+  const errObj = error as { code?: unknown; message?: unknown; customData?: unknown };
+  const rawCode = typeof errObj?.code === 'string' && errObj.code.trim() ? errObj.code.trim() : '';
+  const rawMessage = error instanceof Error ? error.message : String(error || 'Unknown error');
+  const code =
+    rawCode ||
+    (rawMessage.toLowerCase().includes('cors') || rawMessage.toLowerCase().includes('preflight')
+      ? 'storage/cors-or-network'
+      : 'storage/unknown');
+
+  console.error('[WaveLink Firebase Storage Error]', {
+    action: context?.action || 'upload',
+    path: context?.path,
+    bucket: resolvedStorageBucket || '(not set)',
+    code,
+    message: rawMessage,
+    customData: errObj?.customData,
+    rawError: error
+  });
+
+  if (code === 'storage/unauthorized' || rawMessage.toLowerCase().includes('permission')) {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage:
+        'Upload permission denied. Make sure you are signed in and Firebase Storage rules allow your account to write to your profile folder.'
+    };
+  }
+  if (code === 'storage/unauthenticated') {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage: 'Please sign in again before uploading an image.'
+    };
+  }
+  if (code === 'storage/canceled') {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage: 'Upload was cancelled. Tap Retry to try again.'
+    };
+  }
+  if (code === 'storage/retry-limit-exceeded') {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage:
+        'Upload timed out on a slow connection. Check your internet connection and tap Retry.'
+    };
+  }
+  if (code === 'storage/quota-exceeded') {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage: 'Firebase Storage quota reached. Check your Firebase project Storage plan.'
+    };
+  }
+  if (code === 'storage/invalid-argument' || code === 'storage/bucket-not-found' || !resolvedStorageBucket) {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage:
+        'Firebase Storage bucket is not configured or enabled yet. Check VITE_FIREBASE_STORAGE_BUCKET and Firebase Console Storage setup.'
+    };
+  }
+  if (
+    code === 'storage/cors-or-network' ||
+    rawMessage.toLowerCase().includes('network') ||
+    rawMessage.toLowerCase().includes('failed to fetch')
+  ) {
+    return {
+      code,
+      message: rawMessage,
+      friendlyMessage:
+        'Upload blocked by network or bucket CORS configuration. Check your connection and Firebase Storage CORS for this site.'
+    };
+  }
+
+  return {
+    code,
+    message: rawMessage,
+    friendlyMessage: rawMessage || 'Image upload failed. Please tap Retry to try again.'
+  };
+}
 
 // ============================================================================
 // FIREBASE REALTIME DATABASE (Presence & Ephemeral Typing Indicators)

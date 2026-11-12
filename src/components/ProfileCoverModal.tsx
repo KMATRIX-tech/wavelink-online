@@ -1,10 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
+  AlertCircle,
   Camera,
   Check,
   Crown,
   Image as ImageIcon,
   Lock,
+  RotateCcw,
   Sparkles,
   Upload,
   Video,
@@ -12,7 +14,13 @@ import {
   ZoomIn
 } from 'lucide-react';
 import { AppearanceTheme, ProfileCoverPresetId, ProfileCoverType, UserProfile } from '../types';
-import { uploadImageToCloudinary } from '../utils/mediaStorage';
+import { auth, formatFirebaseStorageImageError } from '../firebase';
+import {
+  compressProfileImageToBlob,
+  ProfileStorageUploadError,
+  uploadProfileMediaToFirebaseStorage,
+  validateProfileImageFile
+} from '../utils/mediaStorage';
 
 export interface BuiltInCoverPreset {
   id: ProfileCoverPresetId;
@@ -168,17 +176,17 @@ export function getThemeDefaultCoverStyle(theme?: AppearanceTheme): React.CSSPro
 }
 
 /**
- * Crops an image file to a 3:1 cover aspect ratio (1200x400) with vertical pan & zoom,
- * and compresses it to under 500 KB JPEG.
+ * Crops an image file to a 3:1 cover aspect ratio (1600x534 max width) with vertical pan & zoom,
+ * and compresses it to ~300 KB JPEG (never exceeding 5 MB).
  */
 async function cropAndCompressCoverImage(
   imageElement: HTMLImageElement,
   panYPercent: number, // 0 to 100
   zoomLevel: number // 1 to 2.5
 ): Promise<{ blob: Blob; previewDataUrl: string }> {
-  const TARGET_W = 1200;
-  const TARGET_H = 400; // 3:1 cover aspect ratio
-  const MAX_BYTES = 490 * 1024; // Strictly under 500 KB
+  const TARGET_W = 1600;
+  const TARGET_H = 534; // 3:1 cover aspect ratio, max 1600px wide
+  const TARGET_BYTES = 300 * 1024; // ~300 KB target
 
   const canvas = document.createElement('canvas');
   canvas.width = TARGET_W;
@@ -219,26 +227,40 @@ async function cropAndCompressCoverImage(
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(imageElement, srcX, srcY, cropW, cropH, 0, 0, TARGET_W, TARGET_H);
 
-  // Iteratively compress JPEG so it is guaranteed < 500 KB
-  let quality = 0.86;
+  // Iteratively compress JPEG toward ~300 KB
+  let quality = 0.84;
   let finalBlob: Blob | null = null;
 
-  while (quality >= 0.45) {
+  while (quality >= 0.4) {
     // eslint-disable-next-line no-await-in-loop
     const candidate = await new Promise<Blob | null>((resolve) => {
       canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
     });
     if (candidate) {
       finalBlob = candidate;
-      if (candidate.size <= MAX_BYTES) {
+      if (candidate.size <= TARGET_BYTES) {
         break;
       }
     }
-    quality -= 0.1;
+    quality -= 0.08;
   }
 
   if (!finalBlob) {
     throw new Error('Failed to compress cover image.');
+  }
+
+  // If still > 300 KB at low quality, downscale slightly via compressProfileImageToBlob
+  if (finalBlob.size > 400 * 1024) {
+    try {
+      finalBlob = await compressProfileImageToBlob(finalBlob, {
+        maxWidth: 1600,
+        maxHeight: 534,
+        targetMaxBytes: TARGET_BYTES,
+        mimeType: 'image/jpeg'
+      });
+    } catch {
+      // Keep finalBlob as long as it's under 5 MB
+    }
   }
 
   const previewDataUrl = canvas.toDataURL('image/jpeg', Math.max(0.5, quality));
@@ -395,6 +417,7 @@ export const ProfileCoverBanner: React.FC<ProfileCoverBannerProps> = ({
 interface ProfileCoverModalProps {
   isOpen: boolean;
   onClose: () => void;
+  uid?: string;
   isProUser: boolean;
   currentCoverType?: ProfileCoverType;
   currentPresetId?: ProfileCoverPresetId;
@@ -411,6 +434,7 @@ interface ProfileCoverModalProps {
 export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
   isOpen,
   onClose,
+  uid,
   isProUser,
   currentCoverType = 'default',
   currentPresetId = 'theme-default',
@@ -438,6 +462,8 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [canRetryUpload, setCanRetryUpload] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -452,6 +478,7 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
       .catch((err) => {
         if (!cancelled) {
           setErrorMsg(err instanceof Error ? err.message : 'Failed to crop image.');
+          setErrorCode('storage/crop-failed');
         }
       });
     return () => {
@@ -463,21 +490,27 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     setErrorMsg(null);
+    setErrorCode(null);
+    setCanRetryUpload(false);
 
-    if (!file.type.startsWith('image/')) {
+    const validation = validateProfileImageFile(file);
+    if (!validation.valid) {
       setErrorMsg(
         language === 'sw'
-          ? 'Tafadhali chagua faili la picha (JPG, PNG, au WebP).'
-          : 'Please choose an image file (JPG, PNG, or WebP).'
+          ? 'Tafadhali chagua faili la picha pekee (JPG, PNG, WebP, au GIF).'
+          : validation.error || 'Please choose an image file (JPG, PNG, WebP, or GIF).'
       );
+      setErrorCode(validation.errorCode || 'storage/invalid-file-type');
       return;
     }
 
     const objectUrl = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
       setLoadedImage(img);
       setPanYPercent(50);
       setZoomLevel(1);
@@ -489,6 +522,7 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
           ? 'Imeshindwa kusoma picha hii.'
           : 'Could not read this image file.'
       );
+      setErrorCode('storage/unreadable-image');
     };
     img.src = objectUrl;
   };
@@ -502,6 +536,8 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
 
     setIsSaving(true);
     setErrorMsg(null);
+    setErrorCode(null);
+    setCanRetryUpload(false);
     try {
       if (tab === 'presets') {
         const chosen = BUILT_IN_COVER_PRESETS.find((p) => p.id === selectedPreset);
@@ -536,27 +572,42 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
               ? 'Tafadhali chagua picha kwanza.'
               : 'Please select an image to upload first.'
           );
+          setErrorCode('storage/no-file-selected');
           setIsSaving(false);
           return;
         }
 
+        const resolvedUid = uid || auth.currentUser?.uid || '';
         const { blob } = await cropAndCompressCoverImage(loadedImage, panYPercent, zoomLevel);
-        const uploaded = await uploadImageToCloudinary(blob, (pct) => setUploadProgress(pct));
+        const uploaded = await uploadProfileMediaToFirebaseStorage({
+          uid: resolvedUid,
+          folder: 'covers',
+          blob,
+          contentType: 'image/jpeg',
+          onProgress: (pct) => setUploadProgress(pct)
+        });
         await onSaveCover({
           coverType: 'image',
           coverPresetId: 'theme-default',
-          coverImageUrl: uploaded.secureUrl
+          coverImageUrl: uploaded.downloadUrl
         });
         onClose();
       }
-    } catch (err) {
-      setErrorMsg(
-        err instanceof Error
-          ? err.message
-          : language === 'sw'
-          ? 'Imeshindwa kuhifadhi jalada.'
-          : 'Failed to save cover.'
-      );
+    } catch (err: any) {
+      if (err instanceof ProfileStorageUploadError) {
+        console.error('[WaveLink Cover Upload Failed]', {
+          code: err.code,
+          message: err.message,
+          rawError: err
+        });
+        setErrorMsg(err.friendlyMessage);
+        setErrorCode(err.code);
+      } else {
+        const formatted = formatFirebaseStorageImageError(err, { action: 'save-cover' });
+        setErrorMsg(formatted.friendlyMessage);
+        setErrorCode(formatted.code);
+      }
+      setCanRetryUpload(tab === 'upload' && Boolean(loadedImage));
     } finally {
       setIsSaving(false);
       setUploadProgress(0);
@@ -584,8 +635,8 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
               </h3>
               <p className="text-xs text-[var(--text-secondary)]">
                 {language === 'sw'
-                  ? 'Chagua jalada la kisasa au pakia picha yako (< 500 KB)'
-                  : 'Pick a built-in animated/SVG cover or upload & crop your own (< 500 KB)'}
+                  ? 'Chagua jalada la kisasa au pakia picha yako (1600px, ~300 KB)'
+                  : 'Pick a built-in animated/SVG cover or upload & crop your own (1600px, ~300 KB)'}
               </p>
             </div>
           </div>
@@ -644,8 +695,45 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
           {errorMsg && (
-            <div className="p-3 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-rose-600 dark:text-rose-300 text-xs font-bold">
-              {errorMsg}
+            <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-rose-700 dark:text-rose-200 space-y-2">
+              <div className="flex items-start gap-2 text-xs font-bold">
+                <AlertCircle size={16} className="shrink-0 mt-0.5 text-rose-500" />
+                <div className="flex-1 min-w-0">
+                  <p>{errorMsg}</p>
+                  {errorCode && (
+                    <p className="text-[11px] font-mono opacity-80 mt-1">
+                      Error code: {errorCode}
+                    </p>
+                  )}
+                </div>
+              </div>
+              {canRetryUpload && !isSaving && (
+                <button
+                  type="button"
+                  onClick={handleSave}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold transition cursor-pointer"
+                >
+                  <RotateCcw size={13} />
+                  <span>{language === 'sw' ? 'Jaribu Tena' : 'Retry Upload'}</span>
+                </button>
+              )}
+            </div>
+          )}
+
+          {isSaving && tab === 'upload' && (
+            <div className="p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-1.5">
+              <div className="flex items-center justify-between text-xs font-bold text-[var(--text-primary)]">
+                <span>
+                  {language === 'sw' ? 'Inapakia jalada...' : 'Uploading cover photo...'}
+                </span>
+                <span className="font-mono">{uploadProgress}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-black/10 dark:bg-white/10 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[var(--accent-primary)] transition-all duration-200"
+                  style={{ width: `${Math.max(4, uploadProgress)}%` }}
+                />
+              </div>
             </div>
           )}
 
@@ -730,8 +818,8 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
                   </span>
                   <span className="text-xs text-[var(--text-secondary)] text-center">
                     {language === 'sw'
-                      ? 'Inapunguzwa moja kwa moja hadi uwiano wa 3:1 na chini ya 500 KB'
-                      : 'Automatically cropped to 3:1 cover aspect ratio & compressed under 500 KB'}
+                      ? 'Inapunguzwa moja kwa moja hadi upana wa 1600px (uwiano wa 3:1) na ~300 KB'
+                      : 'Automatically cropped to 3:1 cover ratio (max 1600px wide) & compressed to ~300 KB'}
                   </span>
                 </button>
               ) : (
@@ -745,7 +833,7 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
                       />
                     )}
                     <div className="absolute bottom-2 right-2 px-2.5 py-1 rounded-full bg-black/70 text-white text-[11px] font-bold backdrop-blur-xs">
-                      3:1 Cover • {croppedSizeKb} KB (&lt; 500 KB)
+                      3:1 Cover • {croppedSizeKb} KB
                     </div>
                   </div>
 
