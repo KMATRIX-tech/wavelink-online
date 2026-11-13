@@ -169,8 +169,7 @@ export const NotificationSettingsPanel: React.FC = () => {
       } else if (serverResult.reason === 'no_tokens') {
         setStatusFeedback({
           type: 'error',
-          text:
-            'No active FCM device token is saved yet. Tap "Enable Push Notifications" above first (with VITE_FIREBASE_VAPID_KEY configured).'
+          text: 'No active FCM device token is saved yet. Tap "Enable Push Notifications" above first.'
         });
       } else {
         // If Firebase Admin credentials aren't active in local preview, verify SW notification rendering locally

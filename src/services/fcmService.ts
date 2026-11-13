@@ -79,16 +79,9 @@ function hashTokenToId(token: string): string {
 }
 
 export function getVapidPublicKey(): string {
-  const raw =
-    typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_VAPID_KEY
-      ? String((import.meta as any).env.VITE_FIREBASE_VAPID_KEY).trim()
-      : '';
-  if (!raw) {
-    console.warn(
-      '[WaveLink Push] VITE_FIREBASE_VAPID_KEY is missing. Add your Firebase Web Push Certificate key to enable real background push notifications.'
-    );
-  }
-  return raw;
+  return typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_VAPID_KEY
+    ? String((import.meta as any).env.VITE_FIREBASE_VAPID_KEY).trim()
+    : '';
 }
 
 export function getBrowserNotificationPermission(): NotificationPermission | 'unsupported' {
@@ -331,14 +324,6 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
 
     const swReg = await getMessagingServiceWorkerRegistration();
     const vapidKey = getVapidPublicKey();
-    if (!vapidKey) {
-      return {
-        success: false,
-        permission: 'granted',
-        error:
-          'Browser permission was granted, but VITE_FIREBASE_VAPID_KEY is not configured yet. Add your Firebase Web Push certificate key to finish device registration.'
-      };
-    }
 
     const messagingSupported = await isSupported().catch(() => false);
     if (!messagingSupported) {
@@ -353,10 +338,23 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
     }
 
     const messaging = getMessaging(getApp());
-    const fcmToken = await getToken(messaging, {
-      serviceWorkerRegistration: swReg,
-      vapidKey
-    });
+    let fcmToken = '';
+    try {
+      const tokenOptions: { serviceWorkerRegistration?: ServiceWorkerRegistration; vapidKey?: string } = {
+        serviceWorkerRegistration: swReg
+      };
+      if (vapidKey) {
+        tokenOptions.vapidKey = vapidKey;
+      }
+      fcmToken = await getToken(messaging, tokenOptions);
+    } catch (tokenErr: any) {
+      console.error('[WaveLink Push] FCM token registration failed:', tokenErr);
+      return {
+        success: false,
+        permission: 'granted',
+        error: tokenErr?.message || 'Could not retrieve a push registration token from Firebase Cloud Messaging.'
+      };
+    }
 
     if (!fcmToken) {
       return {
@@ -508,18 +506,21 @@ export async function syncExistingDeviceTokenState(
 
   // Permission is already granted — silently ensure token & lastUsedAt are fresh
   try {
-    const vapidKey =
-      typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_VAPID_KEY
-        ? String((import.meta as any).env.VITE_FIREBASE_VAPID_KEY).trim()
-        : '';
+    const vapidKey = getVapidPublicKey();
     const supported = await isSupported().catch(() => false);
-    if (supported && vapidKey) {
+    if (supported) {
       const swReg = await getMessagingServiceWorkerRegistration();
       const messaging = getMessaging(getApp());
-      const freshToken = await getToken(messaging, {
-        serviceWorkerRegistration: swReg,
-        vapidKey
-      }).catch(() => '');
+      const tokenOptions: { serviceWorkerRegistration?: ServiceWorkerRegistration; vapidKey?: string } = {
+        serviceWorkerRegistration: swReg
+      };
+      if (vapidKey) {
+        tokenOptions.vapidKey = vapidKey;
+      }
+      const freshToken = await getToken(messaging, tokenOptions).catch((tokenErr) => {
+        console.error('[WaveLink Push] FCM token registration failed during sync:', tokenErr);
+        return '';
+      });
       if (freshToken) {
         const tokenChanged = freshToken !== savedToken;
         const lastSyncKey = `wavelink_fcm_last_sync_${userId}`;
