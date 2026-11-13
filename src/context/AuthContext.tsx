@@ -30,7 +30,10 @@ import {
   getClientDeviceId,
   setCachedUserProfile,
   sanitizeAvatarUrlForFirestore,
-  sanitizeShortHttpsUrl
+  sanitizeShortHttpsUrl,
+  getBestAuthUserPhotoUrl,
+  isPlaceholderAvatarUrl,
+  isRealUserPhotoUrl
 } from '../firebase';
 import { migrateDataUrlImageToCloudinary } from '../utils/mediaStorage';
 import {
@@ -707,12 +710,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             ? 'sub_admin'
             : 'user';
         const isInitialAdmin = initialRole === 'admin';
+        const bestInitialPhoto = getBestAuthUserPhotoUrl(user, null);
         const initialProfile: UserProfile = {
           id: user.uid,
           email: cleanUserEmail,
           username: isOwnerEmail ? '@keylan' : customUsername || `@${emailPrefix}`,
           displayName: isOwnerEmail ? 'Keylan' : customName || user.displayName || emailPrefix || 'Waver',
-          photoURL: sanitizeAvatarUrlForFirestore(user.photoURL, user.uid),
+          photoURL: sanitizeAvatarUrlForFirestore(bestInitialPhoto, user.uid),
           bio: isInitialAdmin ? 'Platform Owner & Founder of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
           status: 'active',
           isBanned: false,
@@ -759,12 +763,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             : data.role || 'user';
         const isEffectiveAdmin = effectiveRole === 'admin';
 
+        // Always prefer a real login photo (from Google providerData, user.photoURL, or data.avatar) over a missing or DiceBear placeholder
+        const bestPhotoUrl = getBestAuthUserPhotoUrl(user, data);
+        const shouldPersistRealPhoto =
+          isRealUserPhotoUrl(bestPhotoUrl) && isPlaceholderAvatarUrl(data.photoURL);
+
         const mergedProfile: UserProfile = {
           ...data,
           id: user.uid,
           email: data.email || cleanUserEmail,
           username: customUsername || data.username || (isOwnerEmail ? '@keylan' : `@${emailPrefix}`),
           displayName: customName || data.displayName || user.displayName || (isOwnerEmail ? 'Keylan' : emailPrefix || 'Waver'),
+          photoURL: bestPhotoUrl,
           role: effectiveRole,
           isSubAdmin: effectiveRole === 'sub_admin',
           isPro: Boolean(data.isPro || localPro || isEffectiveAdmin),
@@ -776,17 +786,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           ...rewardFields
         };
         setUserProfile(mergedProfile);
+        setCachedUserProfile(user.uid, mergedProfile);
         if (effectiveRole === 'admin' || effectiveRole === 'sub_admin') {
           setServerVerifiedRole(effectiveRole);
           setAdminCheckFailedReason(null);
         }
 
-        // Non-blocking presence sync (never write protected role/Pro/points fields from non-admin client)
+        // Non-blocking presence + login photo sync (never write protected role/Pro/points fields from non-admin client)
         setDoc(
           userDocRef,
           cleanFirestoreData({
             isOnline: true,
             lastSeenAt: nowIso,
+            ...(shouldPersistRealPhoto ? { photoURL: bestPhotoUrl } : {}),
             ...(isOwnerEmail ? { email: user.email || cleanUserEmail, role: 'admin', isOwner: true } : {}),
             ...(customName ? { displayName: customName } : {}),
             ...(customUsername ? { username: customUsername } : {}),
@@ -798,6 +810,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }),
           { merge: true }
         ).catch(() => {});
+
+        if (shouldPersistRealPhoto && !isRealUserPhotoUrl(user.photoURL)) {
+          fbUpdateProfile(user, { photoURL: bestPhotoUrl }).catch(() => {});
+        }
 
         if (newlyAwarded) {
           setDailyRewardJustClaimed({
@@ -876,7 +892,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           migratedMediaProfileUids.delete(uid);
         }
       } else {
-        patch.photoURL = sanitizeAvatarUrlForFirestore('', uid);
+        patch.photoURL = getBestAuthUserPhotoUrl(user, profile);
       }
     }
 
@@ -1236,8 +1252,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               if (canonicalRole === 'admin' || canonicalRole === 'sub_admin') {
                 setServerVerifiedRole(canonicalRole);
               }
+              const bestSnapPhoto = getBestAuthUserPhotoUrl(user, snapData);
+              if (isRealUserPhotoUrl(bestSnapPhoto) && isPlaceholderAvatarUrl(snapData.photoURL)) {
+                setDoc(
+                  userDocRef,
+                  { photoURL: bestSnapPhoto, updatedAt: new Date().toISOString() },
+                  { merge: true }
+                ).catch(() => {});
+              }
               setUserProfile({
                 ...snapData,
+                photoURL: bestSnapPhoto,
                 isPro: Boolean(snapData.isPro || snapData.isVerifiedByAdmin || currentLocalPro || isSnapAdmin),
                 hasBlueStar: Boolean(
                   snapData.hasBlueStar || snapData.isVerifiedByAdmin || snapData.isPro || currentLocalPro || isSnapAdmin

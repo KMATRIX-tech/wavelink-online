@@ -31,7 +31,9 @@ import {
   getAuthHeaders,
   batchCacheUserProfiles,
   notifyQuotaExceeded,
-  isFirestoreQuotaError
+  isFirestoreQuotaError,
+  resolveUserAvatarUrl,
+  getBestAuthUserPhotoUrl
 } from '../firebase';
 import {
   collection,
@@ -1089,7 +1091,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
           entityId: rawPost.id,
           actorId: currentUser.uid,
           actorName: userProfile?.displayName || currentUser.displayName || 'A waver',
-          actorPhotoURL: userProfile?.photoURL || currentUser.photoURL || undefined
+          actorPhotoURL: getBestAuthUserPhotoUrl(currentUser, userProfile) || undefined
         });
       }
     } catch (error) {
@@ -1221,7 +1223,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
     clearFailedVideoAndStudioDrafts();
     const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
     const safeAuthorPhotoURL = sanitizeAvatarUrlForFirestore(
-      userProfile?.photoURL || currentUser.photoURL,
+      getBestAuthUserPhotoUrl(currentUser, userProfile),
       currentUser.uid
     );
 
@@ -1371,19 +1373,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
     if (currentUser?.uid) {
       knownProfiles.set(currentUser.uid, {
         name: userProfile?.displayName || currentUser.displayName || 'You',
-        avatar:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+        avatar: resolveUserAvatarUrl(
+          currentUser.uid,
+          getBestAuthUserPhotoUrl(currentUser, userProfile),
+          userProfile
+        ),
       });
     }
     posts.forEach((p) => {
       if (p.authorId && p.authorName && !knownProfiles.has(p.authorId)) {
         knownProfiles.set(p.authorId, {
           name: p.authorName.split(' ')[0] || p.authorName,
-          avatar:
-            p.authorPhotoURL ||
-            `https://api.dicebear.com/7.x/shapes/svg?seed=${p.authorId}`,
+          avatar: resolveUserAvatarUrl(p.authorId, p.authorPhotoURL),
         });
       }
     });
@@ -1391,9 +1392,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       if (m.id && m.displayName && !knownProfiles.has(m.id)) {
         knownProfiles.set(m.id, {
           name: m.displayName.split(' ')[0] || m.displayName,
-          avatar:
-            m.photoURL ||
-            `https://api.dicebear.com/7.x/shapes/svg?seed=${m.id}`,
+          avatar: resolveUserAvatarUrl(m.id, m.photoURL, m),
         });
       }
     });
@@ -1524,10 +1523,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
         authorEmail: currentUser.email || '',
         authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
         authorUsername: userProfile?.username || `@${currentUser.email?.split('@')[0] || 'waver'}`,
-        authorPhotoURL:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+        authorPhotoURL: resolveUserAvatarUrl(
+          currentUser.uid,
+          getBestAuthUserPhotoUrl(currentUser, userProfile),
+          userProfile
+        ),
         content: text,
         createdAt: new Date().toISOString()
       };
@@ -1550,7 +1550,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
           entityId: postId,
           actorId: currentUser.uid,
           actorName: userProfile?.displayName || currentUser.displayName || 'A waver',
-          actorPhotoURL: userProfile?.photoURL || currentUser.photoURL || undefined
+          actorPhotoURL: getBestAuthUserPhotoUrl(currentUser, userProfile) || undefined
         });
       }
 
@@ -1964,11 +1964,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
             <div className="flex items-start gap-3">
               <Avatar
                 uid={currentUser?.uid}
-                src={
-                  userProfile?.photoURL ||
-                  currentUser?.photoURL ||
-                  `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser?.uid || 'user'}`
-                }
+                src={resolveUserAvatarUrl(
+                  currentUser?.uid,
+                  getBestAuthUserPhotoUrl(currentUser, userProfile),
+                  userProfile
+                )}
                 alt="User"
                 fallbackName={userProfile?.displayName || currentUser?.displayName || 'Waver'}
                 size={44}
@@ -2597,9 +2597,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 const hasAnyMedia = hasVideoMedia || hasImageMedia;
                 const likedByInfo = getLikedByInfo(post);
                 const isMenuOpen = openPostMenuId === post.id;
-                const authorAvatarUrl =
-                  post.authorPhotoURL ||
-                  `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`;
+                const authorAvatarUrl = resolveUserAvatarUrl(
+                  post.authorId,
+                  post.authorPhotoURL
+                );
 
                 const handleSelectAuthorProfile = () => {
                   window.dispatchEvent(

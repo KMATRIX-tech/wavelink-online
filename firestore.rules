@@ -198,6 +198,7 @@ service cloud.firestore {
         isValidOptionalString(data, 'bio', 500) &&
         isValidOptionalString(data, 'email', 160) &&
         isValidOptionalString(data, 'photoURL', 150000) &&
+        isValidOptionalString(data, 'avatar', 1024) &&
         isValidOptionalString(data, 'coverImageUrl', 4096) &&
         isValidOptionalString(data, 'coverPresetId', 80) &&
         isValidOptionalString(data, 'coverType', 32) &&
@@ -351,11 +352,27 @@ service cloud.firestore {
         request.resource.data.get('_serverGrantKey', '') == 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
     }
 
+    // Allow any signed-in user to heal a missing or DiceBear placeholder photoURL on a user document with a verified short HTTPS photoURL
+    function isSafeAvatarHealUpdate() {
+      let incoming = request.resource.data;
+      let existing = resource.data;
+      let existingPhoto = existing.get('photoURL', '');
+      let incomingPhoto = incoming.get('photoURL', '');
+      return isSignedIn() &&
+        incoming.diff(existing).affectedKeys().hasOnly(['photoURL', 'updatedAt']) &&
+        incomingPhoto is string &&
+        incomingPhoto.size() >= 8 &&
+        incomingPhoto.size() < 500 &&
+        incomingPhoto.matches('^https://.*') &&
+        !incomingPhoto.matches('.*dicebear\\.com.*') &&
+        (existingPhoto == '' || !(existingPhoto is string) || existingPhoto.matches('.*dicebear\\.com.*'));
+    }
+
     // User profiles: users can read directory profiles, create/update only their own (with RBAC/Pro/points guards), or delete their own account
     match /users/{userId} {
       allow read: if true;
       allow create: if isAdmin() || (isValidId(userId) && (isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileCreate(userId)));
-      allow update: if isAdmin() || (isValidId(userId) && (isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileUpdate(userId)));
+      allow update: if isAdmin() || (isValidId(userId) && (isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileUpdate(userId) || isSafeAvatarHealUpdate()));
       allow delete: if isSuperAdmin() || (isValidId(userId) && isOwner(userId));
 
       // Device FCM Push Notification Tokens — strictly private to the user

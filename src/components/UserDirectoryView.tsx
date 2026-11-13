@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, batchCacheUserProfiles, notifyQuotaExceeded, isFirestoreQuotaError } from '../firebase';
+import {
+  db,
+  handleFirestoreError,
+  OperationType,
+  batchCacheUserProfiles,
+  notifyQuotaExceeded,
+  isFirestoreQuotaError,
+  normalizeUserProfileData,
+  resolveUserAvatarUrl
+} from '../firebase';
 import { collection, query, orderBy, getDocs, where, limit } from 'firebase/firestore';
 import { UserProfile } from '../types';
 import { CrystalBadge } from './CrystalBadge';
@@ -110,7 +119,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
       const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'), limit(25));
       const snapshot = await getDocs(q);
       const list: UserProfile[] = [];
-      snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
+      snapshot.forEach((d) => list.push(normalizeUserProfileData(d.id, d.data()) as UserProfile));
       batchCacheUserProfiles(list);
       setUsers(list);
     } catch (err) {
@@ -205,7 +214,7 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
                   <div className="flex items-start justify-between gap-3 mb-3">
                     <Avatar
                       uid={user.id}
-                      src={user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.id}`}
+                      src={resolveUserAvatarUrl(user.id, user.photoURL, user)}
                       alt={user.displayName}
                       fallbackName={user.displayName}
                       size={48}

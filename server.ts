@@ -3550,7 +3550,7 @@ Escalation Required: ${
   ): Promise<void> {
     if (!uid) return;
     try {
-      if (getAdminApps().length) {
+      if (ensureFirebaseAdminInitialized() && getAdminApps().length) {
         let firestoreId = '';
         try {
           const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
@@ -3560,6 +3560,20 @@ Escalation Required: ${
           }
         } catch {
           // ignore
+        }
+        let authPhotoUrl = '';
+        try {
+          const userRec = await getAdminAuth(getAdminApp()).getUser(uid);
+          const candidate =
+            userRec?.providerData?.map((p) => p?.photoURL).find((u) => u && u.startsWith('https://') && !u.includes('dicebear.com')) ||
+            (userRec?.photoURL && userRec.photoURL.startsWith('https://') && !userRec.photoURL.includes('dicebear.com')
+              ? userRec.photoURL
+              : '');
+          if (candidate && candidate.length < 500) {
+            authPhotoUrl = candidate.trim();
+          }
+        } catch {
+          // ignore auth lookup notice
         }
         const adminDb = firestoreId
           ? getAdminFirestore(getAdminApp(), firestoreId)
@@ -3574,6 +3588,7 @@ Escalation Required: ${
               email,
               username: username.startsWith('@') ? username : `@${username}`,
               ...(displayName ? { displayName } : {}),
+              ...(authPhotoUrl ? { photoURL: authPhotoUrl } : {}),
               emailVerified: true,
               isContactVerified: true,
               verificationMethod: 'email',
@@ -3851,6 +3866,95 @@ Escalation Required: ${
       return res.json({ success: true, authEmail: cached.authEmail, channel: 'email' });
     }
     return res.json({ success: true, authEmail: null });
+  });
+
+  /**
+   * POST /api/users/resolve-avatars
+   * Resolves real login profile pictures (e.g., Google OAuth photoURL from Firebase Auth or legacy avatar field)
+   * for a list of user UIDs and backfills /users/{uid}.photoURL in Firestore if it was missing or a DiceBear placeholder.
+   */
+  app.post('/api/users/resolve-avatars', rateLimitGlobal, async (req, res) => {
+    const rawUids = Array.isArray(req.body?.uids) ? req.body.uids : [];
+    const cleanUids: string[] = rawUids
+      .map((u: unknown) => sanitizeServerString(u, 128))
+      .filter((u: string) => Boolean(u && u !== 'wavelink_support_bot'))
+      .slice(0, 25);
+
+    if (cleanUids.length === 0) {
+      return res.json({ success: true, avatars: {} });
+    }
+
+    const avatars: Record<string, string> = {};
+    const isRealUrl = (u: unknown): u is string =>
+      typeof u === 'string' &&
+      u.trim().startsWith('https://') &&
+      u.trim().length < 500 &&
+      !u.toLowerCase().includes('dicebear.com') &&
+      !u.toLowerCase().includes('ui-avatars.com');
+
+    try {
+      if (ensureFirebaseAdminInitialized() && getAdminApps().length) {
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        const adminDb =
+          firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+            ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+            : getAdminFirestore(getAdminApp());
+        const adminAuth = getAdminAuth(getAdminApp());
+
+        await Promise.all(
+          cleanUids.map(async (uid) => {
+            try {
+              const userRec = await adminAuth.getUser(uid).catch(() => null);
+              if (userRec) {
+                const providerUrl = userRec.providerData
+                  ?.map((p) => p?.photoURL)
+                  .find((u) => isRealUrl(u));
+                const bestAuthUrl = providerUrl || (isRealUrl(userRec.photoURL) ? userRec.photoURL : '');
+                if (bestAuthUrl && isRealUrl(bestAuthUrl)) {
+                  avatars[uid] = bestAuthUrl.trim();
+                  await adminDb
+                    .collection('users')
+                    .doc(uid)
+                    .set(
+                      { photoURL: bestAuthUrl.trim(), updatedAt: new Date().toISOString() },
+                      { merge: true }
+                    )
+                    .catch(() => {});
+                  return;
+                }
+              }
+
+              const docSnap = await adminDb.collection('users').doc(uid).get().catch(() => null);
+              if (docSnap && docSnap.exists) {
+                const d = docSnap.data() || {};
+                const candidate = [d.photoURL, d.avatar, d.googlePhotoURL, d.profilePicture, d.picture].find((u) =>
+                  isRealUrl(u)
+                );
+                if (candidate && isRealUrl(candidate)) {
+                  avatars[uid] = candidate.trim();
+                  if (!isRealUrl(d.photoURL)) {
+                    await adminDb
+                      .collection('users')
+                      .doc(uid)
+                      .set(
+                        { photoURL: candidate.trim(), updatedAt: new Date().toISOString() },
+                        { merge: true }
+                      )
+                      .catch(() => {});
+                  }
+                }
+              }
+            } catch {
+              // ignore individual uid lookup error
+            }
+          })
+        );
+      }
+    } catch {
+      // non-fatal if Admin SDK credentials are not present in local preview
+    }
+
+    return res.json({ success: true, avatars });
   });
 
   app.post('/api/admin/verify', rateLimitGlobal, async (req, res) => {

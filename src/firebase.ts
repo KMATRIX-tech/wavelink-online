@@ -7,7 +7,8 @@ import {
   persistentSingleTabManager,
   setLogLevel,
   doc,
-  getDoc
+  getDoc,
+  setDoc
 } from 'firebase/firestore';
 import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
@@ -122,6 +123,223 @@ export const rtdb = realtimeDbInstance;
 const userProfileMemoryCache = new Map<string, { profile: UserProfile; timestamp: number }>();
 const pendingProfileFetches = new Map<string, Promise<UserProfile | null>>();
 const PROFILE_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
+const DISCOVERED_AVATAR_STORAGE_KEY = 'wavelink_real_user_avatars_v1';
+const healedFirestoreAvatarUids = new Set<string>();
+
+const discoveredRealUserAvatarMap: Map<string, string> = (() => {
+  const map = new Map<string, string>();
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = window.localStorage.getItem(DISCOVERED_AVATAR_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          Object.entries(parsed).forEach(([k, v]) => {
+            if (typeof k === 'string' && typeof v === 'string' && v.startsWith('https://') && !v.includes('dicebear.com')) {
+              map.set(k, v);
+            }
+          });
+        }
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return map;
+})();
+
+function persistDiscoveredAvatarsToStorage(): void {
+  try {
+    if (typeof window === 'undefined') return;
+    const obj: Record<string, string> = {};
+    discoveredRealUserAvatarMap.forEach((v, k) => {
+      obj[k] = v;
+    });
+    window.localStorage.setItem(DISCOVERED_AVATAR_STORAGE_KEY, JSON.stringify(obj));
+  } catch {
+    // ignore quota errors
+  }
+}
+
+export function isPlaceholderAvatarUrl(url: unknown): boolean {
+  if (typeof url !== 'string') return true;
+  const trimmed = url.trim();
+  if (!trimmed) return true;
+  const lower = trimmed.toLowerCase();
+  return (
+    lower.includes('api.dicebear.com') ||
+    lower.includes('dicebear.com') ||
+    lower.includes('ui-avatars.com')
+  );
+}
+
+export function isRealUserPhotoUrl(url: unknown): url is string {
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed.length >= 500 || !trimmed.startsWith('https://')) return false;
+  return !isPlaceholderAvatarUrl(trimmed);
+}
+
+export function getDiscoveredUserAvatar(uid?: string | null): string | undefined {
+  if (!uid) return undefined;
+  return discoveredRealUserAvatarMap.get(uid);
+}
+
+export function recordDiscoveredUserAvatar(
+  uid?: string | null,
+  candidateUrl?: unknown,
+  persistToFirestore = false
+): string | undefined {
+  if (!uid || !isRealUserPhotoUrl(candidateUrl)) return undefined;
+  const cleanUid = uid.trim();
+  const cleanUrl = candidateUrl.trim();
+  if (!cleanUid || cleanUid === 'wavelink_support_bot') return cleanUrl;
+
+  const prevUrl = discoveredRealUserAvatarMap.get(cleanUid);
+  const changed = prevUrl !== cleanUrl;
+  discoveredRealUserAvatarMap.set(cleanUid, cleanUrl);
+
+  const cachedEntry = userProfileMemoryCache.get(cleanUid);
+  const cachedWasPlaceholder = !cachedEntry || isPlaceholderAvatarUrl(cachedEntry.profile.photoURL);
+  if (cachedEntry && cachedWasPlaceholder) {
+    userProfileMemoryCache.set(cleanUid, {
+      profile: { ...cachedEntry.profile, photoURL: cleanUrl },
+      timestamp: cachedEntry.timestamp
+    });
+  }
+
+  if (changed) {
+    persistDiscoveredAvatarsToStorage();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('wavelink:user-avatar-resolved', {
+          detail: { uid: cleanUid, photoURL: cleanUrl }
+        })
+      );
+    }
+  }
+
+  if (persistToFirestore && cachedWasPlaceholder && !healedFirestoreAvatarUids.has(cleanUid)) {
+    healedFirestoreAvatarUids.add(cleanUid);
+    setDoc(
+      doc(db, 'users', cleanUid),
+      { photoURL: cleanUrl, updatedAt: new Date().toISOString() },
+      { merge: true }
+    ).catch(() => {});
+  }
+
+  return cleanUrl;
+}
+
+export function resolveUserAvatarUrl(
+  uid?: string | null,
+  primaryUrl?: unknown,
+  profileObj?: Record<string, any> | null
+): string {
+  const cleanUid = (uid || profileObj?.id || profileObj?.uid || '').trim();
+  const cachedProfile = cleanUid ? userProfileMemoryCache.get(cleanUid)?.profile : undefined;
+
+  const candidates: unknown[] = [
+    primaryUrl,
+    profileObj?.photoURL,
+    (profileObj as any)?.avatar,
+    (profileObj as any)?.googlePhotoURL,
+    (profileObj as any)?.authPhotoURL,
+    (profileObj as any)?.profilePicture,
+    (profileObj as any)?.picture,
+    (profileObj as any)?.senderPhotoURL,
+    (profileObj as any)?.senderAvatar,
+    (profileObj as any)?.authorPhotoURL,
+    (profileObj as any)?.actorPhotoURL,
+    cleanUid ? discoveredRealUserAvatarMap.get(cleanUid) : undefined,
+    cachedProfile?.photoURL,
+    (cachedProfile as any)?.avatar
+  ];
+
+  for (const cand of candidates) {
+    if (isRealUserPhotoUrl(cand)) {
+      if (cleanUid) {
+        recordDiscoveredUserAvatar(cleanUid, cand, false);
+      }
+      return cand.trim();
+    }
+  }
+
+  for (const cand of candidates) {
+    if (typeof cand === 'string' && cand.trim().startsWith('https://') && cand.trim().length < 500) {
+      return cand.trim();
+    }
+  }
+
+  return `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(cleanUid || 'waver')}`;
+}
+
+export function getBestAuthUserPhotoUrl(
+  user?: {
+    uid?: string;
+    photoURL?: string | null;
+    providerData?: Array<{ photoURL?: string | null } | null>;
+  } | null,
+  profile?: Partial<UserProfile> | Record<string, any> | null
+): string {
+  const uid = user?.uid || (profile as any)?.id || (profile as any)?.uid || 'waver';
+  const profilePhoto = typeof profile?.photoURL === 'string' ? profile.photoURL.trim() : '';
+
+  // 1. Custom uploaded Cloudinary avatar on profile takes top priority
+  if (isRealUserPhotoUrl(profilePhoto) && profilePhoto.includes('res.cloudinary.com')) {
+    recordDiscoveredUserAvatar(uid, profilePhoto, false);
+    return profilePhoto;
+  }
+
+  // 2. Real non-placeholder profile photoURL
+  if (isRealUserPhotoUrl(profilePhoto)) {
+    recordDiscoveredUserAvatar(uid, profilePhoto, false);
+    return profilePhoto;
+  }
+
+  // 3. Google / OAuth provider photoURL from user.providerData (preserved even if top-level user.photoURL was cleared)
+  const providerPhoto = user?.providerData
+    ?.map((p) => p?.photoURL)
+    .find((url) => isRealUserPhotoUrl(url));
+  if (providerPhoto && isRealUserPhotoUrl(providerPhoto)) {
+    recordDiscoveredUserAvatar(uid, providerPhoto, false);
+    return providerPhoto.trim();
+  }
+
+  // 4. Top-level Firebase Auth user.photoURL
+  if (isRealUserPhotoUrl(user?.photoURL)) {
+    recordDiscoveredUserAvatar(uid, user.photoURL, false);
+    return user.photoURL.trim();
+  }
+
+  // 5. Legacy avatar field on user document (written by Google sign-in on AuthPage)
+  const legacyAvatar = (profile as any)?.avatar;
+  if (isRealUserPhotoUrl(legacyAvatar)) {
+    recordDiscoveredUserAvatar(uid, legacyAvatar, false);
+    return legacyAvatar.trim();
+  }
+
+  // 6. Previously discovered real avatar for this UID
+  const discovered = discoveredRealUserAvatarMap.get(uid);
+  if (isRealUserPhotoUrl(discovered)) {
+    return discovered;
+  }
+
+  return resolveUserAvatarUrl(uid, profile?.photoURL || user?.photoURL, profile as Record<string, any> | null);
+}
+
+export function normalizeUserProfileData(userId: string, rawData: Record<string, any>): UserProfile {
+  const resolvedPhoto = resolveUserAvatarUrl(userId, rawData?.photoURL, rawData);
+  const rawPhotoWasPlaceholder = isPlaceholderAvatarUrl(rawData?.photoURL);
+  if (rawPhotoWasPlaceholder && isRealUserPhotoUrl(resolvedPhoto)) {
+    recordDiscoveredUserAvatar(userId, resolvedPhoto, true);
+  }
+  return {
+    ...(rawData as UserProfile),
+    id: userId,
+    photoURL: resolvedPhoto
+  };
+}
 
 export function getCachedUserProfile(userId: string): UserProfile | null {
   if (!userId) return null;
@@ -131,12 +349,17 @@ export function getCachedUserProfile(userId: string): UserProfile | null {
     userProfileMemoryCache.delete(userId);
     return null;
   }
+  const discovered = discoveredRealUserAvatarMap.get(userId);
+  if (discovered && isPlaceholderAvatarUrl(entry.profile.photoURL)) {
+    return { ...entry.profile, photoURL: discovered };
+  }
   return entry.profile;
 }
 
 export function setCachedUserProfile(userId: string, profile: UserProfile): void {
   if (!userId || !profile) return;
-  userProfileMemoryCache.set(userId, { profile, timestamp: Date.now() });
+  const normalized = normalizeUserProfileData(userId, profile as Record<string, any>);
+  userProfileMemoryCache.set(userId, { profile: normalized, timestamp: Date.now() });
 }
 
 export function batchCacheUserProfiles(profiles: UserProfile[]): void {
@@ -144,7 +367,8 @@ export function batchCacheUserProfiles(profiles: UserProfile[]): void {
   const now = Date.now();
   profiles.forEach((p) => {
     if (p && p.id) {
-      userProfileMemoryCache.set(p.id, { profile: p, timestamp: now });
+      const normalized = normalizeUserProfileData(p.id, p as Record<string, any>);
+      userProfileMemoryCache.set(p.id, { profile: normalized, timestamp: now });
     }
   });
 }
@@ -162,7 +386,7 @@ export async function fetchUserProfileCached(userId: string): Promise<UserProfil
     try {
       const snap = await getDoc(doc(db, 'users', userId));
       if (snap.exists()) {
-        const profile = { id: snap.id, ...snap.data() } as UserProfile;
+        const profile = normalizeUserProfileData(snap.id, snap.data() as Record<string, any>);
         setCachedUserProfile(userId, profile);
         return profile;
       }

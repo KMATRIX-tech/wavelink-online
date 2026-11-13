@@ -8,7 +8,14 @@ import {
   cleanFirestoreData,
   batchCacheUserProfiles,
   notifyQuotaExceeded,
-  isFirestoreQuotaError
+  isFirestoreQuotaError,
+  normalizeUserProfileData,
+  recordDiscoveredUserAvatar,
+  isPlaceholderAvatarUrl,
+  isRealUserPhotoUrl,
+  getBestAuthUserPhotoUrl,
+  fetchUserProfileCached,
+  resolveUserAvatarUrl
 } from '../firebase';
 import {
   collection,
@@ -132,6 +139,8 @@ import { useTheme } from '../context/ThemeContext';
 
 // Module-level in-memory caches so user profiles, avatars, and groups are read once and reused across tab switches
 const chatProfileMemoryCache = new Map<string, UserProfile>();
+const checkedDmAvatarChannels = new Set<string>();
+const serverResolvedAvatarUids = new Set<string>();
 let chatGroupsMemoryCache: ChatGroup[] = [];
 
 const QUICK_REACTION_EMOJIS = ['❤️', '😂', '🔥', '👍', '🙌', '😮'];
@@ -1079,7 +1088,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         if (!isMounted) return;
         const otherUsers: UserProfile[] = [];
         snap.forEach((d) => {
-          const prof = { id: d.id, ...d.data() } as UserProfile;
+          const prof = normalizeUserProfileData(d.id, d.data() as Record<string, any>);
           chatProfileMemoryCache.set(d.id, prof);
           if (d.id !== currentUser?.uid && d.id !== SUPPORT_BOT_ID) {
             otherUsers.push(prof);
@@ -1167,6 +1176,36 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     };
   }, [currentUser?.uid]);
 
+  // Listen for live resolved user avatars so members & active chat header update immediately
+  useEffect(() => {
+    const handleAvatarResolved = (e: Event) => {
+      const detail = (e as CustomEvent<{ uid?: string; photoURL?: string }>).detail;
+      const targetUid = detail?.uid;
+      const nextUrl = detail?.photoURL;
+      if (!targetUid || !nextUrl) return;
+
+      const existingCached = chatProfileMemoryCache.get(targetUid);
+      if (existingCached) {
+        chatProfileMemoryCache.set(targetUid, { ...existingCached, photoURL: nextUrl });
+      }
+      setMembers((prev) => {
+        let changed = false;
+        const next = prev.map((m) => {
+          if (m.id === targetUid && m.photoURL !== nextUrl) {
+            changed = true;
+            return { ...m, photoURL: nextUrl };
+          }
+          return m;
+        });
+        return changed ? next : prev;
+      });
+    };
+    window.addEventListener('wavelink:user-avatar-resolved', handleAvatarResolved as EventListener);
+    return () => {
+      window.removeEventListener('wavelink:user-avatar-resolved', handleAvatarResolved as EventListener);
+    };
+  }, []);
+
   // Synthesize any DM participants discovered in `channels` who might not have a document in `users` yet
   const allMembers = React.useMemo(() => {
     if (!currentUser?.uid) return members;
@@ -1180,7 +1219,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         knownIds.add(otherUid);
         const cached = chatProfileMemoryCache.get(otherUid);
         if (cached) {
-          extraMembers.push(cached);
+          extraMembers.push({
+            ...cached,
+            photoURL: resolveUserAvatarUrl(otherUid, cached.photoURL, cached as Record<string, any>)
+          });
         } else {
           const synth: UserProfile = {
             id: otherUid,
@@ -1190,7 +1232,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               meta.lastMessageSenderId === otherUid && meta.lastMessageSenderName
                 ? meta.lastMessageSenderName
                 : `Waver (${otherUid.slice(0, 6)})`,
-            photoURL: `https://api.dicebear.com/7.x/shapes/svg?seed=${otherUid}`,
+            photoURL: resolveUserAvatarUrl(otherUid, undefined, meta as Record<string, any>),
             status: 'active',
             isBanned: false,
             createdAt: meta.updatedAt || new Date().toISOString()
@@ -1282,11 +1324,29 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         const nextBaselineUnread: Record<string, number> = {};
 
         snapshot.forEach((docSnap) => {
-          const data = docSnap.data() as ChatChannelMeta;
+          const data = docSnap.data() as ChatChannelMeta & {
+            lastMessageSenderPhotoURL?: string;
+            participantPhotos?: Record<string, string>;
+          };
           const chanId = docSnap.id;
           nextMetaMap[chanId] = { ...data, id: chanId };
           if (data?.typing && typeof data.typing === 'object') {
             nextTypingMap[chanId] = data.typing as Record<string, TypingStatusEntry>;
+            Object.entries(data.typing).forEach(([tUid, tEntry]) => {
+              if (tUid && tEntry?.photoURL && isRealUserPhotoUrl(tEntry.photoURL)) {
+                recordDiscoveredUserAvatar(tUid, tEntry.photoURL, true);
+              }
+            });
+          }
+          if (data?.participantPhotos && typeof data.participantPhotos === 'object') {
+            Object.entries(data.participantPhotos).forEach(([pUid, pUrl]) => {
+              if (pUid && isRealUserPhotoUrl(pUrl)) {
+                recordDiscoveredUserAvatar(pUid, pUrl, true);
+              }
+            });
+          }
+          if (data?.lastMessageSenderId && isRealUserPhotoUrl(data.lastMessageSenderPhotoURL)) {
+            recordDiscoveredUserAvatar(data.lastMessageSenderId, data.lastMessageSenderPhotoURL, true);
           }
           if (chanId === activeChannel) {
             setChannelLastSeen((data?.lastSeen as Record<string, string>) || {});
@@ -1340,6 +1400,110 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     return () => unsub();
   }, [currentUser?.uid, activeChannel, convoFetchLimit]);
 
+  // Recover real login profile pictures for DM participants whose profile still has a placeholder avatar
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    const channelEntries = Object.values(channelMetaMap);
+    if (channelEntries.length === 0) return;
+
+    const uidsNeedingServerLookup: string[] = [];
+
+    channelEntries.forEach((meta) => {
+      if (!meta?.id?.startsWith('dm_')) return;
+      const otherUid = getOtherDmParticipantId(meta.id, currentUser.uid);
+      if (!otherUid || otherUid === currentUser.uid || otherUid === SUPPORT_BOT_ID) return;
+
+      const knownMember = members.find((m) => m.id === otherUid) || chatProfileMemoryCache.get(otherUid);
+      if (!knownMember) {
+        fetchUserProfileCached(otherUid).then((fetched) => {
+          if (fetched) {
+            chatProfileMemoryCache.set(otherUid, fetched);
+            setMembers((prev) => (prev.some((p) => p.id === otherUid) ? prev : [...prev, fetched]));
+          }
+        });
+      }
+
+      const currentPhoto = knownMember?.photoURL;
+      if (!isRealUserPhotoUrl(currentPhoto)) {
+        if (!serverResolvedAvatarUids.has(otherUid)) {
+          serverResolvedAvatarUids.add(otherUid);
+          uidsNeedingServerLookup.push(otherUid);
+        }
+
+        if (!checkedDmAvatarChannels.has(meta.id)) {
+          checkedDmAvatarChannels.add(meta.id);
+          // Check latest messages in this DM channel for the friend's real senderPhotoURL
+          getDocs(
+            query(
+              collection(db, 'channels', meta.id, 'messages'),
+              orderBy('createdAt', 'desc'),
+              limit(6)
+            )
+          )
+            .then((msgSnap) => {
+              msgSnap.forEach((mDoc) => {
+                const mData = mDoc.data();
+                const sId = mData?.senderId;
+                const sPhoto = mData?.senderPhotoURL || mData?.senderAvatar;
+                if (sId && isRealUserPhotoUrl(sPhoto)) {
+                  recordDiscoveredUserAvatar(sId, sPhoto, true);
+                }
+              });
+            })
+            .catch(() => {});
+        }
+      }
+    });
+
+    if (uidsNeedingServerLookup.length > 0) {
+      const batchUids = uidsNeedingServerLookup.slice(0, 10);
+
+      // Also check posts & notifications authored by these friends in case they haven't sent a DM message yet
+      getDocs(query(collection(db, 'posts'), where('authorId', 'in', batchUids), limit(15)))
+        .then((postSnap) => {
+          postSnap.forEach((pDoc) => {
+            const pData = pDoc.data();
+            const aId = pData?.authorId;
+            const aPhoto = pData?.authorPhotoURL || pData?.authorAvatar;
+            if (aId && isRealUserPhotoUrl(aPhoto)) {
+              recordDiscoveredUserAvatar(aId, aPhoto, true);
+            }
+          });
+        })
+        .catch(() => {});
+
+      getDocs(query(collection(db, 'notifications'), where('actorId', 'in', batchUids), limit(15)))
+        .then((notifSnap) => {
+          notifSnap.forEach((nDoc) => {
+            const nData = nDoc.data();
+            const actId = nData?.actorId;
+            const actPhoto = nData?.actorPhotoURL || nData?.actorAvatar;
+            if (actId && isRealUserPhotoUrl(actPhoto)) {
+              recordDiscoveredUserAvatar(actId, actPhoto, true);
+            }
+          });
+        })
+        .catch(() => {});
+
+      fetch('/api/users/resolve-avatars', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uids: uidsNeedingServerLookup })
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data?.avatars && typeof data.avatars === 'object') {
+            Object.entries(data.avatars).forEach(([uId, url]) => {
+              if (uId && isRealUserPhotoUrl(url)) {
+                recordDiscoveredUserAvatar(uId, url, true);
+              }
+            });
+          }
+        })
+        .catch(() => {});
+    }
+  }, [channelMetaMap, members, currentUser?.uid]);
+
   // 2c. Real-time WebSocket connection for instant (<20ms) typing indicators + 1s expiry clock
   useEffect(() => {
     const tickInterval = setInterval(() => {
@@ -1369,10 +1533,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               channelId: activeChannel,
               userId: currentUser.uid,
               name: userProfile?.displayName || currentUser.displayName || 'Waver',
-              photoURL:
-                userProfile?.photoURL ||
-                currentUser.photoURL ||
-                `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`
+              photoURL: getBestAuthUserPhotoUrl(currentUser, userProfile)
             })
           );
         };
@@ -1473,10 +1634,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
     const nowIso = new Date(now).toISOString();
     const senderName = userProfile?.displayName || currentUser.displayName || 'Waver';
-    const senderPhotoURL =
-      userProfile?.photoURL ||
-      currentUser.photoURL ||
-      `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`;
+    const senderPhotoURL = getBestAuthUserPhotoUrl(currentUser, userProfile);
 
     // 1. Instant WebSocket broadcast
     if (chatWsRef.current && chatWsRef.current.readyState === WebSocket.OPEN) {
@@ -1541,10 +1699,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             channelId: activeChannel,
             userId: currentUser.uid,
             name: userProfile?.displayName || currentUser.displayName || 'Waver',
-            photoURL:
-              userProfile?.photoURL ||
-              currentUser.photoURL ||
-              `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`
+            photoURL: getBestAuthUserPhotoUrl(currentUser, userProfile)
           })
         );
       } catch {
@@ -1803,9 +1958,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
           if (change.type === 'removed') {
             mergedDocsMap.delete(change.doc.id);
           } else {
+            const rawMsg = change.doc.data() as ChannelMessage & { senderAvatar?: string };
+            if (rawMsg?.senderId) {
+              const candidateAvatar = rawMsg.senderPhotoURL || rawMsg.senderAvatar;
+              if (isRealUserPhotoUrl(candidateAvatar)) {
+                recordDiscoveredUserAvatar(rawMsg.senderId, candidateAvatar, true);
+              }
+            }
             mergedDocsMap.set(change.doc.id, {
-              id: change.doc.id,
-              ...change.doc.data()
+              ...rawMsg,
+              id: change.doc.id
             } as ChannelMessage);
           }
         });
@@ -2488,6 +2650,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       const messagePreview =
         rawSnippet.length > 45 ? `${rawSnippet.substring(0, 45).trim()}…` : rawSnippet;
 
+      const resolvedSenderPhotoURL = getBestAuthUserPhotoUrl(currentUser, userProfile);
+
       const data: Record<string, any> = {
         id: msgId,
         conversationId: targetChannel,
@@ -2498,10 +2662,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         senderEmail: currentUser.email || 'user',
         senderName: senderDisplayName,
         senderUsername: userProfile?.username || `@${currentUser.email?.split('@')[0] || 'waver'}`,
-        senderPhotoURL:
-          userProfile?.photoURL ||
-          currentUser.photoURL ||
-          `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
+        senderPhotoURL: resolvedSenderPhotoURL,
         text: sanitizedText,
         mediaType: chatMediaType,
         isEdited: false,
@@ -2570,6 +2731,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             lastMessageText: messagePreview,
             lastMessageSenderId: currentUser.uid,
             lastMessageSenderName: senderDisplayName,
+            lastMessageSenderPhotoURL: resolvedSenderPhotoURL,
+            participantPhotos: {
+              [currentUser.uid]: resolvedSenderPhotoURL
+            },
             lastMessageAt: nowIso,
             lastSeen: { [currentUser.uid]: nowIso },
             unread: unreadPatch,

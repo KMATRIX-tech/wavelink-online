@@ -14,6 +14,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { usePresence } from '../context/PresenceContext';
 import { useTheme } from '../context/ThemeContext';
+import { resolveUserAvatarUrl, isRealUserPhotoUrl, recordDiscoveredUserAvatar } from '../firebase';
 import type { UserProfile } from '../types';
 import { User as UserIcon } from 'lucide-react';
 
@@ -89,15 +90,43 @@ export const Avatar: React.FC<AvatarProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [imageError, setImageError] = useState(false);
+  const [resolvedLiveUrl, setResolvedLiveUrl] = useState<string | null>(null);
   const [isVisibleInViewport, setIsVisibleInViewport] = useState<boolean>(!onlyWhenVisible);
   const [showLongPressHint, setShowLongPressHint] = useState(false);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { isLiteMode } = useTheme();
 
-  // Reset imageError if src updates
+  const effectiveUid = (uid || targetProfile?.id || '').trim();
+  const effectiveSrc =
+    resolvedLiveUrl ||
+    resolveUserAvatarUrl(effectiveUid, src, targetProfile as Record<string, any> | null);
+
+  // Reset imageError if src updates and record any real avatar URL for this UID
   useEffect(() => {
     setImageError(false);
-  }, [src]);
+    if (effectiveUid && isRealUserPhotoUrl(src)) {
+      recordDiscoveredUserAvatar(effectiveUid, src, false);
+    }
+  }, [src, effectiveUid]);
+
+  // Listen for live avatar resolution events when a friend's real photo is discovered from messages/auth/profile
+  useEffect(() => {
+    if (!effectiveUid || typeof window === 'undefined') {
+      setResolvedLiveUrl(null);
+      return;
+    }
+    const handleResolved = (e: Event) => {
+      const detail = (e as CustomEvent<{ uid?: string; photoURL?: string }>).detail;
+      if (detail?.uid === effectiveUid && detail.photoURL) {
+        setImageError(false);
+        setResolvedLiveUrl(detail.photoURL);
+      }
+    };
+    window.addEventListener('wavelink:user-avatar-resolved', handleResolved as EventListener);
+    return () => {
+      window.removeEventListener('wavelink:user-avatar-resolved', handleResolved as EventListener);
+    };
+  }, [effectiveUid]);
 
   // Observe viewport visibility when showStatus && onlyWhenVisible
   useEffect(() => {
@@ -196,9 +225,9 @@ export const Avatar: React.FC<AvatarProps> = ({
       <div
         className={`w-full h-full rounded-full overflow-hidden flex items-center justify-center bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300 ${ringClassName}`}
       >
-        {src && !imageError ? (
+        {effectiveSrc && !imageError ? (
           <img
-            src={src}
+            src={effectiveSrc}
             alt={alt}
             loading={priority ? 'eager' : 'lazy'}
             decoding="async"

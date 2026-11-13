@@ -31,7 +31,9 @@ import {
   isAuthNetworkError,
   formatEmailVerificationError,
   extractSafeFirebaseAuthCode,
-  cleanFirestoreData
+  cleanFirestoreData,
+  getBestAuthUserPhotoUrl,
+  isRealUserPhotoUrl
 } from '../firebase';
 import { recordSystemDomain } from '../services/verificationService';
 import { validateStrongPassword } from '../utils/security';
@@ -804,7 +806,8 @@ export const AuthPage: React.FC = () => {
         return;
       }
 
-      // 4. Merge ONLY username & displayName into /users/{uid} so all existing posts, followers, points, and Pro status remain intact
+      // 4. Merge username, displayName, and Google/Auth photoURL into /users/{uid} so all existing posts, followers, points, and Pro status remain intact
+      const setupPhotoUrl = getBestAuthUserPhotoUrl(activeUser, null);
       await setDoc(
         doc(db, 'users', activeUser.uid),
         cleanFirestoreData({
@@ -812,12 +815,11 @@ export const AuthPage: React.FC = () => {
           email: targetEmail,
           username: formattedUsername,
           displayName: name,
-          emailVerified: true,
-          isContactVerified: true,
+          ...(isRealUserPhotoUrl(setupPhotoUrl) ? { photoURL: setupPhotoUrl } : {}),
           updatedAt: new Date().toISOString()
         }),
         { merge: true }
-      );
+      ).catch(() => {});
 
       await completeVerifiedAuthSession(name, formattedUsername);
       setStatusMessage('Account updated! Signing you in with all your existing data...');
@@ -963,6 +965,7 @@ export const AuthPage: React.FC = () => {
         }
 
         // Write Firestore profile document (enforced by Firestore rules requiring request.auth.token.email_verified == true)
+        const signupPhotoUrl = getBestAuthUserPhotoUrl(activeUser, null);
         await setDoc(
           doc(db, 'users', activeUser.uid),
           cleanFirestoreData({
@@ -970,6 +973,7 @@ export const AuthPage: React.FC = () => {
             email: cleanEmail,
             username: formattedUsername,
             displayName: name,
+            ...(isRealUserPhotoUrl(signupPhotoUrl) ? { photoURL: signupPhotoUrl } : {}),
             updatedAt: new Date().toISOString()
           }),
           { merge: true }
@@ -1101,6 +1105,8 @@ export const AuthPage: React.FC = () => {
         existingData?.displayName || fbUser.displayName || fallbackHandle;
       const isOwnerAccount = cleanEmail === 'keylanmbilinyi5@gmail.com';
 
+      const resolvedPhotoUrl = getBestAuthUserPhotoUrl(fbUser, existingData);
+
       await setDoc(
         userRef,
         cleanFirestoreData({
@@ -1108,9 +1114,8 @@ export const AuthPage: React.FC = () => {
           email: cleanEmail,
           username: resolvedUsername,
           displayName: resolvedDisplayName,
-          avatar: existingData?.avatar || fbUser.photoURL || '',
-          emailVerified: true,
-          isContactVerified: true,
+          photoURL: resolvedPhotoUrl,
+          avatar: resolvedPhotoUrl,
           ...(isOwnerAccount ? { role: 'admin', isOwner: true } : {}),
           updatedAt: new Date().toISOString()
         }),
