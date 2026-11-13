@@ -1,10 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
 import { UserNotificationSettings } from '../types';
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
+  fetchDeviceTokenFromUserDoc,
   getBrowserNotificationPermission,
+  getDeviceSavedTokenFromUserDoc,
+  getMessagingServiceWorkerRegistration,
+  getNotificationStatusKind,
   getSavedDeviceToken,
   requestPushPermissionAndSaveToken,
   removeCurrentDeviceFcmToken,
@@ -30,7 +34,8 @@ import {
   ShieldCheck,
   Send,
   Volume2,
-  Info
+  Info,
+  RefreshCw
 } from 'lucide-react';
 
 export const NotificationSettingsPanel: React.FC = () => {
@@ -45,12 +50,15 @@ export const NotificationSettingsPanel: React.FC = () => {
   const [permissionState, setPermissionState] = useState<NotificationPermission | 'unsupported'>(() =>
     getBrowserNotificationPermission()
   );
-  const [deviceToken, setDeviceToken] = useState<string | null>(() => getSavedDeviceToken());
+  const [docDeviceToken, setDocDeviceToken] = useState<string | null>(() =>
+    getDeviceSavedTokenFromUserDoc(userProfile)
+  );
+  const [isRechecking, setIsRechecking] = useState(false);
   const [isRequestingPermission, setIsRequestingPermission] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSendingTest, setIsSendingTest] = useState(false);
   const [statusFeedback, setStatusFeedback] = useState<{
-    type: 'success' | 'error';
+    type: 'success' | 'error' | 'info';
     text: string;
   } | null>(null);
 
@@ -63,6 +71,66 @@ export const NotificationSettingsPanel: React.FC = () => {
     }
   }, [userProfile?.notificationSettings]);
 
+  // Keep docDeviceToken synced with userProfile.fcmTokens & browser permission
+  useEffect(() => {
+    setPermissionState(getBrowserNotificationPermission());
+    setDocDeviceToken(getDeviceSavedTokenFromUserDoc(userProfile));
+  }, [userProfile]);
+
+  const refreshStatusFromBrowserAndFirestore = useCallback(
+    async (showMessage = false) => {
+      const nextPermission = getBrowserNotificationPermission();
+      setPermissionState(nextPermission);
+
+      if (!currentUser?.uid) return;
+      setIsRechecking(true);
+      if (showMessage) setStatusFeedback(null);
+      try {
+        const { tokenInDoc } = await fetchDeviceTokenFromUserDoc(currentUser.uid);
+        setDocDeviceToken(tokenInDoc);
+        if (showMessage) {
+          if (nextPermission === 'denied') {
+            setStatusFeedback({
+              type: 'error',
+              text: 'Still blocked in the browser. Follow steps 1–3 above in Chrome, then tap Re-check.'
+            });
+          } else if (nextPermission === 'granted' && tokenInDoc) {
+            setStatusFeedback({
+              type: 'success',
+              text: 'Notifications are On and this device token is saved in your user document.'
+            });
+          } else if (nextPermission === 'granted' && !tokenInDoc) {
+            setStatusFeedback({
+              type: 'info',
+              text: 'Browser permission is now allowed! Tap "Enable notifications" to save your device token.'
+            });
+          } else {
+            setStatusFeedback({
+              type: 'info',
+              text: 'Notifications are not set up yet. Tap "Enable notifications" to turn them on.'
+            });
+          }
+        }
+      } catch (err: any) {
+        console.error('[WaveLink Push] Failed to check user document fcmTokens:', err);
+        if (showMessage) {
+          setStatusFeedback({
+            type: 'error',
+            text: `Could not verify saved device token in Firestore: ${err?.message || String(err)}`
+          });
+        }
+      } finally {
+        setIsRechecking(false);
+      }
+    },
+    [currentUser?.uid]
+  );
+
+  // Verify Firestore user document token state when panel mounts
+  useEffect(() => {
+    refreshStatusFromBrowserAndFirestore(false);
+  }, [refreshStatusFromBrowserAndFirestore]);
+
   const handleEnableDevicePush = async () => {
     if (!currentUser) return;
     setIsRequestingPermission(true);
@@ -72,29 +140,33 @@ export const NotificationSettingsPanel: React.FC = () => {
       const result = await requestPushPermissionAndSaveToken(currentUser.uid);
       setPermissionState(result.permission);
       if (result.success && result.token) {
-        setDeviceToken(result.token);
+        setDocDeviceToken(result.token);
         setStatusFeedback({
           type: 'success',
           text:
             language === 'sw'
               ? 'Arifa za simu zimewashwa kwenye kifaa hiki!'
-              : 'Push notifications are now active on this device!'
+              : 'Notifications are now On! Device token saved to your user document.'
         });
         showGlobalToast(
           language === 'sw'
             ? 'Arifa zimewashwa kwenye kifaa hiki!'
-            : 'Push notifications enabled on this device!'
+            : 'Notifications enabled on this device!'
         );
       } else {
         setStatusFeedback({
           type: 'error',
           text:
             result.error ||
-            (language === 'sw'
-              ? 'Imeshindikana kuwasha arifa. Tafadhali angalia ruhusa za kivinjari chako.'
-              : 'Could not enable push notifications. Please check your browser permission settings.')
+            'Could not enable notifications on this device.'
         });
       }
+    } catch (err: any) {
+      console.error('[WaveLink Push] Unexpected enable failure:', err);
+      setStatusFeedback({
+        type: 'error',
+        text: err?.message || String(err) || 'Could not enable notifications.'
+      });
     } finally {
       setIsRequestingPermission(false);
     }
@@ -106,19 +178,25 @@ export const NotificationSettingsPanel: React.FC = () => {
     setStatusFeedback(null);
     try {
       await removeCurrentDeviceFcmToken(currentUser.uid);
-      setDeviceToken(null);
+      setDocDeviceToken(null);
       setStatusFeedback({
         type: 'success',
         text:
           language === 'sw'
             ? 'Kifaa hiki kimeondolewa na hakitapokea tena arifa.'
-            : 'This device token has been removed and will no longer receive push alerts.'
+            : 'This device token has been removed from your user document.'
       });
       showGlobalToast(
         language === 'sw'
           ? 'Arifa zimezimwa kwenye kifaa hiki.'
           : 'Push notifications turned off for this device.'
       );
+    } catch (err: any) {
+      console.error('[WaveLink Push] Error removing device token:', err);
+      setStatusFeedback({
+        type: 'error',
+        text: `Could not turn off notifications on this device: ${err?.message || String(err)}`
+      });
     } finally {
       setIsRequestingPermission(false);
     }
@@ -143,8 +221,12 @@ export const NotificationSettingsPanel: React.FC = () => {
     try {
       await saveUserNotificationSettings(currentUser.uid, nextSettings);
       await updateUserProfile({ notificationSettings: nextSettings });
-    } catch (err) {
-      console.warn('Failed to save notification settings:', err);
+    } catch (err: any) {
+      console.error('Failed to save notification settings:', err);
+      setStatusFeedback({
+        type: 'error',
+        text: `Failed to save notification setting: ${err?.message || String(err)}`
+      });
     } finally {
       setIsSaving(false);
     }
@@ -154,64 +236,118 @@ export const NotificationSettingsPanel: React.FC = () => {
     if (!currentUser) return;
     setIsSendingTest(true);
     setStatusFeedback(null);
+
     try {
-      const serverResult = await sendTestPushNotificationToSelf();
-      if (serverResult.sent && (serverResult.successCount || 0) > 0) {
-        setStatusFeedback({
-          type: 'success',
-          text:
-            language === 'sw'
-              ? `Arifa halisi ya jaribio imetumwa kwenye vifaa ${serverResult.successCount}!`
-              : `Real test push notification delivered to ${serverResult.successCount} registered device${
-                  serverResult.successCount === 1 ? '' : 's'
-                }!`
-        });
-      } else if (serverResult.reason === 'no_tokens') {
+      if (typeof window === 'undefined' || !('Notification' in window)) {
         setStatusFeedback({
           type: 'error',
-          text: 'No active FCM device token is saved yet. Tap "Enable Push Notifications" above first.'
+          text: 'Browser Notification API is not supported in this browser.'
         });
-      } else {
-        // If Firebase Admin credentials aren't active in local preview, verify SW notification rendering locally
-        if ('serviceWorker' in navigator && Notification.permission === 'granted') {
-          const reg =
-            (await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js')) ||
-            (await navigator.serviceWorker.getRegistration('/'));
-          if (reg) {
-            await reg.showNotification('WaveLink Test Notification', {
-              body:
-                serverResult.error ||
-                'Local notification preview worked. Deploy Cloud Functions & Firebase credentials for background phone pushes.',
-              icon: '/pwa-192x192.png',
-              badge: '/pwa-192x192.png',
-              tag: 'wavelink-test-local'
-            } as any);
-          }
+        return;
+      }
+
+      const currentPerm = Notification.permission;
+      setPermissionState(currentPerm);
+
+      if (currentPerm === 'denied') {
+        setStatusFeedback({
+          type: 'error',
+          text: 'Notifications are blocked in the browser. Follow the Chrome unblock steps above, then tap Re-check.'
+        });
+        return;
+      }
+
+      if (currentPerm !== 'granted') {
+        setStatusFeedback({
+          type: 'error',
+          text: 'Notification permission is not granted yet. Tap "Enable notifications" first.'
+        });
+        return;
+      }
+
+      // 1. Immediately verify device side using the service worker's showNotification
+      let swReg: ServiceWorkerRegistration;
+      try {
+        swReg = await getMessagingServiceWorkerRegistration();
+      } catch (swErr: any) {
+        console.error('[WaveLink Test Push] Service worker error:', swErr);
+        setStatusFeedback({
+          type: 'error',
+          text: `Service worker failed: ${swErr?.message || String(swErr)}`
+        });
+        return;
+      }
+
+      try {
+        await swReg.showNotification('WaveLink Test Notification', {
+          body: 'Device notifications are working! Checking server push...',
+          icon: '/pwa-192x192.png',
+          badge: '/pwa-192x192.png',
+          tag: 'wavelink-test-local'
+        } as any);
+      } catch (localErr: any) {
+        console.error('[WaveLink Test Push] Local showNotification error:', localErr);
+        setStatusFeedback({
+          type: 'error',
+          text: `Local notification failed (showNotification): ${localErr?.message || String(localErr)}`
+        });
+        return;
+      }
+
+      // 2. Also ask the server endpoint / function to send a real push if available
+      try {
+        const serverResult = await sendTestPushNotificationToSelf();
+        if (serverResult.sent && (serverResult.successCount || 0) > 0) {
+          setStatusFeedback({
+            type: 'success',
+            text:
+              language === 'sw'
+                ? `Arifa ya kifaa imeonyeshwa na arifa halisi ya seva imetumwa kwenye vifaa ${serverResult.successCount}!`
+                : `Local notification shown right away, and real server push delivered to ${serverResult.successCount} registered device${
+                    serverResult.successCount === 1 ? '' : 's'
+                  }!`
+          });
+        } else if (serverResult.reason === 'no_tokens') {
+          setStatusFeedback({
+            type: 'info',
+            text: 'Local notification worked on this device! No FCM token is saved on the server yet — tap "Enable notifications" to save your token.'
+          });
+        } else {
+          setStatusFeedback({
+            type: 'info',
+            text: `Local notification worked on this device! Server push response: ${
+              serverResult.error || serverResult.reason || 'Server push is not active in this environment.'
+            }`
+          });
         }
+      } catch (serverErr: any) {
+        console.error('[WaveLink Test Push] Server push check failed:', serverErr);
         setStatusFeedback({
-          type: 'error',
-          text:
-            serverResult.error ||
-            serverResult.reason ||
-            'Server FCM delivery is not configured in this environment yet.'
+          type: 'info',
+          text: `Local notification worked on this device! Server push check failed: ${
+            serverErr?.message || String(serverErr)
+          }`
         });
       }
-    } catch (err: any) {
-      setStatusFeedback({
-        type: 'error',
-        text: err?.message || 'Could not send test notification right now.'
-      });
     } finally {
       setIsSendingTest(false);
     }
   };
 
-  const isDeviceSubscribed = Boolean(deviceToken && permissionState === 'granted');
+  const statusKind = getNotificationStatusKind(permissionState, docDeviceToken || getSavedDeviceToken());
+  const isDeviceSubscribed = statusKind === 'on';
   const registeredDevices = Array.isArray(userProfile?.fcmTokens) ? userProfile!.fcmTokens : [];
   const likesAndCommentsChecked =
     settings.likesAndComments !== undefined
       ? settings.likesAndComments !== false
       : settings.reactions !== false || settings.replies !== false;
+
+  const statusLabel =
+    statusKind === 'on'
+      ? 'On'
+      : statusKind === 'blocked'
+      ? 'Blocked in the browser'
+      : 'Not set up yet';
 
   const categoryItems: Array<{
     key: 'messages' | 'calls' | 'followers' | 'likesAndComments' | 'followedPosts' | 'soundAndVibration';
@@ -306,32 +442,49 @@ export const NotificationSettingsPanel: React.FC = () => {
           <div className="flex items-start gap-3.5 max-w-xl">
             <div
               className={`p-3 rounded-2xl shrink-0 ${
-                isDeviceSubscribed
+                statusKind === 'on'
                   ? 'bg-emerald-50 text-emerald-600 border border-emerald-200'
+                  : statusKind === 'blocked'
+                  ? 'bg-rose-50 text-rose-600 border border-rose-200'
                   : 'bg-blue-50 text-blue-600 border border-blue-200'
               }`}
             >
-              {isDeviceSubscribed ? <Bell size={22} /> : <Smartphone size={22} />}
+              {statusKind === 'on' ? (
+                <Bell size={22} />
+              ) : statusKind === 'blocked' ? (
+                <BellOff size={22} />
+              ) : (
+                <Smartphone size={22} />
+              )}
             </div>
             <div>
               <div className="flex items-center gap-2 flex-wrap">
                 <h3 className="text-base font-extrabold text-stone-900">
-                  {t('notif.settings_title')}
+                  {language === 'sw' ? 'Arifa (Notifications)' : 'Notifications'}
                 </h3>
-                {isDeviceSubscribed ? (
+                {statusKind === 'on' ? (
                   <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold">
                     <CheckCircle2 size={12} />
-                    <span>{language === 'sw' ? 'Imewashwa' : 'Active'}</span>
+                    <span>{statusLabel}</span>
+                  </span>
+                ) : statusKind === 'blocked' ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-rose-50 text-rose-700 border border-rose-200 text-[11px] font-bold">
+                    <AlertCircle size={12} />
+                    <span>{statusLabel}</span>
                   </span>
                 ) : (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-stone-100 text-stone-600 text-[11px] font-bold">
-                    <span>{language === 'sw' ? 'Bado haijawashwa' : 'Not enabled yet'}</span>
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-amber-50 text-amber-800 border border-amber-200 text-[11px] font-bold">
+                    <span>{statusLabel}</span>
                   </span>
                 )}
               </div>
 
               <p className="text-xs sm:text-sm text-stone-600 mt-1 leading-relaxed">
                 {t('notif.kind_explanation')}
+              </p>
+              <p className="text-[11px] text-stone-500 mt-1.5 font-medium">
+                Browser permission: <strong>{permissionState}</strong> • User profile token:{' '}
+                <strong>{docDeviceToken ? 'Saved on this device' : 'Not saved yet'}</strong>
               </p>
             </div>
           </div>
@@ -367,18 +520,50 @@ export const NotificationSettingsPanel: React.FC = () => {
                 {isRequestingPermission ? (
                   <>
                     <Loader2 size={15} className="animate-spin" />
-                    <span>{language === 'sw' ? 'Inaomba ruhusa...' : 'Requesting Permission...'}</span>
+                    <span>{language === 'sw' ? 'Inawasha...' : 'Enabling...'}</span>
                   </>
                 ) : (
                   <>
                     <Bell size={15} />
-                    <span>{t('notif.enable_btn')}</span>
+                    <span>{language === 'sw' ? 'Washa arifa' : 'Enable notifications'}</span>
                   </>
                 )}
               </button>
             )}
           </div>
         </div>
+
+        {/* Short plain Chrome unblock steps + Re-check button when blocked */}
+        {statusKind === 'blocked' && (
+          <div className="p-4 rounded-xl bg-rose-50/90 border border-rose-200 text-xs text-rose-950 space-y-2.5">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2 font-extrabold text-rose-900">
+                <AlertCircle size={15} className="shrink-0 text-rose-600" />
+                <span>How to unblock notifications in Chrome:</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => refreshStatusFromBrowserAndFirestore(true)}
+                disabled={isRechecking}
+                className="px-3 py-1.5 rounded-lg bg-white hover:bg-rose-100 text-rose-800 border border-rose-300 text-xs font-extrabold inline-flex items-center gap-1.5 transition cursor-pointer"
+              >
+                <RefreshCw size={13} className={isRechecking ? 'animate-spin' : ''} />
+                <span>{isRechecking ? 'Checking...' : 'Re-check'}</span>
+              </button>
+            </div>
+            <ol className="list-decimal pl-5 space-y-1 text-[11px] sm:text-xs text-rose-900 leading-relaxed">
+              <li>
+                Tap the <strong>site settings / tune (or lock) icon</strong> to the left of the website address in Chrome.
+              </li>
+              <li>
+                Open <strong>Notifications</strong> (or <strong>Permissions → Notifications</strong>) and change it from <strong>Block</strong> to <strong>Allow</strong>.
+              </li>
+              <li>
+                Tap <strong>Re-check</strong> above, then tap <strong>Enable notifications</strong>.
+              </li>
+            </ol>
+          </div>
+        )}
 
         {registeredDevices.length > 0 && (
           <div className="pt-2 border-t border-stone-100">
@@ -400,18 +585,22 @@ export const NotificationSettingsPanel: React.FC = () => {
 
         {statusFeedback && (
           <div
-            className={`p-3 rounded-xl text-xs font-semibold flex items-center gap-2 border ${
+            className={`p-3 rounded-xl text-xs font-semibold flex items-start gap-2 border ${
               statusFeedback.type === 'success'
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : statusFeedback.type === 'info'
+                ? 'bg-blue-50 border-blue-200 text-blue-800'
                 : 'bg-rose-50 border-rose-200 text-rose-700'
             }`}
           >
             {statusFeedback.type === 'success' ? (
-              <CheckCircle2 size={15} className="shrink-0 text-emerald-600" />
+              <CheckCircle2 size={15} className="shrink-0 mt-0.5 text-emerald-600" />
+            ) : statusFeedback.type === 'info' ? (
+              <Info size={15} className="shrink-0 mt-0.5 text-blue-600" />
             ) : (
-              <AlertCircle size={15} className="shrink-0 text-rose-600" />
+              <AlertCircle size={15} className="shrink-0 mt-0.5 text-rose-600" />
             )}
-            <span>{statusFeedback.text}</span>
+            <span className="break-words">{statusFeedback.text}</span>
           </div>
         )}
       </div>

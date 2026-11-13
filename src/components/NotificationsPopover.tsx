@@ -18,17 +18,17 @@ import {
 } from '../services/notificationService';
 import {
   getBrowserNotificationPermission,
+  getDeviceSavedTokenFromUserDoc,
+  getNotificationStatusKind,
   getSavedDeviceToken,
   requestPushPermissionAndSaveToken
 } from '../services/fcmService';
 import {
   Bell,
-  Check,
   CheckCheck,
   Trash2,
   MessageSquare,
   PhoneCall,
-  Video,
   Heart,
   MessageCircle,
   Coins,
@@ -37,27 +37,43 @@ import {
   ExternalLink,
   Settings,
   Megaphone,
-  X
+  X,
+  AlertCircle
 } from 'lucide-react';
+import { triggerHaptic } from '../utils/haptics';
 
 interface NotificationsPopoverProps {
   onNavigateTab?: (tab: ActiveTab) => void;
   onStartChat?: (userId: string) => void;
+  hasUnreadNotifications?: boolean;
 }
 
 export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
   onNavigateTab,
-  onStartChat
+  onStartChat,
+  hasUnreadNotifications = false
 }) => {
-  const { currentUser, showGlobalToast } = useAuth();
+  const { currentUser, userProfile, showGlobalToast } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [filterType, setFilterType] = useState<string>('all');
   const [isLoading, setIsLoading] = useState(true);
-  const [isPushEnabled, setIsPushEnabled] = useState<boolean>(
-    () => Boolean(getSavedDeviceToken() && getBrowserNotificationPermission() === 'granted')
+  const [permissionState, setPermissionState] = useState<NotificationPermission | 'unsupported'>(() =>
+    getBrowserNotificationPermission()
+  );
+  const [savedTokenInDoc, setSavedTokenInDoc] = useState<string | null>(() =>
+    getDeviceSavedTokenFromUserDoc(userProfile) || getSavedDeviceToken()
   );
   const [isEnablingPush, setIsEnablingPush] = useState(false);
+  const [popoverError, setPopoverError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPermissionState(getBrowserNotificationPermission());
+    setSavedTokenInDoc(getDeviceSavedTokenFromUserDoc(userProfile) || getSavedDeviceToken());
+  }, [userProfile, isOpen]);
+
+  const statusKind = getNotificationStatusKind(permissionState, savedTokenInDoc);
+  const isPushEnabled = statusKind === 'on';
 
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -186,6 +202,7 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     setIsOpen(false);
     if (typeof window !== 'undefined') {
       localStorage.setItem('wavelink_settings_initial_section', 'notifications');
+      window.dispatchEvent(new CustomEvent('wavelink:open-notification-settings'));
     }
     if (onNavigateTab) {
       onNavigateTab('settings');
@@ -195,14 +212,21 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
   const handleEnablePushFromPopover = async () => {
     if (!currentUser) return;
     setIsEnablingPush(true);
+    setPopoverError(null);
     try {
       const res = await requestPushPermissionAndSaveToken(currentUser.uid);
-      if (res.success) {
-        setIsPushEnabled(true);
-        showGlobalToast('Push notifications enabled on this device!');
+      setPermissionState(res.permission);
+      if (res.success && res.token) {
+        setSavedTokenInDoc(res.token);
+        showGlobalToast('Notifications enabled on this device!');
       } else if (res.error) {
+        setPopoverError(res.error);
         showGlobalToast(res.error);
       }
+    } catch (err: any) {
+      const msg = err?.message || String(err) || 'Could not enable notifications.';
+      setPopoverError(msg);
+      showGlobalToast(msg);
     } finally {
       setIsEnablingPush(false);
     }
@@ -237,21 +261,24 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     <div ref={containerRef} className="relative">
       {/* Bell Button */}
       <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="relative p-2 rounded-2xl text-slate-600 hover:text-[#3B82F6] hover:bg-blue-50 transition active:scale-95 border border-slate-200/80 bg-[#F8FAFC]"
+        type="button"
+        onClick={() => {
+          triggerHaptic('light');
+          setIsOpen((prev) => !prev);
+        }}
+        className="relative min-h-[38px] min-w-[38px] p-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 flex items-center justify-center transition active:scale-95 cursor-pointer"
         title="Notifications"
+        aria-label="Notifications"
       >
-        <Bell size={18} />
-        {unreadCount > 0 && (
-          <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-black flex items-center justify-center ring-2 ring-white animate-pulse">
-            {unreadCount > 99 ? '99+' : unreadCount}
-          </span>
+        <Bell size={16} />
+        {(unreadCount > 0 || hasUnreadNotifications) && (
+          <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#F43F5E] ring-2 ring-white dark:ring-stone-900" />
         )}
       </button>
 
       {/* Floating Notifications Popover */}
       {isOpen && (
-        <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-3xl bg-white border border-slate-200/80 text-[#0F172A] shadow-[0_12px_40px_-8px_rgba(15,23,42,0.12)] overflow-hidden z-50 animate-in fade-in">
+        <div className="absolute right-[-44px] sm:right-0 mt-2 w-[calc(100vw-1.5rem)] max-w-sm sm:w-96 rounded-3xl bg-white border border-slate-200/80 text-[#0F172A] shadow-[0_12px_40px_-8px_rgba(15,23,42,0.12)] overflow-hidden z-50 animate-in fade-in">
           {/* Header */}
           <div className="p-3.5 border-b border-slate-100 flex items-center justify-between bg-[#F8FAFC]">
             <div className="flex items-center gap-2">
@@ -295,22 +322,64 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
             </div>
           </div>
 
-          {/* Explicit Push Opt-In Banner (One Kind Sentence, Never Prompts on Load) */}
-          {!isPushEnabled && (
-            <div className="px-3.5 py-2.5 bg-blue-50/80 border-b border-blue-100 flex items-center justify-between gap-2.5">
-              <p className="text-[11px] text-slate-700 leading-snug">
-                Enable push notifications so you never miss a message, call, or update from your friends.
-              </p>
-              <button
-                type="button"
-                disabled={isEnablingPush}
-                onClick={handleEnablePushFromPopover}
-                className="px-2.5 py-1.5 rounded-xl bg-[#3B82F6] hover:bg-blue-700 text-white text-[11px] font-bold shrink-0 transition active:scale-95"
-              >
-                {isEnablingPush ? 'Enabling...' : 'Enable'}
-              </button>
+          {/* Permanent Push Notification Status & Quick Enable / Settings Strip */}
+          <div className="px-3.5 py-2.5 bg-blue-50/80 border-b border-blue-100 space-y-2">
+            <div className="flex items-center justify-between gap-2.5">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-extrabold text-slate-800">Push status:</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                      statusKind === 'on'
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : statusKind === 'blocked'
+                        ? 'bg-rose-100 text-rose-800'
+                        : 'bg-amber-100 text-amber-800'
+                    }`}
+                  >
+                    {statusKind === 'on'
+                      ? 'On'
+                      : statusKind === 'blocked'
+                      ? 'Blocked in the browser'
+                      : 'Not set up yet'}
+                  </span>
+                </div>
+                {!isPushEnabled && (
+                  <p className="text-[11px] text-slate-600 leading-snug mt-0.5">
+                    {statusKind === 'blocked'
+                      ? 'Blocked in Chrome. Open Notification Settings for unblock steps.'
+                      : 'Turn on notifications for messages, calls & updates.'}
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {statusKind === 'not_set_up' && (
+                  <button
+                    type="button"
+                    disabled={isEnablingPush}
+                    onClick={handleEnablePushFromPopover}
+                    className="px-2.5 py-1.5 rounded-xl bg-[#3B82F6] hover:bg-blue-700 text-white text-[11px] font-bold transition active:scale-95 cursor-pointer"
+                  >
+                    {isEnablingPush ? 'Enabling...' : 'Enable'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleOpenNotificationSettings}
+                  className="px-2.5 py-1.5 rounded-xl bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 text-[11px] font-bold transition cursor-pointer"
+                >
+                  Settings
+                </button>
+              </div>
             </div>
-          )}
+
+            {popoverError && (
+              <div className="p-2 rounded-lg bg-rose-50 border border-rose-200 text-[11px] font-semibold text-rose-700 flex items-start gap-1.5">
+                <AlertCircle size={13} className="shrink-0 mt-0.5 text-rose-600" />
+                <span className="break-words">{popoverError}</span>
+              </div>
+            )}
+          </div>
 
           {/* Filter Pills */}
           <div className="flex px-3 pt-2 pb-1 gap-1 border-b border-slate-100 bg-white overflow-x-auto scrollbar-none text-[11px] font-semibold">

@@ -527,6 +527,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     return 'profile';
   });
+
+  useEffect(() => {
+    const openNotificationsSection = () => {
+      try {
+        localStorage.removeItem('wavelink_settings_initial_section');
+      } catch {
+        // ignore
+      }
+      setActiveSettingsSection('notifications');
+      if (typeof window !== 'undefined') {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    };
+
+    try {
+      const requested = localStorage.getItem('wavelink_settings_initial_section');
+      if (requested === 'notifications') {
+        openNotificationsSection();
+      }
+    } catch {
+      // ignore
+    }
+
+    window.addEventListener('wavelink:open-notification-settings', openNotificationsSection);
+    return () => {
+      window.removeEventListener('wavelink:open-notification-settings', openNotificationsSection);
+    };
+  }, []);
   const [selectedLegalDoc, setSelectedLegalDoc] = useState<LegalDocType | null>(null);
   const [isDailyRewardModalOpen, setIsDailyRewardModalOpen] = useState(false);
   const [gentleProNote, setGentleProNote] = useState<string | null>(null);
@@ -1378,6 +1406,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         onClick: () => setActiveSettingsSection('appearance')
       },
       {
+        id: 'notifications',
+        icon: <Bell size={18} className="text-blue-500" />,
+        iconBg: 'bg-blue-500/15 border-blue-500/25',
+        label: language === 'sw' ? 'Arifa (Notifications)' : 'Notifications',
+        onClick: () => setActiveSettingsSection('notifications')
+      },
+      {
         id: 'privacy',
         icon: <Lock size={18} className="text-emerald-500" />,
         iconBg: 'bg-emerald-500/15 border-emerald-500/25',
@@ -1960,7 +1995,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 { id: 'appearance', label: language === 'sw' ? 'Mandhari' : 'Themes' },
                 { id: 'privacy', label: language === 'sw' ? 'Faragha' : 'Privacy' },
                 { id: 'security', label: language === 'sw' ? 'Nenosiri' : 'Password' },
-                { id: 'notifications', label: language === 'sw' ? 'Arifa' : 'Alerts' },
+                { id: 'notifications', label: language === 'sw' ? 'Arifa' : 'Notifications' },
                 { id: 'stats', label: language === 'sw' ? 'Takwimu' : 'Stats' },
                 { id: 'pro', label: 'Pro' },
                 { id: 'settings_hub', label: language === 'sw' ? 'Mipangilio' : 'All Settings' },
@@ -3459,6 +3494,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </span>
                     <span className="text-[11px] text-[#78716C] block">
                       Choose &amp; read platform terms
+                    </span>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-[#78716C]" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveSettingsSection('notifications')}
+                className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-blue-50/60 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-blue-50 text-[#2563EB] border border-blue-200 flex items-center justify-center shrink-0">
+                    <Bell size={16} />
+                  </div>
+                  <div>
+                    <span className="text-xs font-extrabold text-[#1C1917] block">
+                      {language === 'sw' ? 'Arifa (Notifications)' : 'Notifications'}
+                    </span>
+                    <span className="text-[11px] text-[#78716C] block">
+                      Push status, test alerts &amp; toggles
                     </span>
                   </div>
                 </div>

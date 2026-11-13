@@ -12,7 +12,6 @@ import {
   WifiOff,
   UserPlus,
   Search,
-  Bell,
   Plus,
   Check,
   Zap,
@@ -24,6 +23,7 @@ import {
 import { inviteFriends } from '../utils/share.js';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { Avatar } from './Avatar';
+import { NotificationsPopover } from './NotificationsPopover';
 
 interface TopHeaderProps {
   activeTab: ActiveTab;
@@ -421,22 +421,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               )}
             </div>
 
-            {/* Item 4: Notifications Bell */}
-            <button
-              type="button"
-              onClick={() => {
-                triggerHaptic('light');
-                if (onNavigateTab) onNavigateTab('announcements');
-              }}
-              className="relative min-h-[38px] min-w-[38px] p-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 flex items-center justify-center transition active:scale-95 cursor-pointer"
-              title={t('header.notifications')}
-              aria-label={t('header.notifications')}
-            >
-              <Bell size={16} />
-              {hasUnreadNotifications && (
-                <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#F43F5E] ring-2 ring-white dark:ring-stone-900" />
-              )}
-            </button>
+            {/* Item 4: Notifications Bell Menu */}
+            <NotificationsPopover
+              onNavigateTab={onNavigateTab}
+              onStartChat={onStartChat}
+              hasUnreadNotifications={hasUnreadNotifications}
+            />
 
             {/* Item 5: Profile Avatar */}
             {currentUser && (

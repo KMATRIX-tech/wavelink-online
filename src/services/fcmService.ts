@@ -112,18 +112,70 @@ export function isStandalonePWA(): boolean {
   );
 }
 
-export async function getMessagingServiceWorkerRegistration(): Promise<
-  ServiceWorkerRegistration | undefined
-> {
-  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return undefined;
+export async function getMessagingServiceWorkerRegistration(): Promise<ServiceWorkerRegistration> {
+  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) {
+    throw new Error('Service workers are not supported in this browser.');
+  }
   let swReg =
     (await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js')) ||
     (await navigator.serviceWorker.getRegistration('/'));
   if (!swReg) {
     swReg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', { scope: '/' });
   }
-  await navigator.serviceWorker.ready;
-  return swReg;
+  const readyReg = await navigator.serviceWorker.ready;
+  const finalReg = swReg || readyReg;
+  if (!finalReg) {
+    throw new Error('Service worker could not become active.');
+  }
+  return finalReg;
+}
+
+/**
+ * Checks whether this browser device has a saved real FCM token in `userProfile.fcmTokens`.
+ */
+export function getDeviceSavedTokenFromUserDoc(
+  userProfile?: { fcmTokens?: FcmTokenEntry[] } | null
+): string | null {
+  if (!userProfile || !Array.isArray(userProfile.fcmTokens)) return null;
+  const deviceId = getOrCreateDeviceId();
+  const localToken = getSavedDeviceToken();
+
+  const match = userProfile.fcmTokens.find(
+    (item) =>
+      item &&
+      typeof item.token === 'string' &&
+      item.token.trim().length > 0 &&
+      !item.token.startsWith('fcm_web_') &&
+      (item.deviceId === deviceId || (Boolean(localToken) && item.token === localToken))
+  );
+  return match?.token || null;
+}
+
+/**
+ * Fetches `users/{userId}.fcmTokens` directly from Firestore to verify whether this device has a saved token.
+ */
+export async function fetchDeviceTokenFromUserDoc(userId: string): Promise<{
+  tokenInDoc: string | null;
+  allTokens: FcmTokenEntry[];
+}> {
+  const userSnap = await getDoc(doc(db, 'users', userId));
+  const rawTokens =
+    userSnap.exists() && Array.isArray(userSnap.data()?.fcmTokens)
+      ? (userSnap.data()!.fcmTokens as FcmTokenEntry[])
+      : [];
+  const tokenInDoc = getDeviceSavedTokenFromUserDoc({ fcmTokens: rawTokens });
+  return { tokenInDoc, allTokens: rawTokens };
+}
+
+export type NotificationStatusKind = 'on' | 'blocked' | 'not_set_up';
+
+export function getNotificationStatusKind(
+  permission: NotificationPermission | 'unsupported',
+  savedTokenInUserDoc: string | null
+): NotificationStatusKind {
+  if (permission === 'denied') return 'blocked';
+  if (permission === 'granted' && Boolean(savedTokenInUserDoc)) return 'on';
+  return 'not_set_up';
 }
 
 /**
@@ -217,13 +269,13 @@ async function persistTokenEntryForUser(
 
   const userRef = doc(db, 'users', userId);
   let existingTokens: FcmTokenEntry[] = [];
-  try {
-    const userSnap = await getDoc(userRef);
-    if (userSnap.exists() && Array.isArray(userSnap.data()?.fcmTokens)) {
+  let userDocExists = false;
+  const userSnap = await getDoc(userRef);
+  if (userSnap.exists()) {
+    userDocExists = true;
+    if (Array.isArray(userSnap.data()?.fcmTokens)) {
       existingTokens = userSnap.data()!.fcmTokens as FcmTokenEntry[];
     }
-  } catch {
-    // ignore read error; proceed with fresh array
   }
 
   const prevForDevice = existingTokens.find(
@@ -250,10 +302,22 @@ async function persistTokenEntryForUser(
 
   const nextArray = [entry, ...filtered].slice(0, MAX_DEVICES_PER_USER);
 
-  await updateDoc(userRef, {
-    fcmTokens: cleanFirestoreData(nextArray),
-    updatedAt: nowIso
-  });
+  if (userDocExists) {
+    await updateDoc(userRef, {
+      fcmTokens: cleanFirestoreData(nextArray),
+      updatedAt: nowIso
+    });
+  } else {
+    await setDoc(
+      userRef,
+      {
+        uid: userId,
+        fcmTokens: cleanFirestoreData(nextArray),
+        updatedAt: nowIso
+      },
+      { merge: true }
+    );
+  }
 
   // Also persist in subcollection for backwards compatibility & server test lookups
   const tokenDoc: FcmDeviceTokenDoc = {
@@ -273,7 +337,9 @@ async function persistTokenEntryForUser(
     doc(db, 'users', userId, 'fcmTokens', tokenId),
     cleanFirestoreData(tokenDoc),
     { merge: true }
-  ).catch(() => {});
+  ).catch((subErr) => {
+    console.warn('[WaveLink Push] Subcollection token mirror skipped:', subErr);
+  });
 
   return { tokenId, entry };
 }
@@ -287,6 +353,7 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
   token?: string;
   permission: NotificationPermission | 'unsupported';
   error?: string;
+  failedStep?: 'permission' | 'support' | 'service_worker' | 'token' | 'save';
   needsHomeScreenInstall?: boolean;
 }> {
   if (typeof window === 'undefined' || !('Notification' in window)) {
@@ -294,6 +361,7 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
       return {
         success: false,
         permission: 'unsupported',
+        failedStep: 'support',
         needsHomeScreenInstall: true,
         error:
           'On iPhone, tap the Share button in Safari and select "Add to Home Screen" first to enable push notifications.'
@@ -302,105 +370,156 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
     return {
       success: false,
       permission: 'unsupported',
+      failedStep: 'support',
       error: 'Push notifications are not supported by this browser.'
     };
   }
 
-  try {
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {
-      if (permission === 'denied') {
-        await removeCurrentDeviceFcmToken(userId);
-      }
-      return {
-        success: false,
-        permission,
-        error:
-          permission === 'denied'
-            ? 'Notification permission was blocked. You can re-enable it anytime in your browser site settings.'
-            : 'Notification permission request was dismissed.'
-      };
-    }
-
-    const swReg = await getMessagingServiceWorkerRegistration();
-    const vapidKey = getVapidPublicKey();
-
-    const messagingSupported = await isSupported().catch(() => false);
-    if (!messagingSupported) {
-      return {
-        success: false,
-        permission: 'granted',
-        error:
-          isIOSDevice() && !isStandalonePWA()
-            ? 'On iPhone, open WaveLink from your Home Screen icon after tapping Share -> Add to Home Screen.'
-            : 'Firebase Cloud Messaging is not supported in this browser context (HTTPS required).'
-      };
-    }
-
-    const messaging = getMessaging(getApp());
-    let fcmToken = '';
+  // Step 1: Request browser permission if needed
+  let permission: NotificationPermission = Notification.permission;
+  if (permission !== 'granted') {
     try {
-      const tokenOptions: { serviceWorkerRegistration?: ServiceWorkerRegistration; vapidKey?: string } = {
-        serviceWorkerRegistration: swReg
-      };
-      if (vapidKey) {
-        tokenOptions.vapidKey = vapidKey;
-      }
-      fcmToken = await getToken(messaging, tokenOptions);
-    } catch (tokenErr: any) {
-      console.error('[WaveLink Push] FCM token registration failed:', tokenErr);
+      permission = await Notification.requestPermission();
+    } catch (permErr: any) {
+      console.error('[WaveLink Push] Permission request failed:', permErr);
       return {
         success: false,
-        permission: 'granted',
-        error: tokenErr?.message || 'Could not retrieve a push registration token from Firebase Cloud Messaging.'
+        permission: getBrowserNotificationPermission(),
+        failedStep: 'permission',
+        error: `Permission request failed: ${permErr?.message || String(permErr)}`
       };
     }
+  }
 
-    if (!fcmToken) {
-      return {
-        success: false,
-        permission: 'granted',
-        error: 'Could not retrieve a push registration token from Firebase Cloud Messaging.'
-      };
+  if (permission !== 'granted') {
+    if (permission === 'denied') {
+      await removeCurrentDeviceFcmToken(userId).catch(() => {});
     }
-
-    const { tokenId, entry } = await persistTokenEntryForUser(userId, fcmToken);
-
-    localStorage.setItem(LOCAL_TOKEN_KEY, fcmToken);
-    localStorage.setItem(LOCAL_TOKEN_ID_KEY, tokenId);
-
-    // Register with local Express server as well for immediate server test alerts
-    try {
-      const headers = await getAuthHeaders();
-      await fetch('/api/notifications/register-token', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          userId,
-          tokenId,
-          token: fcmToken,
-          deviceId: entry.deviceId,
-          deviceName: entry.deviceName,
-          platform: entry.platform
-        })
-      });
-    } catch {
-      // non-fatal
-    }
-
-    return {
-      success: true,
-      token: fcmToken,
-      permission: 'granted'
-    };
-  } catch (err: any) {
-    console.error('[WaveLink Push] Error enabling push notifications:', err);
     return {
       success: false,
-      permission: getBrowserNotificationPermission(),
-      error: err?.message || 'Could not enable push notifications on this device.'
+      permission,
+      failedStep: 'permission',
+      error:
+        permission === 'denied'
+          ? 'Notifications are blocked in the browser. Follow the Chrome unblock steps below and tap Re-check.'
+          : 'Notification permission request was dismissed before allowing notifications.'
     };
   }
+
+  // Step 2: Check Firebase Messaging support & register service worker
+  let messagingSupported = false;
+  try {
+    messagingSupported = await isSupported();
+  } catch (supportErr: any) {
+    console.error('[WaveLink Push] Messaging support check failed:', supportErr);
+    return {
+      success: false,
+      permission: 'granted',
+      failedStep: 'support',
+      error: `Browser push check failed: ${supportErr?.message || String(supportErr)}`
+    };
+  }
+
+  if (!messagingSupported) {
+    return {
+      success: false,
+      permission: 'granted',
+      failedStep: 'support',
+      error:
+        isIOSDevice() && !isStandalonePWA()
+          ? 'On iPhone, open WaveLink from your Home Screen icon after tapping Share -> Add to Home Screen.'
+          : 'Firebase Cloud Messaging is not supported in this browser context (HTTPS and Push API required).'
+    };
+  }
+
+  let swReg: ServiceWorkerRegistration;
+  try {
+    swReg = await getMessagingServiceWorkerRegistration();
+  } catch (swErr: any) {
+    console.error('[WaveLink Push] Service worker registration failed:', swErr);
+    return {
+      success: false,
+      permission: 'granted',
+      failedStep: 'service_worker',
+      error: `Service worker registration failed: ${swErr?.message || String(swErr)}`
+    };
+  }
+
+  // Step 3: Get FCM token (without vapidKey if VITE_FIREBASE_VAPID_KEY is missing or empty)
+  const vapidKey = getVapidPublicKey();
+  let fcmToken = '';
+  try {
+    const messaging = getMessaging(getApp());
+    const tokenOptions: { serviceWorkerRegistration: ServiceWorkerRegistration; vapidKey?: string } = {
+      serviceWorkerRegistration: swReg
+    };
+    if (vapidKey) {
+      tokenOptions.vapidKey = vapidKey;
+    }
+    fcmToken = await getToken(messaging, tokenOptions);
+  } catch (tokenErr: any) {
+    console.error('[WaveLink Push] FCM token registration failed:', tokenErr);
+    return {
+      success: false,
+      permission: 'granted',
+      failedStep: 'token',
+      error: `Failed to get FCM token: ${tokenErr?.message || String(tokenErr)}`
+    };
+  }
+
+  if (!fcmToken) {
+    return {
+      success: false,
+      permission: 'granted',
+      failedStep: 'token',
+      error: 'Firebase Cloud Messaging returned an empty registration token.'
+    };
+  }
+
+  // Step 4: Save FCM token to user document's fcmTokens array
+  let tokenId = '';
+  let entry: FcmTokenEntry;
+  try {
+    const saved = await persistTokenEntryForUser(userId, fcmToken);
+    tokenId = saved.tokenId;
+    entry = saved.entry;
+  } catch (saveErr: any) {
+    console.error('[WaveLink Push] Saving FCM token to Firestore failed:', saveErr);
+    return {
+      success: false,
+      permission: 'granted',
+      failedStep: 'save',
+      error: `Failed to save FCM token to your user document: ${saveErr?.message || String(saveErr)}`
+    };
+  }
+
+  localStorage.setItem(LOCAL_TOKEN_KEY, fcmToken);
+  localStorage.setItem(LOCAL_TOKEN_ID_KEY, tokenId);
+
+  // Register with local Express server as well for immediate server test alerts (non-fatal)
+  try {
+    const headers = await getAuthHeaders();
+    await fetch('/api/notifications/register-token', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        userId,
+        tokenId,
+        token: fcmToken,
+        deviceId: entry.deviceId,
+        deviceName: entry.deviceName,
+        platform: entry.platform
+      })
+    });
+  } catch {
+    // non-fatal
+  }
+
+  return {
+    success: true,
+    token: fcmToken,
+    permission: 'granted'
+  };
 }
 
 /**
