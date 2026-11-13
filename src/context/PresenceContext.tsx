@@ -28,10 +28,37 @@ import {
   serverTimestamp as rtdbServerTimestamp,
   DatabaseReference
 } from 'firebase/database';
-import { doc, updateDoc } from 'firebase/firestore';
+import { doc, updateDoc, onSnapshot } from 'firebase/firestore';
 import { rtdb, db, getCachedUserProfile } from '../firebase';
 import { useAuth } from './AuthContext';
 import type { UserProfile } from '../types';
+
+const FIRESTORE_HEARTBEAT_OFFLINE_THRESHOLD_MS = 3 * 60 * 1000; // Treat anyone with no update in 3 minutes as offline
+
+function parseLastSeenMs(profile?: Partial<UserProfile> | null): number | undefined {
+  if (!profile) return undefined;
+  const raw = profile.lastSeenAt || profile.lastSeen;
+  if (!raw) return undefined;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function deriveFirestoreHeartbeatPresence(profile?: Partial<UserProfile> | null): {
+  state: 'online' | 'offline';
+  lastChanged?: number;
+} | null {
+  if (!profile) return null;
+  const lastChanged = parseLastSeenMs(profile);
+  if (lastChanged === undefined) {
+    return profile.isOnline ? { state: 'online' } : null;
+  }
+  const isFresh = Date.now() - lastChanged <= FIRESTORE_HEARTBEAT_OFFLINE_THRESHOLD_MS;
+  const isOnline = Boolean(profile.isOnline !== false && isFresh);
+  return {
+    state: isOnline ? 'online' : 'offline',
+    lastChanged
+  };
+}
 
 export type PresenceStatusKind = 'loading' | 'online' | 'offline' | 'hidden' | 'unreachable';
 
@@ -143,10 +170,12 @@ async function mirrorOfflineToFirestore(uid: string) {
     return;
   }
   lastFirestoreMirrorTime = now;
+  const nowIso = new Date().toISOString();
   try {
     await updateDoc(doc(db, 'users', uid), {
       isOnline: false,
-      lastSeenAt: new Date().toISOString()
+      lastSeen: nowIso,
+      lastSeenAt: nowIso
     });
   } catch {
     // Non-fatal: RTDB is the source of truth; do not retry on quota error
@@ -298,12 +327,23 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   // (a) PRESENCE WRITER: .info/connected + onDisconnect FIRST + multi-tab
   // ==========================================================================
   useEffect(() => {
-    if (!rtdb || !currentUser?.uid) {
+    if (!currentUser?.uid) {
       setIsOwnOnline(false);
       setIsRtdbConnected(false);
       globalRtdbConnected = false;
       globalRtdbReachable = Boolean(rtdb);
       setIsRtdbReachable(Boolean(rtdb));
+      notifyHealthSubscribers();
+      return;
+    }
+
+    if (!rtdb) {
+      // Firestore heartbeat fallback when RTDB is not configured
+      setIsOwnOnline(showOnlineStatus);
+      setIsRtdbConnected(false);
+      globalRtdbConnected = false;
+      globalRtdbReachable = false;
+      setIsRtdbReachable(false);
       notifyHealthSubscribers();
       return;
     }
@@ -513,7 +553,7 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   // (b) SHARED PRESENCE MANAGER (1 listener per UID, ref-counted, 1s batch)
   // ==========================================================================
   const subscribePresence = useCallback((targetUid: string): (() => void) => {
-    if (!targetUid || !rtdb) {
+    if (!targetUid) {
       return () => {};
     }
 
@@ -533,78 +573,132 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     // Initialize loading state in store if not cached yet
     if (!presenceStore.has(targetUid)) {
+      const cachedHb = deriveFirestoreHeartbeatPresence(getCachedUserProfile(targetUid));
       presenceStore.set(targetUid, {
-        state: 'offline',
-        loading: true
+        state: cachedHb ? cachedHb.state : 'offline',
+        lastChanged: cachedHb?.lastChanged,
+        loading: !cachedHb
       });
     }
 
-    const targetStatusRef = ref(rtdb, `/status/${targetUid}`);
     let offlineDelayTimer: ReturnType<typeof setTimeout> | null = null;
+    let unsubFirestoreFallback: (() => void) | null = null;
 
-    const unsubRtdb = onValue(
-      targetStatusRef,
-      (snapshot) => {
-        if (!globalRtdbReachable) {
-          globalRtdbReachable = true;
-          setIsRtdbReachable(true);
-          notifyHealthSubscribers();
-        }
-
-        const val = snapshot.val();
-        const rawState: 'online' | 'offline' =
-          val && val.state === 'online' ? 'online' : 'offline';
-        const lastChanged =
-          typeof val?.lastChanged === 'number' ? val.lastChanged : undefined;
-
-        const prev = presenceStore.get(targetUid);
-
-        if (rawState === 'offline' && prev && !prev.loading && prev.state === 'online') {
-          // Flaky mobile network protection: wait 7s before flipping to offline in UI
-          if (offlineDelayTimer) clearTimeout(offlineDelayTimer);
-          offlineDelayTimer = setTimeout(() => {
-            offlineDelayTimer = null;
+    const startFirestoreFallbackListener = () => {
+      if (unsubFirestoreFallback) return;
+      unsubFirestoreFallback = onSnapshot(
+        doc(db, 'users', targetUid),
+        (docSnap) => {
+          if (!docSnap.exists()) return;
+          const data = docSnap.data() as Partial<UserProfile>;
+          const hb = deriveFirestoreHeartbeatPresence(data);
+          if (hb) {
             presenceStore.set(targetUid, {
-              state: 'offline',
-              lastChanged,
+              state: hb.state,
+              lastChanged: hb.lastChanged,
               loading: false,
               errored: false
             });
             schedulePresenceNotification(targetUid);
-          }, FLAKY_OFFLINE_DELAY_MS);
-          return;
+          }
+        },
+        () => {
+          // Ignore fallback listener error
         }
+      );
+    };
 
-        if (rawState === 'online' && offlineDelayTimer) {
-          clearTimeout(offlineDelayTimer);
-          offlineDelayTimer = null;
+    let unsubRtdb: (() => void) | null = null;
+
+    if (rtdb && globalRtdbReachable) {
+      const targetStatusRef = ref(rtdb, `/status/${targetUid}`);
+      unsubRtdb = onValue(
+        targetStatusRef,
+        (snapshot) => {
+          if (!globalRtdbReachable) {
+            globalRtdbReachable = true;
+            setIsRtdbReachable(true);
+            notifyHealthSubscribers();
+          }
+
+          const val = snapshot.val();
+          if (!val) {
+            // No RTDB presence node yet for this user — check Firestore 2-min heartbeat / 3-min threshold
+            const cachedHb = deriveFirestoreHeartbeatPresence(getCachedUserProfile(targetUid));
+            if (cachedHb) {
+              presenceStore.set(targetUid, {
+                state: cachedHb.state,
+                lastChanged: cachedHb.lastChanged,
+                loading: false,
+                errored: false
+              });
+              schedulePresenceNotification(targetUid);
+            } else {
+              startFirestoreFallbackListener();
+            }
+            return;
+          }
+
+          const rawState: 'online' | 'offline' =
+            val && val.state === 'online' ? 'online' : 'offline';
+          const lastChanged =
+            typeof val?.lastChanged === 'number' ? val.lastChanged : undefined;
+
+          const prev = presenceStore.get(targetUid);
+
+          if (rawState === 'offline' && prev && !prev.loading && prev.state === 'online') {
+            // Flaky mobile network protection: wait 7s before flipping to offline in UI
+            if (offlineDelayTimer) clearTimeout(offlineDelayTimer);
+            offlineDelayTimer = setTimeout(() => {
+              offlineDelayTimer = null;
+              presenceStore.set(targetUid, {
+                state: 'offline',
+                lastChanged,
+                loading: false,
+                errored: false
+              });
+              schedulePresenceNotification(targetUid);
+            }, FLAKY_OFFLINE_DELAY_MS);
+            return;
+          }
+
+          if (rawState === 'online' && offlineDelayTimer) {
+            clearTimeout(offlineDelayTimer);
+            offlineDelayTimer = null;
+          }
+
+          presenceStore.set(targetUid, {
+            state: rawState,
+            lastChanged,
+            loading: false,
+            errored: false
+          });
+          schedulePresenceNotification(targetUid);
+        },
+        (err) => {
+          console.warn(`[Presence] Read error for ${targetUid}, using Firestore heartbeat fallback:`, err);
+          startFirestoreFallbackListener();
         }
-
-        presenceStore.set(targetUid, {
-          state: rawState,
-          lastChanged,
-          loading: false,
-          errored: false
-        });
-        schedulePresenceNotification(targetUid);
-      },
-      (err) => {
-        console.warn(`[Presence] Read error for ${targetUid}:`, err);
-        presenceStore.set(targetUid, {
-          state: 'offline',
-          loading: false,
-          errored: true
-        });
-        schedulePresenceNotification(targetUid);
-      }
-    );
+      );
+    } else {
+      startFirestoreFallbackListener();
+    }
 
     const unsubscribe = () => {
       if (offlineDelayTimer) clearTimeout(offlineDelayTimer);
-      try {
-        unsubRtdb();
-      } catch {
-        // ignore
+      if (unsubRtdb) {
+        try {
+          unsubRtdb();
+        } catch {
+          // ignore
+        }
+      }
+      if (unsubFirestoreFallback) {
+        try {
+          unsubFirestoreFallback();
+        } catch {
+          // ignore
+        }
       }
     };
 
@@ -648,17 +742,52 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         };
       }
 
-      if (!rtdb || !globalRtdbReachable) {
+      const entry = presenceStore.get(uid);
+      const resolvedProfile = targetProfile || getCachedUserProfile(uid);
+      const hbFallback = deriveFirestoreHeartbeatPresence(resolvedProfile);
+
+      if (!rtdb || !globalRtdbReachable || (entry && entry.errored)) {
+        if (entry && !entry.loading && !entry.errored) {
+          const isStale =
+            entry.state === 'online' &&
+            entry.lastChanged !== undefined &&
+            Date.now() - entry.lastChanged > FIRESTORE_HEARTBEAT_OFFLINE_THRESHOLD_MS;
+          const finalState = isStale ? 'offline' : entry.state;
+          return {
+            status: finalState,
+            state: finalState,
+            lastChanged: entry.lastChanged,
+            loading: false,
+            canShowLastSeen: privacy.canShowLastSeen
+          };
+        }
+        if (hbFallback) {
+          return {
+            status: hbFallback.state,
+            state: hbFallback.state,
+            lastChanged: hbFallback.lastChanged,
+            loading: false,
+            canShowLastSeen: privacy.canShowLastSeen
+          };
+        }
         return {
-          status: 'unreachable',
+          status: 'offline',
           state: 'offline',
           loading: false,
           canShowLastSeen: privacy.canShowLastSeen
         };
       }
 
-      const entry = presenceStore.get(uid);
       if (!entry || entry.loading) {
+        if (hbFallback) {
+          return {
+            status: hbFallback.state,
+            state: hbFallback.state,
+            lastChanged: hbFallback.lastChanged,
+            loading: false,
+            canShowLastSeen: privacy.canShowLastSeen
+          };
+        }
         return {
           status: 'loading',
           state: 'offline',
@@ -667,19 +796,10 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         };
       }
 
-      if (entry.errored) {
-        return {
-          status: 'unreachable',
-          state: 'offline',
-          loading: false,
-          canShowLastSeen: privacy.canShowLastSeen
-        };
-      }
-
       return {
         status: entry.state,
         state: entry.state,
-        lastChanged: entry.lastChanged,
+        lastChanged: entry.lastChanged ?? hbFallback?.lastChanged,
         loading: false,
         canShowLastSeen: privacy.canShowLastSeen
       };
@@ -688,7 +808,7 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   );
 
   const getCachedIsOnline = useCallback((uid?: string): boolean => {
-    if (!uid || !globalRtdbReachable) return false;
+    if (!uid) return false;
     const privacy = evaluatePresencePrivacy({
       viewerUid: viewerUidRef.current,
       viewerProfile: viewerProfileRef.current,
@@ -696,7 +816,11 @@ export const PresenceProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     });
     if (!privacy.canShowDot) return false;
     const entry = presenceStore.get(uid);
-    return Boolean(entry && !entry.loading && !entry.errored && entry.state === 'online');
+    if (entry && !entry.loading && !entry.errored) {
+      return entry.state === 'online';
+    }
+    const hbFallback = deriveFirestoreHeartbeatPresence(getCachedUserProfile(uid));
+    return Boolean(hbFallback && hbFallback.state === 'online');
   }, []);
 
   // ==========================================================================

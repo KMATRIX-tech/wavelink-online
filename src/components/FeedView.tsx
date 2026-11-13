@@ -243,6 +243,8 @@ interface FeedViewProps {
   onClearFocusPostId?: () => void;
   onOpenWelink?: (mode?: 'chat' | 'image' | 'voice') => void;
   onStartChat?: (userId: string) => void;
+  hasNewPosts?: boolean;
+  onLoadNewPosts?: () => void;
 }
 
 export const FeedView: React.FC<FeedViewProps> = ({
@@ -252,7 +254,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
   initialFocusPostId,
   onClearFocusPostId,
   onOpenWelink,
-  onStartChat
+  onStartChat,
+  hasNewPosts = false,
+  onLoadNewPosts
 }) => {
   const {
     currentUser,
@@ -1717,6 +1721,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
       <div className="wavelink-feed-row">
         {/* Center Main Feed (Mobile < 768px: Full Width Single Column; Desktop >= 1024px: Centered max 660px) */}
         <div className="wavelink-feed-column overflow-hidden">
+          {/* Floating "New posts" Pill (Tapping scrolls up and loads new posts without auto-inserting while reading) */}
+          {hasNewPosts && (
+            <div className="sticky top-3 z-30 flex justify-center pointer-events-none my-1 animate-in fade-in">
+              <button
+                type="button"
+                onClick={() => {
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                  onLoadNewPosts?.();
+                  void loadInitialPosts(true);
+                }}
+                className="pointer-events-auto min-h-[44px] px-4 py-2 rounded-full bg-[#F43F5E] hover:bg-rose-600 text-white text-xs font-extrabold shadow-lg flex items-center gap-2 ring-2 ring-white/80 dark:ring-slate-900 transition active:scale-95 cursor-pointer"
+              >
+                <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+                <span>{language === 'sw' ? 'Machapisho mapya ↑' : 'New posts ↑'}</span>
+              </button>
+            </div>
+          )}
+
           {/* Background Video Upload Progress Chip at the Top of the Feed */}
           <VideoUploadProgressChip variant="feed-inline" />
 

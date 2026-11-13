@@ -2461,13 +2461,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               {[
                 {
                   key: 'showOnlineStatus' as const,
-                  title: 'Show my online status',
-                  desc: 'Let friends see a green dot when you are online (default ON). Like WhatsApp, turning this off also hides other users’ online status and last seen from you.'
+                  title: "Show when I'm online",
+                  desc: "Off hides my green dot and last seen, and I won't see others' online status or last seen either."
                 },
                 {
                   key: 'showLastSeen' as const,
                   title: 'Show last seen timestamp',
-                  desc: 'Display when you were last active (e.g. "Last seen 5 min ago") in chat headers and your profile.'
+                  desc: 'Display when you were last active (e.g. "last seen 5 min ago") in chat headers and your profile.'
                 },
                 {
                   key: 'showReadReceipts' as const,
@@ -2484,9 +2484,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 return (
                   <div
                     key={item.key}
-                    onClick={() =>
-                      setPrivacySettings((prev) => ({ ...prev, [item.key]: !prev[item.key] }))
-                    }
+                    onClick={() => {
+                      setPrivacySettings((prev) => {
+                        const nextVal = !prev[item.key];
+                        const nextSettings = {
+                          ...prev,
+                          [item.key]: nextVal,
+                          ...(item.key === 'showOnlineStatus' && !nextVal ? { showLastSeen: false } : {}),
+                          updatedAt: new Date().toISOString()
+                        };
+                        updateUserProfile({ privacySettings: nextSettings }).catch(() => {});
+                        return nextSettings;
+                      });
+                    }}
                     className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-4 cursor-pointer hover:bg-stone-100/60 transition"
                   >
                     <div>

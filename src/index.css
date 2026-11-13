@@ -4338,4 +4338,90 @@ html[data-has-custom-bg="true"] .wavelink-chat-center-col:not([data-chat-themed=
   }
 }
 
+/* ============================================================================
+   MIX YOUR OWN THEME ENGINE (Font, Card Style, Corner Roundness, Bubbles, Nav)
+   ============================================================================ */
+html[data-has-theme-mix="true"] body,
+html[data-has-theme-mix="true"] .wavelink-app-shell {
+  font-family: var(--mix-font-family, 'Plus Jakarta Sans', sans-serif);
+}
+
+/* Corner roundness across feed, chat, profile & create cards */
+html[data-has-theme-mix="true"] .wavelink-glass-post-card {
+  border-radius: var(--mix-card-radius, 24px) !important;
+}
+
+/* Card style: solid */
+html[data-has-theme-mix="true"][data-card-style="solid"]:not([data-has-custom-bg="true"]) .wavelink-glass-post-card {
+  background: var(--bg-surface) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: 1px solid var(--border-hairline) !important;
+}
+
+/* Card style: outline */
+html[data-has-theme-mix="true"][data-card-style="outline"]:not([data-has-custom-bg="true"]) .wavelink-glass-post-card {
+  background: color-mix(in srgb, var(--bg-surface) 42%, transparent) !important;
+  border: 1.5px solid color-mix(in srgb, var(--accent-primary) 55%, var(--border-hairline)) !important;
+  box-shadow: none !important;
+}
+
+/* Chat bubble style customization */
+html[data-has-theme-mix="true"] .wavelink-convo-bubble--sent {
+  background: var(--accent-primary) !important;
+  color: var(--accent-contrast-text, #FFFFFF) !important;
+}
+
+html[data-has-theme-mix="true"][data-chat-bubble-style="rounded"] .wavelink-convo-bubble {
+  border-radius: 26px !important;
+}
+
+html[data-has-theme-mix="true"][data-chat-bubble-style="minimal"] .wavelink-convo-bubble {
+  border-radius: 8px !important;
+  box-shadow: none !important;
+}
+
+html[data-has-theme-mix="true"][data-chat-bubble-style="glass"] .wavelink-convo-bubble--received {
+  background: color-mix(in srgb, var(--bg-surface) 68%, transparent) !important;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* Mobile-only (< 768px) Mix Your Own Theme styles */
+@media (max-width: 767px) {
+  html[data-has-theme-mix="true"][data-nav-style="solid"] .wavelink-mobile-bottom-nav nav {
+    background: var(--bg-surface) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  html[data-has-theme-mix="true"][data-nav-style="minimal"] .wavelink-mobile-bottom-nav nav {
+    box-shadow: none !important;
+    border-top: 1px solid var(--border-hairline) !important;
+  }
+
+  html[data-has-theme-mix="true"][data-nav-style="bordered"] .wavelink-mobile-bottom-nav nav {
+    border-top: 2px solid var(--accent-primary) !important;
+  }
+}
+
+/* Desktop-only (>= 1024px) Mix Your Own Theme styles */
+@media (min-width: 1024px) {
+  html[data-has-theme-mix="true"][data-nav-style="solid"] .wavelink-desktop-sidebar > div {
+    background: var(--bg-surface) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  html[data-has-theme-mix="true"][data-nav-style="minimal"] .wavelink-desktop-sidebar > div {
+    box-shadow: none !important;
+    border: 1px solid var(--border-hairline) !important;
+  }
+
+  html[data-has-theme-mix="true"][data-nav-style="bordered"] .wavelink-desktop-sidebar > div {
+    border: 2px solid color-mix(in srgb, var(--accent-primary) 50%, var(--border-hairline)) !important;
+  }
+}
+
+
 

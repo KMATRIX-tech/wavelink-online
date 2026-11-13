@@ -1,8 +1,24 @@
-import React, { useState, useRef } from 'react';
-import { APPEARANCE_THEMES, useTheme } from '../context/ThemeContext';
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  APPEARANCE_THEMES,
+  THEME_MIX_ACCENT_PRESETS,
+  THEME_MIX_FONTS,
+  evaluateAccentContrast,
+  encodeShareableThemeMix,
+  decodeShareableThemeMix,
+  useTheme
+} from '../context/ThemeContext';
 import { useLanguage } from '../context/LanguageContext';
 import { useAuth } from '../context/AuthContext';
-import { AppearanceTheme } from '../types';
+import {
+  AppearanceTheme,
+  CustomThemeMix,
+  ThemeMixCardStyle,
+  ThemeMixCornerRoundness,
+  ThemeMixFontFamily,
+  ThemeMixChatBubbleStyle,
+  ThemeMixNavBarStyle
+} from '../types';
 import { validateCustomBackgroundFile } from '../utils/mediaStorage';
 import { CustomBackgroundModal } from './CustomBackgroundModal';
 import {
@@ -19,7 +35,12 @@ import {
   Sliders,
   Crown,
   X,
-  WifiOff
+  WifiOff,
+  Palette,
+  Share2,
+  Copy,
+  BookmarkPlus,
+  Type
 } from 'lucide-react';
 
 interface ThemePickerPanelProps {
@@ -52,7 +73,18 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
     customBgLoadFailed,
     isSavingCustomBg,
     selectCustomBackgroundFromHistory,
-    removeCustomBackground
+    removeCustomBackground,
+    customThemeMix,
+    activeThemeMix,
+    savedThemeMixes,
+    sharedThemeMixCandidate,
+    isSavingThemeMix,
+    setPreviewThemeMix,
+    saveCustomThemeMix,
+    resetCustomThemeMix,
+    saveAsNewThemeMix,
+    deleteSavedThemeMix,
+    dismissSharedThemeMixCandidate
   } = useTheme();
   const { language } = useLanguage();
   const { showGlobalToast, isProEffective } = useAuth();
@@ -63,6 +95,47 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
   const [selectedCustomFile, setSelectedCustomFile] = useState<File | null>(null);
   const [isCustomBgModalOpen, setIsCustomBgModalOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Mix your own theme local draft state
+  const defaultDraftMix = (): CustomThemeMix => {
+    if (activeThemeMix) return activeThemeMix;
+    const baseMeta = APPEARANCE_THEMES.find((t) => t.id === appearanceTheme) || APPEARANCE_THEMES[0];
+    return {
+      baseTheme: appearanceTheme,
+      accentColor: baseMeta.previewAccent,
+      cardStyle: 'glass',
+      cornerRoundness: 'round',
+      fontFamily: 'jakarta',
+      chatBubbleStyle: 'modern',
+      navBarStyle: 'floating'
+    };
+  };
+
+  const [mixDraft, setMixDraft] = useState<CustomThemeMix>(defaultDraftMix);
+  const [newThemeName, setNewThemeName] = useState('');
+  const [showSaveAsInput, setShowSaveAsInput] = useState(false);
+  const [shareCodeInput, setShareCodeInput] = useState('');
+  const [showImportCodeBox, setShowImportCodeBox] = useState(false);
+  const [mixStatusMsg, setMixStatusMsg] = useState<string | null>(null);
+  const [mixErrorMsg, setMixErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (sharedThemeMixCandidate) {
+      setMixDraft(sharedThemeMixCandidate);
+    } else if (customThemeMix) {
+      setMixDraft(customThemeMix);
+    }
+  }, [customThemeMix, sharedThemeMixCandidate]);
+
+  const updateMixDraft = (patch: Partial<CustomThemeMix>) => {
+    setMixErrorMsg(null);
+    setMixStatusMsg(null);
+    setMixDraft((prev) => {
+      const next: CustomThemeMix = { ...prev, ...patch };
+      setPreviewThemeMix(next);
+      return next;
+    });
+  };
 
   const currentMeta =
     APPEARANCE_THEMES.find((t) => t.id === activeTheme) || APPEARANCE_THEMES[0];
@@ -712,6 +785,792 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
           </div>
         )}
       </div>
+
+      {/* =====================================================================
+          MIX YOUR OWN THEME BUILDER (Free for Everyone)
+          ===================================================================== */}
+      {(() => {
+        const draftBaseMeta =
+          APPEARANCE_THEMES.find((t) => t.id === mixDraft.baseTheme) || APPEARANCE_THEMES[0];
+        const contrastInfo = evaluateAccentContrast(mixDraft.accentColor, draftBaseMeta.isDark);
+        const fontMeta = THEME_MIX_FONTS[mixDraft.fontFamily] || THEME_MIX_FONTS.jakarta;
+        const previewRadius =
+          mixDraft.cornerRoundness === 'sharp'
+            ? '8px'
+            : mixDraft.cornerRoundness === 'medium'
+            ? '14px'
+            : '22px';
+
+        return (
+          <div className="wavelink-glass-post-card rounded-3xl p-4 sm:p-5 space-y-4">
+            {/* Header */}
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-3 min-w-0">
+                <div
+                  className="w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 text-white shadow-sm"
+                  style={{
+                    backgroundColor: mixDraft.accentColor,
+                    color: contrastInfo.buttonTextColor
+                  }}
+                >
+                  <Palette size={18} />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs sm:text-sm font-extrabold text-[var(--text-primary)]">
+                      {language === 'sw' ? 'Changanya muonekano wako' : 'Mix your own theme'}
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">
+                      {language === 'sw' ? 'Bure kwa wote' : 'Free for everyone'}
+                    </span>
+                    {customThemeMix && (
+                      <span
+                        className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider"
+                        style={{
+                          backgroundColor: mixDraft.accentColor,
+                          color: contrastInfo.buttonTextColor
+                        }}
+                      >
+                        {customThemeMix.name || (language === 'sw' ? 'Inatumika' : 'Active Mix')}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] sm:text-xs text-[var(--text-secondary)] mt-0.5 leading-snug">
+                    {language === 'sw'
+                      ? 'Chagua msingi wa muonekano, rangi ya msisitizo, mtindo wa kadi, kona, fonti na viputo vya ujumbe.'
+                      : 'Pick a base theme, accent color, card style, corner roundness, font, chat bubble & nav style.'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowImportCodeBox((v) => !v)}
+                  className="min-h-[44px] px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center gap-1.5 hover:opacity-90 cursor-pointer"
+                >
+                  <Eye size={14} />
+                  <span>{language === 'sw' ? 'Jaribu msimbo' : 'Try a theme code'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const code = encodeShareableThemeMix(mixDraft);
+                    const shareUrl = `${window.location.origin}${window.location.pathname}?themeMix=${encodeURIComponent(code)}`;
+                    try {
+                      if (navigator.clipboard?.writeText) {
+                        await navigator.clipboard.writeText(shareUrl);
+                      }
+                      const msg =
+                        language === 'sw'
+                          ? `Kiungo na msimbo wa muonekano umenakiliwa (${code})! 📋`
+                          : `Share link copied! Theme code: ${code} 📋`;
+                      setMixStatusMsg(msg);
+                      showGlobalToast?.(msg);
+                    } catch {
+                      setMixStatusMsg(`Share code: ${code}`);
+                    }
+                  }}
+                  className="min-h-[44px] px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center gap-1.5 hover:opacity-90 cursor-pointer"
+                >
+                  <Share2 size={14} />
+                  <span>{language === 'sw' ? 'Shiriki muonekano wangu' : 'Share my theme'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Shared theme candidate banner when opened via ?themeMix=... link */}
+            {sharedThemeMixCandidate && (
+              <div className="p-3.5 rounded-2xl bg-blue-500/12 border border-blue-500/30 flex items-center justify-between gap-3 flex-wrap">
+                <div className="text-xs font-bold text-[var(--text-primary)]">
+                  ✨{' '}
+                  {language === 'sw'
+                    ? 'Unajaribu muonekano ulioshirikiwa na rafiki! Hifadhi ili uendelee kuutumia.'
+                    : 'Previewing a shared friend theme! Tap "Try this theme" to save it to your account.'}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => dismissSharedThemeMixCandidate()}
+                    className="min-h-[44px] px-3 py-1.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-bold cursor-pointer"
+                  >
+                    {language === 'sw' ? 'Funga' : 'Dismiss'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const res = await saveCustomThemeMix(sharedThemeMixCandidate);
+                      if (res.success) {
+                        const msg =
+                          language === 'sw'
+                            ? 'Muonekano ulioshirikiwa umehifadhiwa! ✨'
+                            : 'Shared theme applied and saved! ✨';
+                        setMixStatusMsg(msg);
+                        showGlobalToast?.(msg);
+                      } else if (res.error) {
+                        setMixErrorMsg(res.error);
+                      }
+                    }}
+                    className="min-h-[44px] px-3.5 py-1.5 rounded-xl text-xs font-extrabold shadow-sm cursor-pointer"
+                    style={{
+                      backgroundColor: sharedThemeMixCandidate.accentColor,
+                      color: evaluateAccentContrast(
+                        sharedThemeMixCandidate.accentColor,
+                        draftBaseMeta.isDark
+                      ).buttonTextColor
+                    }}
+                  >
+                    {language === 'sw' ? 'Jaribu muonekano huu' : 'Try this theme'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Paste a friend's theme code or link */}
+            {showImportCodeBox && (
+              <div className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2.5">
+                <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                  {language === 'sw'
+                    ? 'Bandika msimbo wa muonekano (WL-...) au kiungo cha rafiki'
+                    : "Paste a friend's theme code (WL-...) or link"}
+                </label>
+                <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                  <input
+                    type="text"
+                    value={shareCodeInput}
+                    onChange={(e) => setShareCodeInput(e.target.value)}
+                    placeholder="WL-eyJiIjoib2NlYW4i..."
+                    className="flex-1 min-h-[44px] px-3.5 py-2 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-xs font-mono text-[var(--text-primary)] focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const decoded = decodeShareableThemeMix(shareCodeInput);
+                      if (!decoded) {
+                        setMixErrorMsg(
+                          language === 'sw'
+                            ? 'Msimbo wa muonekano si sahihi.'
+                            : 'Invalid theme code or link. Please check and try again.'
+                        );
+                        return;
+                      }
+                      setMixErrorMsg(null);
+                      setMixDraft(decoded);
+                      setPreviewThemeMix(decoded);
+                      const msg =
+                        language === 'sw'
+                          ? 'Muonekano wa rafiki umewekwa kwenye hakikisho! Bonyeza Hifadhi uupendapo.'
+                          : 'Try this theme: live preview active! Tap Save to keep it.';
+                      setMixStatusMsg(msg);
+                      showGlobalToast?.(msg);
+                    }}
+                    className="min-h-[44px] px-4 py-2 rounded-xl text-xs font-extrabold shadow-sm cursor-pointer shrink-0"
+                    style={{
+                      backgroundColor: mixDraft.accentColor,
+                      color: contrastInfo.buttonTextColor
+                    }}
+                  >
+                    {language === 'sw' ? 'Jaribu muonekano huu' : 'Try this theme'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Saved Custom Themes (up to 3) */}
+            {savedThemeMixes.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-[11px] font-extrabold text-[var(--text-secondary)] uppercase tracking-wider">
+                  <span>
+                    {language === 'sw'
+                      ? `Mionekano Yangu Iliyohifadhiwa (${savedThemeMixes.length}/3)`
+                      : `My Saved Themes (${savedThemeMixes.length}/3)`}
+                  </span>
+                  <span className="normal-case font-semibold">
+                    {language === 'sw' ? 'Gusa kutumia papo hapo' : 'Tap to apply'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {savedThemeMixes.map((saved) => {
+                    const base =
+                      APPEARANCE_THEMES.find((t) => t.id === saved.baseTheme) ||
+                      APPEARANCE_THEMES[0];
+                    const isCurrent =
+                      customThemeMix?.name === saved.name &&
+                      customThemeMix?.accentColor === saved.accentColor &&
+                      customThemeMix?.baseTheme === saved.baseTheme;
+                    return (
+                      <div
+                        key={saved.id}
+                        className={`p-2.5 rounded-2xl border flex items-center justify-between gap-2 transition ${
+                          isCurrent
+                            ? 'border-[var(--accent-primary)] bg-[var(--bg-subtle)]'
+                            : 'border-[var(--border-hairline)] bg-[var(--bg-surface)]'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setMixDraft(saved);
+                            await saveCustomThemeMix(saved);
+                            showGlobalToast?.(`"${saved.name}" applied! ✨`);
+                          }}
+                          className="flex items-center gap-2.5 min-w-0 flex-1 text-left cursor-pointer min-h-[44px]"
+                        >
+                          <span
+                            className="w-7 h-7 rounded-xl flex items-center justify-center text-sm shrink-0 shadow-xs"
+                            style={{ backgroundColor: saved.accentColor, color: '#fff' }}
+                          >
+                            {base.emoji}
+                          </span>
+                          <div className="min-w-0">
+                            <span className="text-xs font-extrabold text-[var(--text-primary)] block truncate">
+                              {saved.name}
+                            </span>
+                            <span className="text-[10px] text-[var(--text-secondary)] block truncate">
+                              {base.name} · {saved.cardStyle} · {saved.cornerRoundness}
+                            </span>
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Delete ${saved.name}`}
+                          onClick={async () => {
+                            await deleteSavedThemeMix(saved.id);
+                          }}
+                          className="min-w-[44px] min-h-[44px] rounded-xl text-rose-500 hover:bg-rose-500/10 flex items-center justify-center shrink-0 cursor-pointer"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 1. Base Theme Picker */}
+            <div className="space-y-1.5">
+              <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                1. {language === 'sw' ? 'Muonekano wa Msingi' : 'Base theme'}
+              </label>
+              <div className="flex items-center gap-2 overflow-x-auto pb-1 no-scrollbar">
+                {APPEARANCE_THEMES.map((t) => {
+                  const selected = mixDraft.baseTheme === t.id;
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => updateMixDraft({ baseTheme: t.id })}
+                      className={`min-h-[44px] px-3 py-2 rounded-2xl border text-xs font-extrabold flex items-center gap-1.5 shrink-0 transition cursor-pointer ${
+                        selected
+                          ? 'ring-2 ring-[var(--accent-primary)] border-[var(--accent-primary)] bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                          : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      <span>{t.emoji}</span>
+                      <span>{language === 'sw' ? t.nameSw : t.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 2. Accent Color (Color Picker + 12 Presets + Contrast Auto-Check) */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <label className="text-xs font-extrabold text-[var(--text-primary)]">
+                  2. {language === 'sw' ? 'Rangi ya Msisitizo (Chagua au badilisha)' : 'Accent color (Picker + 12 presets)'}
+                </label>
+                <span className="text-[11px] font-bold text-[var(--text-secondary)]">
+                  Contrast {contrastInfo.contrastRatioOnButton}:1{' '}
+                  {contrastInfo.wasAutoAdjusted
+                    ? language === 'sw'
+                      ? '(Imerekebishwa kusomeka vizuri)'
+                      : '(Auto-adjusted for readability)'
+                    : '✓ Readable'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <label className="relative min-w-[44px] min-h-[44px] px-3 py-1.5 rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="color"
+                    value={mixDraft.accentColor}
+                    onChange={(e) => updateMixDraft({ accentColor: e.target.value.toUpperCase() })}
+                    aria-label="Pick custom accent color"
+                    className="w-6 h-6 rounded-lg border-0 cursor-pointer bg-transparent"
+                  />
+                  <span className="text-xs font-mono font-bold text-[var(--text-primary)]">
+                    {mixDraft.accentColor}
+                  </span>
+                </label>
+
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {THEME_MIX_ACCENT_PRESETS.map((preset) => {
+                    const isSelected =
+                      mixDraft.accentColor.toUpperCase() === preset.hex.toUpperCase();
+                    return (
+                      <button
+                        key={preset.hex}
+                        type="button"
+                        title={preset.label}
+                        aria-label={`Select ${preset.label} (${preset.hex})`}
+                        onClick={() => updateMixDraft({ accentColor: preset.hex })}
+                        className={`min-w-[44px] min-h-[44px] rounded-2xl flex items-center justify-center transition cursor-pointer border ${
+                          isSelected
+                            ? 'scale-105 ring-2 ring-offset-1 ring-[var(--text-primary)] border-white'
+                            : 'border-black/10 hover:scale-105'
+                        }`}
+                        style={{ backgroundColor: preset.hex }}
+                      >
+                        {isSelected && (
+                          <Check
+                            size={15}
+                            strokeWidth={3}
+                            style={{
+                              color: evaluateAccentContrast(preset.hex, draftBaseMeta.isDark)
+                                .buttonTextColor
+                            }}
+                          />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* 3. Card Style & 4. Corner Roundness */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                  3. {language === 'sw' ? 'Mtindo wa Kadi' : 'Card style'}
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {(
+                    [
+                      { id: 'glass', label: 'Glass' },
+                      { id: 'solid', label: 'Solid' },
+                      { id: 'outline', label: 'Outline' }
+                    ] as Array<{ id: ThemeMixCardStyle; label: string }>
+                  ).map((opt) => {
+                    const active = mixDraft.cardStyle === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => updateMixDraft({ cardStyle: opt.id })}
+                        className={`min-h-[44px] px-3 py-2 rounded-2xl border text-xs font-extrabold transition cursor-pointer ${
+                          active
+                            ? 'border-[var(--accent-primary)] bg-[var(--bg-subtle)] text-[var(--text-primary)] ring-2 ring-[var(--accent-primary)]'
+                            : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                  4. {language === 'sw' ? 'Mzunguko wa Kona' : 'Corner roundness'}
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {(
+                    [
+                      { id: 'sharp', label: 'Sharp' },
+                      { id: 'medium', label: 'Medium' },
+                      { id: 'round', label: 'Round' }
+                    ] as Array<{ id: ThemeMixCornerRoundness; label: string }>
+                  ).map((opt) => {
+                    const active = mixDraft.cornerRoundness === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => updateMixDraft({ cornerRoundness: opt.id })}
+                        className={`min-h-[44px] px-3 py-2 rounded-2xl border text-xs font-extrabold transition cursor-pointer ${
+                          active
+                            ? 'border-[var(--accent-primary)] bg-[var(--bg-subtle)] text-[var(--text-primary)] ring-2 ring-[var(--accent-primary)]'
+                            : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* 5. Font (4 Free Google Fonts) */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5">
+                <Type size={14} />
+                <span>5. {language === 'sw' ? 'Fonti ya Programu (Google Fonts 4)' : 'Font (4 free Google Fonts)'}</span>
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {(Object.keys(THEME_MIX_FONTS) as ThemeMixFontFamily[]).map((fontKey) => {
+                  const f = THEME_MIX_FONTS[fontKey];
+                  const active = mixDraft.fontFamily === fontKey;
+                  return (
+                    <button
+                      key={fontKey}
+                      type="button"
+                      onClick={() => updateMixDraft({ fontFamily: fontKey })}
+                      style={{ fontFamily: f.cssFamily }}
+                      className={`min-h-[48px] p-2.5 rounded-2xl border text-left transition cursor-pointer ${
+                        active
+                          ? 'border-[var(--accent-primary)] bg-[var(--bg-subtle)] text-[var(--text-primary)] ring-2 ring-[var(--accent-primary)]'
+                          : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      <span className="text-xs font-extrabold block truncate">{f.label}</span>
+                      <span className="text-[10px] opacity-75 block truncate">{f.sample}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 6. Chat Bubble Style & 7. Navigation Bar Style */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                  6. {language === 'sw' ? 'Mtindo wa Viputo vya Chat' : 'Chat bubble style'}
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {(
+                    [
+                      { id: 'modern', label: 'Modern' },
+                      { id: 'rounded', label: 'Pill' },
+                      { id: 'minimal', label: 'Minimal' },
+                      { id: 'glass', label: 'Glass' }
+                    ] as Array<{ id: ThemeMixChatBubbleStyle; label: string }>
+                  ).map((opt) => {
+                    const active = mixDraft.chatBubbleStyle === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => updateMixDraft({ chatBubbleStyle: opt.id })}
+                        className={`min-h-[44px] px-2.5 py-2 rounded-2xl border text-xs font-extrabold transition cursor-pointer ${
+                          active
+                            ? 'border-[var(--accent-primary)] bg-[var(--bg-subtle)] text-[var(--text-primary)] ring-2 ring-[var(--accent-primary)]'
+                            : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                  7. {language === 'sw' ? 'Mtindo wa Upau wa Urambazaji' : 'Navigation bar style'}
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {(
+                    [
+                      { id: 'floating', label: 'Floating' },
+                      { id: 'solid', label: 'Solid' },
+                      { id: 'minimal', label: 'Minimal' },
+                      { id: 'bordered', label: 'Bordered' }
+                    ] as Array<{ id: ThemeMixNavBarStyle; label: string }>
+                  ).map((opt) => {
+                    const active = mixDraft.navBarStyle === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => updateMixDraft({ navBarStyle: opt.id })}
+                        className={`min-h-[44px] px-2.5 py-2 rounded-2xl border text-xs font-extrabold transition cursor-pointer ${
+                          active
+                            ? 'border-[var(--accent-primary)] bg-[var(--bg-subtle)] text-[var(--text-primary)] ring-2 ring-[var(--accent-primary)]'
+                            : 'border-[var(--border-hairline)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Live App Screen Preview */}
+            <div
+              className="p-3.5 sm:p-4 border transition-all duration-300 space-y-3"
+              style={{
+                background: draftBaseMeta.previewGradient,
+                color: draftBaseMeta.previewText,
+                borderRadius: previewRadius,
+                fontFamily: fontMeta.cssFamily,
+                borderColor: draftBaseMeta.isDark
+                  ? 'rgba(255,255,255,0.18)'
+                  : 'rgba(15,23,42,0.12)'
+              }}
+            >
+              <div className="flex items-center justify-between text-[11px] font-extrabold uppercase tracking-wider opacity-85">
+                <span>
+                  {language === 'sw'
+                    ? 'Hakikisho la Skrini ya Programu'
+                    : 'Live App Screen Preview'}
+                </span>
+                <span>
+                  {draftBaseMeta.name} · {mixDraft.cardStyle} · {fontMeta.label}
+                </span>
+              </div>
+
+              {/* Simulated Feed Post Card */}
+              <div
+                className="p-3 transition-all space-y-2"
+                style={{
+                  borderRadius: previewRadius,
+                  backgroundColor:
+                    mixDraft.cardStyle === 'outline'
+                      ? 'transparent'
+                      : mixDraft.cardStyle === 'solid'
+                      ? draftBaseMeta.previewCard
+                      : draftBaseMeta.isDark
+                      ? 'rgba(19, 27, 46, 0.72)'
+                      : 'rgba(255, 255, 255, 0.80)',
+                  border:
+                    mixDraft.cardStyle === 'outline'
+                      ? `2px solid ${contrastInfo.readableAccentText}`
+                      : draftBaseMeta.isDark
+                      ? '1px solid rgba(255,255,255,0.16)'
+                      : '1px solid rgba(15,23,42,0.10)',
+                  backdropFilter: mixDraft.cardStyle === 'glass' ? 'blur(10px)' : 'none'
+                }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div
+                      className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-extrabold relative"
+                      style={{
+                        backgroundColor: mixDraft.accentColor,
+                        color: contrastInfo.buttonTextColor
+                      }}
+                    >
+                      A
+                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-[#10B981] ring-2 ring-white" />
+                    </div>
+                    <div>
+                      <div className="text-xs font-extrabold leading-none">Amina · Online</div>
+                      <div className="text-[10px] opacity-70 mt-0.5">Dar es Salaam · Just now</div>
+                    </div>
+                  </div>
+                  <span
+                    className="px-2.5 py-1 text-[10px] font-extrabold"
+                    style={{
+                      backgroundColor: mixDraft.accentColor,
+                      color: contrastInfo.buttonTextColor,
+                      borderRadius: previewRadius
+                    }}
+                  >
+                    Follow
+                  </span>
+                </div>
+                <p className="text-xs leading-snug">
+                  Testing my custom WaveLink theme mix with readable contrast & live styles! ✨
+                </p>
+
+                {/* Simulated Chat Bubbles */}
+                <div className="pt-1 flex flex-col gap-1.5">
+                  <div
+                    className="self-start max-w-[78%] px-3 py-1.5 text-[11px] font-semibold"
+                    style={{
+                      backgroundColor: draftBaseMeta.isDark
+                        ? 'rgba(255,255,255,0.10)'
+                        : 'rgba(15,23,42,0.07)',
+                      borderRadius:
+                        mixDraft.chatBubbleStyle === 'rounded'
+                          ? '9999px'
+                          : mixDraft.chatBubbleStyle === 'minimal'
+                          ? '6px'
+                          : previewRadius
+                    }}
+                  >
+                    How does the new theme look?
+                  </div>
+                  <div
+                    className="self-end max-w-[78%] px-3 py-1.5 text-[11px] font-bold shadow-xs"
+                    style={{
+                      backgroundColor:
+                        mixDraft.chatBubbleStyle === 'minimal'
+                          ? 'transparent'
+                          : mixDraft.accentColor,
+                      color:
+                        mixDraft.chatBubbleStyle === 'minimal'
+                          ? contrastInfo.readableAccentText
+                          : contrastInfo.buttonTextColor,
+                      border:
+                        mixDraft.chatBubbleStyle === 'minimal'
+                          ? `1.5px solid ${contrastInfo.readableAccentText}`
+                          : 'none',
+                      borderRadius:
+                        mixDraft.chatBubbleStyle === 'rounded'
+                          ? '9999px'
+                          : mixDraft.chatBubbleStyle === 'minimal'
+                          ? '6px'
+                          : previewRadius
+                    }}
+                  >
+                    Super clean and readable! 🔥
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Status / Error Feedback */}
+            {mixStatusMsg && (
+              <div className="p-3 rounded-2xl bg-emerald-500/12 border border-emerald-500/30 text-emerald-700 dark:text-emerald-200 text-xs font-bold flex items-center gap-2">
+                <Check size={15} className="shrink-0 text-emerald-500" />
+                <span>{mixStatusMsg}</span>
+              </div>
+            )}
+            {mixErrorMsg && (
+              <div className="p-3 rounded-2xl bg-rose-500/12 border border-rose-500/30 text-rose-700 dark:text-rose-200 text-xs font-bold flex items-center gap-2">
+                <AlertCircle size={15} className="shrink-0 text-rose-500" />
+                <span>{mixErrorMsg}</span>
+              </div>
+            )}
+
+            {/* Save as new theme name input */}
+            {showSaveAsInput && (
+              <div className="p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                <input
+                  type="text"
+                  maxLength={28}
+                  value={newThemeName}
+                  onChange={(e) => setNewThemeName(e.target.value)}
+                  placeholder={
+                    language === 'sw' ? 'Jina la muonekano (mf. Usiku wa Buluu)' : 'Theme name (e.g. Electric Sunset)'
+                  }
+                  className="flex-1 min-h-[44px] px-3.5 py-2 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-xs font-bold text-[var(--text-primary)] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  disabled={isSavingThemeMix}
+                  onClick={async () => {
+                    const res = await saveAsNewThemeMix(
+                      mixDraft,
+                      newThemeName.trim() || `Mix #${savedThemeMixes.length + 1}`
+                    );
+                    if (res.success) {
+                      setShowSaveAsInput(false);
+                      setNewThemeName('');
+                      const msg =
+                        language === 'sw'
+                          ? 'Muonekano mpya umehifadhiwa kwenye orodha yako (hadi 3)! ✨'
+                          : 'Saved to your custom themes (up to 3)! ✨';
+                      setMixStatusMsg(msg);
+                      showGlobalToast?.(msg);
+                    } else if (res.error) {
+                      setMixErrorMsg(res.error);
+                    }
+                  }}
+                  className="min-h-[44px] px-4 py-2 rounded-xl text-xs font-extrabold shadow-sm cursor-pointer shrink-0"
+                  style={{
+                    backgroundColor: mixDraft.accentColor,
+                    color: contrastInfo.buttonTextColor
+                  }}
+                >
+                  {language === 'sw' ? 'Thibitisha Kuhifadhi' : 'Confirm Save'}
+                </button>
+              </div>
+            )}
+
+            {/* Action Buttons: Save, Reset, Save as new theme */}
+            <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
+              <button
+                type="button"
+                disabled={isSavingThemeMix}
+                onClick={async () => {
+                  const res = await resetCustomThemeMix();
+                  const baseMeta =
+                    APPEARANCE_THEMES.find((t) => t.id === appearanceTheme) || APPEARANCE_THEMES[0];
+                  setMixDraft({
+                    baseTheme: appearanceTheme,
+                    accentColor: baseMeta.previewAccent,
+                    cardStyle: 'glass',
+                    cornerRoundness: 'round',
+                    fontFamily: 'jakarta',
+                    chatBubbleStyle: 'modern',
+                    navBarStyle: 'floating'
+                  });
+                  if (res.success) {
+                    const msg =
+                      language === 'sw'
+                        ? 'Muonekano umerudishwa kwenye chaguo la msingi.'
+                        : 'Custom theme mix reset to default.';
+                    setMixStatusMsg(msg);
+                    showGlobalToast?.(msg);
+                  }
+                }}
+                className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5 hover:opacity-90 cursor-pointer"
+              >
+                <RotateCcw size={14} />
+                <span>{language === 'sw' ? 'Rudisha' : 'Reset'}</span>
+              </button>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  disabled={isSavingThemeMix}
+                  onClick={() => setShowSaveAsInput((v) => !v)}
+                  className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5 hover:opacity-90 cursor-pointer"
+                >
+                  <BookmarkPlus size={14} />
+                  <span>
+                    {language === 'sw'
+                      ? `Hifadhi kama mpya (${savedThemeMixes.length}/3)`
+                      : `Save as new theme (${savedThemeMixes.length}/3)`}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isSavingThemeMix}
+                  onClick={async () => {
+                    const res = await saveCustomThemeMix(mixDraft);
+                    if (res.success) {
+                      const msg =
+                        language === 'sw'
+                          ? 'Mchanganyiko wako wa muonekano umehifadhiwa! ✨'
+                          : 'Your custom theme mix is saved and active! ✨';
+                      setMixStatusMsg(msg);
+                      showGlobalToast?.(msg);
+                    } else if (res.error) {
+                      setMixErrorMsg(res.error);
+                    }
+                  }}
+                  className="min-h-[44px] px-4 py-2 rounded-2xl text-xs font-extrabold flex items-center gap-1.5 shadow-md transition active:scale-95 cursor-pointer disabled:opacity-60"
+                  style={{
+                    backgroundColor: mixDraft.accentColor,
+                    color: contrastInfo.buttonTextColor
+                  }}
+                >
+                  <Sparkles size={14} />
+                  <span>
+                    {isSavingThemeMix
+                      ? language === 'sw'
+                        ? 'Inahifadhi...'
+                        : 'Saving...'
+                      : language === 'sw'
+                      ? 'Hifadhi'
+                      : 'Save'}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Friendly Upgrade Prompt Modal for Non-Pro Users */}
       {showProUpgradePrompt && !isProEffective && (

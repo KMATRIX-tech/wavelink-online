@@ -75,6 +75,26 @@ async function showWaveLinkNotification(payload) {
     return;
   }
 
+  // If the app is currently open and visible in the foreground, don't show a system notification:
+  // forward to the client so it shows the in-app banner and updates red dots instead.
+  try {
+    const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const visibleClients = clientList.filter(
+      (c) => c.focused || c.visibilityState === 'visible'
+    );
+    if (visibleClients.length > 0 && data.forceSystemNotification !== 'true') {
+      visibleClients.forEach((client) => {
+        client.postMessage({
+          type: 'WAVELINK_FOREGROUND_PUSH',
+          payload
+        });
+      });
+      return;
+    }
+  } catch {
+    // Proceed with showing system notification
+  }
+
   const isIncomingCall = notifType === 'incoming_call' || notifType === 'call';
   const isMissedCall = notifType === 'missed_call';
   const isSilent = data.silent === 'true' || data.soundAndVibration === 'false';

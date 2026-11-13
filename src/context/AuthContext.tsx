@@ -53,7 +53,9 @@ import {
   ProfileCoverType,
   StoryHighlightItem,
   CustomAppBackground,
-  CustomBackgroundHistoryItem
+  CustomBackgroundHistoryItem,
+  CustomThemeMix,
+  SavedThemeMix
 } from '../types';
 import {
   removeCurrentDeviceFcmToken,
@@ -348,6 +350,8 @@ interface AuthContextType {
     chatThemes?: Record<string, ChatThemePreference>;
     customBackground?: CustomAppBackground | null;
     customBackgroundHistory?: CustomBackgroundHistoryItem[];
+    customThemeMix?: CustomThemeMix | null;
+    savedThemeMixes?: SavedThemeMix[];
     mutedChannelIds?: string[];
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
@@ -368,8 +372,8 @@ interface AuthContextType {
     details: string;
   }) => Promise<void>;
   dismissWarning: () => Promise<void>;
-  toggleSubAdmin: (targetUserId: string, makeSubAdmin: boolean) => Promise<void>;
-  toggleVerifyUser: (targetUserId: string, verify: boolean) => Promise<void>;
+  toggleSubAdmin: (targetUserId: string, makeSubAdmin: boolean, targetEmail?: string) => Promise<void>;
+  toggleVerifyUser: (targetUserId: string, verify: boolean, targetEmail?: string) => Promise<void>;
   activateHarvestPass: () => Promise<void>;
   verifyAndRedeemCoupon: (rawCode: string) => Promise<boolean>;
   showGlobalToast: (message: string) => void;
@@ -1234,8 +1238,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               }
               setUserProfile({
                 ...snapData,
-                isPro: Boolean(snapData.isPro || currentLocalPro || isSnapAdmin),
-                hasBlueStar: Boolean(snapData.hasBlueStar || snapData.isPro || currentLocalPro || isSnapAdmin),
+                isPro: Boolean(snapData.isPro || snapData.isVerifiedByAdmin || currentLocalPro || isSnapAdmin),
+                hasBlueStar: Boolean(
+                  snapData.hasBlueStar || snapData.isVerifiedByAdmin || snapData.isPro || currentLocalPro || isSnapAdmin
+                ),
+                isVerifiedByAdmin: Boolean(snapData.isVerifiedByAdmin || currentLocalPro || isSnapAdmin),
                 proBadge: snapData.proBadge || (isSnapAdmin ? 'founder' : currentLocalPro ? 'verified' : undefined),
                 points: resolvedPoints,
                 wavePoints: resolvedPoints,
@@ -1252,15 +1259,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         );
 
-        // Heartbeat for online status
+        // Heartbeat for online status (written at most once every 2 minutes)
         if (presenceInterval) clearInterval(presenceInterval);
         presenceInterval = setInterval(() => {
+          const nowIso = new Date().toISOString();
           setDoc(
             userDocRef,
-            { isOnline: true, lastSeenAt: new Date().toISOString() },
+            { isOnline: true, lastSeen: nowIso, lastSeenAt: nowIso },
             { merge: true }
           ).catch(() => {});
-        }, 60000);
+        }, 120000);
       } else {
         if (unsubscribeDoc) unsubscribeDoc();
         if (presenceInterval) clearInterval(presenceInterval);
@@ -1589,6 +1597,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     chatThemes?: Record<string, ChatThemePreference>;
     customBackground?: CustomAppBackground | null;
     customBackgroundHistory?: CustomBackgroundHistoryItem[];
+    customThemeMix?: CustomThemeMix | null;
+    savedThemeMixes?: SavedThemeMix[];
     mutedChannelIds?: string[];
   }) => {
     if (!currentUser) return;
@@ -1801,8 +1811,49 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           .filter(Boolean);
       }
 
+      if (data.customThemeMix !== undefined) {
+        if (data.customThemeMix === null) {
+          updatePayload.customThemeMix = null;
+        } else if (typeof data.customThemeMix === 'object') {
+          updatePayload.customThemeMix = {
+            baseTheme: data.customThemeMix.baseTheme,
+            accentColor: sanitizeUserText(data.customThemeMix.accentColor || '#0D9488', 16),
+            cardStyle: data.customThemeMix.cardStyle || 'glass',
+            cornerRoundness: data.customThemeMix.cornerRoundness || 'medium',
+            fontFamily: data.customThemeMix.fontFamily || 'Plus Jakarta Sans',
+            chatBubbleStyle: data.customThemeMix.chatBubbleStyle || 'modern',
+            navBarStyle: data.customThemeMix.navBarStyle || 'floating',
+            ...(data.customThemeMix.name
+              ? { name: sanitizeUserText(data.customThemeMix.name, 32) }
+              : {}),
+            updatedAt: data.customThemeMix.updatedAt || new Date().toISOString()
+          };
+        }
+      }
+      if (data.savedThemeMixes !== undefined && Array.isArray(data.savedThemeMixes)) {
+        updatePayload.savedThemeMixes = data.savedThemeMixes.slice(0, 3).map((item) => ({
+          id: sanitizeUserText(item.id || `mix_${Date.now()}`, 64),
+          name: sanitizeUserText(item.name || 'My Mix', 32),
+          baseTheme: item.baseTheme,
+          accentColor: sanitizeUserText(item.accentColor || '#0D9488', 16),
+          cardStyle: item.cardStyle || 'glass',
+          cornerRoundness: item.cornerRoundness || 'medium',
+          fontFamily: item.fontFamily || 'Plus Jakarta Sans',
+          chatBubbleStyle: item.chatBubbleStyle || 'modern',
+          navBarStyle: item.navBarStyle || 'floating',
+          createdAt: item.createdAt || new Date().toISOString(),
+          updatedAt: item.updatedAt || new Date().toISOString()
+        }));
+      }
+
       const sanitized = cleanFirestoreData(updatePayload);
-      if (data.chatThemes !== undefined || data.customBackground !== undefined || data.customBackgroundHistory !== undefined) {
+      if (
+        data.chatThemes !== undefined ||
+        data.customBackground !== undefined ||
+        data.customBackgroundHistory !== undefined ||
+        data.customThemeMix !== undefined ||
+        data.savedThemeMixes !== undefined
+      ) {
         try {
           await updateDoc(userRef, sanitized);
         } catch {
@@ -2118,7 +2169,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const canTalkToAdmin = isSuperAdmin || isSubAdmin || isVerified || Boolean(userProfile?.isPro);
 
   // Admin capability to appoint/demote sub-admins (enforced on server + Firestore + audit log)
-  const toggleSubAdmin = async (targetUserId: string, makeSubAdmin: boolean) => {
+  const toggleSubAdmin = async (targetUserId: string, makeSubAdmin: boolean, targetEmail?: string) => {
     if (!isSuperAdmin) {
       console.warn('Permission denied: Only the Platform Owner can manage administrators.');
       return;
@@ -2127,69 +2178,152 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       showGlobalToast('WaveLink Support Bot cannot be granted admin privileges.');
       return;
     }
+    const nowIso = new Date().toISOString();
+    let serverSucceeded = false;
+    let firestoreSucceeded = false;
+    let lastErr: unknown = null;
+
     try {
       const headers = await getAuthHeaders();
-      await fetch('/api/admin/role', {
+      const resp = await fetch('/api/admin/role', {
         method: 'POST',
         headers,
         body: JSON.stringify({
           callerEmail: currentUser?.email,
           targetUserId,
+          targetEmail,
           makeSubAdmin
         })
-      }).catch(() => {});
-
-      const targetUserRef = doc(db, 'users', targetUserId);
-      await setDoc(
-        targetUserRef,
-        {
-          isSubAdmin: makeSubAdmin,
-          role: makeSubAdmin ? 'sub_admin' : 'user',
-          updatedAt: new Date().toISOString()
-        },
-        { merge: true }
-      );
-
-      await recordAdminAuditLog({
-        action: 'role_change',
-        targetId: targetUserId,
-        details: `${makeSubAdmin ? 'Promoted user to Sub-Admin' : 'Demoted Sub-Admin to standard User'}`
       });
+      if (resp.ok) {
+        serverSucceeded = true;
+      }
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${targetUserId}`);
+      lastErr = err;
     }
-  };
 
-  // Admin capability to verify member & grant complimentary Pro status
-  const toggleVerifyUser = async (targetUserId: string, verify: boolean) => {
-    if (!isAdmin) {
-      console.warn('Permission denied: Only administrators can verify members.');
-      return;
-    }
-    if (targetUserId === SUPPORT_BOT_ID) return;
     try {
       const targetUserRef = doc(db, 'users', targetUserId);
       await setDoc(
         targetUserRef,
-        {
-          hasBlueStar: verify,
-          isVerifiedByAdmin: verify,
-          isPro: verify,
-          proBadge: verify ? 'verified' : 'none',
-          proBorderEffect: verify ? 'aura-gold' : 'none',
-          updatedAt: new Date().toISOString()
-        },
+        cleanFirestoreData({
+          isSubAdmin: makeSubAdmin,
+          role: makeSubAdmin ? 'sub_admin' : 'user',
+          updatedAt: nowIso
+        }),
         { merge: true }
       );
-
-      await recordAdminAuditLog({
-        action: 'verify_user',
-        targetId: targetUserId,
-        details: `${verify ? 'Granted Blue Star verification & Pro status' : 'Revoked verification & Pro status'}`
-      });
+      firestoreSucceeded = true;
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${targetUserId}`);
+      lastErr = err;
     }
+
+    if (!firestoreSucceeded && !serverSucceeded && lastErr) {
+      handleFirestoreError(lastErr, OperationType.UPDATE, `users/${targetUserId}`);
+    }
+
+    await recordAdminAuditLog({
+      action: 'role_change',
+      targetId: targetUserId,
+      targetLabel: targetEmail,
+      details: `${makeSubAdmin ? 'Promoted user to Sub-Admin' : 'Demoted Sub-Admin to standard User'}`
+    }).catch(() => {});
+
+    showGlobalToast(makeSubAdmin ? 'Appointed user as Sub-Admin!' : 'Revoked Sub-Admin privileges.');
+  };
+
+  // Admin capability to verify member & grant complimentary Pro status
+  const toggleVerifyUser = async (targetUserId: string, verify: boolean, targetEmail?: string) => {
+    if (!isAdmin) {
+      console.warn('Permission denied: Only administrators can verify members.');
+      return;
+    }
+    if (!targetUserId || targetUserId === SUPPORT_BOT_ID) return;
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAtIso = verify
+      ? new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString()
+      : '';
+
+    const proPayload: Record<string, any> = {
+      hasBlueStar: verify,
+      isVerifiedByAdmin: verify,
+      isPro: verify,
+      proPlan: verify ? 'annual' : 'free',
+      proExpiresAt: expiresAtIso,
+      proBadge: verify ? 'verified' : 'none',
+      proBorderEffect: verify ? 'aura-gold' : 'none',
+      proAccentColor: verify ? 'emerald' : 'purple',
+      updatedAt: nowIso
+    };
+
+    let serverSucceeded = false;
+    let firestoreSucceeded = false;
+    let lastErr: unknown = null;
+
+    // 1. Server-side Admin SDK + REST update
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch('/api/admin/grant-pro', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          callerEmail: currentUser?.email,
+          isSubAdmin,
+          targetUserId,
+          targetEmail,
+          verify
+        })
+      });
+      if (resp.ok) {
+        serverSucceeded = true;
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+
+    // 2. Direct client Firestore SDK update (plus any matching profile doc with the same email)
+    try {
+      const targetUserRef = doc(db, 'users', targetUserId);
+      await setDoc(targetUserRef, cleanFirestoreData(proPayload), { merge: true });
+      firestoreSucceeded = true;
+
+      const cleanTargetEmail = (targetEmail || '').trim().toLowerCase();
+      if (cleanTargetEmail && cleanTargetEmail !== 'keylanmbilinyi5@gmail.com') {
+        try {
+          const emailSnap = await getDocs(
+            query(collection(db, 'users'), where('email', '==', cleanTargetEmail))
+          );
+          for (const d of emailSnap.docs) {
+            if (d.id !== targetUserId) {
+              await setDoc(doc(db, 'users', d.id), cleanFirestoreData(proPayload), { merge: true }).catch(() => {});
+            }
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+
+    if (!firestoreSucceeded && !serverSucceeded && lastErr) {
+      handleFirestoreError(lastErr, OperationType.UPDATE, `users/${targetUserId}`);
+    }
+
+    await recordAdminAuditLog({
+      action: 'verify_user',
+      targetId: targetUserId,
+      targetLabel: targetEmail,
+      details: `${verify ? 'Granted Blue Star verification & Pro status' : 'Revoked verification & Pro status'}`
+    }).catch(() => {});
+
+    showGlobalToast(
+      verify
+        ? '🌟 Verified & WaveLink Pro granted!'
+        : 'WaveLink Pro & Verification revoked.'
+    );
   };
 
   // Instant Harvest Pass ("HARVEST2026") activation:

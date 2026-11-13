@@ -16,6 +16,7 @@ interface MobileBottomNavProps {
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
   hasUnreadNotifications?: boolean;
+  hasNewPosts?: boolean;
   unreadChatCount?: number;
 }
 
@@ -23,6 +24,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   activeTab,
   setActiveTab,
   hasUnreadNotifications = false,
+  hasNewPosts = false,
   unreadChatCount = 0
 }) => {
   const { userProfile, currentUser } = useAuth();
@@ -37,7 +39,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   }, [activeTab]);
 
   useEffect(() => {
-    setLiveUnreadChat((prev) => Math.max(prev, unreadChatCount));
+    setLiveUnreadChat(unreadChatCount);
   }, [unreadChatCount]);
 
   useEffect(() => {
@@ -153,7 +155,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     };
   }, []);
 
-  const effectiveUnreadChat = Math.max(liveUnreadChat, unreadChatCount);
+  const effectiveUnreadChat = liveUnreadChat;
   const shouldHideNav = isTypingInChat || isBottomSheetOpen || isHiddenOnScrollDown;
 
   const navItems: {
@@ -167,7 +169,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     {
       id: 'feed',
       ariaLabel: t('nav.home') || 'Home',
-      showDot: hasUnreadNotifications,
+      showDot: Boolean(hasNewPosts || hasUnreadNotifications),
       renderIcon: (active) => (
         <Home
           size={22}
@@ -307,11 +309,11 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
                 </span>
               )}
 
-              {/* Subtle Activity Dot on Home if unread notifications */}
+              {/* Red Dot on Home if new posts or unread activity */}
               {!item.badgeCount && item.showDot && (
                 <span
-                  className="absolute top-2 right-2.5 w-2 h-2 rounded-full bg-[#14B8A6] ring-2 ring-[#0F172A]"
-                  aria-hidden="true"
+                  className="absolute top-1.5 right-2 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-[#0F172A] shadow-xs"
+                  aria-label="New posts available"
                 />
               )}
 

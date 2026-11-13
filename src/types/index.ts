@@ -60,6 +60,30 @@ export interface CustomBackgroundHistoryItem {
   createdAt: string;
 }
 
+export type ThemeMixCardStyle = 'glass' | 'solid' | 'outline';
+export type ThemeMixCornerRoundness = 'sharp' | 'medium' | 'round';
+export type ThemeMixFontFamily = 'jakarta' | 'outfit' | 'space' | 'playfair';
+export type ThemeMixChatBubbleStyle = 'modern' | 'rounded' | 'minimal' | 'glass';
+export type ThemeMixNavBarStyle = 'floating' | 'solid' | 'minimal' | 'bordered';
+
+export interface CustomThemeMix {
+  baseTheme: AppearanceTheme;
+  accentColor: string; // Hex #RRGGBB
+  cardStyle: ThemeMixCardStyle;
+  cornerRoundness: ThemeMixCornerRoundness;
+  fontFamily: ThemeMixFontFamily;
+  chatBubbleStyle: ThemeMixChatBubbleStyle;
+  navBarStyle: ThemeMixNavBarStyle;
+  name?: string;
+  updatedAt?: string;
+}
+
+export interface SavedThemeMix extends CustomThemeMix {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
 export interface SharedChatThemeSuggestion {
   themeId: ChatThemeId;
   accentColor?: string;
@@ -204,6 +228,8 @@ export interface UserProfile {
   chatThemes?: Record<string, ChatThemePreference>;
   customBackground?: CustomAppBackground | null;
   customBackgroundHistory?: CustomBackgroundHistoryItem[];
+  customThemeMix?: CustomThemeMix | null;
+  savedThemeMixes?: SavedThemeMix[];
   privacySettings?: UserPrivacySettings;
   notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;
@@ -597,6 +623,7 @@ export interface ChatChannelMeta {
   lastMessageSenderName?: string;
   lastMessageAt?: string;
   unreadCounts?: Record<string, number>;
+  unread?: Record<string, number>;
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
   suggestedTheme?: SharedChatThemeSuggestion | null;

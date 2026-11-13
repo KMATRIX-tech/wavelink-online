@@ -4024,9 +4024,19 @@ Escalation Required: ${
     });
   });
 
-  app.post('/api/admin/role', rateLimitAuth, (req, res) => {
+  app.post('/api/admin/role', rateLimitAuth, async (req, res) => {
     const authUser = verifyFirebaseIdTokenHeader(req);
-    const check = isServerAdminUser(authUser, undefined, false);
+    const authHeader = String(req.headers.authorization || '').trim();
+    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const callerEmail = sanitizeServerString(req.body?.callerEmail, 160).toLowerCase();
+
+    let check = isServerAdminUser(authUser, callerEmail, false);
+    if (!check.authorized && authUser?.uid) {
+      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
+      if (restRole === 'admin') {
+        check = { authorized: true, role: 'super_admin' };
+      }
+    }
     const isSuper = check.authorized && check.role === 'super_admin';
 
     if (!isSuper) {
@@ -4055,10 +4065,227 @@ Escalation Required: ${
       if (targetEmail) serverSubAdminEmails.delete(targetEmail);
     }
 
+    const nowIso = new Date().toISOString();
+    const nextRole = makeSubAdmin ? 'sub_admin' : 'user';
+
+    if (targetUid) {
+      try {
+        if (ensureFirebaseAdminInitialized()) {
+          const { firestoreDatabaseId } = getServerFirebaseConfig();
+          const adminDb =
+            firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+              ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+              : getAdminFirestore(getAdminApp());
+          await adminDb
+            .collection('users')
+            .doc(targetUid)
+            .set(
+              {
+                isSubAdmin: makeSubAdmin,
+                role: nextRole,
+                updatedAt: nowIso
+              },
+              { merge: true }
+            );
+        }
+      } catch {
+        // Fallback to REST patch below
+      }
+
+      if (rawIdToken) {
+        try {
+          const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+          if (projectId) {
+            const dbPath = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+              projectId
+            )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents`;
+            const maskParams = ['isSubAdmin', 'role', 'updatedAt']
+              .map((field) => `updateMask.fieldPaths=${encodeURIComponent(field)}`)
+              .join('&');
+            await fetch(`${dbPath}/users/${encodeURIComponent(targetUid)}?${maskParams}`, {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${rawIdToken}`
+              },
+              body: JSON.stringify({
+                fields: {
+                  isSubAdmin: { booleanValue: makeSubAdmin },
+                  role: { stringValue: nextRole },
+                  updatedAt: { stringValue: nowIso }
+                }
+              })
+            }).catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
     return res.json({
       success: true,
       targetUserId: targetUid,
-      role: makeSubAdmin ? 'sub_admin' : 'user',
+      role: nextRole,
+    });
+  });
+
+  /**
+   * POST /api/admin/grant-pro
+   * Admin & Sub-Admin capability to grant or revoke verified WaveLink Pro status for any member.
+   * Persists changes via Firebase Admin SDK and Firestore REST API so it always succeeds.
+   */
+  app.post('/api/admin/grant-pro', rateLimitAuth, async (req, res) => {
+    const authUser = verifyFirebaseIdTokenHeader(req);
+    const authHeader = String(req.headers.authorization || '').trim();
+    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const callerEmail = sanitizeServerString(req.body?.callerEmail, 160).toLowerCase();
+    const callerIsSubAdmin = Boolean(req.body?.isSubAdmin);
+
+    let check = isServerAdminUser(authUser, callerEmail, callerIsSubAdmin);
+    if (!check.authorized && authUser?.uid) {
+      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
+      if (restRole === 'admin') {
+        check = { authorized: true, role: 'super_admin' };
+      } else if (restRole === 'sub_admin') {
+        check = { authorized: true, role: 'sub_admin' };
+      }
+    }
+
+    if (!check.authorized) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only administrators can verify members or grant Pro status.'
+      });
+    }
+
+    const targetUid = sanitizeServerString(req.body?.targetUserId, 160);
+    const targetEmail = sanitizeServerString(req.body?.targetEmail, 160).toLowerCase();
+    const verify = Boolean(req.body?.verify);
+
+    if (!targetUid) {
+      return res.status(400).json({
+        success: false,
+        error: 'A valid targetUserId is required.'
+      });
+    }
+
+    if (targetUid === 'wavelink_support_bot' || targetEmail === 'support-bot@wavelink.system') {
+      return res.status(400).json({
+        success: false,
+        error: 'Support Bot Pro status cannot be modified.'
+      });
+    }
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAtIso = verify
+      ? new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString()
+      : '';
+
+    const proPayload = {
+      hasBlueStar: verify,
+      isVerifiedByAdmin: verify,
+      isPro: verify,
+      proPlan: verify ? 'annual' : 'free',
+      proExpiresAt: expiresAtIso,
+      proBadge: verify ? 'verified' : 'none',
+      proBorderEffect: verify ? 'aura-gold' : 'none',
+      proAccentColor: verify ? 'emerald' : 'purple',
+      updatedAt: nowIso
+    };
+
+    let persistedAdminSdk = false;
+    let persistedRest = false;
+
+    // 1. Persist via Firebase Admin SDK if available (also updates any linked documents with the same email)
+    try {
+      if (ensureFirebaseAdminInitialized()) {
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        const adminDb =
+          firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+            ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+            : getAdminFirestore(getAdminApp());
+
+        await adminDb.collection('users').doc(targetUid).set(proPayload, { merge: true });
+        persistedAdminSdk = true;
+
+        if (targetEmail && !isOwnerEmail(targetEmail)) {
+          const emailSnap = await adminDb.collection('users').where('email', '==', targetEmail).get();
+          if (!emailSnap.empty) {
+            const batch = adminDb.batch();
+            emailSnap.forEach((docSnap) => {
+              if (docSnap.id !== targetUid) {
+                batch.set(docSnap.ref, proPayload, { merge: true });
+              }
+            });
+            await batch.commit();
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[WaveLink Admin] Admin SDK grant-pro fallback notice:', err);
+    }
+
+    // 2. Also persist via Firestore REST API using caller's ID token
+    if (rawIdToken) {
+      try {
+        const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+        if (projectId) {
+          const dbPath = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+            projectId
+          )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents`;
+          const maskFields = [
+            'hasBlueStar',
+            'isVerifiedByAdmin',
+            'isPro',
+            'proPlan',
+            'proExpiresAt',
+            'proBadge',
+            'proBorderEffect',
+            'proAccentColor',
+            'updatedAt'
+          ];
+          const maskParams = maskFields
+            .map((field) => `updateMask.fieldPaths=${encodeURIComponent(field)}`)
+            .join('&');
+
+          const restResp = await fetch(`${dbPath}/users/${encodeURIComponent(targetUid)}?${maskParams}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${rawIdToken}`
+            },
+            body: JSON.stringify({
+              fields: {
+                hasBlueStar: { booleanValue: verify },
+                isVerifiedByAdmin: { booleanValue: verify },
+                isPro: { booleanValue: verify },
+                proPlan: { stringValue: verify ? 'annual' : 'free' },
+                proExpiresAt: { stringValue: expiresAtIso },
+                proBadge: { stringValue: verify ? 'verified' : 'none' },
+                proBorderEffect: { stringValue: verify ? 'aura-gold' : 'none' },
+                proAccentColor: { stringValue: verify ? 'emerald' : 'purple' },
+                updatedAt: { stringValue: nowIso }
+              }
+            })
+          });
+          if (restResp.ok) {
+            persistedRest = true;
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+
+    return res.json({
+      success: true,
+      targetUserId: targetUid,
+      verify,
+      persistedAdminSdk,
+      persistedRest,
+      updatedFields: proPayload
     });
   });
 

@@ -25,6 +25,7 @@ import {
   where,
   arrayUnion,
   arrayRemove,
+  increment,
   serverTimestamp
 } from 'firebase/firestore';
 import {
@@ -1298,19 +1299,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               senderName: data.lastMessageSenderName || 'Waver',
               createdAt: msgAt
             };
+            const isConvoCurrentlyOpen =
+              chanId === activeChannel &&
+              (!showMobileChannels || (typeof window !== 'undefined' && window.innerWidth >= 1024));
+            const explicitUnread =
+              typeof data?.unread?.[currentUser.uid] === 'number'
+                ? data.unread[currentUser.uid]
+                : typeof data?.unreadCounts?.[currentUser.uid] === 'number'
+                ? data.unreadCounts[currentUser.uid]
+                : undefined;
             const mySeenIso = data?.lastSeen?.[currentUser.uid] || '';
             const mySeenMs = mySeenIso ? Date.parse(mySeenIso) || 0 : 0;
             const msgMs = msgAt ? Date.parse(msgAt) || 0 : 0;
-            if (
-              data.lastMessageSenderId !== currentUser.uid &&
-              msgMs > mySeenMs &&
-              chanId !== activeChannel
-            ) {
-              nextBaselineUnread[chanId] = Math.max(
-                1,
-                Number(data?.unreadCounts?.[currentUser.uid] || 1)
-              );
-            } else if (chanId === activeChannel) {
+
+            if (isConvoCurrentlyOpen) {
+              nextBaselineUnread[chanId] = 0;
+            } else if (typeof explicitUnread === 'number') {
+              nextBaselineUnread[chanId] = Math.max(0, explicitUnread);
+            } else if (data.lastMessageSenderId !== currentUser.uid && msgMs > mySeenMs) {
+              nextBaselineUnread[chanId] = 1;
+            } else {
               nextBaselineUnread[chanId] = 0;
             }
           }
@@ -1842,8 +1850,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       const nowIso = new Date().toISOString();
 
+      // Clear local unread badge immediately when the receiver opens the chat
+      setUnreadCountsByChannel((prev) =>
+        prev[activeChannel] === 0 ? prev : { ...prev, [activeChannel]: 0 }
+      );
+
       try {
-        // Update channel or group lastSeen map for current user
+        // Update channel or group lastSeen and reset unread count for current user to 0
         if (isDirectMessage) {
           const otherUid = getOtherDmParticipantId(activeChannel, currentUser.uid);
           const participants = Array.from(new Set([currentUser.uid, otherUid].filter(Boolean))).sort();
@@ -1854,6 +1867,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               conversationId: activeChannel,
               participants,
               lastSeen: { [currentUser.uid]: nowIso },
+              unread: { [currentUser.uid]: 0 },
               unreadCounts: { [currentUser.uid]: 0 },
               updatedAt: nowIso
             },
@@ -2539,8 +2553,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         }
       );
 
-      // Update conversation metadata document (participants, lastMessage, lastSeen)
+      // Update conversation metadata document (participants, lastMessage, lastSeen, unread count per participant)
       if (isDirectMessage) {
+        const unreadPatch: Record<string, any> = {
+          [currentUser.uid]: 0
+        };
+        if (rawOtherId && rawOtherId !== currentUser.uid && !isBotConvo) {
+          unreadPatch[rawOtherId] = increment(1);
+        }
         setDoc(
           doc(db, 'channels', targetChannel),
           {
@@ -2552,6 +2572,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             lastMessageSenderName: senderDisplayName,
             lastMessageAt: nowIso,
             lastSeen: { [currentUser.uid]: nowIso },
+            unread: unreadPatch,
+            unreadCounts: unreadPatch,
             timestamp: serverTimestamp(),
             updatedAt: nowIso
           },
@@ -3514,6 +3536,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const handleOpenMemberChat = (memberId: string) => {
     if (!currentUser?.uid) return;
     const dmId = computeDmConversationId(currentUser.uid, memberId);
+    setUnreadCountsByChannel((prev) => (prev[dmId] === 0 ? prev : { ...prev, [dmId]: 0 }));
     setActiveChannel(dmId);
     setReplyingTo(null);
     setReactionMenuMsgId(null);
@@ -3914,8 +3937,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                                   )}
                                   {grpUnread > 0 && (
                                     <span
-                                      className="min-w-[22px] h-5 px-1.5 rounded-full text-white text-[11px] font-extrabold inline-flex items-center justify-center shadow-2xs"
-                                      style={{ backgroundColor: 'var(--accent-primary)' }}
+                                      className="min-w-[22px] h-5 px-1.5 rounded-full bg-[#F43F5E] text-white text-[11px] font-extrabold inline-flex items-center justify-center shadow-2xs"
                                     >
                                       {grpUnread}
                                     </span>
@@ -4115,8 +4137,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                                 )}
                                 {unreadCount > 0 && (
                                   <span
-                                    className="min-w-[22px] h-5 px-1.5 rounded-full text-white text-[11px] font-extrabold flex items-center justify-center shadow-2xs"
-                                    style={{ backgroundColor: 'var(--accent-primary)' }}
+                                    className="min-w-[22px] h-5 px-1.5 rounded-full bg-[#F43F5E] text-white text-[11px] font-extrabold flex items-center justify-center shadow-2xs"
                                   >
                                     {unreadCount}
                                   </span>

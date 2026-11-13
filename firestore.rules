@@ -66,9 +66,13 @@ service cloud.firestore {
     // Single source of truth for admin role across Admin Desk, Server Routes, and Firestore Rules:
     // Checks Firebase custom claims (token.role == 'admin' / token.admin == true), /users/{uid}.role, and /admins/{uid}
     function isOwnerEmailToken() {
-      return isSignedIn() &&
-        request.auth.token.get('email', '') is string &&
-        request.auth.token.get('email', '').lower() == 'keylanmbilinyi5@gmail.com';
+      return isSignedIn() && (
+        ('email' in request.auth.token &&
+          request.auth.token.email is string &&
+          request.auth.token.email.lower() == 'keylanmbilinyi5@gmail.com') ||
+        (request.auth.token.get('email', '') is string &&
+          request.auth.token.get('email', '').lower() == 'keylanmbilinyi5@gmail.com')
+      );
     }
 
     function hasAdminCustomClaim() {
@@ -89,8 +93,11 @@ service cloud.firestore {
       return isSignedIn() && (
         hasAdminCustomClaim() ||
         getUserRole() in ['admin', 'super_admin'] ||
-        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isOwner', false) == true) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isOwner', false) == true ||
+          (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('email', '') is string &&
+           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('email', '').lower() == 'keylanmbilinyi5@gmail.com')
+        )) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
@@ -209,6 +216,9 @@ service cloud.firestore {
         (!('fcmTokens' in data) || isValidFcmTokensArray(data.fcmTokens)) &&
         (!('mutedChannelIds' in data) || (data.mutedChannelIds is list && data.mutedChannelIds.size() <= 200)) &&
         (!('notificationSettings' in data) || data.notificationSettings is map) &&
+        (!('privacySettings' in data) || data.privacySettings is map) &&
+        (!('customThemeMix' in data) || data.customThemeMix == null || (data.customThemeMix is map && data.customThemeMix.size() <= 12)) &&
+        (!('savedThemeMixes' in data) || (data.savedThemeMixes is list && data.savedThemeMixes.size() <= 3)) &&
         (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*')) &&
         (!('customBackground' in data) || data.customBackground == null || isValidCustomBackgroundItem(data.customBackground)) &&
         (!('customBackgroundHistory' in data) || isValidCustomBackgroundHistory(data.customBackgroundHistory));
@@ -344,9 +354,9 @@ service cloud.firestore {
     // User profiles: users can read directory profiles, create/update only their own (with RBAC/Pro/points guards), or delete their own account
     match /users/{userId} {
       allow read: if true;
-      allow create: if isValidId(userId) && (isAdmin() || isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileCreate(userId));
-      allow update: if isValidId(userId) && (isAdmin() || isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileUpdate(userId));
-      allow delete: if isValidId(userId) && (isOwner(userId) || isSuperAdmin());
+      allow create: if isAdmin() || (isValidId(userId) && (isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileCreate(userId)));
+      allow update: if isAdmin() || (isValidId(userId) && (isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileUpdate(userId)));
+      allow delete: if isSuperAdmin() || (isValidId(userId) && isOwner(userId));
 
       // Device FCM Push Notification Tokens — strictly private to the user
       match /fcmTokens/{tokenId} {

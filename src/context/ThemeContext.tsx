@@ -2,11 +2,249 @@ import React, { createContext, useContext, useEffect, useState, useCallback, use
 import {
   AppearanceTheme,
   CustomAppBackground,
-  CustomBackgroundHistoryItem
+  CustomBackgroundHistoryItem,
+  CustomThemeMix,
+  SavedThemeMix,
+  ThemeMixCardStyle,
+  ThemeMixCornerRoundness,
+  ThemeMixFontFamily,
+  ThemeMixChatBubbleStyle,
+  ThemeMixNavBarStyle
 } from '../types';
 import { useAuth } from './AuthContext';
 import { useDataSaver } from '../services/dataSaverService';
 import { computeEffectiveTextMode } from '../utils/mediaStorage';
+
+export const THEME_MIX_ACCENT_PRESETS: Array<{ hex: string; label: string }> = [
+  { hex: '#2563EB', label: 'Ocean Blue' },
+  { hex: '#0D9488', label: 'Lagoon Teal' },
+  { hex: '#E11D48', label: 'Rose Crimson' },
+  { hex: '#EC4899', label: 'Hot Pink' },
+  { hex: '#8B5CF6', label: 'Royal Violet' },
+  { hex: '#06B6D4', label: 'Electric Cyan' },
+  { hex: '#10B981', label: 'Emerald Mint' },
+  { hex: '#22C55E', label: 'Neon Green' },
+  { hex: '#EA580C', label: 'Sunset Orange' },
+  { hex: '#F59E0B', label: 'Solar Amber' },
+  { hex: '#EF4444', label: 'Nitro Red' },
+  { hex: '#6366F1', label: 'Indigo Pulse' }
+];
+
+export const THEME_MIX_FONTS: Record<
+  ThemeMixFontFamily,
+  { label: string; cssFamily: string; sample: string }
+> = {
+  jakarta: {
+    label: 'Plus Jakarta Sans',
+    cssFamily: "'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif",
+    sample: 'Clean & geometric'
+  },
+  outfit: {
+    label: 'Outfit',
+    cssFamily: "'Outfit', -apple-system, BlinkMacSystemFont, sans-serif",
+    sample: 'Modern & friendly'
+  },
+  space: {
+    label: 'Space Grotesk',
+    cssFamily: "'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif",
+    sample: 'Tech & expressive'
+  },
+  playfair: {
+    label: 'Playfair Display',
+    cssFamily: "'Playfair Display', Georgia, serif",
+    sample: 'Editorial serif'
+  }
+};
+
+function sanitizeHexColor(raw?: string | null, fallback = '#2563EB'): string {
+  if (!raw || typeof raw !== 'string') return fallback;
+  const trimmed = raw.trim();
+  if (/^#[0-9A-Fa-f]{6}$/.test(trimmed)) return trimmed.toUpperCase();
+  if (/^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
+    const r = trimmed[1];
+    const g = trimmed[2];
+    const b = trimmed[3];
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return fallback;
+}
+
+/**
+ * Compute relative luminance (0..1) and WCAG contrast to pick readable button text (#FFFFFF or #0F172A)
+ * and ensure the accent color itself remains readable on the current dark/light canvas.
+ */
+export function evaluateAccentContrast(
+  hexColor: string,
+  isDarkCanvas: boolean
+): {
+  buttonTextColor: '#FFFFFF' | '#0F172A';
+  readableAccentText: string;
+  contrastRatioOnButton: number;
+  wasAutoAdjusted: boolean;
+} {
+  const hex = sanitizeHexColor(hexColor);
+  const r8 = parseInt(hex.slice(1, 3), 16);
+  const g8 = parseInt(hex.slice(3, 5), 16);
+  const b8 = parseInt(hex.slice(5, 7), 16);
+
+  const toLinear = (c: number) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+
+  const lum = 0.2126 * toLinear(r8) + 0.7152 * toLinear(g8) + 0.0722 * toLinear(b8);
+  const contrastWithWhite = (1.0 + 0.05) / (lum + 0.05);
+  const contrastWithDark = (lum + 0.05) / (0.015 + 0.05);
+
+  const buttonTextColor: '#FFFFFF' | '#0F172A' =
+    contrastWithWhite >= 3.2 || contrastWithWhite >= contrastWithDark ? '#FFFFFF' : '#0F172A';
+  const contrastRatioOnButton = Math.round(
+    Math.max(contrastWithWhite, contrastWithDark) * 10
+  ) / 10;
+
+  // Ensure accent text on surface has sufficient contrast
+  let readableAccentText = hex;
+  let wasAutoAdjusted = false;
+  if (isDarkCanvas && lum < 0.14) {
+    // Lighten overly dark accent when used as text on dark canvas
+    const lift = (v: number) => Math.min(255, Math.round(v + (255 - v) * 0.48));
+    readableAccentText = `#${lift(r8).toString(16).padStart(2, '0')}${lift(g8)
+      .toString(16)
+      .padStart(2, '0')}${lift(b8).toString(16).padStart(2, '0')}`.toUpperCase();
+    wasAutoAdjusted = true;
+  } else if (!isDarkCanvas && lum > 0.62) {
+    // Darken overly pale accent when used as text on light canvas
+    const darken = (v: number) => Math.max(0, Math.round(v * 0.58));
+    readableAccentText = `#${darken(r8).toString(16).padStart(2, '0')}${darken(g8)
+      .toString(16)
+      .padStart(2, '0')}${darken(b8).toString(16).padStart(2, '0')}`.toUpperCase();
+    wasAutoAdjusted = true;
+  }
+
+  return {
+    buttonTextColor,
+    readableAccentText,
+    contrastRatioOnButton,
+    wasAutoAdjusted
+  };
+}
+
+export function normalizeCustomThemeMix(
+  raw?: Partial<CustomThemeMix> | null,
+  fallbackBaseTheme: AppearanceTheme = 'ocean'
+): CustomThemeMix | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const baseTheme = normalizeAppearanceTheme(raw.baseTheme || fallbackBaseTheme);
+  const meta = APPEARANCE_THEMES.find((t) => t.id === baseTheme) || APPEARANCE_THEMES[0];
+  const accentColor = sanitizeHexColor(raw.accentColor, meta.previewAccent);
+
+  const validCards: ThemeMixCardStyle[] = ['glass', 'solid', 'outline'];
+  const cardStyle: ThemeMixCardStyle = validCards.includes(raw.cardStyle as ThemeMixCardStyle)
+    ? (raw.cardStyle as ThemeMixCardStyle)
+    : 'glass';
+
+  const validCorners: ThemeMixCornerRoundness[] = ['sharp', 'medium', 'round'];
+  const cornerRoundness: ThemeMixCornerRoundness = validCorners.includes(
+    raw.cornerRoundness as ThemeMixCornerRoundness
+  )
+    ? (raw.cornerRoundness as ThemeMixCornerRoundness)
+    : 'round';
+
+  const validFonts: ThemeMixFontFamily[] = ['jakarta', 'outfit', 'space', 'playfair'];
+  const fontFamily: ThemeMixFontFamily = validFonts.includes(raw.fontFamily as ThemeMixFontFamily)
+    ? (raw.fontFamily as ThemeMixFontFamily)
+    : 'jakarta';
+
+  const validBubbles: ThemeMixChatBubbleStyle[] = ['modern', 'rounded', 'minimal', 'glass'];
+  const chatBubbleStyle: ThemeMixChatBubbleStyle = validBubbles.includes(
+    raw.chatBubbleStyle as ThemeMixChatBubbleStyle
+  )
+    ? (raw.chatBubbleStyle as ThemeMixChatBubbleStyle)
+    : 'modern';
+
+  const validNavs: ThemeMixNavBarStyle[] = ['floating', 'solid', 'minimal', 'bordered'];
+  const navBarStyle: ThemeMixNavBarStyle = validNavs.includes(raw.navBarStyle as ThemeMixNavBarStyle)
+    ? (raw.navBarStyle as ThemeMixNavBarStyle)
+    : 'floating';
+
+  return {
+    baseTheme,
+    accentColor,
+    cardStyle,
+    cornerRoundness,
+    fontFamily,
+    chatBubbleStyle,
+    navBarStyle,
+    ...(raw.name && typeof raw.name === 'string' ? { name: raw.name.slice(0, 40) } : {}),
+    ...(raw.updatedAt && typeof raw.updatedAt === 'string' ? { updatedAt: raw.updatedAt } : {})
+  };
+}
+
+/**
+ * Encode a CustomThemeMix into a short, safe share code (contains ONLY colors and style tokens, never images or personal data).
+ */
+export function encodeShareableThemeMix(mix: CustomThemeMix): string {
+  const clean = normalizeCustomThemeMix(mix);
+  if (!clean) return '';
+  const compactPayload = {
+    b: clean.baseTheme,
+    a: clean.accentColor,
+    c: clean.cardStyle,
+    r: clean.cornerRoundness,
+    f: clean.fontFamily,
+    m: clean.chatBubbleStyle,
+    n: clean.navBarStyle,
+    ...(clean.name ? { t: clean.name.slice(0, 28) } : {})
+  };
+  try {
+    const json = JSON.stringify(compactPayload);
+    const b64 = btoa(encodeURIComponent(json))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    return `WL-${b64}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Decode a shared theme code or URL containing ?themeMix=...
+ */
+export function decodeShareableThemeMix(input: string): CustomThemeMix | null {
+  if (!input || typeof input !== 'string') return null;
+  let token = input.trim();
+  try {
+    if (token.includes('themeMix=')) {
+      const urlObj = new URL(token, window.location.origin);
+      token = urlObj.searchParams.get('themeMix') || token;
+    }
+  } catch {
+    const match = token.match(/[?&]themeMix=([^&#\s]+)/);
+    if (match?.[1]) token = decodeURIComponent(match[1]);
+  }
+  if (token.startsWith('WL-')) {
+    token = token.slice(3);
+  }
+  try {
+    const padded = token.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonStr = decodeURIComponent(atob(padded));
+    const parsed = JSON.parse(jsonStr);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return normalizeCustomThemeMix({
+      baseTheme: parsed.b || parsed.baseTheme,
+      accentColor: parsed.a || parsed.accentColor,
+      cardStyle: parsed.c || parsed.cardStyle,
+      cornerRoundness: parsed.r || parsed.cornerRoundness,
+      fontFamily: parsed.f || parsed.fontFamily,
+      chatBubbleStyle: parsed.m || parsed.chatBubbleStyle,
+      navBarStyle: parsed.n || parsed.navBarStyle,
+      name: typeof (parsed.t || parsed.name) === 'string' ? (parsed.t || parsed.name).slice(0, 28) : undefined
+    });
+  } catch {
+    return null;
+  }
+}
 
 export interface AppearanceThemeMetadata {
   id: AppearanceTheme;
@@ -260,6 +498,19 @@ interface ThemeContextType {
   removeCustomBackground: () => Promise<SaveThemeResult>;
   reportCustomBgLoadError: (failedUrl: string) => void;
   clearCustomBgLoadError: () => void;
+  // Mix your own theme (Free for everyone)
+  customThemeMix: CustomThemeMix | null;
+  previewThemeMix: CustomThemeMix | null;
+  activeThemeMix: CustomThemeMix | null;
+  savedThemeMixes: SavedThemeMix[];
+  sharedThemeMixCandidate: CustomThemeMix | null;
+  isSavingThemeMix: boolean;
+  setPreviewThemeMix: (mix: CustomThemeMix | null) => void;
+  saveCustomThemeMix: (mix: CustomThemeMix) => Promise<SaveThemeResult>;
+  resetCustomThemeMix: () => Promise<SaveThemeResult>;
+  saveAsNewThemeMix: (mix: CustomThemeMix, name: string) => Promise<SaveThemeResult>;
+  deleteSavedThemeMix: (id: string) => Promise<SaveThemeResult>;
+  dismissSharedThemeMixCandidate: () => void;
 }
 
 const ThemeContext = createContext<ThemeContextType>({
@@ -295,6 +546,18 @@ const ThemeContext = createContext<ThemeContextType>({
   removeCustomBackground: async () => ({ success: true }),
   reportCustomBgLoadError: () => {},
   clearCustomBgLoadError: () => {},
+  customThemeMix: null,
+  previewThemeMix: null,
+  activeThemeMix: null,
+  savedThemeMixes: [],
+  sharedThemeMixCandidate: null,
+  isSavingThemeMix: false,
+  setPreviewThemeMix: () => {},
+  saveCustomThemeMix: async () => ({ success: true }),
+  resetCustomThemeMix: async () => ({ success: true }),
+  saveAsNewThemeMix: async () => ({ success: true }),
+  deleteSavedThemeMix: async () => ({ success: true }),
+  dismissSharedThemeMixCandidate: () => {},
 });
 
 export const useTheme = () => useContext(ThemeContext);
@@ -323,6 +586,54 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [isSavingCustomBg, setIsSavingCustomBg] = useState(false);
   const [failedCustomBgUrl, setFailedCustomBgUrl] = useState<string | null>(null);
 
+  // Mix your own theme state (free for everyone)
+  const [customThemeMix, setCustomThemeMixState] = useState<CustomThemeMix | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem('wavelink_custom_theme_mix');
+        if (raw) return normalizeCustomThemeMix(JSON.parse(raw));
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  });
+  const [previewThemeMix, setPreviewThemeMixState] = useState<CustomThemeMix | null>(null);
+  const [savedThemeMixes, setSavedThemeMixesState] = useState<SavedThemeMix[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem('wavelink_saved_theme_mixes');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return parsed.slice(0, 3);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return [];
+  });
+  const [sharedThemeMixCandidate, setSharedThemeMixCandidate] = useState<CustomThemeMix | null>(null);
+  const [isSavingThemeMix, setIsSavingThemeMix] = useState(false);
+
+  // Detect ?themeMix=... in URL on boot so a friend opening a shared link can preview and save it
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('themeMix');
+    if (!code) return;
+    const decoded = decodeShareableThemeMix(code);
+    if (decoded) {
+      setSharedThemeMixCandidate(decoded);
+      setPreviewThemeMixState(decoded);
+      // Clean URL query parameter without reloading
+      params.delete('themeMix');
+      const nextSearch = params.toString();
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+    }
+  }, []);
+
   // Prevents stale Firestore onSnapshot events from reverting a newly selected theme
   const pendingSaveRef = useRef<{
     theme: AppearanceTheme;
@@ -334,6 +645,11 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const pendingCustomBgSaveRef = useRef<{
     updatedAt: string;
     bg: CustomAppBackground | null;
+    inFlight: boolean;
+    savedAt: number;
+  } | null>(null);
+
+  const pendingThemeMixSaveRef = useRef<{
     inFlight: boolean;
     savedAt: number;
   } | null>(null);
@@ -406,6 +722,47 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [currentUser?.uid, userProfile?.customBackground, userProfile?.customBackgroundHistory]);
 
+  // Sync customThemeMix and savedThemeMixes from existing userProfile snapshot (zero extra reads)
+  useEffect(() => {
+    if (!currentUser?.uid || !userProfile) return;
+    const pendingMix = pendingThemeMixSaveRef.current;
+    if (pendingMix && (pendingMix.inFlight || Date.now() - pendingMix.savedAt < 12000)) {
+      return;
+    }
+
+    const remoteMix = userProfile.customThemeMix
+      ? normalizeCustomThemeMix(userProfile.customThemeMix)
+      : null;
+    const remoteSaved = Array.isArray(userProfile.savedThemeMixes)
+      ? userProfile.savedThemeMixes
+          .map((item) => {
+            const norm = normalizeCustomThemeMix(item);
+            if (!norm) return null;
+            return {
+              ...norm,
+              id: typeof item.id === 'string' ? item.id : `mix_${Date.now()}`,
+              name: typeof item.name === 'string' && item.name.trim() ? item.name.trim().slice(0, 32) : 'My Mix',
+              createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString()
+            } as SavedThemeMix;
+          })
+          .filter((x): x is SavedThemeMix => Boolean(x))
+          .slice(0, 3)
+      : [];
+
+    setCustomThemeMixState(remoteMix);
+    setSavedThemeMixesState(remoteSaved);
+    try {
+      if (remoteMix) {
+        localStorage.setItem('wavelink_custom_theme_mix', JSON.stringify(remoteMix));
+      } else {
+        localStorage.removeItem('wavelink_custom_theme_mix');
+      }
+      localStorage.setItem('wavelink_saved_theme_mixes', JSON.stringify(remoteSaved));
+    } catch {
+      // ignore storage errors
+    }
+  }, [currentUser?.uid, userProfile?.customThemeMix, userProfile?.savedThemeMixes]);
+
   // Sync from user profile in Firestore ONLY when no newer local selection is in-flight / recently saved / failed
   useEffect(() => {
     if (!userProfile?.appearanceTheme) return;
@@ -413,18 +770,15 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const pending = pendingSaveRef.current;
 
     if (pending) {
-      // If a Firestore save failed, keep user's local selection until they retry or switch
       if (pending.failed && remoteTheme !== pending.theme) {
         return;
       }
-      // While save is in-flight or within 15s grace window waiting for snapshot propagation, ignore older snapshots
       if (
         (pending.inFlight || Date.now() - pending.savedAt < 15000) &&
         remoteTheme !== pending.theme
       ) {
         return;
       }
-      // Once Firestore echoes back our newly saved theme, clear the pending lock
       if (remoteTheme === pending.theme) {
         pendingSaveRef.current = null;
       }
@@ -438,7 +792,9 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [userProfile?.appearanceTheme]);
 
-  const activeTheme: AppearanceTheme = previewTheme || appearanceTheme;
+  const activeThemeMix: CustomThemeMix | null = previewThemeMix !== null ? previewThemeMix : customThemeMix;
+  const activeTheme: AppearanceTheme =
+    previewTheme || (activeThemeMix ? activeThemeMix.baseTheme : appearanceTheme);
   const isDarkTheme = isDarkAppearanceTheme(activeTheme);
 
   const customBgLoadFailed = Boolean(
@@ -467,7 +823,7 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     ? customBgContrast === 'dark'
     : isDarkTheme;
 
-  // Apply active theme + custom background mode/contrast to <html> immediately
+  // Apply active theme + custom background mode/contrast + Mix Your Own Theme CSS variables to <html> immediately
   useEffect(() => {
     const root = window.document.documentElement;
     root.setAttribute('data-theme', activeTheme);
@@ -485,7 +841,52 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       root.removeAttribute('data-has-custom-bg');
       root.removeAttribute('data-custom-bg-contrast');
     }
-  }, [activeTheme, effectiveDarkMode, isCustomBackgroundActive, customBgContrast]);
+
+    if (activeThemeMix) {
+      const contrast = evaluateAccentContrast(activeThemeMix.accentColor, effectiveDarkMode);
+      const fontMeta = THEME_MIX_FONTS[activeThemeMix.fontFamily] || THEME_MIX_FONTS.jakarta;
+      const radiusPx =
+        activeThemeMix.cornerRoundness === 'sharp'
+          ? '10px'
+          : activeThemeMix.cornerRoundness === 'medium'
+          ? '18px'
+          : '26px';
+      const btnRadiusPx =
+        activeThemeMix.cornerRoundness === 'sharp'
+          ? '8px'
+          : activeThemeMix.cornerRoundness === 'medium'
+          ? '14px'
+          : '9999px';
+
+      root.setAttribute('data-has-theme-mix', 'true');
+      root.setAttribute('data-card-style', activeThemeMix.cardStyle);
+      root.setAttribute('data-corner-roundness', activeThemeMix.cornerRoundness);
+      root.setAttribute('data-theme-font', activeThemeMix.fontFamily);
+      root.setAttribute('data-chat-bubble-style', activeThemeMix.chatBubbleStyle);
+      root.setAttribute('data-nav-style', activeThemeMix.navBarStyle);
+
+      root.style.setProperty('--accent-primary', activeThemeMix.accentColor);
+      root.style.setProperty('--accent-readable-text', contrast.readableAccentText);
+      root.style.setProperty('--accent-contrast-text', contrast.buttonTextColor);
+      root.style.setProperty('--mix-card-radius', radiusPx);
+      root.style.setProperty('--mix-btn-radius', btnRadiusPx);
+      root.style.setProperty('--mix-font-family', fontMeta.cssFamily);
+    } else {
+      root.removeAttribute('data-has-theme-mix');
+      root.removeAttribute('data-card-style');
+      root.removeAttribute('data-corner-roundness');
+      root.removeAttribute('data-theme-font');
+      root.removeAttribute('data-chat-bubble-style');
+      root.removeAttribute('data-nav-style');
+
+      root.style.removeProperty('--accent-primary');
+      root.style.removeProperty('--accent-readable-text');
+      root.style.removeProperty('--accent-contrast-text');
+      root.style.removeProperty('--mix-card-radius');
+      root.style.removeProperty('--mix-btn-radius');
+      root.style.removeProperty('--mix-font-family');
+    }
+  }, [activeTheme, effectiveDarkMode, isCustomBackgroundActive, customBgContrast, activeThemeMix]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -755,6 +1156,195 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setFailedCustomBgUrl(null);
   }, []);
 
+  const setPreviewThemeMix = useCallback((mix: CustomThemeMix | null) => {
+    setPreviewThemeMixState(mix ? normalizeCustomThemeMix(mix) : null);
+  }, []);
+
+  const dismissSharedThemeMixCandidate = useCallback(() => {
+    setSharedThemeMixCandidate(null);
+    setPreviewThemeMixState(null);
+  }, []);
+
+  const saveCustomThemeMix = useCallback(
+    async (mix: CustomThemeMix): Promise<SaveThemeResult> => {
+      const normalized = normalizeCustomThemeMix(mix, appearanceTheme);
+      if (!normalized) {
+        return { success: false, error: 'Invalid theme configuration.' };
+      }
+      const withTimestamp: CustomThemeMix = {
+        ...normalized,
+        updatedAt: new Date().toISOString()
+      };
+
+      pendingThemeMixSaveRef.current = { inFlight: true, savedAt: Date.now() };
+      setPreviewThemeMixState(null);
+      setPreviewThemeState(null);
+      setSharedThemeMixCandidate(null);
+      setCustomThemeMixState(withTimestamp);
+      setAppearanceThemeState(withTimestamp.baseTheme);
+
+      try {
+        localStorage.setItem('wavelink_custom_theme_mix', JSON.stringify(withTimestamp));
+        localStorage.setItem('wavelink_appearance_theme', withTimestamp.baseTheme);
+      } catch {
+        // ignore storage errors
+      }
+
+      if (!currentUser?.uid) {
+        pendingThemeMixSaveRef.current = null;
+        return { success: true };
+      }
+
+      setIsSavingThemeMix(true);
+      try {
+        await updateUserProfile({
+          appearanceTheme: withTimestamp.baseTheme,
+          customThemeMix: withTimestamp
+        });
+        if (pendingThemeMixSaveRef.current) {
+          pendingThemeMixSaveRef.current.inFlight = false;
+          pendingThemeMixSaveRef.current.savedAt = Date.now();
+        }
+        return { success: true };
+      } catch (err: any) {
+        const msg = err instanceof Error ? err.message : 'Failed to save custom theme mix.';
+        setThemeSaveError(msg);
+        return { success: false, error: msg };
+      } finally {
+        setIsSavingThemeMix(false);
+      }
+    },
+    [appearanceTheme, currentUser?.uid, updateUserProfile]
+  );
+
+  const resetCustomThemeMix = useCallback(async (): Promise<SaveThemeResult> => {
+    pendingThemeMixSaveRef.current = { inFlight: true, savedAt: Date.now() };
+    setPreviewThemeMixState(null);
+    setSharedThemeMixCandidate(null);
+    setCustomThemeMixState(null);
+    try {
+      localStorage.removeItem('wavelink_custom_theme_mix');
+    } catch {
+      // ignore
+    }
+
+    if (!currentUser?.uid) {
+      pendingThemeMixSaveRef.current = null;
+      return { success: true };
+    }
+
+    setIsSavingThemeMix(true);
+    try {
+      await updateUserProfile({ customThemeMix: null });
+      if (pendingThemeMixSaveRef.current) {
+        pendingThemeMixSaveRef.current.inFlight = false;
+        pendingThemeMixSaveRef.current.savedAt = Date.now();
+      }
+      return { success: true };
+    } catch (err: any) {
+      const msg = err instanceof Error ? err.message : 'Failed to reset custom theme mix.';
+      return { success: false, error: msg };
+    } finally {
+      setIsSavingThemeMix(false);
+    }
+  }, [currentUser?.uid, updateUserProfile]);
+
+  const saveAsNewThemeMix = useCallback(
+    async (mix: CustomThemeMix, name: string): Promise<SaveThemeResult> => {
+      const normalized = normalizeCustomThemeMix(mix, appearanceTheme);
+      if (!normalized) {
+        return { success: false, error: 'Invalid theme configuration.' };
+      }
+      const cleanName = (name || 'My Custom Theme').trim().slice(0, 32) || 'My Custom Theme';
+      const nowIso = new Date().toISOString();
+      const newEntry: SavedThemeMix = {
+        ...normalized,
+        id: `mix_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        name: cleanName,
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
+
+      // Keep up to 3 saved themes (if already 3, replace oldest or same name)
+      const withoutSameName = savedThemeMixes.filter(
+        (m) => m.name.toLowerCase() !== cleanName.toLowerCase()
+      );
+      const nextSaved = [newEntry, ...withoutSameName].slice(0, 3);
+
+      pendingThemeMixSaveRef.current = { inFlight: true, savedAt: Date.now() };
+      setPreviewThemeMixState(null);
+      setSharedThemeMixCandidate(null);
+      setCustomThemeMixState(newEntry);
+      setSavedThemeMixesState(nextSaved);
+      setAppearanceThemeState(newEntry.baseTheme);
+
+      try {
+        localStorage.setItem('wavelink_custom_theme_mix', JSON.stringify(newEntry));
+        localStorage.setItem('wavelink_saved_theme_mixes', JSON.stringify(nextSaved));
+        localStorage.setItem('wavelink_appearance_theme', newEntry.baseTheme);
+      } catch {
+        // ignore
+      }
+
+      if (!currentUser?.uid) {
+        pendingThemeMixSaveRef.current = null;
+        return { success: true };
+      }
+
+      setIsSavingThemeMix(true);
+      try {
+        await updateUserProfile({
+          appearanceTheme: newEntry.baseTheme,
+          customThemeMix: newEntry,
+          savedThemeMixes: nextSaved
+        });
+        if (pendingThemeMixSaveRef.current) {
+          pendingThemeMixSaveRef.current.inFlight = false;
+          pendingThemeMixSaveRef.current.savedAt = Date.now();
+        }
+        return { success: true };
+      } catch (err: any) {
+        const msg = err instanceof Error ? err.message : 'Failed to save new theme preset.';
+        return { success: false, error: msg };
+      } finally {
+        setIsSavingThemeMix(false);
+      }
+    },
+    [appearanceTheme, currentUser?.uid, savedThemeMixes, updateUserProfile]
+  );
+
+  const deleteSavedThemeMix = useCallback(
+    async (id: string): Promise<SaveThemeResult> => {
+      const nextSaved = savedThemeMixes.filter((m) => m.id !== id);
+      pendingThemeMixSaveRef.current = { inFlight: true, savedAt: Date.now() };
+      setSavedThemeMixesState(nextSaved);
+      try {
+        localStorage.setItem('wavelink_saved_theme_mixes', JSON.stringify(nextSaved));
+      } catch {
+        // ignore
+      }
+      if (!currentUser?.uid) {
+        pendingThemeMixSaveRef.current = null;
+        return { success: true };
+      }
+      setIsSavingThemeMix(true);
+      try {
+        await updateUserProfile({ savedThemeMixes: nextSaved });
+        if (pendingThemeMixSaveRef.current) {
+          pendingThemeMixSaveRef.current.inFlight = false;
+          pendingThemeMixSaveRef.current.savedAt = Date.now();
+        }
+        return { success: true };
+      } catch (err: any) {
+        const msg = err instanceof Error ? err.message : 'Failed to delete saved theme.';
+        return { success: false, error: msg };
+      } finally {
+        setIsSavingThemeMix(false);
+      }
+    },
+    [currentUser?.uid, savedThemeMixes, updateUserProfile]
+  );
+
   return (
     <ThemeContext.Provider
       value={{
@@ -790,6 +1380,18 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         removeCustomBackground,
         reportCustomBgLoadError,
         clearCustomBgLoadError,
+        customThemeMix,
+        previewThemeMix,
+        activeThemeMix,
+        savedThemeMixes,
+        sharedThemeMixCandidate,
+        isSavingThemeMix,
+        setPreviewThemeMix,
+        saveCustomThemeMix,
+        resetCustomThemeMix,
+        saveAsNewThemeMix,
+        deleteSavedThemeMix,
+        dismissSharedThemeMixCandidate,
       }}
     >
       {children}

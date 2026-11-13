@@ -43,6 +43,8 @@ interface SidebarProps {
   onOpenWelink?: () => void;
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
+  unreadChatCount?: number;
+  hasNewPosts?: boolean;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -52,7 +54,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCloseMobile,
   onOpenWelink,
   isCollapsed: controlledCollapsed,
-  onToggleCollapse
+  onToggleCollapse,
+  unreadChatCount = 0,
+  hasNewPosts = false
 }) => {
   const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, adminCheckFailedReason, signOut } = useAuth();
   const { t, language } = useLanguage();
@@ -61,6 +65,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const { currency, countryMeta, patternFrame, formatPrice } = useAfricanRegion(userProfile);
   const activeFrameClass =
     KANGA_PATTERN_FRAMES.find((f) => f.id === patternFrame)?.cssClass || '';
+  const [liveUnreadChat, setLiveUnreadChat] = useState<number>(unreadChatCount);
+
+  useEffect(() => {
+    setLiveUnreadChat(unreadChatCount);
+  }, [unreadChatCount]);
+
+  useEffect(() => {
+    const handleUnreadChatEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ count?: number }>;
+      if (typeof custom.detail?.count === 'number') {
+        setLiveUnreadChat(custom.detail.count);
+      }
+    };
+    window.addEventListener('wavelink:unread-chat-count', handleUnreadChatEvent);
+    return () => window.removeEventListener('wavelink:unread-chat-count', handleUnreadChatEvent);
+  }, []);
+
   const [internalCollapsed, setInternalCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem('wavelink_left_sidebar_collapsed') === 'true';
@@ -197,6 +218,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
           const isItemAdmin = item.id === 'admin';
+          const isChatItem = item.id === 'chat';
+          const isFeedItem = item.id === 'feed';
+          const chatUnreadNum = isChatItem ? liveUnreadChat : 0;
+          const showFeedRedDot = isFeedItem && hasNewPosts;
 
           return (
             <div key={item.id} className="relative group/nav">
@@ -223,24 +248,47 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 }`}
               >
                 <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3 min-w-0'}`}>
-                  <span className={`shrink-0 ${isActive ? 'text-white' : 'text-[var(--text-primary)]'}`}>
+                  <span className={`relative shrink-0 ${isActive ? 'text-white' : 'text-[var(--text-primary)]'}`}>
                     {item.icon}
+                    {collapsedMode && chatUnreadNum > 0 && (
+                      <span className="absolute -top-1.5 -right-2 min-w-[16px] h-[16px] px-1 rounded-full bg-[#F43F5E] text-white text-[9px] font-extrabold flex items-center justify-center ring-2 ring-[var(--bg-surface)]">
+                        {chatUnreadNum > 99 ? '99+' : chatUnreadNum}
+                      </span>
+                    )}
+                    {collapsedMode && showFeedRedDot && (
+                      <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-[var(--bg-surface)]" />
+                    )}
                   </span>
                   {!collapsedMode && <span className="truncate">{item.label}</span>}
                 </div>
 
-                {!collapsedMode && item.badge && (
+                {!collapsedMode && chatUnreadNum > 0 ? (
                   <span
-                    className={`text-[9px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider shrink-0 ${
-                      isActive
-                        ? 'bg-white/25 text-white'
-                        : isItemAdmin && isAdmin
-                        ? 'bg-emerald-500/15 text-emerald-600'
-                        : 'bg-[var(--bg-subtle)] text-[var(--accent-primary)] border border-[var(--border-hairline)]'
-                    }`}
+                    className="min-w-[20px] h-[20px] px-1.5 rounded-full bg-[#F43F5E] text-white text-[10px] font-extrabold flex items-center justify-center shrink-0 shadow-xs"
+                    aria-label={`${chatUnreadNum} unread messages`}
                   >
-                    {item.badge}
+                    {chatUnreadNum > 99 ? '99+' : chatUnreadNum}
                   </span>
+                ) : !collapsedMode && showFeedRedDot ? (
+                  <span
+                    className="w-2.5 h-2.5 rounded-full bg-[#F43F5E] shrink-0 shadow-xs"
+                    aria-label="New posts available"
+                  />
+                ) : (
+                  !collapsedMode &&
+                  item.badge && (
+                    <span
+                      className={`text-[9px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider shrink-0 ${
+                        isActive
+                          ? 'bg-white/25 text-white'
+                          : isItemAdmin && isAdmin
+                          ? 'bg-emerald-500/15 text-emerald-600'
+                          : 'bg-[var(--bg-subtle)] text-[var(--accent-primary)] border border-[var(--border-hairline)]'
+                      }`}
+                    >
+                      {item.badge}
+                    </span>
+                  )
                 )}
               </button>
 
@@ -248,10 +296,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
               {collapsedMode && (
                 <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg flex items-center gap-1.5 -translate-y-9">
                   <span>{item.label}</span>
-                  {item.badge && (
-                    <span className="px-1.5 py-0.2 rounded-md bg-blue-500/30 text-blue-200 text-[10px] uppercase">
-                      {item.badge}
+                  {chatUnreadNum > 0 ? (
+                    <span className="px-1.5 py-0.2 rounded-full bg-[#F43F5E] text-white text-[10px] font-extrabold">
+                      {chatUnreadNum}
                     </span>
+                  ) : (
+                    item.badge && (
+                      <span className="px-1.5 py-0.2 rounded-md bg-blue-500/30 text-blue-200 text-[10px] uppercase">
+                        {item.badge}
+                      </span>
+                    )
                   )}
                 </div>
               )}

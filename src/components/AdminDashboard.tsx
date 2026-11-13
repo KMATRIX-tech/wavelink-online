@@ -738,7 +738,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     }
 
     try {
-      const qUsers = query(collection(db, 'users'), limit(50));
+      const qUsers = query(collection(db, 'users'), limit(250));
       const qPosts = query(collection(db, 'posts'), limit(40));
       const qTickets = query(collection(db, 'supportTickets'), limit(40));
       const qVerif = query(collection(db, 'pending_verifications'), limit(40));
@@ -784,7 +784,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
       if (usersSnap.status === 'fulfilled') {
         const list: UserProfile[] = [];
-        usersSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as UserProfile));
+        usersSnap.value.forEach((d) => list.push({ ...(d.data() as UserProfile), id: d.id }));
         setUsers(list);
         batchCacheUserProfiles(list);
       }
@@ -1063,17 +1063,116 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     }
   };
 
+  const [updatingProUserId, setUpdatingProUserId] = useState<string | null>(null);
+  const [updatingRoleUserId, setUpdatingRoleUserId] = useState<string | null>(null);
+
+  // Grant or Revoke Verified Pro status with immediate table state update
+  const handleToggleVerifyPro = async (targetUser: UserProfile, verify: boolean) => {
+    if (!targetUser?.id || updatingProUserId === targetUser.id) return;
+    setUpdatingProUserId(targetUser.id);
+    setActionFeedback(null);
+
+    const previousUsers = users;
+    const nowIso = new Date().toISOString();
+    const targetEmailClean = (targetUser.email || '').trim().toLowerCase();
+
+    // Optimistic UI update so the table badge & button react immediately
+    setUsers((prev) => {
+      const updated = prev.map((u) => {
+        const isSameUser =
+          u.id === targetUser.id ||
+          (Boolean(targetEmailClean) &&
+            targetEmailClean !== 'keylanmbilinyi5@gmail.com' &&
+            (u.email || '').trim().toLowerCase() === targetEmailClean);
+        if (!isSameUser) return u;
+        return {
+          ...u,
+          isPro: verify,
+          hasBlueStar: verify,
+          isVerifiedByAdmin: verify,
+          proPlan: verify ? ('annual' as const) : undefined,
+          proBadge: verify ? ('verified' as const) : undefined,
+          proBorderEffect: verify ? ('aura-gold' as const) : ('none' as const),
+          updatedAt: nowIso
+        };
+      });
+      batchCacheUserProfiles(updated);
+      return updated;
+    });
+
+    try {
+      await toggleVerifyUser(targetUser.id, verify, targetUser.email);
+      setActionFeedback(
+        verify
+          ? `🌟 Verified & granted complimentary WaveLink Pro to ${targetUser.displayName || targetUser.email}!`
+          : `Revoked Admin Verified & Pro status from ${targetUser.displayName || targetUser.email}.`
+      );
+      setTimeout(() => setActionFeedback(null), 4500);
+    } catch (err: any) {
+      setUsers(previousUsers);
+      setActionFeedback(`Error updating Pro status: ${err?.message || String(err)}`);
+    } finally {
+      setUpdatingProUserId(null);
+    }
+  };
+
+  // Appoint or Demote Sub-Admin with immediate table state update
+  const handleToggleSubAdminRole = async (targetUser: UserProfile, makeSubAdmin: boolean) => {
+    if (!targetUser?.id || updatingRoleUserId === targetUser.id) return;
+    setUpdatingRoleUserId(targetUser.id);
+    setActionFeedback(null);
+
+    const previousUsers = users;
+    const nowIso = new Date().toISOString();
+
+    setUsers((prev) =>
+      prev.map((u) =>
+        u.id === targetUser.id
+          ? {
+              ...u,
+              isSubAdmin: makeSubAdmin,
+              role: makeSubAdmin ? 'sub_admin' : 'user',
+              updatedAt: nowIso
+            }
+          : u
+      )
+    );
+
+    try {
+      await toggleSubAdmin(targetUser.id, makeSubAdmin, targetUser.email);
+      setActionFeedback(
+        makeSubAdmin
+          ? `🛡️ Appointed ${targetUser.displayName || targetUser.email} as a Sub-Admin Moderator!`
+          : `Removed Sub-Admin Moderator privileges from ${targetUser.displayName || targetUser.email}.`
+      );
+      setTimeout(() => setActionFeedback(null), 4500);
+    } catch (err: any) {
+      setUsers(previousUsers);
+      setActionFeedback(`Error updating role: ${err?.message || String(err)}`);
+    } finally {
+      setUpdatingRoleUserId(null);
+    }
+  };
+
   // Issue Warning to user
   const handleConfirmWarning = async () => {
     if (!warningUser || !warningReason.trim()) return;
     setIsSubmittingWarning(true);
     try {
       const cleanReason = sanitizeUserText(warningReason, 400);
+      const nowIso = new Date().toISOString();
       await updateDoc(doc(db, 'users', warningUser.id), {
         status: 'warned',
         warningMessage: cleanReason,
-        updatedAt: new Date().toISOString()
+        updatedAt: nowIso
       });
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === warningUser.id
+            ? { ...u, status: 'warned', warningMessage: cleanReason, updatedAt: nowIso }
+            : u
+        )
+      );
       await recordAdminAuditLog({
         action: 'warn_user',
         targetId: warningUser.id,
@@ -1092,11 +1191,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   // Clear Warning
   const handleClearWarning = async (userId: string) => {
     try {
+      const nowIso = new Date().toISOString();
       await updateDoc(doc(db, 'users', userId), {
         status: 'active',
         warningMessage: '',
-        updatedAt: new Date().toISOString()
+        updatedAt: nowIso
       });
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === userId ? { ...u, status: 'active', warningMessage: '', updatedAt: nowIso } : u
+        )
+      );
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${userId}`);
     }
@@ -1104,19 +1209,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Ban user (no window.prompt required)
   const handleBanUser = async (user: UserProfile) => {
-    if (user.role === 'super_admin') {
+    if (user.role === 'super_admin' || user.role === 'admin' || (user as any).isOwner) {
       console.warn('The primary platform administrator cannot be banned.');
       return;
     }
     const reason = 'Violation of WaveLink community safety policies';
 
     try {
+      const nowIso = new Date().toISOString();
       await updateDoc(doc(db, 'users', user.id), {
         isBanned: true,
         status: 'banned',
         warningMessage: reason,
-        updatedAt: new Date().toISOString()
+        updatedAt: nowIso
       });
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === user.id
+            ? { ...u, isBanned: true, status: 'banned', warningMessage: reason, updatedAt: nowIso }
+            : u
+        )
+      );
       await recordAdminAuditLog({
         action: 'ban_user',
         targetId: user.id,
@@ -1134,12 +1247,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const handleUnbanUser = async (userId: string) => {
     const target = users.find((u) => u.id === userId);
     try {
+      const nowIso = new Date().toISOString();
       await updateDoc(doc(db, 'users', userId), {
         isBanned: false,
         status: 'active',
         warningMessage: '',
-        updatedAt: new Date().toISOString()
+        updatedAt: nowIso
       });
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === userId
+            ? { ...u, isBanned: false, status: 'active', warningMessage: '', updatedAt: nowIso }
+            : u
+        )
+      );
       await recordAdminAuditLog({
         action: 'unban_user',
         targetId: userId,
@@ -1430,6 +1551,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setActionFeedback(null);
     try {
       await approveVerification(verif, currentUser?.email || ADMIN_EMAIL);
+      const nowIso = new Date().toISOString();
+      setVerifications((prev) =>
+        prev.map((v) =>
+          v.id === verif.id
+            ? { ...v, status: 'approved', approvedAt: nowIso, approvedBy: currentUser?.email || ADMIN_EMAIL }
+            : v
+        )
+      );
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === verif.userId
+            ? { ...u, isPro: true, hasBlueStar: true, proPlan: verif.tierId, proBadge: 'verified', updatedAt: nowIso }
+            : u
+        )
+      );
       await recordAdminAuditLog({
         action: 'verify_user',
         targetId: verif.userId,
@@ -1454,6 +1590,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setActionFeedback(null);
     try {
       await rejectVerification(verif.id, verif.userId, reason);
+      setVerifications((prev) =>
+        prev.map((v) => (v.id === verif.id ? { ...v, status: 'rejected', notes: reason } : v))
+      );
       setActionFeedback(`Transaction ${verif.transactionId} rejected.`);
       setTimeout(() => setActionFeedback(null), 4000);
     } catch (err: any) {
@@ -1470,6 +1609,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setActionFeedback(null);
     try {
       await approvePaymentRequest(req, currentUser?.email || ADMIN_EMAIL);
+      const nowIso = new Date().toISOString();
+      setPaymentRequests((prev) =>
+        prev.map((r) =>
+          r.id === req.id
+            ? { ...r, status: 'approved', approvedAt: nowIso, approvedBy: currentUser?.email || ADMIN_EMAIL }
+            : r
+        )
+      );
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === req.userId
+            ? {
+                ...u,
+                isPro: true,
+                hasBlueStar: true,
+                proPlan: req.plan === 'harvest' ? 'annual' : 'monthly',
+                proBadge: 'verified',
+                updatedAt: nowIso
+              }
+            : u
+        )
+      );
       await recordAdminAuditLog({
         action: 'verify_user',
         targetId: req.userId,
@@ -1494,6 +1655,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setActionFeedback(null);
     try {
       await rejectPaymentRequest(req.id, req.userId, reason);
+      setPaymentRequests((prev) =>
+        prev.map((r) => (r.id === req.id ? { ...r, status: 'rejected', notes: reason } : r))
+      );
       setActionFeedback(`Payment notification ${req.transactionId} rejected.`);
       setTimeout(() => setActionFeedback(null), 4000);
     } catch (err: any) {
@@ -3358,8 +3522,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               </thead>
               <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
                 {users.map((user) => {
-                  const isTargetSuperAdmin = user.role === 'super_admin';
+                  const isTargetSuperAdmin =
+                    user.role === 'super_admin' ||
+                    user.role === 'admin' ||
+                    Boolean((user as any).isOwner) ||
+                    (user.email || '').trim().toLowerCase() === 'keylanmbilinyi5@gmail.com';
                   const isTargetSubAdmin = !isTargetSuperAdmin && (user.isSubAdmin || user.role === 'sub_admin');
+                  const isUpdatingThisUserPro = updatingProUserId === user.id;
+                  const isUpdatingThisUserRole = updatingRoleUserId === user.id;
 
                   return (
                     <tr key={user.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/30 transition">
@@ -3373,7 +3543,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                           <CrystalBadge
                             email={user.email}
                             name={user.displayName}
-                            isPro={user.isPro}
+                            isPro={Boolean(user.isPro || user.isVerifiedByAdmin)}
                             isSubAdmin={isTargetSubAdmin}
                             size="sm"
                           />
@@ -3447,21 +3617,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                             {isSuperAdmin && (
                               isTargetSubAdmin ? (
                                 <button
-                                  onClick={() => toggleSubAdmin(user.id, false)}
-                                  className="px-2 py-1 text-xs rounded-lg bg-indigo-50 dark:bg-indigo-950/40 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 font-semibold flex items-center gap-1 transition"
+                                  type="button"
+                                  disabled={isUpdatingThisUserRole}
+                                  onClick={() => handleToggleSubAdminRole(user, false)}
+                                  className="px-2 py-1 text-xs rounded-lg bg-indigo-50 dark:bg-indigo-950/40 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
                                   title="Revoke Sub-Admin status"
                                 >
                                   <UserMinus size={12} />
-                                  <span>Revoke Mod</span>
+                                  <span>{isUpdatingThisUserRole ? 'Updating...' : 'Revoke Mod'}</span>
                                 </button>
                               ) : (
                                 <button
-                                  onClick={() => toggleSubAdmin(user.id, true)}
-                                  className="px-2 py-1 text-xs rounded-lg bg-purple-50 dark:bg-purple-950/40 hover:bg-purple-100 text-purple-700 dark:text-purple-300 font-semibold flex items-center gap-1 transition"
+                                  type="button"
+                                  disabled={isUpdatingThisUserRole}
+                                  onClick={() => handleToggleSubAdminRole(user, true)}
+                                  className="px-2 py-1 text-xs rounded-lg bg-purple-50 dark:bg-purple-950/40 hover:bg-purple-100 text-purple-700 dark:text-purple-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
                                   title="Appoint as Sub-Admin with limited moderation privileges"
                                 >
                                   <UserPlus size={12} />
-                                  <span>Make Sub-Admin</span>
+                                  <span>{isUpdatingThisUserRole ? 'Updating...' : 'Make Sub-Admin'}</span>
                                 </button>
                               )
                             )}
@@ -3469,21 +3643,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                             {/* Admin & Super Admin: Verify Member / Grant Complimentary Pro Access */}
                             {user.isVerifiedByAdmin || user.isPro ? (
                               <button
-                                onClick={() => toggleVerifyUser(user.id, false)}
-                                className="px-2 py-1 text-xs rounded-lg bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 text-amber-700 dark:text-amber-300 font-semibold flex items-center gap-1 transition"
+                                type="button"
+                                disabled={isUpdatingThisUserPro}
+                                onClick={() => handleToggleVerifyPro(user, false)}
+                                className="px-2 py-1 text-xs rounded-lg bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 text-amber-700 dark:text-amber-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
                                 title="Revoke Admin Verified and Pro status"
                               >
                                 <Crown size={12} className="text-amber-600" />
-                                <span>Revoke Pro</span>
+                                <span>{isUpdatingThisUserPro ? 'Revoking...' : 'Revoke Pro'}</span>
                               </button>
                             ) : (
                               <button
-                                onClick={() => toggleVerifyUser(user.id, true)}
-                                className="px-2 py-1 text-xs rounded-lg bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-700 dark:text-emerald-300 font-semibold flex items-center gap-1 transition"
+                                type="button"
+                                disabled={isUpdatingThisUserPro}
+                                onClick={() => handleToggleVerifyPro(user, true)}
+                                className="px-2 py-1 text-xs rounded-lg bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-700 dark:text-emerald-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
                                 title="Verify user & grant complimentary WaveLink Pro perks"
                               >
                                 <Crown size={12} className="text-emerald-600" />
-                                <span>Verify (Grant Pro)</span>
+                                <span>{isUpdatingThisUserPro ? 'Granting Pro...' : 'Verify (Grant Pro)'}</span>
                               </button>
                             )}
 

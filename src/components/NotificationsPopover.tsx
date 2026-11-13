@@ -47,12 +47,14 @@ interface NotificationsPopoverProps {
   onNavigateTab?: (tab: ActiveTab) => void;
   onStartChat?: (userId: string) => void;
   hasUnreadNotifications?: boolean;
+  unreadNotificationCount?: number;
 }
 
 export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
   onNavigateTab,
   onStartChat,
-  hasUnreadNotifications = false
+  hasUnreadNotifications = false,
+  unreadNotificationCount = 0
 }) => {
   const { currentUser, userProfile, showGlobalToast } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
@@ -133,31 +135,46 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  const unreadCount = Math.max(
+    notifications.filter((n) => !n.read).length,
+    unreadNotificationCount
+  );
+
+  // Sync unread bell count to App.tsx for browser tab title & Badging API
+  useEffect(() => {
+    window.dispatchEvent(
+      new CustomEvent('wavelink:unread-bell-count', {
+        detail: { count: notifications.filter((n) => !n.read).length }
+      })
+    );
+  }, [notifications]);
 
   // Filter list
   const filteredNotifications = notifications.filter((n) => {
     if (filterType === 'all') return true;
     if (filterType === 'messages') return n.type === 'message';
-    if (filterType === 'calls') return n.type === 'call';
-    if (filterType === 'posts') return ['post_like', 'post_comment', 'post_tip', 'post_boost'].includes(n.type);
+    if (filterType === 'calls') return n.type === 'call' || n.type === 'incoming_call';
+    if (filterType === 'posts') return ['post_like', 'post_comment', 'post_tip', 'post_boost', 'post_reaction'].includes(n.type);
     if (filterType === 'follows') return n.type === 'follow';
     return true;
   });
 
   const handleItemClick = async (notif: AppNotification) => {
     if (!notif.read) {
+      setNotifications((prev) =>
+        prev.map((item) => (item.id === notif.id ? { ...item, read: true } : item))
+      );
       await markNotificationAsRead(notif.id);
     }
     setIsOpen(false);
 
-    if (notif.type === 'message' || notif.type === 'call') {
+    if (notif.type === 'message' || notif.type === 'call' || notif.type === 'incoming_call') {
       if (onStartChat && notif.actorId) {
         onStartChat(notif.actorId);
       } else if (onNavigateTab) {
         onNavigateTab('chat');
       }
-    } else if (['post_like', 'post_comment', 'post_tip', 'post_boost'].includes(notif.type)) {
+    } else if (['post_like', 'post_comment', 'post_tip', 'post_boost', 'post_reaction'].includes(notif.type)) {
       if (onNavigateTab) {
         onNavigateTab('feed');
       }
@@ -278,14 +295,21 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
         onClick={() => {
           triggerHaptic('light');
           setIsOpen((prev) => !prev);
+          window.dispatchEvent(new CustomEvent('wavelink:bell-opened'));
         }}
-        className="relative min-h-[38px] min-w-[38px] p-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 flex items-center justify-center transition active:scale-95 cursor-pointer"
+        className="relative min-h-[44px] min-w-[44px] p-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 flex items-center justify-center transition active:scale-95 cursor-pointer"
         title="Notifications"
-        aria-label="Notifications"
+        aria-label={unreadCount > 0 ? `Notifications (${unreadCount} unread)` : 'Notifications'}
       >
         <Bell size={16} />
-        {(unreadCount > 0 || hasUnreadNotifications) && (
-          <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#F43F5E] ring-2 ring-white dark:ring-stone-900" />
+        {unreadCount > 0 ? (
+          <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-[#F43F5E] text-white text-[10px] font-extrabold flex items-center justify-center ring-2 ring-white dark:ring-stone-900 shadow-xs">
+            {unreadCount > 99 ? '99+' : unreadCount}
+          </span>
+        ) : (
+          hasUnreadNotifications && (
+            <span className="absolute top-1.5 right-1.5 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-white dark:ring-stone-900" />
+          )
         )}
       </button>
 
@@ -302,21 +326,28 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
                 Notifications
               </h3>
               {unreadCount > 0 && (
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-[#3B82F6] border border-blue-200">
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-[#F43F5E] border border-rose-200">
                   {unreadCount} new
                 </span>
               )}
             </div>
 
             <div className="flex items-center gap-1">
-              {unreadCount > 0 && (
+              {(unreadCount > 0 || notifications.some((n) => !n.read)) && (
                 <button
-                  onClick={() => currentUser && markAllNotificationsAsRead(currentUser.uid)}
-                  className="p-1.5 text-xs text-[#3B82F6] hover:text-blue-700 font-semibold flex items-center gap-1 transition"
+                  type="button"
+                  onClick={() => {
+                    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+                    window.dispatchEvent(new CustomEvent('wavelink:notifications-marked-read'));
+                    if (currentUser) {
+                      void markAllNotificationsAsRead(currentUser.uid);
+                    }
+                  }}
+                  className="px-2 py-1 rounded-lg text-xs text-[#3B82F6] hover:bg-blue-50 hover:text-blue-700 font-extrabold flex items-center gap-1 transition cursor-pointer"
                   title="Mark all as read"
                 >
                   <CheckCheck size={14} />
-                  <span className="text-[11px]">Read all</span>
+                  <span className="text-[11px]">Mark all as read</span>
                 </button>
               )}
               <button

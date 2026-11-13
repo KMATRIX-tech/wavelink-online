@@ -16,7 +16,7 @@ import {
   getCachedUserProfile,
   sanitizeShortHttpsUrl
 } from './firebase';
-import { collection, query, where, limit, onSnapshot, updateDoc, setDoc, doc, getDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, query, where, orderBy, limit, onSnapshot, updateDoc, setDoc, doc, getDoc, serverTimestamp, increment } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
 import { getCloudinaryTinyPlaceholderUrl } from './utils/mediaStorage';
@@ -204,6 +204,17 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   const [isWelinkOpen, setIsWelinkOpen] = useState(false);
   const [welinkInitialMode, setWelinkInitialMode] = useState<'chat' | 'image' | 'voice'>('chat');
   const [unreadNotificationIds, setUnreadNotificationIds] = useState<string[]>([]);
+  const [unreadChatCount, setUnreadChatCount] = useState<number>(0);
+  const [hasNewPosts, setHasNewPosts] = useState<boolean>(false);
+  const lastFeedVisitAtRef = useRef<number>((() => {
+    try {
+      const saved = localStorage.getItem('wavelink_last_feed_visit_ms');
+      const parsed = saved ? Number(saved) : NaN;
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now();
+    } catch {
+      return Date.now();
+    }
+  })());
   const [showInterestPicker, setShowInterestPicker] = useState<boolean>(false);
   const [isTourOpen, setIsTourOpen] = useState<boolean>(() => {
     try {
@@ -391,10 +402,139 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     return () => unsub();
   }, [currentUser?.uid]);
 
+  // Listen to the user's active DM conversations (already bounded) to compute unread message badge count
+  useEffect(() => {
+    if (!currentUser?.uid) {
+      setUnreadChatCount(0);
+      return;
+    }
+    const q = query(
+      collection(db, 'channels'),
+      where('participants', 'array-contains', currentUser.uid),
+      limit(25)
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        let total = 0;
+        snap.forEach((docSnap) => {
+          const data = docSnap.data();
+          const unreadMap = data?.unread || data?.unreadCounts || {};
+          const rawCount = Number(unreadMap[currentUser.uid] ?? 0);
+          if (Number.isFinite(rawCount) && rawCount > 0) {
+            total += rawCount;
+          }
+        });
+        setUnreadChatCount(total);
+      },
+      () => {}
+    );
+
+    const handleUnreadChatCustomEvent = (e: Event) => {
+      const count = (e as CustomEvent<number>).detail;
+      if (typeof count === 'number' && Number.isFinite(count)) {
+        setUnreadChatCount(Math.max(0, count));
+      }
+    };
+    window.addEventListener('wavelink:unread-chat-count', handleUnreadChatCustomEvent as EventListener);
+    return () => {
+      unsub();
+      window.removeEventListener('wavelink:unread-chat-count', handleUnreadChatCustomEvent as EventListener);
+    };
+  }, [currentUser?.uid]);
+
+  // Listen to ONLY the single newest post (limit(1)) to show a red dot on Home and floating "New posts" pill
+  useEffect(() => {
+    if (!currentUser?.uid) {
+      setHasNewPosts(false);
+      return;
+    }
+    const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(1));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        if (snap.empty) return;
+        const newestDoc = snap.docs[0];
+        const data = newestDoc.data();
+        if (!data || data.isRemoved || data.authorId === currentUser.uid) {
+          return;
+        }
+        const rawCreated = data.createdAt;
+        const createdMs =
+          typeof rawCreated === 'string'
+            ? Date.parse(rawCreated)
+            : typeof rawCreated?.toMillis === 'function'
+            ? rawCreated.toMillis()
+            : typeof rawCreated?.seconds === 'number'
+            ? rawCreated.seconds * 1000
+            : 0;
+        if (createdMs > lastFeedVisitAtRef.current + 1500) {
+          setHasNewPosts(true);
+        }
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [currentUser?.uid]);
+
+  const markFeedVisitedNow = useCallback(() => {
+    const now = Date.now();
+    lastFeedVisitAtRef.current = now;
+    setHasNewPosts(false);
+    try {
+      localStorage.setItem('wavelink_last_feed_visit_ms', String(now));
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  // Clear bell unread badge immediately when bell menu opens or "Mark all as read" is tapped
+  useEffect(() => {
+    const handleClearBellUnread = () => {
+      setUnreadNotificationIds([]);
+    };
+    window.addEventListener('wavelink:bell-opened', handleClearBellUnread);
+    window.addEventListener('wavelink:notifications-marked-read', handleClearBellUnread);
+    return () => {
+      window.removeEventListener('wavelink:bell-opened', handleClearBellUnread);
+      window.removeEventListener('wavelink:notifications-marked-read', handleClearBellUnread);
+    };
+  }, []);
+
+  // Sync browser tab title "(3) WaveLink" and PWA Badging API (navigator.setAppBadge / clearAppBadge)
+  useEffect(() => {
+    const totalBadgeCount =
+      Math.max(0, unreadChatCount) +
+      Math.max(0, unreadNotificationIds.length) +
+      (hasNewPosts ? 1 : 0);
+
+    if (typeof document !== 'undefined') {
+      document.title =
+        totalBadgeCount > 0
+          ? `(${totalBadgeCount}) WaveLink`
+          : 'WaveLink - Connect, Share, and Discover';
+    }
+
+    if (typeof navigator !== 'undefined') {
+      const navWithBadge = navigator as Navigator & {
+        setAppBadge?: (contents?: number) => Promise<void>;
+        clearAppBadge?: () => Promise<void>;
+      };
+      if (totalBadgeCount > 0 && typeof navWithBadge.setAppBadge === 'function') {
+        navWithBadge.setAppBadge(totalBadgeCount).catch(() => {});
+      } else if (totalBadgeCount === 0 && typeof navWithBadge.clearAppBadge === 'function') {
+        navWithBadge.clearAppBadge().catch(() => {});
+      }
+    }
+  }, [unreadChatCount, unreadNotificationIds.length, hasNewPosts]);
+
   const setActiveTab = (tab: ActiveTab) => {
     triggerHaptic(tab === 'studio' ? 'medium' : 'tab');
     if (tab === 'settings') {
       setViewedProfileUserId(null);
+    }
+    if (tab === 'feed') {
+      markFeedVisitedNow();
     }
     setActiveTabState(tab);
     try {
@@ -405,7 +545,9 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
     // Clear unread notification dot when user checks Home or Profile
     if ((tab === 'feed' || tab === 'settings') && unreadNotificationIds.length > 0) {
-      unreadNotificationIds.slice(0, 10).forEach((id) => {
+      const toMark = [...unreadNotificationIds];
+      setUnreadNotificationIds([]);
+      toMark.slice(0, 15).forEach((id) => {
         updateDoc(doc(db, 'notifications', id), { read: true }).catch(() => {});
       });
     }
@@ -1060,6 +1202,14 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           lastMessageSenderName: senderDisplayName,
           lastMessageAt: nowIso,
           lastSeen: { [currentUser.uid]: nowIso },
+          unread: {
+            [currentUser.uid]: 0,
+            [targetCallerId]: increment(1)
+          },
+          unreadCounts: {
+            [currentUser.uid]: 0,
+            [targetCallerId]: increment(1)
+          },
           timestamp: serverTimestamp(),
           updatedAt: nowIso
         },
@@ -1192,6 +1342,21 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           ...(data.data || {}),
           ...(data.url ? { url: data.url } : {})
         });
+      } else if (data && data.type === 'WAVELINK_FOREGROUND_PUSH') {
+        const pType = data.data?.type || '';
+        if (pType !== 'incoming_call' && pType !== 'call' && pType !== 'call_dismiss') {
+          const bannerId = `fg_sw_${Date.now()}`;
+          setForegroundBanner({
+            id: bannerId,
+            title: data.title || 'WaveLink',
+            body: data.body || 'You have a new update on WaveLink',
+            icon: data.icon,
+            data: data.data
+          });
+          window.setTimeout(() => {
+            setForegroundBanner((prev) => (prev?.id === bannerId ? null : prev));
+          }, 5500);
+        }
       }
     };
 
@@ -1253,6 +1418,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         onStartChat={handleStartChatWithUser}
         onOpenWelink={handleOpenWelink}
         hasUnreadNotifications={unreadNotificationIds.length > 0}
+        unreadNotificationCount={unreadNotificationIds.length}
         onSelectHashtag={(tag) => {
           setSelectedHashtag(tag);
           setActiveTab('feed');
@@ -1268,6 +1434,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           isOpenMobile={false}
           onCloseMobile={() => {}}
           onOpenWelink={() => handleOpenWelink('chat')}
+          unreadChatCount={unreadChatCount}
+          hasNewPosts={hasNewPosts}
         />
 
         {/* Main Body View with subtle fade-in transition when switching tabs */}
@@ -1286,6 +1454,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
               onClearFocusPostId={() => setFocusedPostId(null)}
               onOpenWelink={handleOpenWelink}
               onStartChat={handleStartChatWithUser}
+              hasNewPosts={hasNewPosts}
+              onLoadNewPosts={markFeedVisitedNow}
             />
           )}
           {activeTab === 'trending' && (
@@ -1385,7 +1555,9 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       <MobileBottomNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        unreadChatCount={unreadChatCount}
         hasUnreadNotifications={unreadNotificationIds.length > 0}
+        hasNewPosts={hasNewPosts}
       />
 
       {/* Single Floating Assistant Button (hidden on Chat and when any bottom sheet or keyboard is open on phones) */}

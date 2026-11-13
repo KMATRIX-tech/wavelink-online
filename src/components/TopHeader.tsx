@@ -33,6 +33,7 @@ interface TopHeaderProps {
   onSelectHashtag?: (hashtag: string) => void;
   onOpenWelink?: (mode?: 'chat' | 'image' | 'voice') => void;
   hasUnreadNotifications?: boolean;
+  unreadNotificationCount?: number;
 }
 
 export const TopHeader: React.FC<TopHeaderProps> = ({
@@ -40,7 +41,8 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   onStartChat,
   onSelectHashtag,
   onOpenWelink,
-  hasUnreadNotifications = false
+  hasUnreadNotifications = false,
+  unreadNotificationCount = 0
 }) => {
   const { currentUser, userProfile, updateUserProfile } = useAuth();
   const { language, setLanguage, t } = useLanguage();
@@ -426,6 +428,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               onNavigateTab={onNavigateTab}
               onStartChat={onStartChat}
               hasUnreadNotifications={hasUnreadNotifications}
+              unreadNotificationCount={unreadNotificationCount}
             />
 
             {/* Item 5: Profile Avatar */}
