@@ -24,9 +24,11 @@ if (typeof window !== 'undefined') {
 // Register PWA & FCM service worker for offline shell, installability, and push notifications
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch((err) => {
-      console.warn('ServiceWorker registration note:', err);
-    });
+    navigator.serviceWorker
+      .register('/firebase-messaging-sw.js', { scope: '/' })
+      .catch((err) => {
+        console.warn('ServiceWorker registration note:', err);
+      });
   });
 }
 

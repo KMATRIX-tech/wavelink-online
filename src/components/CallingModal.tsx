@@ -31,9 +31,17 @@ import {
   Send,
   X,
 } from 'lucide-react';
-import { CallRecipient, ChannelMessage } from '../types';
+import { CallRecipient, ChannelMessage, UserProfile } from '../types';
 import { useAuth } from '../context/AuthContext';
-import { auth, db, cleanFirestoreData, sanitizeAvatarUrlForFirestore } from '../firebase';
+import {
+  auth,
+  db,
+  cleanFirestoreData,
+  sanitizeAvatarUrlForFirestore,
+  sanitizeShortHttpsUrl,
+  fetchUserProfileCached,
+  getCachedUserProfile,
+} from '../firebase';
 import {
   doc,
   setDoc,
@@ -181,7 +189,6 @@ function sendCallSignalOverWs(payload: {
   targetUserId: string;
   fromUserId: string;
   fromName: string;
-  fromPhotoURL?: string;
   callType: 'video' | 'voice';
   signalType: 'offer' | 'answer' | 'end' | 'declined';
   signalData?: RTCSessionDescriptionInit;
@@ -245,17 +252,48 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const resolvedUserName =
     propUserName || userProfile?.displayName || currentUser?.displayName || 'WaveLink Member';
   const resolvedUserAvatar =
-    propUserAvatar ||
-    userProfile?.photoURL ||
-    currentUser?.photoURL ||
-    `https://api.dicebear.com/7.x/shapes/svg?seed=${resolvedUserId}`;
+    sanitizeShortHttpsUrl(propUserAvatar) ||
+    sanitizeShortHttpsUrl(userProfile?.photoURL) ||
+    sanitizeShortHttpsUrl(currentUser?.photoURL) ||
+    `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(resolvedUserId)}`;
 
   const resolvedRecipientId = recipient?.id || contact?.id || 'wavelink_peer';
-  const resolvedRecipientName = recipient?.name || contact?.name || 'WaveLink Member';
+  const [peerProfile, setPeerProfile] = useState<UserProfile | null>(() =>
+    resolvedRecipientId && resolvedRecipientId !== 'wavelink_peer'
+      ? getCachedUserProfile(resolvedRecipientId)
+      : null
+  );
+
+  useEffect(() => {
+    let active = true;
+    if (!resolvedRecipientId || resolvedRecipientId === 'wavelink_peer') {
+      setPeerProfile(null);
+      return;
+    }
+    const cached = getCachedUserProfile(resolvedRecipientId);
+    if (cached) {
+      setPeerProfile(cached);
+      return;
+    }
+    fetchUserProfileCached(resolvedRecipientId)
+      .then((profile) => {
+        if (active && profile) {
+          setPeerProfile(profile);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [resolvedRecipientId]);
+
+  const resolvedRecipientName =
+    peerProfile?.displayName || recipient?.name || contact?.name || 'WaveLink Member';
   const resolvedRecipientAvatar =
-    recipient?.photoURL ||
-    contact?.avatar ||
-    `https://api.dicebear.com/7.x/shapes/svg?seed=${resolvedRecipientId}`;
+    sanitizeShortHttpsUrl(peerProfile?.photoURL) ||
+    sanitizeShortHttpsUrl(recipient?.photoURL) ||
+    sanitizeShortHttpsUrl(contact?.avatar) ||
+    `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(resolvedRecipientId)}`;
 
   const initialIsIncoming =
     typeof isInitiator === 'boolean' ? !isInitiator : Boolean(propIsIncoming);
@@ -1438,24 +1476,14 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         const nowIso = new Date().toISOString();
         const meta = userMetaRef.current;
         const resolvedCallerUid = activeAuthUser.uid;
-        const safeCallerPhoto = sanitizeAvatarUrlForFirestore(meta.userAvatar, resolvedCallerUid);
-        const safeReceiverPhoto = sanitizeAvatarUrlForFirestore(meta.recipientAvatar, meta.recipientId);
         try {
           await setDoc(
             callDocRef,
             cleanFirestoreData({
-              id: activeCallId,
-              callId: activeCallId,
-              caller: resolvedCallerUid,
               callerId: resolvedCallerUid,
               callerName: meta.userName,
-              callerPhotoURL: safeCallerPhoto,
-              receiver: meta.recipientId,
-              receiverId: meta.recipientId,
-              receiverName: meta.recipientName,
-              receiverPhotoURL: safeReceiverPhoto,
+              calleeId: meta.recipientId,
               type: normalizedMode,
-              callType: normalizedMode,
               status: 'ringing',
               offer: {
                 type: offer.type,
@@ -1481,7 +1509,6 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           targetUserId: meta.recipientId,
           fromUserId: resolvedCallerUid,
           fromName: meta.userName,
-          fromPhotoURL: safeCallerPhoto,
           callType: normalizedMode,
           signalType: 'offer',
           signalData: { type: offer.type, sdp: offer.sdp },
@@ -1492,7 +1519,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             recipientId: meta.recipientId,
             actorId: resolvedCallerUid,
             actorName: meta.userName,
-            actorPhotoURL: safeCallerPhoto,
+            actorPhotoURL: sanitizeShortHttpsUrl(meta.userAvatar) || undefined,
             type: 'incoming_call',
             title: normalizedMode === 'video' ? 'Incoming Video Call 📞' : 'Incoming Voice Call 📞',
             body: `${meta.userName} is calling you on WaveLink. Tap to answer.`,

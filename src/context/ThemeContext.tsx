@@ -1,6 +1,12 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
-import { AppearanceTheme } from '../types';
+import {
+  AppearanceTheme,
+  CustomAppBackground,
+  CustomBackgroundHistoryItem
+} from '../types';
 import { useAuth } from './AuthContext';
+import { useDataSaver } from '../services/dataSaverService';
+import { computeEffectiveTextMode } from '../utils/mediaStorage';
 
 export interface AppearanceThemeMetadata {
   id: AppearanceTheme;
@@ -235,6 +241,25 @@ interface ThemeContextType {
   isLiteMode: boolean;
   setLiteMode: (enabled: boolean) => void;
   toggleLiteMode: () => void;
+  // Custom app background (Pro only)
+  customBackground: CustomAppBackground | null;
+  customBackgroundHistory: CustomBackgroundHistoryItem[];
+  activeCustomBackground: CustomAppBackground | null;
+  isCustomBackgroundActive: boolean;
+  customBgContrast: 'light' | 'dark' | null;
+  isDataSaverBlockingCustomBg: boolean;
+  customBgLoadFailed: boolean;
+  isSavingCustomBg: boolean;
+  saveCustomBackground: (
+    bg: CustomAppBackground,
+    options?: { addToHistory?: boolean }
+  ) => Promise<SaveThemeResult>;
+  selectCustomBackgroundFromHistory: (
+    item: CustomBackgroundHistoryItem
+  ) => Promise<SaveThemeResult>;
+  removeCustomBackground: () => Promise<SaveThemeResult>;
+  reportCustomBgLoadError: (failedUrl: string) => void;
+  clearCustomBgLoadError: () => void;
 }
 
 const ThemeContext = createContext<ThemeContextType>({
@@ -257,12 +282,26 @@ const ThemeContext = createContext<ThemeContextType>({
   isLiteMode: false,
   setLiteMode: () => {},
   toggleLiteMode: () => {},
+  customBackground: null,
+  customBackgroundHistory: [],
+  activeCustomBackground: null,
+  isCustomBackgroundActive: false,
+  customBgContrast: null,
+  isDataSaverBlockingCustomBg: false,
+  customBgLoadFailed: false,
+  isSavingCustomBg: false,
+  saveCustomBackground: async () => ({ success: true }),
+  selectCustomBackgroundFromHistory: async () => ({ success: true }),
+  removeCustomBackground: async () => ({ success: true }),
+  reportCustomBgLoadError: () => {},
+  clearCustomBgLoadError: () => {},
 });
 
 export const useTheme = () => useContext(ThemeContext);
 
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { currentUser, userProfile, updateUserProfile } = useAuth();
+  const { currentUser, userProfile, isProEffective, updateUserProfile } = useAuth();
+  const { enabled: isDataSaverOn } = useDataSaver();
 
   const [appearanceTheme, setAppearanceThemeState] = useState<AppearanceTheme>(() => {
     if (typeof window !== 'undefined') {
@@ -278,12 +317,25 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [themeSaveError, setThemeSaveError] = useState<string | null>(null);
 
+  // Custom app background state (cached locally per-UID for instant zero-read boot)
+  const [customBackground, setCustomBackgroundState] = useState<CustomAppBackground | null>(null);
+  const [customBackgroundHistory, setCustomBackgroundHistoryState] = useState<CustomBackgroundHistoryItem[]>([]);
+  const [isSavingCustomBg, setIsSavingCustomBg] = useState(false);
+  const [failedCustomBgUrl, setFailedCustomBgUrl] = useState<string | null>(null);
+
   // Prevents stale Firestore onSnapshot events from reverting a newly selected theme
   const pendingSaveRef = useRef<{
     theme: AppearanceTheme;
     inFlight: boolean;
     savedAt: number;
     failed: boolean;
+  } | null>(null);
+
+  const pendingCustomBgSaveRef = useRef<{
+    updatedAt: string;
+    bg: CustomAppBackground | null;
+    inFlight: boolean;
+    savedAt: number;
   } | null>(null);
 
   const [isBatterySaver, setIsBatterySaverState] = useState<boolean>(() => {
@@ -295,6 +347,64 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
     return false;
   });
+
+  // Load cached custom background immediately on uid change (zero extra Firestore reads)
+  useEffect(() => {
+    if (!currentUser?.uid) {
+      setCustomBackgroundState(null);
+      setCustomBackgroundHistoryState([]);
+      setFailedCustomBgUrl(null);
+      return;
+    }
+    try {
+      const cachedRaw = localStorage.getItem(`wavelink_custom_bg_${currentUser.uid}`);
+      if (cachedRaw) {
+        const parsed = JSON.parse(cachedRaw);
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.customBackground !== undefined) {
+            setCustomBackgroundState(parsed.customBackground || null);
+          }
+          if (Array.isArray(parsed.customBackgroundHistory)) {
+            setCustomBackgroundHistoryState(parsed.customBackgroundHistory.slice(0, 5));
+          }
+        }
+      }
+    } catch {
+      // ignore local cache read error
+    }
+  }, [currentUser?.uid]);
+
+  // Sync custom background from existing userProfile snapshot without extra Firestore reads
+  useEffect(() => {
+    if (!currentUser?.uid || !userProfile) return;
+    const pending = pendingCustomBgSaveRef.current;
+    const remoteBg = userProfile.customBackground ?? null;
+    const remoteHist = Array.isArray(userProfile.customBackgroundHistory)
+      ? userProfile.customBackgroundHistory.slice(0, 5)
+      : [];
+
+    if (pending) {
+      const sameUrl = (remoteBg?.url || null) === (pending.bg?.url || null);
+      if ((pending.inFlight || Date.now() - pending.savedAt < 15000) && !sameUrl) {
+        return;
+      }
+      if (sameUrl) {
+        pendingCustomBgSaveRef.current = null;
+      }
+    }
+
+    setCustomBackgroundState(remoteBg);
+    setCustomBackgroundHistoryState(remoteHist);
+    setFailedCustomBgUrl(null);
+    try {
+      localStorage.setItem(
+        `wavelink_custom_bg_${currentUser.uid}`,
+        JSON.stringify({ customBackground: remoteBg, customBackgroundHistory: remoteHist })
+      );
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [currentUser?.uid, userProfile?.customBackground, userProfile?.customBackgroundHistory]);
 
   // Sync from user profile in Firestore ONLY when no newer local selection is in-flight / recently saved / failed
   useEffect(() => {
@@ -331,17 +441,51 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const activeTheme: AppearanceTheme = previewTheme || appearanceTheme;
   const isDarkTheme = isDarkAppearanceTheme(activeTheme);
 
-  // Apply active theme (saved or live preview) to <html> immediately
+  const customBgLoadFailed = Boolean(
+    customBackground?.url &&
+      failedCustomBgUrl &&
+      (failedCustomBgUrl === customBackground.url || failedCustomBgUrl === customBackground.mobileUrl)
+  );
+  const isDataSaverBlockingCustomBg = Boolean(isDataSaverOn && isProEffective && customBackground?.url);
+  const isCustomBackgroundActive = Boolean(
+    currentUser?.uid &&
+      isProEffective &&
+      customBackground?.url &&
+      !isDataSaverOn &&
+      !customBgLoadFailed
+  );
+
+  const customBgContrast: 'light' | 'dark' | null = isCustomBackgroundActive && customBackground
+    ? typeof customBackground.avgLuminance === 'number'
+      ? computeEffectiveTextMode(customBackground.avgLuminance, customBackground.darken)
+      : customBackground.textMode === 'light'
+      ? 'light'
+      : 'dark'
+    : null;
+
+  const effectiveDarkMode = isCustomBackgroundActive
+    ? customBgContrast === 'dark'
+    : isDarkTheme;
+
+  // Apply active theme + custom background mode/contrast to <html> immediately
   useEffect(() => {
     const root = window.document.documentElement;
     root.setAttribute('data-theme', activeTheme);
-    root.setAttribute('data-theme-mode', isDarkTheme ? 'dark' : 'light');
-    if (isDarkTheme) {
+    root.setAttribute('data-theme-mode', effectiveDarkMode ? 'dark' : 'light');
+    if (effectiveDarkMode) {
       root.classList.add('dark');
     } else {
       root.classList.remove('dark');
     }
-  }, [activeTheme, isDarkTheme]);
+
+    if (isCustomBackgroundActive && customBgContrast) {
+      root.setAttribute('data-has-custom-bg', 'true');
+      root.setAttribute('data-custom-bg-contrast', customBgContrast);
+    } else {
+      root.removeAttribute('data-has-custom-bg');
+      root.removeAttribute('data-custom-bg-contrast');
+    }
+  }, [activeTheme, effectiveDarkMode, isCustomBackgroundActive, customBgContrast]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -461,10 +605,160 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setIsBatterySaverState((prev) => !prev);
   };
 
+  const saveCustomBackground = useCallback(
+    async (
+      bg: CustomAppBackground,
+      options?: { addToHistory?: boolean }
+    ): Promise<SaveThemeResult> => {
+      if (!currentUser?.uid) {
+        return { success: false, error: 'Please sign in first.' };
+      }
+      if (!isProEffective) {
+        return { success: false, error: 'Custom backgrounds are a Pro feature.' };
+      }
+
+      const nowIso = new Date().toISOString();
+      const normalizedBg: CustomAppBackground = {
+        ...bg,
+        darken: Math.max(0, Math.min(70, Math.round(bg.darken ?? 25))),
+        blur: Math.max(0, Math.min(12, Math.round(bg.blur ?? 0))),
+        updatedAt: nowIso
+      };
+
+      const shouldAddHistory = options?.addToHistory !== false;
+      let nextHistory = customBackgroundHistory;
+      if (shouldAddHistory) {
+        const historyEntry: CustomBackgroundHistoryItem = {
+          id: `bg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          url: normalizedBg.url,
+          ...(normalizedBg.mobileUrl ? { mobileUrl: normalizedBg.mobileUrl } : {}),
+          darken: normalizedBg.darken,
+          blur: normalizedBg.blur,
+          textMode: normalizedBg.textMode,
+          ...(typeof normalizedBg.avgLuminance === 'number'
+            ? { avgLuminance: normalizedBg.avgLuminance }
+            : {}),
+          createdAt: nowIso
+        };
+        const deduped = customBackgroundHistory.filter((item) => item.url !== normalizedBg.url);
+        nextHistory = [historyEntry, ...deduped].slice(0, 5);
+      }
+
+      pendingCustomBgSaveRef.current = {
+        updatedAt: nowIso,
+        bg: normalizedBg,
+        inFlight: true,
+        savedAt: Date.now()
+      };
+
+      setFailedCustomBgUrl(null);
+      setCustomBackgroundState(normalizedBg);
+      setCustomBackgroundHistoryState(nextHistory);
+      try {
+        localStorage.setItem(
+          `wavelink_custom_bg_${currentUser.uid}`,
+          JSON.stringify({ customBackground: normalizedBg, customBackgroundHistory: nextHistory })
+        );
+      } catch {
+        // ignore storage errors
+      }
+
+      setIsSavingCustomBg(true);
+      try {
+        await updateUserProfile({
+          customBackground: normalizedBg,
+          ...(shouldAddHistory ? { customBackgroundHistory: nextHistory } : {})
+        });
+        if (pendingCustomBgSaveRef.current?.updatedAt === nowIso) {
+          pendingCustomBgSaveRef.current.inFlight = false;
+          pendingCustomBgSaveRef.current.savedAt = Date.now();
+        }
+        return { success: true };
+      } catch (err: any) {
+        const msg =
+          err instanceof Error ? err.message : 'Could not save custom background to your profile.';
+        if (pendingCustomBgSaveRef.current?.updatedAt === nowIso) {
+          pendingCustomBgSaveRef.current = null;
+        }
+        return { success: false, error: msg };
+      } finally {
+        setIsSavingCustomBg(false);
+      }
+    },
+    [currentUser?.uid, isProEffective, customBackgroundHistory, updateUserProfile]
+  );
+
+  const selectCustomBackgroundFromHistory = useCallback(
+    async (item: CustomBackgroundHistoryItem): Promise<SaveThemeResult> => {
+      return saveCustomBackground(
+        {
+          url: item.url,
+          ...(item.mobileUrl ? { mobileUrl: item.mobileUrl } : {}),
+          darken: item.darken,
+          blur: item.blur,
+          textMode: item.textMode,
+          ...(typeof item.avgLuminance === 'number' ? { avgLuminance: item.avgLuminance } : {})
+        },
+        { addToHistory: false }
+      );
+    },
+    [saveCustomBackground]
+  );
+
+  const removeCustomBackground = useCallback(async (): Promise<SaveThemeResult> => {
+    if (!currentUser?.uid) {
+      return { success: false, error: 'Please sign in first.' };
+    }
+    const nowIso = new Date().toISOString();
+    pendingCustomBgSaveRef.current = {
+      updatedAt: nowIso,
+      bg: null,
+      inFlight: true,
+      savedAt: Date.now()
+    };
+
+    setFailedCustomBgUrl(null);
+    setCustomBackgroundState(null);
+    try {
+      localStorage.setItem(
+        `wavelink_custom_bg_${currentUser.uid}`,
+        JSON.stringify({ customBackground: null, customBackgroundHistory })
+      );
+    } catch {
+      // ignore storage errors
+    }
+
+    setIsSavingCustomBg(true);
+    try {
+      await updateUserProfile({ customBackground: null });
+      if (pendingCustomBgSaveRef.current?.updatedAt === nowIso) {
+        pendingCustomBgSaveRef.current.inFlight = false;
+        pendingCustomBgSaveRef.current.savedAt = Date.now();
+      }
+      return { success: true };
+    } catch (err: any) {
+      const msg = err instanceof Error ? err.message : 'Could not remove custom background.';
+      if (pendingCustomBgSaveRef.current?.updatedAt === nowIso) {
+        pendingCustomBgSaveRef.current = null;
+      }
+      return { success: false, error: msg };
+    } finally {
+      setIsSavingCustomBg(false);
+    }
+  }, [currentUser?.uid, customBackgroundHistory, updateUserProfile]);
+
+  const reportCustomBgLoadError = useCallback((failedUrl: string) => {
+    setFailedCustomBgUrl(failedUrl);
+  }, []);
+
+  const clearCustomBgLoadError = useCallback(() => {
+    setFailedCustomBgUrl(null);
+  }, []);
+
   return (
     <ThemeContext.Provider
       value={{
-        theme: isDarkTheme ? 'dark' : 'light',
+        theme: effectiveDarkMode ? 'dark' : 'light',
         appearanceTheme,
         previewTheme,
         activeTheme,
@@ -483,6 +777,19 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         isLiteMode: isBatterySaver,
         setLiteMode: setBatterySaver,
         toggleLiteMode: toggleBatterySaver,
+        customBackground,
+        customBackgroundHistory,
+        activeCustomBackground: isCustomBackgroundActive ? customBackground : null,
+        isCustomBackgroundActive,
+        customBgContrast,
+        isDataSaverBlockingCustomBg,
+        customBgLoadFailed,
+        isSavingCustomBg,
+        saveCustomBackground,
+        selectCustomBackgroundFromHistory,
+        removeCustomBackground,
+        reportCustomBgLoadError,
+        clearCustomBgLoadError,
       }}
     >
       {children}

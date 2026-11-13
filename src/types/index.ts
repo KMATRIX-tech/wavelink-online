@@ -39,6 +39,27 @@ export interface ChatThemePreference {
   updatedAt?: string;
 }
 
+export interface CustomAppBackground {
+  url: string; // Desktop 16:9 or primary Cloudinary HTTPS URL (< 500 chars)
+  mobileUrl?: string; // Phone 9:16 Cloudinary HTTPS URL (< 500 chars)
+  darken: number; // 0 to 70 percentage darkening scrim
+  blur: number; // 0 to 12 px blur radius
+  textMode: 'light' | 'dark'; // 'light' = dark ink on light backdrop; 'dark' = light text on dark backdrop
+  avgLuminance?: number; // 0 to 100 average luminance of cropped photo
+  updatedAt?: string;
+}
+
+export interface CustomBackgroundHistoryItem {
+  id: string;
+  url: string;
+  mobileUrl?: string;
+  darken: number;
+  blur: number;
+  textMode: 'light' | 'dark';
+  avgLuminance?: number;
+  createdAt: string;
+}
+
 export interface SharedChatThemeSuggestion {
   themeId: ChatThemeId;
   accentColor?: string;
@@ -124,11 +145,14 @@ export interface UserNotificationSettings {
   messages: boolean;
   calls: boolean;
   followers: boolean;
+  likesAndComments?: boolean;
   reactions: boolean;
   replies?: boolean;
+  followedPosts?: boolean;
   challenges?: boolean;
   announcements: boolean;
   payments?: boolean;
+  soundAndVibration?: boolean;
   showMessagePreviews: boolean;
   quietHoursEnabled: boolean;
   quietHoursStart: string; // HH:mm in 24h format, e.g. "22:00"
@@ -137,10 +161,21 @@ export interface UserNotificationSettings {
   updatedAt?: string;
 }
 
+export interface FcmTokenEntry {
+  token: string;
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  createdAt: string;
+  lastUsedAt: string;
+}
+
 export interface FcmDeviceTokenDoc {
   id: string;
   token: string;
   userId: string;
+  deviceId?: string;
+  deviceName?: string;
   platform: string;
   userAgent: string;
   isIOS?: boolean;
@@ -163,8 +198,12 @@ export interface UserProfile {
   followingIds?: string[];
   blockedUserIds?: string[];
   closeFriendIds?: string[];
+  mutedChannelIds?: string[];
+  fcmTokens?: FcmTokenEntry[];
   appearanceTheme?: AppearanceTheme;
   chatThemes?: Record<string, ChatThemePreference>;
+  customBackground?: CustomAppBackground | null;
+  customBackgroundHistory?: CustomBackgroundHistoryItem[];
   privacySettings?: UserPrivacySettings;
   notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;

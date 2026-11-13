@@ -249,18 +249,22 @@ async function cropAndCompressCoverImage(
     throw new Error('Failed to compress cover image.');
   }
 
-  // If still > 300 KB at low quality, downscale slightly via compressProfileImageToBlob
-  if (finalBlob.size > 400 * 1024) {
+  // Guarantee cover is strictly under 500 KB before uploading to Cloudinary
+  if (finalBlob.size >= 450 * 1024) {
     try {
       finalBlob = await compressProfileImageToBlob(finalBlob, {
-        maxWidth: 1600,
-        maxHeight: 534,
-        targetMaxBytes: TARGET_BYTES,
+        maxWidth: 1400,
+        maxHeight: 467,
+        targetMaxBytes: 420 * 1024,
         mimeType: 'image/jpeg'
       });
     } catch {
-      // Keep finalBlob as long as it's under 5 MB
+      // Check strict limit below
     }
+  }
+
+  if (finalBlob.size >= 500 * 1024) {
+    throw new Error('Compressed cover image is still 500 KB or larger. Please choose a smaller image.');
   }
 
   const previewDataUrl = canvas.toDataURL('image/jpeg', Math.max(0.5, quality));

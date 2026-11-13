@@ -1,12 +1,13 @@
 {
-  "name": "WaveLink - Connect, Share, and Discover",
+  "id": "/",
+  "name": "WaveLink",
   "short_name": "WaveLink",
-  "description": "Modern social network with real-time feed, video reels, voice & video calling, creator tipping, and push notifications.",
+  "description": "Real-time social network with messaging, voice & video calls, feed moments, and push notifications.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#F8FAFC",
-  "theme_color": "#3B82F6",
+  "theme_color": "#2563EB",
   "orientation": "portrait-primary",
   "gcm_sender_id": "103953800507",
   "categories": ["social", "entertainment", "communication"],
@@ -24,7 +25,7 @@
       "purpose": "any"
     },
     {
-      "src": "/pwa-512x512.png",
+      "src": "/pwa-maskable-512x512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

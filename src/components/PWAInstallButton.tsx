@@ -44,10 +44,10 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ variant = 's
             </div>
             <div className="text-left">
               <div className="leading-tight font-extrabold text-slate-900">
-                {isIOS ? 'Add to iPhone Home' : 'Install WaveLink App'}
+                Install WaveLink
               </div>
               <div className="text-[10px] text-slate-500 font-normal">
-                {isIOS ? 'Unlock full screen & push alerts' : 'Fast home screen access'}
+                {isIOS ? 'Share → Add to Home Screen' : 'Fast home screen access & alerts'}
               </div>
             </div>
           </div>
@@ -60,10 +60,10 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ variant = 's
           type="button"
           onClick={handleInstallClick}
           className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 text-xs font-bold transition"
-          title="Add WaveLink to Home Screen"
+          title="Install WaveLink"
         >
           <Download size={14} />
-          <span className="hidden sm:inline">{isIOS ? 'Add to iPhone' : 'Install App'}</span>
+          <span className="hidden sm:inline">Install WaveLink</span>
         </button>
       )}
 

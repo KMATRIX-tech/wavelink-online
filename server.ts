@@ -5365,12 +5365,141 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     return res.json({ success: true, settings: merged });
   });
 
+  // Test push notification for the signed-in user's own registered devices
+  app.post('/api/notifications/send-test', async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdTokenHeader(req);
+      if (!authUser?.uid) {
+        return res.status(401).json({ sent: false, error: 'Sign in required to send a test notification.' });
+      }
+      const userId = authUser.uid;
+      const adminDb = getServerFirestore();
+
+      const tokenEntries = new Map<string, string>(); // token -> subcollectionDocId (if any)
+      const memMap = userFcmTokensStore.get(userId);
+      if (memMap) {
+        for (const [tId, entry] of memMap.entries()) {
+          if (entry.token && !entry.token.startsWith('fcm_web_')) {
+            tokenEntries.set(entry.token, tId);
+          }
+        }
+      }
+
+      let userData: Record<string, any> | null = null;
+      if (adminDb) {
+        try {
+          const userSnap = await adminDb.doc(`users/${userId}`).get();
+          userData = userSnap.exists ? (userSnap.data() as Record<string, any>) : null;
+          if (userData && Array.isArray(userData.fcmTokens)) {
+            for (const item of userData.fcmTokens) {
+              const tok = item && typeof item.token === 'string' ? item.token.trim() : '';
+              if (tok && !tok.startsWith('fcm_web_')) {
+                if (!tokenEntries.has(tok)) tokenEntries.set(tok, '');
+              }
+            }
+          }
+          const tokSnap = await adminDb.collection(`users/${userId}/fcmTokens`).get();
+          tokSnap.forEach((d) => {
+            const dData = d.data();
+            const tok = dData && typeof dData.token === 'string' ? dData.token.trim() : '';
+            if (tok && !tok.startsWith('fcm_web_')) {
+              tokenEntries.set(tok, d.id);
+            }
+          });
+        } catch (readErr: any) {
+          console.warn('[WaveLink Test Push Read Notice]:', readErr?.message || readErr);
+        }
+      }
+
+      const tokens = Array.from(tokenEntries.keys());
+      if (tokens.length === 0) {
+        return res.json({ sent: false, reason: 'no_tokens', totalTokens: 0, successCount: 0 });
+      }
+      if (!getAdminApps().length) {
+        return res.status(503).json({
+          sent: false,
+          error: 'Firebase Admin SDK credentials are not initialized on this server.'
+        });
+      }
+
+      const multicastResult = await getAdminMessaging(getAdminApp()).sendEachForMulticast({
+        tokens,
+        data: {
+          type: 'test',
+          title: 'WaveLink Test Notification',
+          body: 'Real background push notifications are working on this device.',
+          icon: '/pwa-192x192.png',
+          url: '/?tab=settings',
+          entityId: 'test'
+        },
+        webpush: {
+          headers: { Urgency: 'high', TTL: '300' },
+          fcmOptions: { link: '/?tab=settings' }
+        }
+      });
+
+      const invalidTokens: string[] = [];
+      multicastResult.responses.forEach((resp, idx) => {
+        if (!resp.success && resp.error) {
+          const code = resp.error.code || '';
+          if (
+            code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token' ||
+            code === 'messaging/invalid-argument'
+          ) {
+            const badTok = tokens[idx];
+            if (badTok) invalidTokens.push(badTok);
+          }
+        }
+      });
+
+      if (invalidTokens.length > 0) {
+        const invalidSet = new Set(invalidTokens);
+        for (const badTok of invalidTokens) {
+          const docId = tokenEntries.get(badTok);
+          if (docId) {
+            userFcmTokensStore.get(userId)?.delete(docId);
+            if (adminDb) {
+              adminDb.doc(`users/${userId}/fcmTokens/${docId}`).delete().catch(() => {});
+            }
+          }
+        }
+        if (adminDb && userData && Array.isArray(userData.fcmTokens)) {
+          const remaining = userData.fcmTokens.filter(
+            (item: any) => item && typeof item.token === 'string' && !invalidSet.has(item.token.trim())
+          );
+          await adminDb.doc(`users/${userId}`).update({ fcmTokens: remaining }).catch(() => {});
+        }
+      }
+
+      return res.json({
+        sent: multicastResult.successCount > 0,
+        successCount: multicastResult.successCount,
+        totalTokens: tokens.length,
+        invalidRemovedCount: invalidTokens.length
+      });
+    } catch (err: any) {
+      console.error('[WaveLink Test Push Error]:', err?.message || err);
+      return res.status(500).json({ sent: false, error: 'Could not dispatch test push notification.' });
+    }
+  });
+
   // Server-only push notification dispatch using Firebase Admin SDK
   app.post('/api/notifications/send-push', async (req, res) => {
     try {
       const authUser = await verifyFirebaseIdTokenHeader(req);
       if (!authUser?.uid) {
         return res.status(401).json({ error: 'Authentication required to trigger push notifications' });
+      }
+
+      // Cross-user push notifications are sent strictly by Firebase Cloud Functions triggers.
+      const requestedRecipient = String(req.body?.recipientId || '').trim();
+      if (requestedRecipient && requestedRecipient !== authUser.uid) {
+        return res.status(403).json({
+          sent: false,
+          skippedReason: 'cloud_functions_only',
+          error: 'Cross-user notifications are handled exclusively by Firebase Cloud Functions.'
+        });
       }
 
       // Server-side rate limit on push dispatches per actor
@@ -5388,7 +5517,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         rateEntry.count += 1;
       }
 
-      const recipientId = String(req.body?.recipientId || '').trim();
+      const recipientId = requestedRecipient;
       const actorId = String(req.body?.actorId || authUser.uid).trim();
       const actorName = String(req.body?.actorName || 'WaveLink Member').trim();
       const type = String(req.body?.type || 'system').trim();
@@ -5673,8 +5802,38 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
   });
 
   // ============================================================================
-  // 5. VITE MIDDLEWARE (DEV) OR STATIC DIST SERVING WITH SPA FALLBACK (PROD)
+  // 5. PWA SERVICE WORKER & MANIFEST HEADERS + VITE / STATIC DIST FALLBACK
   // ============================================================================
+  const resolvePublicOrDistAsset = (filename: string): string | null => {
+    const distFile = path.join(__dirname, 'dist', filename);
+    if (process.env.NODE_ENV === 'production' && fs.existsSync(distFile)) {
+      return distFile;
+    }
+    const pubFile = path.join(__dirname, 'public', filename);
+    if (fs.existsSync(pubFile)) {
+      return pubFile;
+    }
+    return fs.existsSync(distFile) ? distFile : null;
+  };
+
+  app.get(['/firebase-messaging-sw.js', '/sw.js'], (req, res, next) => {
+    const fileName = req.path === '/sw.js' ? 'sw.js' : 'firebase-messaging-sw.js';
+    const filePath = resolvePublicOrDistAsset(fileName);
+    if (!filePath) return next();
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Service-Worker-Allowed', '/');
+    return res.sendFile(filePath);
+  });
+
+  app.get('/manifest.json', (_req, res, next) => {
+    const filePath = resolvePublicOrDistAsset('manifest.json');
+    if (!filePath) return next();
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.sendFile(filePath);
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

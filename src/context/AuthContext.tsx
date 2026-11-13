@@ -28,8 +28,11 @@ import {
   getFriendlyAuthErrorMessage,
   getAuthHeaders,
   getClientDeviceId,
-  setCachedUserProfile
+  setCachedUserProfile,
+  sanitizeAvatarUrlForFirestore,
+  sanitizeShortHttpsUrl
 } from '../firebase';
+import { migrateDataUrlImageToCloudinary } from '../utils/mediaStorage';
 import {
   UserProfile,
   PointTransaction,
@@ -48,7 +51,9 @@ import {
   AppLanguage,
   ProfileCoverPresetId,
   ProfileCoverType,
-  StoryHighlightItem
+  StoryHighlightItem,
+  CustomAppBackground,
+  CustomBackgroundHistoryItem
 } from '../types';
 import {
   removeCurrentDeviceFcmToken,
@@ -65,6 +70,7 @@ import {
 } from '../utils/security';
 
 export const DAILY_REWARD_SCHEDULE = [10, 15, 20, 25, 30, 40, 50];
+const migratedMediaProfileUids = new Set<string>();
 
 export function getLocalDateKey(date: Date = new Date()): string {
   const year = date.getFullYear();
@@ -340,6 +346,9 @@ interface AuthContextType {
     pinnedPostId?: string;
     storyHighlights?: StoryHighlightItem[];
     chatThemes?: Record<string, ChatThemePreference>;
+    customBackground?: CustomAppBackground | null;
+    customBackgroundHistory?: CustomBackgroundHistoryItem[];
+    mutedChannelIds?: string[];
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
   toggleBlockUser: (targetUserId: string) => Promise<boolean>;
@@ -699,7 +708,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           email: cleanUserEmail,
           username: isOwnerEmail ? '@keylan' : customUsername || `@${emailPrefix}`,
           displayName: isOwnerEmail ? 'Keylan' : customName || user.displayName || emailPrefix || 'Waver',
-          photoURL: user.photoURL || `https://api.dicebear.com/7.x/shapes/svg?seed=${user.uid}`,
+          photoURL: sanitizeAvatarUrlForFirestore(user.photoURL, user.uid),
           bio: isInitialAdmin ? 'Platform Owner & Founder of WaveLink 🌊' : 'Connecting on WaveLink 🌊',
           status: 'active',
           isBanned: false,
@@ -795,12 +804,201 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           showGlobalToast(`🎁 Daily Login Bonus: +${pointsAwarded} WavePoints! (${rewardFields.loginStreak}-Day Streak 🔥)`);
         }
 
+        // One-time migration for any legacy data:image/* or blob: media still stored in /users/{uid}
+        migrateLegacyProfileMediaIfNeeded(user, mergedProfile).catch(() => {});
+
         // Passively sync existing notification settings & token state (never prompts on load)
         syncExistingDeviceTokenState(user.uid, data.notificationSettings).catch(() => {});
       }
     } catch (err) {
       console.warn('Profile sync notice:', err);
     }
+  };
+
+  const migrateLegacyProfileMediaIfNeeded = async (user: FirebaseUser, profile: UserProfile) => {
+    const uid = user.uid;
+    if (!uid || migratedMediaProfileUids.has(uid)) return;
+
+    const isLegacyDataImage = (val: unknown): boolean =>
+      typeof val === 'string' && val.trim().startsWith('data:image/');
+    const isStaleBlobOrBadUrl = (val: unknown): boolean =>
+      typeof val === 'string' &&
+      val.trim().length > 0 &&
+      (val.trim().startsWith('blob:') || (!val.trim().startsWith('https://') && !val.trim().startsWith('data:image/')));
+
+    const hasLegacyPhoto =
+      isLegacyDataImage(profile.photoURL) ||
+      isStaleBlobOrBadUrl(profile.photoURL) ||
+      (typeof profile.photoURL === 'string' && profile.photoURL.trim().length >= 500);
+    const hasLegacyCover =
+      isLegacyDataImage(profile.coverImageUrl) || isStaleBlobOrBadUrl(profile.coverImageUrl);
+    const hasLegacyChatThemes = Boolean(
+      profile.chatThemes &&
+        typeof profile.chatThemes === 'object' &&
+        Object.values(profile.chatThemes).some(
+          (pref) => pref?.customBgUrl && (isLegacyDataImage(pref.customBgUrl) || isStaleBlobOrBadUrl(pref.customBgUrl))
+        )
+    );
+    const hasLegacyHighlights = Boolean(
+      Array.isArray(profile.storyHighlights) &&
+        profile.storyHighlights.some(
+          (hl) =>
+            isLegacyDataImage(hl?.coverUrl) ||
+            isStaleBlobOrBadUrl(hl?.coverUrl) ||
+            isLegacyDataImage(hl?.mediaUrl) ||
+            isStaleBlobOrBadUrl(hl?.mediaUrl)
+        )
+    );
+
+    if (!hasLegacyPhoto && !hasLegacyCover && !hasLegacyChatThemes && !hasLegacyHighlights) {
+      migratedMediaProfileUids.add(uid);
+      return;
+    }
+
+    migratedMediaProfileUids.add(uid);
+    const patch: Record<string, any> = {};
+
+    if (hasLegacyPhoto) {
+      if (typeof profile.photoURL === 'string' && isLegacyDataImage(profile.photoURL)) {
+        try {
+          const uploadedUrl = await migrateDataUrlImageToCloudinary(profile.photoURL, {
+            maxWidth: 512,
+            maxHeight: 512,
+            targetMaxBytes: 240 * 1024
+          });
+          patch.photoURL = sanitizeAvatarUrlForFirestore(uploadedUrl, uid);
+        } catch {
+          // Leave untouched if offline; retry next session
+          migratedMediaProfileUids.delete(uid);
+        }
+      } else {
+        patch.photoURL = sanitizeAvatarUrlForFirestore('', uid);
+      }
+    }
+
+    if (hasLegacyCover) {
+      if (typeof profile.coverImageUrl === 'string' && isLegacyDataImage(profile.coverImageUrl)) {
+        try {
+          const uploadedCover = await migrateDataUrlImageToCloudinary(profile.coverImageUrl, {
+            maxWidth: 1600,
+            maxHeight: 534,
+            targetMaxBytes: 420 * 1024
+          });
+          patch.coverImageUrl = sanitizeShortHttpsUrl(uploadedCover, 500) || '';
+        } catch {
+          migratedMediaProfileUids.delete(uid);
+        }
+      } else {
+        patch.coverImageUrl = '';
+      }
+    }
+
+    if (hasLegacyChatThemes && profile.chatThemes) {
+      const nextThemes: Record<string, ChatThemePreference> = { ...profile.chatThemes };
+      let changedThemes = false;
+      for (const [convId, pref] of Object.entries(profile.chatThemes)) {
+        if (!pref?.customBgUrl) continue;
+        if (isLegacyDataImage(pref.customBgUrl)) {
+          try {
+            const uploadedThemeUrl = await migrateDataUrlImageToCloudinary(pref.customBgUrl, {
+              maxWidth: 1080,
+              maxHeight: 1440,
+              targetMaxBytes: 380 * 1024
+            });
+            const cleanUrl = sanitizeShortHttpsUrl(uploadedThemeUrl, 500);
+            if (cleanUrl) {
+              nextThemes[convId] = { ...pref, customBgUrl: cleanUrl };
+              changedThemes = true;
+            }
+          } catch {
+            migratedMediaProfileUids.delete(uid);
+          }
+        } else if (isStaleBlobOrBadUrl(pref.customBgUrl)) {
+          const { customBgUrl: _dropped, ...rest } = pref;
+          nextThemes[convId] = rest;
+          changedThemes = true;
+        }
+      }
+      if (changedThemes) {
+        patch.chatThemes = nextThemes;
+      }
+    }
+
+    if (hasLegacyHighlights && Array.isArray(profile.storyHighlights)) {
+      let changedHl = false;
+      const nextHighlights = await Promise.all(
+        profile.storyHighlights.map(async (hl) => {
+          let nextCover = hl.coverUrl;
+          let nextMedia = hl.mediaUrl;
+          if (isLegacyDataImage(nextCover)) {
+            try {
+              nextCover =
+                sanitizeShortHttpsUrl(
+                  await migrateDataUrlImageToCloudinary(nextCover, {
+                    maxWidth: 720,
+                    maxHeight: 1280,
+                    targetMaxBytes: 350 * 1024
+                  }),
+                  500
+                ) || nextCover;
+              changedHl = true;
+            } catch {
+              migratedMediaProfileUids.delete(uid);
+            }
+          } else if (isStaleBlobOrBadUrl(nextCover)) {
+            nextCover = sanitizeAvatarUrlForFirestore('', uid);
+            changedHl = true;
+          }
+
+          if (typeof nextMedia === 'string' && isLegacyDataImage(nextMedia)) {
+            if (nextMedia === hl.coverUrl && nextCover && nextCover.startsWith('https://')) {
+              nextMedia = nextCover;
+              changedHl = true;
+            } else {
+              try {
+                nextMedia =
+                  sanitizeShortHttpsUrl(
+                    await migrateDataUrlImageToCloudinary(nextMedia, {
+                      maxWidth: 720,
+                      maxHeight: 1280,
+                      targetMaxBytes: 350 * 1024
+                    }),
+                    500
+                  ) || nextMedia;
+                changedHl = true;
+              } catch {
+                migratedMediaProfileUids.delete(uid);
+              }
+            }
+          } else if (isStaleBlobOrBadUrl(nextMedia)) {
+            nextMedia = nextCover && nextCover.startsWith('https://') ? nextCover : sanitizeAvatarUrlForFirestore('', uid);
+            changedHl = true;
+          }
+
+          return { ...hl, coverUrl: nextCover, mediaUrl: nextMedia };
+        })
+      );
+      if (changedHl) {
+        patch.storyHighlights = nextHighlights;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) return;
+
+    patch.updatedAt = new Date().toISOString();
+    const sanitizedPatch = cleanFirestoreData(patch);
+    await setDoc(doc(db, 'users', uid), sanitizedPatch, { merge: true });
+
+    if (typeof patch.photoURL === 'string') {
+      await fbUpdateProfile(user, { photoURL: patch.photoURL }).catch(() => {});
+    }
+
+    setUserProfile((prev) => {
+      if (!prev) return prev;
+      const updated = { ...prev, ...sanitizedPatch } as UserProfile;
+      setCachedUserProfile(uid, updated);
+      return updated;
+    });
   };
 
   const claimDailyReward = async (): Promise<{
@@ -1389,6 +1587,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     pinnedPostId?: string;
     storyHighlights?: StoryHighlightItem[];
     chatThemes?: Record<string, ChatThemePreference>;
+    customBackground?: CustomAppBackground | null;
+    customBackgroundHistory?: CustomBackgroundHistoryItem[];
+    mutedChannelIds?: string[];
   }) => {
     if (!currentUser) return;
     try {
@@ -1406,7 +1607,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (data.displayName !== undefined) updatePayload.displayName = sanitizeUserText(data.displayName, 80);
       if (formattedUsername !== undefined) updatePayload.username = sanitizeUserText(formattedUsername, 40);
       if (data.bio !== undefined) updatePayload.bio = sanitizeUserText(data.bio, 280);
-      if (data.photoURL !== undefined) updatePayload.photoURL = data.photoURL;
+      if (data.photoURL !== undefined) {
+        let nextPhotoUrl = String(data.photoURL || '').trim();
+        if (nextPhotoUrl.startsWith('data:image/')) {
+          nextPhotoUrl = await migrateDataUrlImageToCloudinary(nextPhotoUrl, {
+            maxWidth: 512,
+            maxHeight: 512,
+            targetMaxBytes: 240 * 1024
+          });
+        }
+        updatePayload.photoURL = sanitizeAvatarUrlForFirestore(nextPhotoUrl, currentUser.uid);
+      }
       if (data.proBorderEffect !== undefined) updatePayload.proBorderEffect = data.proBorderEffect;
       if (data.proAccentColor !== undefined) updatePayload.proAccentColor = data.proAccentColor;
       if (data.proBadge !== undefined) updatePayload.proBadge = data.proBadge;
@@ -1420,6 +1631,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (data.notificationSettings !== undefined) {
         updatePayload.notificationSettings = data.notificationSettings;
         syncNotificationSettingsToServer(currentUser.uid, data.notificationSettings).catch(() => {});
+      }
+      if (data.mutedChannelIds !== undefined && Array.isArray(data.mutedChannelIds)) {
+        updatePayload.mutedChannelIds = data.mutedChannelIds
+          .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          .slice(0, 200);
       }
       if (data.termsAgreement !== undefined) {
         updatePayload.termsAgreement = data.termsAgreement;
@@ -1470,13 +1686,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         updatePayload.spotlightNote = sanitizeUserText(data.spotlightNote, 200);
       }
       if (data.coverImageUrl !== undefined) {
-        const cleanCoverUrl = String(data.coverImageUrl || '').trim().slice(0, 2048);
+        let cleanCoverUrl = String(data.coverImageUrl || '').trim();
+        if (cleanCoverUrl.startsWith('data:image/')) {
+          cleanCoverUrl = await migrateDataUrlImageToCloudinary(cleanCoverUrl, {
+            maxWidth: 1600,
+            maxHeight: 534,
+            targetMaxBytes: 420 * 1024
+          });
+        }
         updatePayload.coverImageUrl =
-          cleanCoverUrl === '' ||
-          cleanCoverUrl.startsWith('https://') ||
-          cleanCoverUrl.startsWith('http://')
-            ? cleanCoverUrl
-            : '';
+          cleanCoverUrl === '' ? '' : sanitizeShortHttpsUrl(cleanCoverUrl, 500) || '';
       }
       if (data.coverPresetId !== undefined) {
         updatePayload.coverPresetId = data.coverPresetId;
@@ -1488,14 +1707,102 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         updatePayload.pinnedPostId = sanitizeUserText(data.pinnedPostId, 160);
       }
       if (data.storyHighlights !== undefined && Array.isArray(data.storyHighlights)) {
-        updatePayload.storyHighlights = data.storyHighlights.slice(0, 20);
+        updatePayload.storyHighlights = await Promise.all(
+          data.storyHighlights.slice(0, 20).map(async (hl) => {
+            let coverUrl = String(hl.coverUrl || '').trim();
+            let mediaUrl = String(hl.mediaUrl || '').trim();
+            if (coverUrl.startsWith('data:image/')) {
+              coverUrl = await migrateDataUrlImageToCloudinary(coverUrl, {
+                maxWidth: 720,
+                maxHeight: 1280,
+                targetMaxBytes: 350 * 1024
+              });
+            }
+            if (mediaUrl.startsWith('data:image/')) {
+              mediaUrl =
+                mediaUrl === hl.coverUrl && coverUrl.startsWith('https://')
+                  ? coverUrl
+                  : await migrateDataUrlImageToCloudinary(mediaUrl, {
+                      maxWidth: 720,
+                      maxHeight: 1280,
+                      targetMaxBytes: 350 * 1024
+                    });
+            }
+            return {
+              ...hl,
+              coverUrl: sanitizeAvatarUrlForFirestore(coverUrl, currentUser.uid),
+              mediaUrl: sanitizeAvatarUrlForFirestore(mediaUrl || coverUrl, currentUser.uid)
+            };
+          })
+        );
       }
       if (data.chatThemes !== undefined && data.chatThemes && typeof data.chatThemes === 'object') {
-        updatePayload.chatThemes = data.chatThemes;
+        const cleanedThemes: Record<string, ChatThemePreference> = {};
+        for (const [convId, pref] of Object.entries(data.chatThemes)) {
+          if (!pref || typeof pref !== 'object') continue;
+          let customBgUrl = typeof pref.customBgUrl === 'string' ? pref.customBgUrl.trim() : undefined;
+          if (customBgUrl && customBgUrl.startsWith('data:image/')) {
+            customBgUrl = await migrateDataUrlImageToCloudinary(customBgUrl, {
+              maxWidth: 1080,
+              maxHeight: 1440,
+              targetMaxBytes: 380 * 1024
+            });
+          }
+          const validCustomBgUrl = customBgUrl ? sanitizeShortHttpsUrl(customBgUrl, 500) : null;
+          const { customBgUrl: _ignored, ...rest } = pref;
+          cleanedThemes[convId] = validCustomBgUrl ? { ...rest, customBgUrl: validCustomBgUrl } : rest;
+        }
+        updatePayload.chatThemes = cleanedThemes;
+      }
+      if (data.customBackground !== undefined) {
+        if (data.customBackground === null) {
+          updatePayload.customBackground = null;
+        } else if (typeof data.customBackground === 'object') {
+          const safeDesktopUrl = sanitizeShortHttpsUrl(data.customBackground.url, 500);
+          const safeMobileUrl = data.customBackground.mobileUrl
+            ? sanitizeShortHttpsUrl(data.customBackground.mobileUrl, 500)
+            : undefined;
+          if (!safeDesktopUrl) {
+            throw new Error('Custom background URL must be a valid short HTTPS Cloudinary link.');
+          }
+          updatePayload.customBackground = {
+            url: safeDesktopUrl,
+            ...(safeMobileUrl ? { mobileUrl: safeMobileUrl } : {}),
+            darken: Math.max(0, Math.min(70, Math.round(Number(data.customBackground.darken) || 0))),
+            blur: Math.max(0, Math.min(12, Math.round(Number(data.customBackground.blur) || 0))),
+            textMode: data.customBackground.textMode === 'light' ? 'light' : 'dark',
+            ...(typeof data.customBackground.avgLuminance === 'number'
+              ? { avgLuminance: Math.max(0, Math.min(100, Math.round(data.customBackground.avgLuminance))) }
+              : {}),
+            updatedAt: data.customBackground.updatedAt || new Date().toISOString()
+          };
+        }
+      }
+      if (data.customBackgroundHistory !== undefined && Array.isArray(data.customBackgroundHistory)) {
+        updatePayload.customBackgroundHistory = data.customBackgroundHistory
+          .slice(0, 5)
+          .map((item) => {
+            const safeUrl = sanitizeShortHttpsUrl(item?.url, 500);
+            if (!safeUrl) return null;
+            const safeMobile = item?.mobileUrl ? sanitizeShortHttpsUrl(item.mobileUrl, 500) : undefined;
+            return {
+              id: sanitizeUserText(item.id || `bg_${Date.now()}`, 64),
+              url: safeUrl,
+              ...(safeMobile ? { mobileUrl: safeMobile } : {}),
+              darken: Math.max(0, Math.min(70, Math.round(Number(item.darken) || 0))),
+              blur: Math.max(0, Math.min(12, Math.round(Number(item.blur) || 0))),
+              textMode: item.textMode === 'light' ? 'light' : 'dark',
+              ...(typeof item.avgLuminance === 'number'
+                ? { avgLuminance: Math.max(0, Math.min(100, Math.round(item.avgLuminance))) }
+                : {}),
+              createdAt: item.createdAt || new Date().toISOString()
+            };
+          })
+          .filter(Boolean);
       }
 
       const sanitized = cleanFirestoreData(updatePayload);
-      if (data.chatThemes !== undefined) {
+      if (data.chatThemes !== undefined || data.customBackground !== undefined || data.customBackgroundHistory !== undefined) {
         try {
           await updateDoc(userRef, sanitized);
         } catch {
@@ -1505,10 +1812,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await setDoc(userRef, sanitized, { merge: true });
       }
 
-      if (data.displayName || data.photoURL) {
+      if (updatePayload.displayName || updatePayload.photoURL) {
         await fbUpdateProfile(currentUser, {
           displayName: updatePayload.displayName || currentUser.displayName,
-          photoURL: data.photoURL || currentUser.photoURL,
+          photoURL: updatePayload.photoURL || currentUser.photoURL,
         });
       }
 
@@ -1793,9 +2100,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // Verification status: verified by admin, has blue star, or verified badge
   const isVerified = Boolean(userProfile?.hasBlueStar || userProfile?.isVerifiedByAdmin || userProfile?.proBadge === 'verified');
+  const isProSubscriptionExpired = Boolean(
+    userProfile?.proExpiresAt &&
+      !isNaN(Date.parse(userProfile.proExpiresAt)) &&
+      Date.parse(userProfile.proExpiresAt) <= Date.now()
+  );
 
-  // Rule: All premium features do not apply to admins and those verified by admin or who unlocked pro (they get everything free)
-  const isProEffective = isSuperAdmin || isSubAdmin || isVerified || Boolean(userProfile?.isPro);
+  // Rule: All premium features do not apply to admins and those verified by admin or who unlocked active Pro
+  const isProEffective =
+    isSuperAdmin ||
+    isSubAdmin ||
+    Boolean(userProfile?.isVerifiedByAdmin) ||
+    ((isVerified || Boolean(userProfile?.isPro)) && !isProSubscriptionExpired);
   const isExemptFromPayments = isProEffective;
 
   // Only admins or verified people with the blue star can talk to the admin

@@ -81,6 +81,16 @@ export const HelpModal: React.FC<HelpModalProps> = ({
         language === 'sw'
           ? 'Gusa bendera ya nchi na herufi za lugha (kama 🇹🇿 SW) zilizo juu kulia mwa ukurasa ili kuchagua Kiswahili au Kiingereza papo hapo.'
           : 'Tap the country flag and language icon (like 🇹🇿 SW or 🇰🇪 EN) at the top right of the header to switch languages instantly.'
+    },
+    {
+      q:
+        language === 'sw'
+          ? 'Arifa za simu (Push Notifications) hufanyaje kazi kwenye simu?'
+          : 'How do push notifications & calls work when WaveLink is closed?',
+      a:
+        language === 'sw'
+          ? 'Washa arifa katika Mipangilio > Arifa. Kwenye iPhone, gusa Share kisha "Add to Home Screen" kwanza. Pia, programu ya wavuti haiwezi kuchukua skrini nzima simu ikiwa imefungwa—simu zinazoingia zitaonekana kama arifa yenye vitufe vya Answer na Decline.'
+          : 'Enable notifications in Settings > Alerts. On iPhone, tap Safari Share → Add to Home Screen first (iOS 16.4+) and open WaveLink from your Home Screen. Because WaveLink is a web app, incoming calls when your phone is locked appear as high-priority notifications with Answer and Decline buttons rather than taking over the full lock screen.'
     }
   ];
 

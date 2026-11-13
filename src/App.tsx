@@ -8,10 +8,18 @@ import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LanguageProvider, useLanguage } from './context/LanguageContext';
 import { PresenceProvider } from './context/PresenceContext';
-import { db, cleanFirestoreData, testConnection } from './firebase';
+import {
+  db,
+  cleanFirestoreData,
+  testConnection,
+  fetchUserProfileCached,
+  getCachedUserProfile,
+  sanitizeShortHttpsUrl
+} from './firebase';
 import { collection, query, where, limit, onSnapshot, updateDoc, setDoc, doc, getDoc, serverTimestamp } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
+import { getCloudinaryTinyPlaceholderUrl } from './utils/mediaStorage';
 import { ActiveTab, CallRecipient } from './types';
 import { AuthPage } from './components/AuthPage';
 import { TopHeader } from './components/TopHeader';
@@ -44,7 +52,12 @@ import { SimpleModeProvider } from './context/SimpleModeContext';
 import { FirstTimeTourModal } from './components/FirstTimeTourModal';
 import { HelpModal } from './components/HelpModal';
 import { CelebrationBanner } from './components/CelebrationBanner';
-import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles, Volume2, VolumeX, MessageSquare, Send, X } from 'lucide-react';
+import { PushNotificationPrompt } from './components/PushNotificationPrompt';
+import {
+  subscribeToForegroundPushMessages,
+  closeCallNotificationInSW
+} from './services/fcmService';
+import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles, Volume2, VolumeX, MessageSquare, Send, X, Bell } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 
 interface IncomingCallData {
@@ -59,6 +72,78 @@ interface IncomingCallData {
 
 interface AuthenticatedAppProps {
   currentUser: FirebaseUser;
+}
+
+const loadedCustomBgUrls = new Set<string>();
+
+function CustomAppBackgroundLayer({ hidden }: { hidden: boolean }) {
+  const { isCustomBackgroundActive, activeCustomBackground, reportCustomBgLoadError } = useTheme();
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return false;
+    }
+    return window.matchMedia('(max-width: 767px)').matches;
+  });
+  const [loadedUrl, setLoadedUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 767px)');
+    const syncViewport = () => setIsMobileViewport(mq.matches);
+    syncViewport();
+    mq.addEventListener?.('change', syncViewport);
+    return () => {
+      mq.removeEventListener?.('change', syncViewport);
+    };
+  }, []);
+
+  if (hidden || !isCustomBackgroundActive || !activeCustomBackground?.url) {
+    return null;
+  }
+
+  const resolvedUrl = isMobileViewport
+    ? activeCustomBackground.mobileUrl || activeCustomBackground.url
+    : activeCustomBackground.url;
+  const placeholderUrl = getCloudinaryTinyPlaceholderUrl(resolvedUrl);
+  const blurPx = Math.max(0, Math.min(12, Math.round(activeCustomBackground.blur ?? 0)));
+  const darkenOpacity = Math.max(0, Math.min(70, Math.round(activeCustomBackground.darken ?? 25))) / 100;
+  const isLoaded = loadedCustomBgUrls.has(resolvedUrl) || loadedUrl === resolvedUrl;
+
+  return (
+    <div className="wavelink-custom-bg-layer" aria-hidden="true">
+      {placeholderUrl && placeholderUrl !== resolvedUrl && (
+        <img
+          src={placeholderUrl}
+          alt=""
+          decoding="async"
+          className="wavelink-custom-bg-placeholder"
+        />
+      )}
+      <img
+        key={resolvedUrl}
+        src={resolvedUrl}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        onLoad={() => {
+          loadedCustomBgUrls.add(resolvedUrl);
+          setLoadedUrl(resolvedUrl);
+        }}
+        onError={() => {
+          reportCustomBgLoadError(resolvedUrl);
+        }}
+        className={`wavelink-custom-bg-img ${isLoaded ? 'wavelink-custom-bg-img--loaded' : ''}`}
+        style={{
+          filter: blurPx > 0 ? `blur(${blurPx}px)` : undefined,
+          transform: blurPx > 0 ? 'scale(1.06)' : undefined
+        }}
+      />
+      <div
+        className="wavelink-custom-bg-scrim"
+        style={{ backgroundColor: `rgba(2, 6, 23, ${darkenOpacity})` }}
+      />
+    </div>
+  );
 }
 
 function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
@@ -96,6 +181,15 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       return undefined;
     }
   });
+  const [targetChatChannelId, setTargetChatChannelId] = useState<string | undefined>(undefined);
+  const [focusedPostId, setFocusedPostId] = useState<string | null>(null);
+  const [foregroundBanner, setForegroundBanner] = useState<{
+    id: string;
+    title: string;
+    body: string;
+    icon?: string;
+    data?: Record<string, string>;
+  } | null>(null);
 
   const [incomingCall, setIncomingCall] = useState<IncomingCallData | null>(null);
   const [activeCall, setActiveCall] = useState<{
@@ -238,6 +332,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   };
 
   const handleStartChatWithUser = (userId: string) => {
+    setTargetChatChannelId(undefined);
     setTargetChatUserId(userId);
     try {
       localStorage.setItem('wavelink_last_chat_target', userId);
@@ -246,6 +341,50 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     }
     setActiveTab('chat');
   };
+
+  const navigateFromNotificationPayload = useCallback(
+    (payloadData?: Record<string, string>) => {
+      if (!payloadData) return;
+      const nType = payloadData.type || '';
+      const channelId = payloadData.channelId || (nType === 'message' ? payloadData.entityId : '');
+      const postId =
+        payloadData.postId ||
+        (nType === 'post_like' || nType === 'post_comment' || nType === 'followed_post'
+          ? payloadData.entityId
+          : '');
+      const actorId = payloadData.actorId || (nType === 'follow' ? payloadData.entityId : '');
+
+      if (nType === 'message' && channelId) {
+        setTargetChatChannelId(channelId);
+        setActiveTabState('chat');
+      } else if (nType === 'follow' && actorId) {
+        setViewedProfileUserId(actorId);
+        setActiveTabState('settings');
+      } else if (postId) {
+        setFocusedPostId(postId);
+        setActiveTabState('feed');
+      } else if (nType === 'missed_call' && actorId) {
+        setTargetChatUserId(actorId);
+        setActiveTabState('chat');
+      } else if (payloadData.url) {
+        try {
+          const parsed = new URL(payloadData.url, window.location.origin);
+          const tabParam = parsed.searchParams.get('tab') as ActiveTab | null;
+          const chParam = parsed.searchParams.get('channelId');
+          const uParam = parsed.searchParams.get('userId');
+          const pParam = parsed.searchParams.get('postId');
+          if (chParam) setTargetChatChannelId(chParam);
+          if (uParam && tabParam === 'chat') setTargetChatUserId(uParam);
+          if (uParam && tabParam === 'settings') setViewedProfileUserId(uParam);
+          if (pParam) setFocusedPostId(pParam);
+          if (tabParam) setActiveTabState(tabParam);
+        } catch {
+          // ignore invalid URL
+        }
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     testConnection().catch(() => {});
@@ -480,6 +619,45 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     return () => clearTimeout(timeout);
   }, [incomingCall?.callId, stopIncomingRingtone]);
 
+  // Resolve incoming caller's name & profile picture from their user profile (read once, cached in memory)
+  useEffect(() => {
+    const callerId = incomingCall?.callerId;
+    if (!callerId) return;
+    let active = true;
+    const cached = getCachedUserProfile(callerId);
+    if (cached) {
+      const safePhoto = sanitizeShortHttpsUrl(cached.photoURL) || undefined;
+      setIncomingCall((prev) =>
+        prev && prev.callerId === callerId
+          ? {
+              ...prev,
+              callerName: cached.displayName || prev.callerName,
+              callerPhotoURL: safePhoto
+            }
+          : prev
+      );
+      return;
+    }
+    fetchUserProfileCached(callerId)
+      .then((profile) => {
+        if (!active || !profile) return;
+        const safePhoto = sanitizeShortHttpsUrl(profile.photoURL) || undefined;
+        setIncomingCall((prev) =>
+          prev && prev.callerId === callerId
+            ? {
+                ...prev,
+                callerName: profile.displayName || prev.callerName,
+                callerPhotoURL: safePhoto
+              }
+            : prev
+        );
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [incomingCall?.callerId]);
+
   // Real-time Firestore listener for calls addressed to the logged-in user
   useEffect(() => {
     if (!currentUser?.uid) {
@@ -509,11 +687,13 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         ) {
           if (createdAtMs >= newestTime) {
             newestTime = createdAtMs;
+            const resolvedCallerId = String(data.callerId || data.caller || '');
+            const cachedCaller = resolvedCallerId ? getCachedUserProfile(resolvedCallerId) : null;
             newestRinging = {
               callId,
-              callerId: data.callerId || data.caller,
-              callerName: data.callerName || 'WaveLink Member',
-              callerPhotoURL: data.callerPhotoURL || undefined,
+              callerId: resolvedCallerId,
+              callerName: cachedCaller?.displayName || data.callerName || 'WaveLink Member',
+              callerPhotoURL: sanitizeShortHttpsUrl(cachedCaller?.photoURL) || undefined,
               callType: (data.type || data.callType) === 'voice' ? 'voice' : 'video',
               offer: data.offer || undefined,
               createdAt: data.createdAt
@@ -525,7 +705,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       if (newestRinging) {
         setIncomingCall((prev) => {
           if (prev && prev.callId === newestRinging!.callId) {
-            return { ...prev, offer: newestRinging!.offer || prev.offer };
+            return {
+              ...prev,
+              callerName: prev.callerName || newestRinging!.callerName,
+              callerPhotoURL: prev.callerPhotoURL || newestRinging!.callerPhotoURL,
+              offer: newestRinging!.offer || prev.offer
+            };
           }
           return newestRinging;
         });
@@ -545,6 +730,11 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       }
     };
 
+    const qByCalleeId = query(
+      collection(db, 'calls'),
+      where('calleeId', '==', currentUser.uid),
+      limit(30)
+    );
     const qByReceiverId = query(
       collection(db, 'calls'),
       where('receiverId', '==', currentUser.uid),
@@ -556,13 +746,14 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       limit(30)
     );
 
+    let docsByCalleeId: Array<{ id: string; data: () => any }> = [];
     let docsByReceiverId: Array<{ id: string; data: () => any }> = [];
     let docsByReceiver: Array<{ id: string; data: () => any }> = [];
 
     const mergeAndProcess = () => {
       const seen = new Set<string>();
       const combined: Array<{ id: string; data: () => any }> = [];
-      [...docsByReceiverId, ...docsByReceiver].forEach((d) => {
+      [...docsByCalleeId, ...docsByReceiverId, ...docsByReceiver].forEach((d) => {
         if (!seen.has(d.id)) {
           seen.add(d.id);
           combined.push(d);
@@ -570,6 +761,17 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       });
       processCallSnapshots(combined);
     };
+
+    const unsub0 = onSnapshot(
+      qByCalleeId,
+      (snapshot) => {
+        docsByCalleeId = snapshot.docs;
+        mergeAndProcess();
+      },
+      (err) => {
+        console.warn('Incoming calls (calleeId) listener notice:', err);
+      }
+    );
 
     const unsub1 = onSnapshot(
       qByReceiverId,
@@ -594,6 +796,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     );
 
     return () => {
+      unsub0();
       unsub1();
       unsub2();
     };
@@ -628,11 +831,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
             const callerId = data.fromUserId || data.senderId;
             if (data.signalType === 'offer' && callerId && !handledCallIdsRef.current.has(data.callId)) {
+              const cachedCaller = getCachedUserProfile(callerId);
               setIncomingCall((prev) => ({
                 callId: data.callId,
                 callerId,
-                callerName: data.fromName || data.senderName || prev?.callerName || 'WaveLink Member',
-                callerPhotoURL: data.fromPhotoURL || data.senderPhotoURL || prev?.callerPhotoURL,
+                callerName: cachedCaller?.displayName || data.fromName || data.senderName || prev?.callerName || 'WaveLink Member',
+                callerPhotoURL: sanitizeShortHttpsUrl(cachedCaller?.photoURL) || prev?.callerPhotoURL,
                 callType: data.callType || prev?.callType || 'video',
                 offer: data.signalData || data.sdp || prev?.offer
               }));
@@ -671,6 +875,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     if (!incomingCall) return;
     stopIncomingRingtone();
     const { callId, callerId, callerName, callerPhotoURL, callType, offer } = incomingCall;
+    closeCallNotificationInSW(callId).catch(() => {});
     const chosenMode =
       overrideMode || (callType === 'video' ? incomingAcceptMode : 'voice');
     handledCallIdsRef.current.add(callId);
@@ -694,6 +899,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     if (!incomingCall) return;
     stopIncomingRingtone();
     const { callId, callerId } = incomingCall;
+    closeCallNotificationInSW(callId).catch(() => {});
     handledCallIdsRef.current.add(callId);
     setIncomingCall(null);
 
@@ -807,6 +1013,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
       stopIncomingRingtone();
       handledCallIdsRef.current.add(callId);
+      closeCallNotificationInSW(callId).catch(() => {});
       setIncomingCall(null);
 
       if (action === 'decline') {
@@ -822,23 +1029,27 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         try {
           const callSnap = await getDoc(doc(db, 'calls', callId));
           const callData = callSnap.exists() ? callSnap.data() : null;
+          const resolvedCallerId = String(callData?.callerId || callData?.caller || callerId || '');
+          const callerProfile = resolvedCallerId ? await fetchUserProfileCached(resolvedCallerId) : null;
           setActiveCall({
             type: (callData?.type || callData?.callType || callType) === 'voice' ? 'voice' : 'video',
             recipient: {
-              id: callData?.callerId || callData?.caller || callerId || '',
-              name: callData?.callerName || callerName || 'WaveLink Member',
-              photoURL: callData?.callerPhotoURL
+              id: resolvedCallerId,
+              name: callerProfile?.displayName || callData?.callerName || callerName || 'WaveLink Member',
+              photoURL: sanitizeShortHttpsUrl(callerProfile?.photoURL) || undefined
             },
             isInitiator: false,
             callId,
             initialOffer: callData?.offer
           });
         } catch {
+          const cachedCaller = callerId ? getCachedUserProfile(callerId) : null;
           setActiveCall({
             type: callType === 'voice' ? 'voice' : 'video',
             recipient: {
               id: callerId || '',
-              name: callerName || 'WaveLink Member'
+              name: cachedCaller?.displayName || callerName || 'WaveLink Member',
+              photoURL: sanitizeShortHttpsUrl(cachedCaller?.photoURL) || undefined
             },
             isInitiator: false,
             callId
@@ -847,15 +1058,43 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       }
     };
 
-    // Check URL query params when opened from push notification action button
+    // Check URL query params when opened from any push notification (call, chat, profile, post)
     try {
       const params = new URLSearchParams(window.location.search);
       const urlCallAction = params.get('callAction');
       const urlCallId = params.get('callId') || undefined;
+      const urlCallerId = params.get('callerId') || undefined;
+      const urlCallType = (params.get('callType') as 'video' | 'voice' | null) || undefined;
+      const urlTab = params.get('tab') as ActiveTab | null;
+      const urlChannelId = params.get('channelId');
+      const urlUserId = params.get('userId');
+      const urlPostId = params.get('postId');
+
       if (urlCallAction === 'answer' || urlCallAction === 'decline') {
-        executeCallActionById(urlCallAction, urlCallId);
+        executeCallActionById(urlCallAction, urlCallId, urlCallerId, undefined, urlCallType);
         params.delete('callAction');
         params.delete('callId');
+        params.delete('callerId');
+        params.delete('callType');
+        const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}${window.location.hash}`;
+        window.history.replaceState({}, '', nextUrl);
+      } else if (urlTab || urlChannelId || urlUserId || urlPostId) {
+        if (urlChannelId) {
+          setTargetChatChannelId(urlChannelId);
+          setActiveTabState('chat');
+        } else if (urlUserId && urlTab === 'chat') {
+          setTargetChatUserId(urlUserId);
+          setActiveTabState('chat');
+        } else if (urlUserId && urlTab === 'settings') {
+          setViewedProfileUserId(urlUserId);
+          setActiveTabState('settings');
+        } else if (urlPostId) {
+          setFocusedPostId(urlPostId);
+          setActiveTabState('feed');
+        } else if (urlTab) {
+          setActiveTabState(urlTab);
+        }
+        ['tab', 'channelId', 'userId', 'postId'].forEach((k) => params.delete(k));
         const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}${window.location.hash}`;
         window.history.replaceState({}, '', nextUrl);
       }
@@ -868,6 +1107,11 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       if (data && data.type === 'WAVELINK_CALL_NOTIFICATION_ACTION') {
         const action = data.action === 'decline' ? 'decline' : 'answer';
         executeCallActionById(action, data.callId, data.callerId, data.callerName, data.callType);
+      } else if (data && data.type === 'WAVELINK_NOTIFICATION_CLICK') {
+        navigateFromNotificationPayload({
+          ...(data.data || {}),
+          ...(data.url ? { url: data.url } : {})
+        });
       }
     };
 
@@ -877,7 +1121,37 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         navigator.serviceWorker.removeEventListener('message', handleSwMessage);
       };
     }
-  }, [currentUser?.uid, incomingCall, stopIncomingRingtone]);
+  }, [currentUser?.uid, incomingCall, stopIncomingRingtone, navigateFromNotificationPayload]);
+
+  // Subscribe to foreground FCM pushes and render a clean in-app banner when the tab is open & visible
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    let dismissTimer: ReturnType<typeof setTimeout> | null = null;
+    const unsub = subscribeToForegroundPushMessages((payload) => {
+      const pType = payload.data?.type || '';
+      if (pType === 'incoming_call' || pType === 'call' || pType === 'call_dismiss') {
+        return;
+      }
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        const bannerId = `fg_${Date.now()}`;
+        setForegroundBanner({
+          id: bannerId,
+          title: payload.title,
+          body: payload.body,
+          icon: payload.icon,
+          data: payload.data
+        });
+        if (dismissTimer) clearTimeout(dismissTimer);
+        dismissTimer = setTimeout(() => {
+          setForegroundBanner((prev) => (prev?.id === bannerId ? null : prev));
+        }, 5500);
+      }
+    });
+    return () => {
+      if (dismissTimer) clearTimeout(dismissTimer);
+      unsub();
+    };
+  }, [currentUser?.uid]);
 
   if (userProfile?.isBanned) {
     return <BannedView onOpenSupport={() => setActiveTab('settings')} />;
@@ -885,6 +1159,9 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
   return (
     <div className="wavelink-app-shell bg-[var(--bg-canvas)] text-[var(--text-primary)] antialiased transition-colors duration-300">
+      {/* Pro Custom App Background Layer (fixed, lazy-loaded, hidden behind call overlays) */}
+      <CustomAppBackgroundLayer hidden={Boolean(activeCall || incomingCall)} />
+
       {/* Top in-app warning notice if issued by admin */}
       <WarningBanner />
 
@@ -925,6 +1202,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
               onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
               initialFilterTag={selectedHashtag}
               onClearFilterTag={() => setSelectedHashtag(null)}
+              initialFocusPostId={focusedPostId}
+              onClearFocusPostId={() => setFocusedPostId(null)}
               onOpenWelink={handleOpenWelink}
               onStartChat={handleStartChatWithUser}
             />
@@ -976,6 +1255,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
             <ChatChannelsView
               onOpenCall={handleOpenCall}
               initialTargetUserId={targetChatUserId}
+              initialTargetChannelId={targetChatChannelId}
             />
           )}
           {activeTab === 'directory' && (
@@ -1275,6 +1555,57 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           onClose={() => setActiveCall(null)}
         />
       )}
+
+      {/* Foreground In-App Push Notification Banner (when tab is open and visible) */}
+      {foregroundBanner && !incomingCall && !activeCall && (
+        <div
+          role="status"
+          className="fixed top-4 left-1/2 -translate-x-1/2 z-[95] w-[calc(100%-2rem)] max-w-md rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xl p-3.5 flex items-start gap-3 animate-in fade-in slide-in-from-top-3 duration-200"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const data = foregroundBanner.data;
+              setForegroundBanner(null);
+              navigateFromNotificationPayload(data);
+            }}
+            className="flex-1 min-w-0 flex items-center gap-3 text-left cursor-pointer"
+          >
+            {foregroundBanner.icon && foregroundBanner.icon.startsWith('https://') ? (
+              <img
+                src={foregroundBanner.icon}
+                alt=""
+                className="w-10 h-10 rounded-full object-cover shrink-0 border border-black/10"
+              />
+            ) : (
+              <div className="w-10 h-10 rounded-full bg-blue-600/12 text-blue-600 flex items-center justify-center shrink-0">
+                <Bell size={18} />
+              </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-extrabold text-[var(--text-primary)] truncate">
+                {foregroundBanner.title}
+              </div>
+              {foregroundBanner.body && (
+                <div className="text-xs text-[var(--text-secondary)] line-clamp-2 mt-0.5">
+                  {foregroundBanner.body}
+                </div>
+              )}
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setForegroundBanner(null)}
+            aria-label="Dismiss notification"
+            className="p-1 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] shrink-0 cursor-pointer"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+
+      {/* Gentle Post-Sign-In Notification Opt-In Prompt (never shown on initial load) */}
+      <PushNotificationPrompt />
 
       {/* Celebration Toast Banner for Milestones */}
       <CelebrationBanner />

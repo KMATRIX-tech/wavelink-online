@@ -1,7 +1,6 @@
 import {
   auth,
   db,
-  storage,
   formatCloudinaryUploadError,
   getAuthHeaders,
   formatVideoUploadError,
@@ -11,7 +10,6 @@ import {
   CLOUDINARY_IMAGE_UPLOAD_URL
 } from '../firebase';
 import { collection, doc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
 const DB_NAME = 'wavelink_media_db';
 const STORE_NAME = 'videos';
@@ -2389,8 +2387,7 @@ function canvasToJpegBlob(canvas: HTMLCanvasElement, quality: number): Promise<B
 
 /**
  * Crops/scales an image to chat aspect dimensions, iteratively compresses it strictly under 400 KB,
- * and uploads it directly to Firebase Storage under the user's own folder:
- * users/{uid}/chatThemes/{conversationId}_{timestamp}.jpg
+ * and uploads it directly to Cloudinary (preset monarcking72), returning the HTTPS secure_url.
  */
 export async function compressAndUploadChatThemePhoto(params: {
   uid: string;
@@ -2450,22 +2447,283 @@ export async function compressAndUploadChatThemePhoto(params: {
   const safeConvo = String(conversationId || 'chat')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .slice(0, 48);
-  const storagePath = `users/${uid}/chatThemes/${safeConvo}_${Date.now()}.jpg`;
-  const storageRef = ref(storage, storagePath);
-
-  await uploadBytes(storageRef, finalBlob, {
-    contentType: 'image/jpeg',
-    customMetadata: {
-      conversationId: safeConvo,
-      uploadedBy: uid
-    }
+  const namedFile = new File([finalBlob], `wavelink_theme_${safeConvo}_${Date.now()}.jpg`, {
+    type: 'image/jpeg',
+    lastModified: Date.now()
   });
 
-  const downloadUrl = await getDownloadURL(storageRef);
+  const uploaded = await uploadImageToCloudinary(namedFile);
   return {
-    downloadUrl,
-    storagePath,
+    downloadUrl: uploaded.secureUrl,
+    storagePath: uploaded.publicId,
     fileSize: finalBlob.size
   };
 }
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx === -1) {
+    throw new Error('Invalid data URL');
+  }
+  const header = dataUrl.slice(0, commaIdx);
+  const body = dataUrl.slice(commaIdx + 1);
+  const mimeMatch = header.match(/data:([^;]+)/i);
+  const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+
+  if (/;base64/i.test(header)) {
+    const binary = atob(body.replace(/\s+/g, ''));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+  }
+  return new Blob([decodeURIComponent(body)], { type: mimeType });
+}
+
+/**
+ * Compresses a legacy base64 data:image/* string, uploads it to Cloudinary,
+ * and returns only the short HTTPS secure_url.
+ */
+export async function migrateDataUrlImageToCloudinary(
+  dataUrl: string,
+  options: {
+    maxWidth?: number;
+    maxHeight?: number;
+    targetMaxBytes?: number;
+  } = {}
+): Promise<string> {
+  const trimmed = String(dataUrl || '').trim();
+  if (!trimmed.startsWith('data:image/')) {
+    throw new Error('Only image data URLs can be migrated to Cloudinary.');
+  }
+
+  const rawBlob = dataUrlToBlob(trimmed);
+  let uploadBlob: Blob = rawBlob;
+  try {
+    uploadBlob = await compressProfileImageToBlob(rawBlob, {
+      maxWidth: options.maxWidth ?? 512,
+      maxHeight: options.maxHeight ?? 512,
+      targetMaxBytes: options.targetMaxBytes ?? 280 * 1024,
+      mimeType: 'image/jpeg'
+    });
+  } catch {
+    // Fallback to raw image blob (e.g., SVG or animated GIF) if canvas compression is skipped
+    uploadBlob = rawBlob;
+  }
+
+  const uploaded = await uploadImageToCloudinary(uploadBlob);
+  return uploaded.secureUrl;
+}
+
+// ============================================================================
+// CUSTOM APP BACKGROUND (PRO ONLY)
+// - Validates JPG, PNG, WebP only and <= 10 MB before processing
+// - Crops 9:16 (mobile 608x1080) & 16:9 (desktop 1080x608) with long side max 1080px
+// - Computes average luminance + darken effective brightness for light/dark text contrast
+// - Compresses to WebP/JPEG strictly under 400 KB
+// ============================================================================
+export const CUSTOM_BG_MAX_RAW_MB = 10;
+export const CUSTOM_BG_MAX_RAW_BYTES = CUSTOM_BG_MAX_RAW_MB * 1024 * 1024;
+export const CUSTOM_BG_MAX_OUTPUT_BYTES = 400 * 1024; // 400 KB strict cap
+export const CUSTOM_BG_MAX_LONG_SIDE = 1080;
+
+const ALLOWED_CUSTOM_BG_MIMES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+
+export function validateCustomBackgroundFile(file: File | null | undefined): {
+  valid: boolean;
+  mimeType: string;
+  error?: string;
+} {
+  if (!file || file.size <= 0) {
+    return { valid: false, mimeType: '', error: 'Please select a valid image file.' };
+  }
+
+  const rawType = (file.type || '').split(';')[0].trim().toLowerCase();
+  const fileName = (file.name || '').toLowerCase();
+
+  let detectedMime = '';
+  if (ALLOWED_CUSTOM_BG_MIMES.has(rawType)) {
+    detectedMime = rawType === 'image/jpg' ? 'image/jpeg' : rawType;
+  } else if (!rawType && /\.(jpe?g|png|webp)$/i.test(fileName)) {
+    detectedMime = fileName.endsWith('.png')
+      ? 'image/png'
+      : fileName.endsWith('.webp')
+      ? 'image/webp'
+      : 'image/jpeg';
+  }
+
+  if (!detectedMime) {
+    return {
+      valid: false,
+      mimeType: rawType || 'unknown',
+      error: 'Only JPG, PNG, and WebP images are supported for custom backgrounds (no GIFs or videos).'
+    };
+  }
+
+  if (file.size > CUSTOM_BG_MAX_RAW_BYTES) {
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+    return {
+      valid: false,
+      mimeType: detectedMime,
+      error: `This image is ${sizeMb} MB, which is over the ${CUSTOM_BG_MAX_RAW_MB} MB limit. Please choose a smaller photo.`
+    };
+  }
+
+  return { valid: true, mimeType: detectedMime };
+}
+
+export function computeEffectiveTextMode(avgLuminancePct: number, darkenPct: number): 'light' | 'dark' {
+  const lumNorm = Math.max(0, Math.min(1, avgLuminancePct / 100));
+  const darkenFactor = Math.max(0, Math.min(0.7, darkenPct / 100));
+  const effectiveLum = lumNorm * (1 - darkenFactor);
+  // Dark background / heavily darkened -> 'dark' mode (white/light text)
+  // Bright background -> 'light' mode (dark ink text)
+  return effectiveLum < 0.54 ? 'dark' : 'light';
+}
+
+function canvasToEncodedBlob(
+  canvas: HTMLCanvasElement,
+  mimeType: 'image/webp' | 'image/jpeg',
+  quality: number
+): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    try {
+      canvas.toBlob(
+        (blob) => {
+          if (blob && blob.size > 0) {
+            resolve(blob);
+          } else {
+            resolve(null);
+          }
+        },
+        mimeType,
+        quality
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+export async function cropAndCompressCustomBg(params: {
+  image: HTMLImageElement;
+  aspect: '9:16' | '16:9';
+  zoom?: number; // 1 to 3
+  panX?: number; // -1 to 1
+  panY?: number; // -1 to 1
+  darken?: number; // 0 to 70
+}): Promise<{
+  blob: Blob;
+  mimeType: 'image/webp' | 'image/jpeg';
+  width: number;
+  height: number;
+  bytes: number;
+  avgLuminance: number;
+  textMode: 'light' | 'dark';
+}> {
+  const { image, aspect, zoom = 1, panX = 0, panY = 0, darken = 25 } = params;
+  const srcW = Math.max(1, image.naturalWidth || image.width || 1080);
+  const srcH = Math.max(1, image.naturalHeight || image.height || 1080);
+
+  const baseTargetW = aspect === '9:16' ? 608 : CUSTOM_BG_MAX_LONG_SIDE;
+  const baseTargetH = aspect === '9:16' ? CUSTOM_BG_MAX_LONG_SIDE : 608;
+  const safeZoom = Math.max(1, Math.min(3, zoom));
+  const safePanX = Math.max(-1, Math.min(1, panX));
+  const safePanY = Math.max(-1, Math.min(1, panY));
+
+  const renderAtDimensions = (targetW: number, targetH: number) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Canvas image processing is unavailable on this browser.');
+    }
+
+    const coverScale = Math.max(targetW / srcW, targetH / srcH) * safeZoom;
+    const drawW = srcW * coverScale;
+    const drawH = srcH * coverScale;
+    const maxOffsetX = Math.max(0, (drawW - targetW) / 2);
+    const maxOffsetY = Math.max(0, (drawH - targetH) / 2);
+
+    const drawX = (targetW - drawW) / 2 + safePanX * maxOffsetX;
+    const drawY = (targetH - drawH) / 2 + safePanY * maxOffsetY;
+
+    ctx.fillStyle = '#0F172A';
+    ctx.fillRect(0, 0, targetW, targetH);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(image, drawX, drawY, drawW, drawH);
+    return { canvas, ctx };
+  };
+
+  const { canvas: primaryCanvas, ctx: primaryCtx } = renderAtDimensions(baseTargetW, baseTargetH);
+
+  // Sample luminance on cropped image pixels (fast stride)
+  let avgLuminance = 50;
+  try {
+    const imgData = primaryCtx.getImageData(0, 0, baseTargetW, baseTargetH).data;
+    let totalLum = 0;
+    let samples = 0;
+    const stride = 16; // every 4th RGBA pixel
+    for (let i = 0; i < imgData.length; i += stride) {
+      const r = imgData[i];
+      const g = imgData[i + 1];
+      const b = imgData[i + 2];
+      totalLum += (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      samples++;
+    }
+    if (samples > 0) {
+      avgLuminance = Math.round((totalLum / samples) * 100);
+    }
+  } catch {
+    avgLuminance = 45;
+  }
+
+  const textMode = computeEffectiveTextMode(avgLuminance, darken);
+
+  // Compress strictly under 400 KB using WebP first, falling back to JPEG if unsupported
+  const scales = [1, 0.85, 0.72];
+  const qualities = [0.84, 0.72, 0.60, 0.48, 0.38];
+
+  for (const scaleFactor of scales) {
+    const targetW = Math.round(baseTargetW * scaleFactor);
+    const targetH = Math.round(baseTargetH * scaleFactor);
+    const workingCanvas =
+      scaleFactor === 1 ? primaryCanvas : renderAtDimensions(targetW, targetH).canvas;
+
+    for (const mime of ['image/webp', 'image/jpeg'] as const) {
+      for (const q of qualities) {
+        const candidate = await canvasToEncodedBlob(workingCanvas, mime, q);
+        if (candidate && candidate.size < CUSTOM_BG_MAX_OUTPUT_BYTES) {
+          return {
+            blob: candidate,
+            mimeType: candidate.type === 'image/jpeg' ? 'image/jpeg' : mime,
+            width: targetW,
+            height: targetH,
+            bytes: candidate.size,
+            avgLuminance,
+            textMode
+          };
+        }
+      }
+    }
+  }
+
+  throw new Error('Could not compress this image under 400 KB. Please choose a simpler or smaller photo.');
+}
+
+/**
+ * Generates a lightweight (~1 KB) blurred Cloudinary placeholder URL for smooth progressive loading.
+ */
+export function getCloudinaryTinyPlaceholderUrl(url?: string | null): string {
+  if (!url || typeof url !== 'string') return '';
+  if (!url.includes('res.cloudinary.com') || !url.includes('/image/upload/')) {
+    return url;
+  }
+  return url.replace('/image/upload/', '/image/upload/w_48,e_blur:400,q_auto:low,f_auto/');
+}
+
+
 

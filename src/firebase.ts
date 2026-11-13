@@ -9,7 +9,6 @@ import {
   doc,
   getDoc
 } from 'firebase/firestore';
-import { getStorage } from 'firebase/storage';
 import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
 import type { UserProfile } from './types';
@@ -46,8 +45,6 @@ try {
 export const db = firestoreDb;
 
 export const auth = getAuth(app);
-
-export const storage = getStorage(app);
 
 // ============================================================================
 // CLOUDINARY UPLOAD ERROR FORMATTER (Zero Firebase Storage anywhere)
@@ -680,14 +677,24 @@ const AVATAR_URL_FIELD_NAMES = new Set([
 ]);
 
 /**
- * Ensures an avatar URL is a clean HTTP(S) URL and never a base64 data: or blob: URL.
+ * Validates that a URL is strictly a short HTTPS URL (under maxLength chars, default 500),
+ * never a data:, blob:, http:, or oversized URL.
+ */
+export function sanitizeShortHttpsUrl(url: unknown, maxLength = 500): string | null {
+  if (typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed.length >= maxLength) return null;
+  if (!trimmed.startsWith('https://')) return null;
+  return trimmed;
+}
+
+/**
+ * Ensures an avatar URL is a short HTTPS URL (under 500 characters) and never a data:, blob:, or http: URL.
  */
 export function sanitizeAvatarUrlForFirestore(url: unknown, fallbackSeed = 'waver'): string {
-  if (typeof url === 'string') {
-    const trimmed = url.trim();
-    if (trimmed.startsWith('https://') || trimmed.startsWith('http://')) {
-      return trimmed;
-    }
+  const valid = sanitizeShortHttpsUrl(url, 500);
+  if (valid) {
+    return valid;
   }
   return `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(fallbackSeed || 'waver')}`;
 }
@@ -785,7 +792,7 @@ export function cleanFirestoreData<T extends Record<string, any>>(obj: T): Parti
     if (value === undefined) continue;
 
     if (AVATAR_URL_FIELD_NAMES.has(key) && typeof value === 'string') {
-      if (isForbiddenDataOrBlobUrl(value)) {
+      if (isForbiddenDataOrBlobUrl(value) || !sanitizeShortHttpsUrl(value, 500)) {
         const fieldSeed =
           key === 'receiverPhotoURL' || key === 'calleePhotoURL'
             ? String(obj.receiverId || obj.receiver || obj.calleeId || fallbackSeed)

@@ -336,6 +336,7 @@ const getMessageTimestampMs = (msg: Partial<ChannelMessage> & { timestamp?: any 
 interface ChatChannelsViewProps {
   onOpenCall: (type: 'video' | 'voice', recipient?: CallRecipient) => void;
   initialTargetUserId?: string;
+  initialTargetChannelId?: string;
 }
 
 const EMOJI_LIST = [
@@ -603,7 +604,11 @@ const ChatPersonGridCard: React.FC<ChatPersonGridCardProps> = ({
   );
 };
 
-export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, initialTargetUserId }) => {
+export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
+  onOpenCall,
+  initialTargetUserId,
+  initialTargetChannelId
+}) => {
   const {
     currentUser,
     userProfile,
@@ -624,10 +629,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const [isBotReplying, setIsBotReplying] = useState(false);
 
   // Active channel identifier: can be a groupId (e.g. `grp_...`) or DM id (`dm_...`)
-  const [activeChannel, setActiveChannel] = useState<string>('');
-  // On mobile/tablet (< 1024px), start on the Chat List screen unless a specific target user was requested
+  const [activeChannel, setActiveChannel] = useState<string>(() => initialTargetChannelId || '');
+  // On mobile/tablet (< 1024px), start on the Chat List screen unless a specific target user or channel was requested
   const [showMobileChannels, setShowMobileChannels] = useState<boolean>(() => {
-    if (initialTargetUserId) return false;
+    if (initialTargetUserId || initialTargetChannelId) return false;
     return typeof window !== 'undefined' ? window.innerWidth < 1024 : true;
   });
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
@@ -828,30 +833,54 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const isNearBottomRef = useRef<boolean>(true);
   const lastScrolledChannelRef = useRef<string>('');
 
-  // Per-channel mute preference persisted locally
+  // Per-channel mute preference persisted locally & synced to Firestore users/{uid}.mutedChannelIds
   const [mutedChannelIds, setMutedChannelIds] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem('wavelink_muted_channels');
-      return raw ? JSON.parse(raw) : [];
+      const parsed = raw ? JSON.parse(raw) : [];
+      const fromProfile = Array.isArray(userProfile?.mutedChannelIds) ? userProfile!.mutedChannelIds : [];
+      return Array.from(new Set([...parsed, ...fromProfile]));
     } catch {
-      return [];
+      return Array.isArray(userProfile?.mutedChannelIds) ? userProfile!.mutedChannelIds : [];
     }
   });
+
+  useEffect(() => {
+    if (Array.isArray(userProfile?.mutedChannelIds)) {
+      setMutedChannelIds((prev) => {
+        const merged = Array.from(new Set([...userProfile!.mutedChannelIds!, ...prev])).slice(0, 200);
+        try {
+          localStorage.setItem('wavelink_muted_channels', JSON.stringify(merged));
+        } catch {
+          // ignore
+        }
+        return merged;
+      });
+    }
+  }, [userProfile?.mutedChannelIds]);
 
   const toggleMuteChannel = (channelId: string) => {
     if (!channelId) return;
     setMutedChannelIds((prev) => {
       const next = prev.includes(channelId)
         ? prev.filter((id) => id !== channelId)
-        : [...prev, channelId];
+        : [...prev, channelId].slice(0, 200);
       try {
         localStorage.setItem('wavelink_muted_channels', JSON.stringify(next));
       } catch {
         // ignore storage errors
       }
+      updateUserProfile({ mutedChannelIds: next }).catch(() => {});
       return next;
     });
   };
+
+  useEffect(() => {
+    if (initialTargetChannelId) {
+      setActiveChannel(initialTargetChannelId);
+      setShowMobileChannels(false);
+    }
+  }, [initialTargetChannelId]);
 
   // Detect virtual keyboard open/close on mobile via window.visualViewport and adjust chat bounds without clipping
   useEffect(() => {
@@ -980,8 +1009,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         setMembers(list);
         setIsLoadingConversations(false);
 
-        // If target user specified from directory/feed, open that DM immediately
-        if (initialTargetUserId && currentUser?.uid) {
+        // If target channel or target user specified from notification/directory/feed, open that chat immediately
+        if (initialTargetChannelId) {
+          setActiveChannel(initialTargetChannelId);
+          setShowMobileChannels(false);
+        } else if (initialTargetUserId && currentUser?.uid) {
           const dmId = computeDmConversationId(currentUser.uid, initialTargetUserId);
           setActiveChannel(dmId);
           setShowMobileChannels(false);

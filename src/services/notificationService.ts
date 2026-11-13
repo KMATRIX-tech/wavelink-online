@@ -1,4 +1,4 @@
-import { db, auth, cleanFirestoreData, getAuthHeaders, sanitizeAvatarUrlForFirestore } from '../firebase';
+import { db, auth, cleanFirestoreData, sanitizeAvatarUrlForFirestore } from '../firebase';
 import {
   collection,
   doc,
@@ -55,10 +55,9 @@ export function buildShortMessagePreview(
 }
 
 /**
- * Dispatches an in-app notification to Firestore AND triggers a server-only FCM push
- * notification via `/api/notifications/send-push` (which uses the Firebase Admin SDK
- * and enforces the recipient's master switch, per-category toggles, quiet hours, and
- * message preview privacy settings).
+ * Saves an in-app notification document to Firestore.
+ * External Web Push notifications are sent exclusively by Firebase Cloud Functions
+ * triggered by Firestore events (never from the browser).
  */
 export async function sendNotification(params: SendNotificationParams): Promise<void> {
   const currentAuthUser = auth.currentUser;
@@ -120,25 +119,6 @@ export async function sendNotification(params: SendNotificationParams): Promise<
 
     const sanitized = cleanFirestoreData(notification);
     await setDoc(doc(db, 'notifications', notifId), sanitized);
-
-    // Trigger server-only push notification via Firebase Admin SDK
-    const headers = await getAuthHeaders();
-    fetch('/api/notifications/send-push', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        recipientId: params.recipientId,
-        actorId,
-        actorName,
-        type: params.type,
-        title: safeTitle,
-        body: safeBody,
-        entityId: params.entityId || '',
-        recipientSettings
-      })
-    }).catch((pushErr) => {
-      console.warn('Server push dispatch notice (non-fatal):', pushErr);
-    });
   } catch (err) {
     console.warn('Notification dispatch error (non-fatal):', err);
   }

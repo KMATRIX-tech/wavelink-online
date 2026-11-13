@@ -112,7 +112,8 @@ import {
   extractSafeFirebaseAuthCode,
   fetchUserProfileCached,
   getCachedUserProfile,
-  setCachedUserProfile
+  setCachedUserProfile,
+  sanitizeShortHttpsUrl
 } from '../firebase';
 import {
   collection,
@@ -766,9 +767,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setIsUploadingAvatar(true);
     try {
       const compressedBlob = await compressProfileImageToBlob(file, {
-        maxWidth: 800,
-        maxHeight: 800,
-        targetMaxBytes: 250 * 1024,
+        maxWidth: 512,
+        maxHeight: 512,
+        targetMaxBytes: 220 * 1024,
         mimeType: 'image/jpeg'
       });
       const uploaded = await uploadProfileImageToCloudinary({
@@ -813,11 +814,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setProfileSaveError(null);
 
     try {
-      const trimmedAvatar = photoURL.trim();
-      const safeAvatar =
-        trimmedAvatar && (trimmedAvatar.startsWith('https://') || trimmedAvatar.startsWith('http://'))
-          ? trimmedAvatar
-          : undefined;
+      const safeAvatar = sanitizeShortHttpsUrl(photoURL.trim(), 500) || undefined;
 
       await updateUserProfile({
         displayName: displayName.trim(),
@@ -2065,7 +2062,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          <ThemePickerPanel />
+          <ThemePickerPanel onOpenUpgradePro={() => setActiveSettingsSection('pro')} />
         </div>
       )}
 

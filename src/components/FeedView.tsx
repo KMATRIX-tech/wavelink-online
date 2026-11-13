@@ -239,6 +239,8 @@ interface FeedViewProps {
   onNavigateTab?: (tab: string) => void;
   initialFilterTag?: string | null;
   onClearFilterTag?: () => void;
+  initialFocusPostId?: string | null;
+  onClearFocusPostId?: () => void;
   onOpenWelink?: (mode?: 'chat' | 'image' | 'voice') => void;
   onStartChat?: (userId: string) => void;
 }
@@ -247,6 +249,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
   onNavigateTab,
   initialFilterTag,
   onClearFilterTag,
+  initialFocusPostId,
+  onClearFocusPostId,
   onOpenWelink,
   onStartChat
 }) => {
@@ -292,7 +296,52 @@ export const FeedView: React.FC<FeedViewProps> = ({
     PAN_AFRICAN_LANGUAGES[0];
 
   const [feedMode, setFeedMode] = useState<'all' | 'local' | 'following' | 'saved'>('all');
+  const [highlightedPostId, setHighlightedPostId] = useState<string | null>(null);
   const [showCountryPickerBar, setShowCountryPickerBar] = useState(false);
+
+  // Scroll to and highlight a deep-linked post when opened from a push notification
+  useEffect(() => {
+    if (!initialFocusPostId) return;
+    let active = true;
+    const focusPost = async () => {
+      try {
+        const el = document.querySelector(`[data-post-id="${CSS.escape(initialFocusPostId)}"]`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setHighlightedPostId(initialFocusPostId);
+          setTimeout(() => {
+            if (active) setHighlightedPostId(null);
+          }, 3500);
+          onClearFocusPostId?.();
+          return;
+        }
+        // Fetch the post directly if not yet in the loaded window
+        const snap = await getDoc(doc(db, 'posts', initialFocusPostId));
+        if (active && snap.exists()) {
+          const loaded = { id: snap.id, ...snap.data() } as Post;
+          setPosts((prev) => (prev.some((p) => p.id === loaded.id) ? prev : [loaded, ...prev]));
+          setTimeout(() => {
+            const target = document.querySelector(`[data-post-id="${CSS.escape(initialFocusPostId)}"]`);
+            if (target) {
+              target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            setHighlightedPostId(initialFocusPostId);
+            setTimeout(() => setHighlightedPostId(null), 3500);
+            onClearFocusPostId?.();
+          }, 180);
+        } else {
+          onClearFocusPostId?.();
+        }
+      } catch {
+        onClearFocusPostId?.();
+      }
+    };
+    const timer = setTimeout(focusPost, 250);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [initialFocusPostId, onClearFocusPostId]);
   const [reportingPost, setReportingPost] = useState<Post | null>(null);
   const [selectedReportCategory, setSelectedReportCategory] = useState<string>('stolen_content');
   const [reportExtraNote, setReportExtraNote] = useState('');
@@ -2547,7 +2596,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     data-post-id={post.id}
                     className={`wavelink-glass-post-card wavelink-card-enter relative w-full max-w-full overflow-visible break-words rounded-[28px] sm:rounded-[32px] p-3.5 sm:p-5 transition ${
                       post.isBoosted ? 'ring-2 ring-amber-400/50' : ''
-                    }`}
+                    } ${highlightedPostId === post.id ? 'ring-2 ring-blue-500 shadow-lg' : ''}`}
                   >
                     {/* Compact Context Menu Dropdown triggered by the "..." round glass button */}
                     {isMenuOpen && (

@@ -1,18 +1,37 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { APPEARANCE_THEMES, useTheme } from '../context/ThemeContext';
 import { useLanguage } from '../context/LanguageContext';
 import { useAuth } from '../context/AuthContext';
 import { AppearanceTheme } from '../types';
-import { Check, Sparkles, Eye, RotateCcw, Zap, AlertCircle } from 'lucide-react';
+import { validateCustomBackgroundFile } from '../utils/mediaStorage';
+import { CustomBackgroundModal } from './CustomBackgroundModal';
+import {
+  Check,
+  Sparkles,
+  Eye,
+  RotateCcw,
+  Zap,
+  AlertCircle,
+  Image as ImageIcon,
+  Lock,
+  Upload,
+  Trash2,
+  Sliders,
+  Crown,
+  X,
+  WifiOff
+} from 'lucide-react';
 
 interface ThemePickerPanelProps {
   compact?: boolean;
   onThemeSaved?: (theme: AppearanceTheme) => void;
+  onOpenUpgradePro?: () => void;
 }
 
 export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
   compact = false,
-  onThemeSaved
+  onThemeSaved,
+  onOpenUpgradePro
 }) => {
   const {
     appearanceTheme,
@@ -25,12 +44,25 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
     retrySaveTheme,
     clearThemeSaveError,
     isLiteMode,
-    toggleLiteMode
+    toggleLiteMode,
+    customBackground,
+    customBackgroundHistory,
+    isCustomBackgroundActive,
+    isDataSaverBlockingCustomBg,
+    customBgLoadFailed,
+    isSavingCustomBg,
+    selectCustomBackgroundFromHistory,
+    removeCustomBackground
   } = useTheme();
   const { language } = useLanguage();
-  const { showGlobalToast } = useAuth();
+  const { showGlobalToast, isProEffective } = useAuth();
   const [isSaving, setIsSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [showProUpgradePrompt, setShowProUpgradePrompt] = useState(false);
+  const [customBgError, setCustomBgError] = useState<string | null>(null);
+  const [selectedCustomFile, setSelectedCustomFile] = useState<File | null>(null);
+  const [isCustomBgModalOpen, setIsCustomBgModalOpen] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const currentMeta =
     APPEARANCE_THEMES.find((t) => t.id === activeTheme) || APPEARANCE_THEMES[0];
@@ -442,6 +474,327 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
           );
         })}
       </div>
+
+      {/* Custom App Background Card (Pro Feature) */}
+      <div className="wavelink-glass-post-card rounded-3xl p-4 sm:p-5 border border-[var(--border-hairline)] space-y-4">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary)]/15 text-[var(--accent-primary)] flex items-center justify-center shrink-0">
+              <ImageIcon size={19} />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm sm:text-base font-extrabold text-[var(--text-primary)]">
+                  {language === 'sw' ? 'Mandhari yako maalum' : 'Custom background'}
+                </h3>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider bg-amber-500/18 text-amber-600 dark:text-amber-300 border border-amber-500/30">
+                  {!isProEffective && <Lock size={10} />}
+                  <span>Pro</span>
+                </span>
+                {isProEffective && isCustomBackgroundActive && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30">
+                    {language === 'sw' ? 'Inatumika' : 'Active'}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                {language === 'sw'
+                  ? 'Weka picha yako mwenyewe nyuma ya WaveLink (JPG, PNG au WebP hadi MB 10).'
+                  : 'Use your own photo behind the app with live darken, blur & auto text contrast.'}
+              </p>
+            </div>
+          </div>
+
+          {!isProEffective ? (
+            <button
+              type="button"
+              onClick={() => setShowProUpgradePrompt(true)}
+              className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold inline-flex items-center gap-2 hover:border-amber-500/50 transition active:scale-95 cursor-pointer shrink-0"
+            >
+              <Lock size={14} className="text-amber-500" />
+              <span>{language === 'sw' ? 'Fungua Pro' : 'Unlock with Pro'}</span>
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 flex-wrap">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                className="hidden"
+                onChange={(e) => {
+                  const chosen = e.target.files?.[0] || null;
+                  e.target.value = '';
+                  if (!chosen) return;
+                  const validation = validateCustomBackgroundFile(chosen);
+                  if (!validation.valid) {
+                    setCustomBgError(
+                      validation.error || 'Please choose a JPG, PNG, or WebP image under 10 MB.'
+                    );
+                    return;
+                  }
+                  setCustomBgError(null);
+                  setSelectedCustomFile(chosen);
+                  setIsCustomBgModalOpen(true);
+                }}
+              />
+
+              <button
+                type="button"
+                disabled={isSavingCustomBg}
+                onClick={() => {
+                  setCustomBgError(null);
+                  fileInputRef.current?.click();
+                }}
+                className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-sm transition active:scale-95 cursor-pointer disabled:opacity-50"
+              >
+                <Upload size={14} />
+                <span>{language === 'sw' ? 'Pakia picha' : 'Upload photo'}</span>
+              </button>
+
+              {customBackground?.url && (
+                <>
+                  <button
+                    type="button"
+                    disabled={isSavingCustomBg}
+                    onClick={() => {
+                      setCustomBgError(null);
+                      setSelectedCustomFile(null);
+                      setIsCustomBgModalOpen(true);
+                    }}
+                    className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold inline-flex items-center gap-1.5 hover:opacity-90 transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Sliders size={14} className="text-[var(--accent-primary)]" />
+                    <span>{language === 'sw' ? 'Hariri' : 'Edit'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSavingCustomBg}
+                    onClick={async () => {
+                      setCustomBgError(null);
+                      const res = await removeCustomBackground();
+                      if (!res.success && res.error) {
+                        setCustomBgError(res.error);
+                      } else {
+                        showGlobalToast?.(
+                          language === 'sw'
+                            ? 'Umerudi kwenye mandhari ya kawaida.'
+                            : 'Returned to your normal theme.'
+                        );
+                      }
+                    }}
+                    className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-rose-500/12 border border-rose-500/30 text-rose-600 dark:text-rose-300 text-xs font-extrabold inline-flex items-center gap-1.5 hover:bg-rose-500/20 transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Trash2 size={14} />
+                    <span>{language === 'sw' ? 'Ondoa' : 'Remove'}</span>
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Non-Pro clickable preview bar */}
+        {!isProEffective && (
+          <button
+            type="button"
+            onClick={() => setShowProUpgradePrompt(true)}
+            className="w-full min-h-[56px] p-3 rounded-2xl bg-[var(--bg-subtle)] border border-dashed border-[var(--border-hairline)] flex items-center justify-between gap-3 text-left hover:border-amber-500/50 transition cursor-pointer"
+          >
+            <span className="flex items-center gap-2.5 text-xs font-bold text-[var(--text-secondary)]">
+              <Lock size={15} className="text-amber-500 shrink-0" />
+              <span>
+                {language === 'sw'
+                  ? 'Gusa hapa kupata Pro na kutumia picha yako mwenyewe kama mandhari.'
+                  : 'Tap to learn about setting your own custom photo background with WaveLink Pro.'}
+              </span>
+            </span>
+            <span className="px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-300 text-[10px] font-extrabold uppercase shrink-0">
+              Pro
+            </span>
+          </button>
+        )}
+
+        {/* Validation / Upload Error */}
+        {isProEffective && customBgError && (
+          <div
+            role="alert"
+            className="p-3 rounded-2xl bg-rose-500/12 border border-rose-500/30 text-rose-700 dark:text-rose-200 text-xs font-bold flex items-center gap-2"
+          >
+            <AlertCircle size={15} className="shrink-0 text-rose-500" />
+            <span>{customBgError}</span>
+          </div>
+        )}
+
+        {/* Data Saver Notice */}
+        {isProEffective && isDataSaverBlockingCustomBg && (
+          <div className="p-3 rounded-2xl bg-amber-500/12 border border-amber-500/30 text-amber-700 dark:text-amber-200 text-xs font-bold flex items-center gap-2">
+            <WifiOff size={15} className="shrink-0 text-amber-500" />
+            <span>
+              {language === 'sw'
+                ? 'Data Saver imewashwa — tunatumia mandhari ya kawaida kuokoa bando.'
+                : 'Data Saver is on — showing your normal theme instead of downloading the background photo.'}
+            </span>
+          </div>
+        )}
+
+        {/* Fallback notice if image failed to load */}
+        {isProEffective && customBgLoadFailed && (
+          <div className="p-3 rounded-2xl bg-amber-500/12 border border-amber-500/30 text-amber-700 dark:text-amber-200 text-xs font-bold flex items-center gap-2">
+            <AlertCircle size={15} className="shrink-0 text-amber-500" />
+            <span>
+              Could not load your custom background photo, so your normal theme is displayed.
+            </span>
+          </div>
+        )}
+
+        {/* Quick-Switch Gallery of Last 5 Uploaded Backgrounds (Pro only) */}
+        {isProEffective && customBackgroundHistory.length > 0 && (
+          <div className="space-y-2 pt-1">
+            <div className="flex items-center justify-between text-[11px] font-extrabold text-[var(--text-secondary)] uppercase tracking-wider">
+              <span>
+                {language === 'sw'
+                  ? `Zilizopita (${customBackgroundHistory.length}/5)`
+                  : `Recent Uploads (${customBackgroundHistory.length}/5)`}
+              </span>
+              <span className="normal-case font-semibold">
+                {language === 'sw' ? 'Gusa kubadilisha haraka' : 'Tap to switch quickly'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-5 gap-2">
+              {customBackgroundHistory.slice(0, 5).map((item) => {
+                const isSelected = customBackground?.url === item.url;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    disabled={isSavingCustomBg}
+                    onClick={async () => {
+                      setCustomBgError(null);
+                      const res = await selectCustomBackgroundFromHistory(item);
+                      if (!res.success && res.error) {
+                        setCustomBgError(res.error);
+                      } else {
+                        showGlobalToast?.(
+                          language === 'sw'
+                            ? 'Mandhari imebadilishwa! ✨'
+                            : 'Custom background switched! ✨'
+                        );
+                      }
+                    }}
+                    aria-label="Select recent custom background"
+                    className={`relative min-h-[52px] aspect-[9/12] rounded-2xl overflow-hidden border transition cursor-pointer disabled:opacity-50 ${
+                      isSelected
+                        ? 'ring-2 ring-[var(--accent-primary)] border-[var(--accent-primary)] scale-[1.02]'
+                        : 'border-[var(--border-hairline)] hover:opacity-90'
+                    }`}
+                  >
+                    <img
+                      src={item.mobileUrl || item.url}
+                      alt=""
+                      loading="lazy"
+                      className="w-full h-full object-cover"
+                    />
+                    <div
+                      className="absolute inset-0"
+                      style={{ backgroundColor: `rgba(0, 0, 0, ${item.darken / 100})` }}
+                    />
+                    {isSelected && (
+                      <span className="absolute top-1 right-1 w-5 h-5 rounded-full bg-[var(--accent-primary)] text-white flex items-center justify-center shadow-sm">
+                        <Check size={11} strokeWidth={3} />
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Friendly Upgrade Prompt Modal for Non-Pro Users */}
+      {showProUpgradePrompt && !isProEffective && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Custom backgrounds are a Pro feature"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/55 backdrop-blur-xs"
+          onClick={() => setShowProUpgradePrompt(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] shadow-2xl p-5 sm:p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="w-11 h-11 rounded-2xl bg-amber-500/15 text-amber-500 flex items-center justify-center shrink-0">
+                <Crown size={22} />
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowProUpgradePrompt(false)}
+                aria-label="Close upgrade prompt"
+                className="min-w-[44px] min-h-[44px] rounded-full bg-[var(--bg-subtle)] flex items-center justify-center text-[var(--text-primary)] cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <h4 className="text-base sm:text-lg font-extrabold">
+                {language === 'sw'
+                  ? 'Mandhari maalum ni kipengele cha Pro'
+                  : 'Custom backgrounds are a Pro feature'}
+              </h4>
+              <p className="text-xs sm:text-sm text-[var(--text-secondary)] leading-relaxed">
+                {language === 'sw'
+                  ? 'Jiunge na WaveLink Pro ili kupakia picha yako mwenyewe, kurekebisha ukungu na giza, na kuhifadhi mandhari 5 za mwisho.'
+                  : 'Upgrade to WaveLink Pro to upload your own background photo, adjust blur & darkness live, and save up to 5 recent backgrounds.'}
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowProUpgradePrompt(false)}
+                className="flex-1 min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-extrabold cursor-pointer"
+              >
+                {language === 'sw' ? 'Baadaye' : 'Not now'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowProUpgradePrompt(false);
+                  if (onOpenUpgradePro) {
+                    onOpenUpgradePro();
+                  } else {
+                    window.dispatchEvent(
+                      new CustomEvent('wavelink:navigate-tab', { detail: 'monetization' })
+                    );
+                  }
+                }}
+                className="flex-1 min-h-[44px] px-4 py-2 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 text-white text-xs font-extrabold shadow-md hover:opacity-95 cursor-pointer"
+              >
+                {language === 'sw' ? 'Pata Pro' : 'Upgrade to Pro'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pro Crop & Edit Modal */}
+      {isProEffective && isCustomBgModalOpen && (
+        <CustomBackgroundModal
+          isOpen={isCustomBgModalOpen}
+          file={selectedCustomFile}
+          existingBg={selectedCustomFile ? null : customBackground}
+          language={language}
+          onClose={() => {
+            setIsCustomBgModalOpen(false);
+            setSelectedCustomFile(null);
+          }}
+        />
+      )}
     </div>
   );
 };

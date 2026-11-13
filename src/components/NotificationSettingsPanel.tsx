@@ -8,10 +8,10 @@ import {
   getSavedDeviceToken,
   requestPushPermissionAndSaveToken,
   removeCurrentDeviceFcmToken,
-  saveUserNotificationSettings
+  saveUserNotificationSettings,
+  sendTestPushNotificationToSelf
 } from '../services/fcmService';
-import { sendNotification } from '../services/notificationService';
-import { AddToHomeScreenHintCard } from './PWAInstallButton';
+import { AddToHomeScreenHintCard, PWAInstallButton } from './PWAInstallButton';
 import {
   Bell,
   BellOff,
@@ -19,8 +19,7 @@ import {
   PhoneCall,
   UserPlus,
   Heart,
-  Megaphone,
-  Coins,
+  Sparkles,
   Moon,
   Eye,
   EyeOff,
@@ -30,8 +29,8 @@ import {
   Smartphone,
   ShieldCheck,
   Send,
-  Trophy,
-  MessageCircle
+  Volume2,
+  Info
 } from 'lucide-react';
 
 export const NotificationSettingsPanel: React.FC = () => {
@@ -79,7 +78,7 @@ export const NotificationSettingsPanel: React.FC = () => {
           text:
             language === 'sw'
               ? 'Arifa za simu zimewashwa kwenye kifaa hiki!'
-              : 'Push notifications are now enabled for this device!'
+              : 'Push notifications are now active on this device!'
         });
         showGlobalToast(
           language === 'sw'
@@ -127,9 +126,15 @@ export const NotificationSettingsPanel: React.FC = () => {
 
   const handleUpdateSetting = async (patch: Partial<UserNotificationSettings>) => {
     if (!currentUser) return;
+    const syncedPatch: Partial<UserNotificationSettings> = { ...patch };
+    if (patch.likesAndComments !== undefined) {
+      syncedPatch.reactions = patch.likesAndComments;
+      syncedPatch.replies = patch.likesAndComments;
+    }
+
     const nextSettings: UserNotificationSettings = {
       ...settings,
-      ...patch,
+      ...syncedPatch,
       timezoneOffsetMinutes: new Date().getTimezoneOffset(),
       updatedAt: new Date().toISOString()
     };
@@ -150,60 +155,52 @@ export const NotificationSettingsPanel: React.FC = () => {
     setIsSendingTest(true);
     setStatusFeedback(null);
     try {
-      await sendNotification({
-        recipientId: `${currentUser.uid}`,
-        actorId: 'wavelink_push_test',
-        actorName: 'WaveLink Security',
-        type: 'incoming_call',
-        title:
-          language === 'sw'
-            ? 'Simu Inayoingia ya Jaribio 📞'
-            : 'Incoming Call Push Test 📞',
-        body:
-          language === 'sw'
-            ? 'Jaribio la arifa yenye kitufe cha Pokea (Answer) na Kataa (Decline).'
-            : 'Loud notification test with Answer and Decline buttons!'
-      });
-
-      // Also show a browser notification via Service Worker if granted on this device
-      if ('serviceWorker' in navigator && Notification.permission === 'granted' && settings.masterEnabled) {
-        const reg = await navigator.serviceWorker.getRegistration('/sw.js');
-        if (reg) {
-          await reg.showNotification(
-            language === 'sw' ? 'Simu Inayoingia • WaveLink 📞' : 'Incoming WaveLink Call 📞',
-            {
+      const serverResult = await sendTestPushNotificationToSelf();
+      if (serverResult.sent && (serverResult.successCount || 0) > 0) {
+        setStatusFeedback({
+          type: 'success',
+          text:
+            language === 'sw'
+              ? `Arifa halisi ya jaribio imetumwa kwenye vifaa ${serverResult.successCount}!`
+              : `Real test push notification delivered to ${serverResult.successCount} registered device${
+                  serverResult.successCount === 1 ? '' : 's'
+                }!`
+        });
+      } else if (serverResult.reason === 'no_tokens') {
+        setStatusFeedback({
+          type: 'error',
+          text:
+            'No active FCM device token is saved yet. Tap "Enable Push Notifications" above first (with VITE_FIREBASE_VAPID_KEY configured).'
+        });
+      } else {
+        // If Firebase Admin credentials aren't active in local preview, verify SW notification rendering locally
+        if ('serviceWorker' in navigator && Notification.permission === 'granted') {
+          const reg =
+            (await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js')) ||
+            (await navigator.serviceWorker.getRegistration('/'));
+          if (reg) {
+            await reg.showNotification('WaveLink Test Notification', {
               body:
-                language === 'sw'
-                  ? 'Gusa Pokea (Answer) au Kataa (Decline).'
-                  : 'Tap Answer to connect or Decline.',
+                serverResult.error ||
+                'Local notification preview worked. Deploy Cloud Functions & Firebase credentials for background phone pushes.',
               icon: '/pwa-192x192.png',
               badge: '/pwa-192x192.png',
-              tag: 'wavelink-call-test',
-              requireInteraction: true,
-              vibrate: [400, 150, 400, 150, 500],
-              actions: [
-                { action: 'answer_call', title: '📞 Answer' },
-                { action: 'decline_call', title: '✕ Decline' }
-              ]
-            } as any
-          );
+              tag: 'wavelink-test-local'
+            } as any);
+          }
         }
+        setStatusFeedback({
+          type: 'error',
+          text:
+            serverResult.error ||
+            serverResult.reason ||
+            'Server FCM delivery is not configured in this environment yet.'
+        });
       }
-
-      setStatusFeedback({
-        type: 'success',
-        text:
-          language === 'sw'
-            ? 'Arifa ya jaribio imetumwa! Angalia sehemu ya arifa ya simu yako.'
-            : 'Test notification sent! Check your device notification tray and the bell icon.'
-      });
-    } catch {
+    } catch (err: any) {
       setStatusFeedback({
         type: 'error',
-        text:
-          language === 'sw'
-            ? 'Imeshindikana kutuma arifa ya jaribio kwa sasa.'
-            : 'Could not send test notification right now.'
+        text: err?.message || 'Could not send test notification right now.'
       });
     } finally {
       setIsSendingTest(false);
@@ -211,13 +208,100 @@ export const NotificationSettingsPanel: React.FC = () => {
   };
 
   const isDeviceSubscribed = Boolean(deviceToken && permissionState === 'granted');
+  const registeredDevices = Array.isArray(userProfile?.fcmTokens) ? userProfile!.fcmTokens : [];
+  const likesAndCommentsChecked =
+    settings.likesAndComments !== undefined
+      ? settings.likesAndComments !== false
+      : settings.reactions !== false || settings.replies !== false;
+
+  const categoryItems: Array<{
+    key: 'messages' | 'calls' | 'followers' | 'likesAndComments' | 'followedPosts' | 'soundAndVibration';
+    label: string;
+    desc: string;
+    checked: boolean;
+    icon: React.ReactNode;
+    bg: string;
+  }> = [
+    {
+      key: 'messages',
+      label: language === 'sw' ? 'Ujumbe (Messages)' : 'Messages',
+      desc:
+        language === 'sw'
+          ? 'Ujumbe wa moja kwa moja na soga za vikundi'
+          : 'Direct messages and group chat alerts',
+      checked: settings.messages !== false,
+      icon: <MessageSquare size={16} className="text-blue-600" />,
+      bg: 'bg-blue-50'
+    },
+    {
+      key: 'calls',
+      label: language === 'sw' ? 'Simu (Calls)' : 'Calls',
+      desc:
+        language === 'sw'
+          ? 'Arifa kubwa yenye vitufe vya Pokea (Answer) na Kataa (Decline)'
+          : 'High-priority incoming video & voice call alerts and missed call notices',
+      checked: settings.calls !== false,
+      icon: <PhoneCall size={16} className="text-emerald-600" />,
+      bg: 'bg-emerald-50'
+    },
+    {
+      key: 'followers',
+      label: language === 'sw' ? 'Wafuasi Wapya (New followers)' : 'New followers',
+      desc:
+        language === 'sw'
+          ? 'Mtu anapoanza kukufuata kwenye WaveLink'
+          : 'When someone starts following your profile',
+      checked: settings.followers !== false,
+      icon: <UserPlus size={16} className="text-purple-600" />,
+      bg: 'bg-purple-50'
+    },
+    {
+      key: 'likesAndComments',
+      label: language === 'sw' ? 'Likes na Maoni (Likes & comments)' : 'Likes and comments',
+      desc:
+        language === 'sw'
+          ? 'Likes, mioyo na maoni kwenye machapisho yako'
+          : 'Reactions and new comments on your posts',
+      checked: likesAndCommentsChecked,
+      icon: <Heart size={16} className="text-rose-600" />,
+      bg: 'bg-rose-50'
+    },
+    {
+      key: 'followedPosts',
+      label:
+        language === 'sw'
+          ? 'Machapisho mapya kutoka unaowafuata'
+          : 'New posts from people I follow',
+      desc:
+        language === 'sw'
+          ? 'Hadi arifa 1 kwa saa kwa kila mbunifu unayemfuata'
+          : 'Up to once per hour per creator you follow',
+      checked: settings.followedPosts !== false,
+      icon: <Sparkles size={16} className="text-amber-600" />,
+      bg: 'bg-amber-50'
+    },
+    {
+      key: 'soundAndVibration',
+      label: language === 'sw' ? 'Sauti na Mtetemo (Sound / vibration)' : 'Sound and vibration',
+      desc:
+        language === 'sw'
+          ? 'Toa sauti au mtetemo wa simu arifa zinapoingia'
+          : 'Play notification sound and vibrate device on alert',
+      checked: settings.soundAndVibration !== false,
+      icon: <Volume2 size={16} className="text-teal-600" />,
+      bg: 'bg-teal-50'
+    }
+  ];
 
   return (
     <div className="space-y-5">
-      {/* Friendly Add to Home Screen Hint (Especially for iPhone Users) */}
-      <AddToHomeScreenHintCard />
+      {/* Install WaveLink & iPhone Home Screen Prompt */}
+      <div className="space-y-2.5">
+        <PWAInstallButton variant="full" />
+        <AddToHomeScreenHintCard />
+      </div>
 
-      {/* 1. Explicit Permission Opt-In Card (One Kind Sentence, Never Prompts on Load) */}
+      {/* 1. Device Push Registration Card */}
       <div className="bg-white rounded-2xl border border-stone-200/90 p-5 shadow-xs space-y-4">
         <div className="flex items-start justify-between gap-4 flex-wrap">
           <div className="flex items-start gap-3.5 max-w-xl">
@@ -247,41 +331,39 @@ export const NotificationSettingsPanel: React.FC = () => {
                 )}
               </div>
 
-              {/* Kind explanation sentence */}
               <p className="text-xs sm:text-sm text-stone-600 mt-1 leading-relaxed">
                 {t('notif.kind_explanation')}
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex items-center gap-2.5 flex-wrap shrink-0">
+            <button
+              type="button"
+              onClick={handleSendTestPush}
+              disabled={isSendingTest}
+              className="px-3.5 py-2.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-xs font-bold inline-flex items-center gap-1.5 transition cursor-pointer"
+            >
+              {isSendingTest ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              <span>{language === 'sw' ? 'Tuma arifa ya jaribio' : 'Send test notification'}</span>
+            </button>
+
             {isDeviceSubscribed ? (
-              <>
-                <button
-                  type="button"
-                  onClick={handleSendTestPush}
-                  disabled={isSendingTest}
-                  className="px-3.5 py-2.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-xs font-bold inline-flex items-center gap-1.5 transition"
-                >
-                  {isSendingTest ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                  <span>{t('notif.test_btn')}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDisableDevicePush}
-                  disabled={isRequestingPermission}
-                  className="px-3.5 py-2.5 rounded-xl bg-stone-100 hover:bg-rose-50 text-stone-700 hover:text-rose-600 border border-stone-200 text-xs font-bold inline-flex items-center gap-1.5 transition"
-                >
-                  <BellOff size={14} />
-                  <span>{t('notif.disable_btn')}</span>
-                </button>
-              </>
+              <button
+                type="button"
+                onClick={handleDisableDevicePush}
+                disabled={isRequestingPermission}
+                className="px-3.5 py-2.5 rounded-xl bg-stone-100 hover:bg-rose-50 text-stone-700 hover:text-rose-600 border border-stone-200 text-xs font-bold inline-flex items-center gap-1.5 transition cursor-pointer"
+              >
+                <BellOff size={14} />
+                <span>{t('notif.disable_btn')}</span>
+              </button>
             ) : (
               <button
                 type="button"
                 onClick={handleEnableDevicePush}
                 disabled={isRequestingPermission}
-                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs sm:text-sm font-extrabold inline-flex items-center gap-2 shadow-sm transition active:scale-95"
+                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs sm:text-sm font-extrabold inline-flex items-center gap-2 shadow-sm transition active:scale-95 cursor-pointer"
               >
                 {isRequestingPermission ? (
                   <>
@@ -298,6 +380,24 @@ export const NotificationSettingsPanel: React.FC = () => {
             )}
           </div>
         </div>
+
+        {registeredDevices.length > 0 && (
+          <div className="pt-2 border-t border-stone-100">
+            <div className="text-[11px] font-bold text-stone-500 uppercase tracking-wider mb-1.5">
+              Registered devices ({registeredDevices.length}/5)
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {registeredDevices.map((dev, idx) => (
+                <div
+                  key={`${dev.deviceId || idx}`}
+                  className="px-2.5 py-1 rounded-lg bg-stone-50 border border-stone-200 text-[11px] text-stone-700 font-semibold"
+                >
+                  {dev.deviceName || dev.platform || 'Device'}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {statusFeedback && (
           <div
@@ -378,131 +478,46 @@ export const NotificationSettingsPanel: React.FC = () => {
       >
         <div>
           <h4 className="text-sm font-extrabold text-stone-900">
-            {language === 'sw' ? 'Aina za Arifa' : 'Notification Categories'}
+            {language === 'sw' ? 'Aina za Arifa' : 'Notification Preferences'}
           </h4>
           <p className="text-xs text-stone-500 mt-0.5">
             {language === 'sw'
               ? 'Chagua ni arifa zipi ungependa kupokea kutoka kwenye seva ya WaveLink.'
-              : 'Choose exactly which updates WaveLink sends from the server to your devices.'}
+              : 'Choose which push alerts WaveLink sends to your phone and computer.'}
           </p>
         </div>
 
         <div className="divide-y divide-stone-100">
-          {[
-            {
-              key: 'messages' as const,
-              label: t('notif.cat_messages'),
-              desc:
-                language === 'sw'
-                  ? 'Ujumbe wa moja kwa moja na soga za vikundi'
-                  : 'Direct messages and group chat messages',
-              icon: <MessageSquare size={16} className="text-blue-600" />,
-              bg: 'bg-blue-50'
-            },
-            {
-              key: 'calls' as const,
-              label: t('notif.cat_calls'),
-              desc:
-                language === 'sw'
-                  ? 'Arifa kubwa yenye kitufe cha Pokea (Answer) na Kataa (Decline)'
-                  : 'Loud high-priority alert with Answer & Decline action buttons',
-              icon: <PhoneCall size={16} className="text-emerald-600" />,
-              bg: 'bg-emerald-50'
-            },
-            {
-              key: 'followers' as const,
-              label: t('notif.cat_followers'),
-              desc:
-                language === 'sw'
-                  ? 'Mtu anapoanza kukufuata kwenye WaveLink'
-                  : 'When someone starts following your profile',
-              icon: <UserPlus size={16} className="text-purple-600" />,
-              bg: 'bg-purple-50'
-            },
-            {
-              key: 'reactions' as const,
-              label: t('notif.cat_reactions'),
-              desc:
-                language === 'sw'
-                  ? 'Likes, mioyo na moto kwenye machapisho, Reels na Sparks zako'
-                  : 'Likes, hearts, and fire reactions on your posts, Reels & Sparks',
-              icon: <Heart size={16} className="text-rose-600" />,
-              bg: 'bg-rose-50'
-            },
-            {
-              key: 'replies' as const,
-              label: t('notif.cat_replies'),
-              desc:
-                language === 'sw'
-                  ? 'Maoni na majibu kwenye machapisho au Sparks zako'
-                  : 'Comments and replies on your posts, Reels, and Sparks',
-              icon: <MessageCircle size={16} className="text-sky-600" />,
-              bg: 'bg-sky-50'
-            },
-            {
-              key: 'challenges' as const,
-              label: t('notif.cat_challenges'),
-              desc:
-                language === 'sw'
-                  ? 'Vikumbusho vya mashindano ya wabunifu ya wiki na matokeo ya washindi'
-                  : 'Weekly creator challenge reminders, deadlines, and leaderboard results',
-              icon: <Trophy size={16} className="text-amber-600" />,
-              bg: 'bg-amber-50'
-            },
-            {
-              key: 'announcements' as const,
-              label:
-                language === 'sw' ? 'Matangazo na Matukio' : 'Announcements & Events',
-              desc:
-                language === 'sw'
-                  ? 'Matangazo rasmi ya jumuiya na ratiba za matukio'
-                  : 'Official Notice Board bulletins, schedules, and community events',
-              icon: <Megaphone size={16} className="text-orange-600" />,
-              bg: 'bg-orange-50'
-            },
-            {
-              key: 'payments' as const,
-              label:
-                language === 'sw'
-                  ? 'Malipo na Zawadi za Wabunifu'
-                  : 'Payment Confirmations & Tips',
-              desc:
-                language === 'sw'
-                  ? 'Zawadi za pesa za simu, kuongeza ufikiaji na uthibitisho wa Pro'
-                  : 'Mobile money creator tips, post boosts, and Pro pass receipts',
-              icon: <Coins size={16} className="text-teal-600" />,
-              bg: 'bg-teal-50'
-            }
-          ].map((item) => {
-            const isChecked = settings[item.key] !== false;
-            return (
-              <div key={item.key} className="py-3.5 first:pt-1 last:pb-1 flex items-center justify-between gap-4">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className={`p-2 rounded-xl ${item.bg} shrink-0`}>{item.icon}</div>
-                  <div className="min-w-0">
-                    <div className="text-xs sm:text-sm font-bold text-stone-900">{item.label}</div>
-                    <div className="text-[11px] text-stone-500">{item.desc}</div>
-                  </div>
+          {categoryItems.map((item) => (
+            <div
+              key={item.key}
+              className="py-3.5 first:pt-1 last:pb-1 flex items-center justify-between gap-4"
+            >
+              <div className="flex items-center gap-3 min-w-0">
+                <div className={`p-2 rounded-xl ${item.bg} shrink-0`}>{item.icon}</div>
+                <div className="min-w-0">
+                  <div className="text-xs sm:text-sm font-bold text-stone-900">{item.label}</div>
+                  <div className="text-[11px] text-stone-500">{item.desc}</div>
                 </div>
-
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={isChecked}
-                  onClick={() => handleUpdateSetting({ [item.key]: !isChecked })}
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
-                    isChecked ? 'bg-blue-600' : 'bg-stone-300'
-                  }`}
-                >
-                  <span
-                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                      isChecked ? 'translate-x-5' : 'translate-x-0'
-                    }`}
-                  />
-                </button>
               </div>
-            );
-          })}
+
+              <button
+                type="button"
+                role="switch"
+                aria-checked={item.checked}
+                onClick={() => handleUpdateSetting({ [item.key]: !item.checked })}
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+                  item.checked ? 'bg-blue-600' : 'bg-stone-300'
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                    item.checked ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -522,7 +537,7 @@ export const NotificationSettingsPanel: React.FC = () => {
                 Show Short Message Previews
               </h4>
               <p className="text-xs text-stone-500 mt-0.5">
-                WaveLink never sends full private messages in push notifications—only a brief snippet, or you can hide previews completely.
+                Display a short snippet in message alerts, or hide previews completely on your lock screen.
               </p>
             </div>
           </div>
@@ -545,26 +560,6 @@ export const NotificationSettingsPanel: React.FC = () => {
             />
           </button>
         </div>
-
-        {/* Live Lock-Screen Preview Example */}
-        <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200/80 flex items-center gap-3">
-          <div className="w-8 h-8 rounded-xl bg-blue-600 text-white font-black text-xs flex items-center justify-center shrink-0">
-            W
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="font-bold text-stone-900">
-                {settings.showMessagePreviews ? 'Amani Creative' : 'New message from Amani Creative'}
-              </span>
-              <span className="text-stone-400">now</span>
-            </div>
-            <p className="text-xs text-stone-600 truncate mt-0.5">
-              {settings.showMessagePreviews
-                ? 'Hey! Are you joining the WaveLink creator meetup…'
-                : 'Sent you a private message on WaveLink. Tap to view.'}
-            </p>
-          </div>
-        </div>
       </div>
 
       {/* 5. Quiet Hours */}
@@ -581,7 +576,7 @@ export const NotificationSettingsPanel: React.FC = () => {
             <div>
               <h4 className="text-sm font-extrabold text-stone-900">Quiet Hours</h4>
               <p className="text-xs text-stone-500 mt-0.5">
-                Automatically silence push notifications from the server during your rest hours.
+                Silence non-urgent push notifications from the server during your rest hours.
               </p>
             </div>
           </div>
@@ -633,11 +628,27 @@ export const NotificationSettingsPanel: React.FC = () => {
         )}
       </div>
 
+      {/* 6. Honest Web Push Limits */}
+      <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200 text-xs text-amber-950 space-y-1.5">
+        <div className="flex items-center gap-2 font-extrabold text-amber-900">
+          <Info size={15} className="shrink-0 text-amber-700" />
+          <span>How mobile notifications work on a web app</span>
+        </div>
+        <ul className="list-disc pl-5 space-y-1 text-[11px] text-amber-900/90 leading-relaxed">
+          <li>
+            <strong>Incoming calls:</strong> Web apps cannot take over the whole phone screen while your phone is locked like a native carrier call. Instead, incoming calls arrive as a loud, high-priority notification with <strong>Answer</strong> and <strong>Decline</strong> buttons.
+          </li>
+          <li>
+            <strong>iPhone &amp; iPad:</strong> Apple requires installing WaveLink to your Home Screen (Safari <strong>Share → Add to Home Screen</strong> on iOS 16.4+) and opening it from your Home Screen icon to receive push alerts.
+          </li>
+        </ul>
+      </div>
+
       {/* Security Note */}
       <div className="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80 flex items-center gap-2.5 text-[11px] text-stone-500">
         <ShieldCheck size={15} className="text-emerald-600 shrink-0" />
         <span>
-          Push notifications are dispatched exclusively by the WaveLink server using Firebase Cloud Messaging. Your device token is stored privately under your account and automatically deleted when you sign out.
+          Push notifications are sent exclusively by WaveLink Firebase Cloud Functions using your saved preferences, capped at 20 alerts/hour, and removed automatically when you sign out.
         </span>
       </div>
     </div>

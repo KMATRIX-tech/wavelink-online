@@ -136,6 +136,54 @@ service cloud.firestore {
       );
     }
 
+    function isValidCustomBackgroundUrl(val) {
+      return val is string &&
+        val.size() > 10 &&
+        val.size() <= 500 &&
+        val.matches('^https://.*') &&
+        !val.matches('^data:.*') &&
+        !val.matches('^blob:.*');
+    }
+
+    function isValidCustomBackgroundItem(bg) {
+      return bg is map &&
+        ('url' in bg) && isValidCustomBackgroundUrl(bg.url) &&
+        (!('mobileUrl' in bg) || bg.mobileUrl == null || isValidCustomBackgroundUrl(bg.mobileUrl)) &&
+        ('darken' in bg) && bg.darken is number && bg.darken >= 0 && bg.darken <= 70 &&
+        ('blur' in bg) && bg.blur is number && bg.blur >= 0 && bg.blur <= 12 &&
+        ('textMode' in bg) && bg.textMode in ['light', 'dark'];
+    }
+
+    function isValidCustomBackgroundHistory(hist) {
+      return hist is list &&
+        hist.size() <= 5 &&
+        (hist.size() < 1 || isValidCustomBackgroundItem(hist[0])) &&
+        (hist.size() < 2 || isValidCustomBackgroundItem(hist[1])) &&
+        (hist.size() < 3 || isValidCustomBackgroundItem(hist[2])) &&
+        (hist.size() < 4 || isValidCustomBackgroundItem(hist[3])) &&
+        (hist.size() < 5 || isValidCustomBackgroundItem(hist[4]));
+    }
+
+    function isValidFcmTokenEntry(entry) {
+      return entry is map &&
+        ('token' in entry) && entry.token is string && entry.token.size() > 10 && entry.token.size() <= 1024 &&
+        (!('deviceId' in entry) || (entry.deviceId is string && entry.deviceId.size() <= 128)) &&
+        (!('deviceName' in entry) || (entry.deviceName is string && entry.deviceName.size() <= 120)) &&
+        (!('platform' in entry) || (entry.platform is string && entry.platform.size() <= 80)) &&
+        (!('createdAt' in entry) || (entry.createdAt is string && entry.createdAt.size() <= 64)) &&
+        (!('lastUsedAt' in entry) || (entry.lastUsedAt is string && entry.lastUsedAt.size() <= 64));
+    }
+
+    function isValidFcmTokensArray(arr) {
+      return arr is list &&
+        arr.size() <= 5 &&
+        (arr.size() < 1 || isValidFcmTokenEntry(arr[0])) &&
+        (arr.size() < 2 || isValidFcmTokenEntry(arr[1])) &&
+        (arr.size() < 3 || isValidFcmTokenEntry(arr[2])) &&
+        (arr.size() < 4 || isValidFcmTokenEntry(arr[3])) &&
+        (arr.size() < 5 || isValidFcmTokenEntry(arr[4]));
+    }
+
     // Validate User Profile payload lengths & types (used on both create and update)
     function isValidUserProfilePayload(data) {
       return isValidOptionalString(data, 'displayName', 80) &&
@@ -158,7 +206,12 @@ service cloud.firestore {
         isValidOptionalString(data, 'proAccentColor', 32) &&
         isValidOptionalString(data, 'proBadge', 32) &&
         (!('chatThemes' in data) || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
-        (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*'));
+        (!('fcmTokens' in data) || isValidFcmTokensArray(data.fcmTokens)) &&
+        (!('mutedChannelIds' in data) || (data.mutedChannelIds is list && data.mutedChannelIds.size() <= 200)) &&
+        (!('notificationSettings' in data) || data.notificationSettings is map) &&
+        (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*')) &&
+        (!('customBackground' in data) || data.customBackground == null || isValidCustomBackgroundItem(data.customBackground)) &&
+        (!('customBackgroundHistory' in data) || isValidCustomBackgroundHistory(data.customBackgroundHistory));
     }
 
     // Check if the authenticated user is a Pro member, verified by Admin, or an Admin
@@ -188,6 +241,8 @@ service cloud.firestore {
         (!('isPro' in data) || data.isPro == false || isAdmin()) &&
         (!('hasBlueStar' in data) || data.hasBlueStar == false || isAdmin()) &&
         (!('isVerifiedByAdmin' in data) || data.isVerifiedByAdmin == false || isAdmin()) &&
+        (!('customBackground' in data) || data.customBackground == null || isUserProOrAdmin()) &&
+        (!('customBackgroundHistory' in data) || data.customBackgroundHistory.size() == 0 || isUserProOrAdmin()) &&
         (!('emailVerified' in data) || data.emailVerified == isEmailVerified()) &&
         (!('phoneVerified' in data) || data.phoneVerified == false) &&
         (!('isContactVerified' in data) || data.isContactVerified == isEmailVerified()) &&
@@ -197,12 +252,18 @@ service cloud.firestore {
 
     // Users can update ONLY their own safe profile fields (photo, cover, bio, displayName, username, theme, language, settings),
     // and NEVER role, admin, sub-admin, Pro, verified badges, ban state, or points.
+    // Custom app background fields require Pro or Admin status (except setting customBackground = null to remove).
     function isSafeUserProfileUpdate(userId) {
       let incoming = request.resource.data;
       let existing = resource.data;
       return isOwner(userId) &&
         isValidUserProfilePayload(incoming) &&
         (!('uid' in incoming) || incoming.uid == userId) &&
+        (
+          !incoming.diff(existing).affectedKeys().hasAny(['customBackground', 'customBackgroundHistory']) ||
+          isUserProOrAdmin() ||
+          (('customBackground' in incoming) && incoming.customBackground == null && !incoming.diff(existing).affectedKeys().hasAny(['customBackgroundHistory']))
+        ) &&
         !incoming.diff(existing).affectedKeys().hasAny([
           'role',
           'admin',
@@ -312,6 +373,11 @@ service cloud.firestore {
       // Per-Chat Theme Preferences subcollection — strictly only the owning user can read/write their own chat settings
       match /chatSettings/{settingId} {
         allow read, write: if isOwner(userId);
+      }
+
+      // Server-only push rate limit & dedupe metadata managed exclusively by Cloud Functions
+      match /privatePushMeta/{docId} {
+        allow read, write: if false;
       }
     }
 
@@ -693,10 +759,11 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
-    // Live Video & Voice Calls (Strictly only the caller and the receiver can read and update the call and its ICE candidate subcollections)
+    // Live Video & Voice Calls (Strictly only the caller and the callee/receiver can read and update the call and its ICE candidate subcollections)
     function isCallParticipantData(d) {
       return d != null && (
         d.get('callerId', '') == request.auth.uid ||
+        d.get('calleeId', '') == request.auth.uid ||
         d.get('receiverId', '') == request.auth.uid ||
         d.get('caller', '') == request.auth.uid ||
         d.get('receiver', '') == request.auth.uid
@@ -718,13 +785,15 @@ service cloud.firestore {
         isValidId(callId) &&
         (request.resource.data.get('callerId', '') == request.auth.uid ||
          request.resource.data.get('caller', '') == request.auth.uid) &&
-        ((request.resource.data.get('receiverId', '') is string && request.resource.data.get('receiverId', '').size() > 0) ||
-         (request.resource.data.get('receiver', '') is string && request.resource.data.get('receiver', '').size() > 0));
+        ((request.resource.data.get('calleeId', '') is string && request.resource.data.get('calleeId', '').size() > 0) ||
+         (request.resource.data.get('receiverId', '') is string && request.resource.data.get('receiverId', '').size() > 0) ||
+         (request.resource.data.get('receiver', '') is string && request.resource.data.get('receiver', '').size() > 0)) &&
+        !request.resource.data.keys().hasAny(['callerPhotoURL', 'receiverPhotoURL', 'calleePhotoURL']);
       allow update: if isSignedIn() &&
         isValidId(callId) &&
         resource != null &&
         isCallParticipantData(resource.data) &&
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['caller', 'callerId', 'receiver', 'receiverId']);
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['caller', 'callerId', 'calleeId', 'receiver', 'receiverId', 'callerPhotoURL', 'receiverPhotoURL', 'calleePhotoURL']);
       allow delete: if isSignedIn() &&
         isValidId(callId) &&
         resource != null &&
