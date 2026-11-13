@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders, batchCacheUserProfiles } from '../firebase';
+import { auth, db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders, batchCacheUserProfiles } from '../firebase';
+import {
+  fetchIceServersForCall,
+  FetchIceServersResult
+} from '../utils/webrtcConfig';
 import {
   collection,
   query,
@@ -96,7 +100,8 @@ import {
   Tag,
   Trash2,
   Trophy,
-  RefreshCw
+  RefreshCw,
+  Activity
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -309,6 +314,43 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   // AzamPay Test Connection State
   const [isTestingAzampay, setIsTestingAzampay] = useState(false);
   const [azampayTestResult, setAzampayTestResult] = useState<string | null>(null);
+
+  // System Health: /api/ice-servers TURN Relay Diagnostic State
+  const [iceHealthStatus, setIceHealthStatus] = useState<'idle' | 'testing' | 'healthy' | 'degraded'>('idle');
+  const [iceHealthResult, setIceHealthResult] = useState<FetchIceServersResult | null>(null);
+  const [iceHealthCheckedAt, setIceHealthCheckedAt] = useState<string | null>(null);
+
+  const handleTestIceServersHealth = useCallback(async () => {
+    setIceHealthStatus('testing');
+    try {
+      const activeUser = auth.currentUser || currentUser;
+      const idToken = activeUser ? await activeUser.getIdToken() : '';
+      const result = await fetchIceServersForCall(idToken);
+      const isRelayHealthy =
+        result.hasRelayServers &&
+        !result.isFallback &&
+        (!result.httpStatus || result.httpStatus === 200);
+      setIceHealthResult(result);
+      setIceHealthStatus(isRelayHealthy ? 'healthy' : 'degraded');
+      setIceHealthCheckedAt(new Date().toLocaleTimeString());
+    } catch {
+      setIceHealthResult({
+        iceServers: [],
+        hasRelayServers: false,
+        isFallback: true,
+        missingEnvVars: [],
+        reason: 'Failed to contact /api/ice-servers endpoint.',
+      });
+      setIceHealthStatus('degraded');
+      setIceHealthCheckedAt(new Date().toLocaleTimeString());
+    }
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (serverAdminVerified && currentUser && iceHealthStatus === 'idle') {
+      handleTestIceServersHealth();
+    }
+  }, [serverAdminVerified, currentUser, iceHealthStatus, handleTestIceServersHealth]);
 
   const handleTestAzamPayAuth = async () => {
     setIsTestingAzampay(true);
@@ -2450,6 +2492,95 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               <span className="text-[10px] text-gray-400">Public posts</span>
             </div>
           </div>
+
+          {/* System Health: WebRTC TURN Relay (/api/ice-servers) Check */}
+          <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-5 sm:p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-3">
+                <div
+                  className={`p-2.5 rounded-2xl ${
+                    iceHealthStatus === 'healthy'
+                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/70 dark:text-emerald-300'
+                      : iceHealthStatus === 'degraded'
+                      ? 'bg-rose-100 text-rose-700 dark:bg-rose-950/70 dark:text-rose-300'
+                      : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+                  }`}
+                >
+                  <Activity size={20} />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-sm sm:text-base text-gray-900 dark:text-white">
+                    System Health: Video &amp; Voice Call Relay (TURN)
+                  </h3>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Tests <code className="font-mono">/api/ice-servers</code> to verify Metered relay servers are active.
+                    {iceHealthCheckedAt ? ` Last checked at ${iceHealthCheckedAt}.` : ''}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleTestIceServersHealth}
+                disabled={iceHealthStatus === 'testing'}
+                className="px-4 py-2 rounded-xl bg-gray-900 hover:bg-gray-800 dark:bg-white dark:hover:bg-gray-100 text-white dark:text-gray-900 text-xs font-bold inline-flex items-center gap-2 transition disabled:opacity-60 cursor-pointer"
+              >
+                {iceHealthStatus === 'testing' ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <RefreshCw size={14} />
+                )}
+                <span>{iceHealthStatus === 'testing' ? 'Testing...' : 'Test /api/ice-servers'}</span>
+              </button>
+            </div>
+
+            {iceHealthStatus === 'healthy' && (
+              <div className="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/70 flex items-start gap-3">
+                <span className="w-3 h-3 rounded-full bg-emerald-500 mt-1 shrink-0 shadow-xs shadow-emerald-500/50" />
+                <div className="space-y-1 text-xs">
+                  <p className="font-extrabold text-emerald-800 dark:text-emerald-200">
+                    Healthy — Metered TURN relay servers active
+                  </p>
+                  <p className="text-emerald-700 dark:text-emerald-300/90 leading-relaxed">
+                    Calls receive temporary Metered relay credentials ({iceHealthResult?.iceServers.length || 0} ICE entries configured), allowing reliable audio and video connections over mobile data and restrictive firewalls.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {iceHealthStatus === 'degraded' && (
+              <div className="p-4 rounded-2xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/70 flex items-start gap-3">
+                <span className="w-3 h-3 rounded-full bg-rose-500 mt-1 shrink-0 shadow-xs shadow-rose-500/50" />
+                <div className="space-y-2 text-xs">
+                  <p className="font-extrabold text-rose-800 dark:text-rose-200">
+                    STUN-Only Fallback — Relay Servers Not Available
+                  </p>
+                  <p className="text-rose-700 dark:text-rose-300/90 leading-relaxed">
+                    The server fell back to free public STUN servers only. Calls may work on open Wi-Fi, but calls between mobile data networks or behind strict carrier NATs are likely to fail until Metered TURN credentials are configured.
+                  </p>
+                  {iceHealthResult?.missingEnvVars && iceHealthResult.missingEnvVars.length > 0 ? (
+                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                      <span className="font-bold text-rose-800 dark:text-rose-200">
+                        Missing server environment variable(s):
+                      </span>
+                      {iceHealthResult.missingEnvVars.map((envName) => (
+                        <code
+                          key={envName}
+                          className="px-2 py-0.5 rounded-lg bg-rose-100 dark:bg-rose-900/70 border border-rose-300 dark:border-rose-700 font-mono font-bold text-rose-900 dark:text-rose-100"
+                        >
+                          {envName}
+                        </code>
+                      ))}
+                    </div>
+                  ) : iceHealthResult?.reason ? (
+                    <p className="font-mono text-[11px] text-rose-700 dark:text-rose-300">
+                      Detail: {iceHealthResult.reason}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -3161,6 +3292,54 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                 {appSettings?.voiceCallsUnlocked ? 'Lock Voice Calls' : 'Unlock Voice Calls'}
               </button>
             </div>
+          </div>
+
+          {/* TURN Relay System Health summary inside Calling Controls */}
+          <div className="pt-2 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-2.5 text-xs">
+              <span
+                className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                  iceHealthStatus === 'healthy'
+                    ? 'bg-emerald-500'
+                    : iceHealthStatus === 'degraded'
+                    ? 'bg-rose-500'
+                    : 'bg-gray-400'
+                }`}
+              />
+              <span className="font-bold text-gray-900 dark:text-white">
+                System Health (/api/ice-servers):
+              </span>
+              <span
+                className={
+                  iceHealthStatus === 'healthy'
+                    ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                    : iceHealthStatus === 'degraded'
+                    ? 'text-rose-600 dark:text-rose-400 font-semibold'
+                    : 'text-gray-500'
+                }
+              >
+                {iceHealthStatus === 'healthy'
+                  ? 'Green — Relay servers active'
+                  : iceHealthStatus === 'degraded'
+                  ? iceHealthResult?.missingEnvVars?.length
+                    ? `Red — STUN only (missing ${iceHealthResult.missingEnvVars.join(', ')})`
+                    : 'Red — STUN-only fallback active'
+                  : 'Checking...'}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handleTestIceServersHealth}
+              disabled={iceHealthStatus === 'testing'}
+              className="px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-xs font-bold text-gray-800 dark:text-gray-200 inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              {iceHealthStatus === 'testing' ? (
+                <Loader2 size={13} className="animate-spin" />
+              ) : (
+                <RefreshCw size={13} />
+              )}
+              <span>Re-test Relay</span>
+            </button>
           </div>
         </div>
       )}

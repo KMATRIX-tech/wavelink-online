@@ -1556,6 +1556,173 @@ const rateLimitUpload = createRateLimiter({
   errorMessage: 'Too many upload chunks. Please wait a moment and try again.',
 });
 
+// ============================================================================
+// STRICT FIREBASE ID TOKEN VERIFICATION & METERED ICE SERVER CACHE (10 MIN)
+// ============================================================================
+let cachedSecureTokenCerts: { certs: Record<string, string>; expiresAt: number } | null = null;
+
+async function getFirebaseSecureTokenCerts(): Promise<Record<string, string> | null> {
+  if (cachedSecureTokenCerts && Date.now() < cachedSecureTokenCerts.expiresAt) {
+    return cachedSecureTokenCerts.certs;
+  }
+  try {
+    const resp = await fetch(
+      'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com',
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!resp.ok) return cachedSecureTokenCerts?.certs || null;
+    const certs = (await resp.json()) as Record<string, string>;
+    const cc = resp.headers.get('cache-control') || '';
+    const maxAgeMatch = cc.match(/max-age=(\d+)/i);
+    const maxAgeSec = maxAgeMatch ? Math.max(300, Number(maxAgeMatch[1])) : 3600;
+    cachedSecureTokenCerts = {
+      certs,
+      expiresAt: Date.now() + maxAgeSec * 1000,
+    };
+    return certs;
+  } catch {
+    return cachedSecureTokenCerts?.certs || null;
+  }
+}
+
+async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
+  valid: boolean;
+  uid: string;
+  email: string;
+  error?: string;
+}> {
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (!authHeader.startsWith('Bearer ')) {
+    return { valid: false, uid: '', email: '', error: 'Sign-in required: missing Firebase ID token.' };
+  }
+  const token = authHeader.slice(7).trim();
+  if (!token || token.split('.').length !== 3) {
+    return { valid: false, uid: '', email: '', error: 'Invalid Firebase ID token format.' };
+  }
+
+  // 1. Try Firebase Admin SDK when credentials are available
+  try {
+    if (ensureFirebaseAdminInitialized() && getAdminApps().length > 0) {
+      const decoded = await getAdminAuth(getAdminApp()).verifyIdToken(token, true);
+      if (decoded?.uid) {
+        return {
+          valid: true,
+          uid: decoded.uid,
+          email: String(decoded.email || '').trim().toLowerCase(),
+        };
+      }
+    }
+  } catch (err: any) {
+    const code = String(err?.code || '');
+    if (
+      code === 'auth/id-token-expired' ||
+      code === 'auth/id-token-revoked' ||
+      code === 'auth/invalid-id-token' ||
+      code === 'auth/argument-error' ||
+      code === 'auth/user-disabled'
+    ) {
+      return { valid: false, uid: '', email: '', error: 'Firebase ID token is invalid or expired.' };
+    }
+    // Otherwise ADC/service-account may be absent in preview/Render -> continue to Google public cert verification
+  }
+
+  // 2. Cryptographic JWT RS256 verification against Google's Firebase Auth X.509 certificates
+  try {
+    const [headerB64, payloadB64, sigB64] = token.split('.');
+    const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as {
+      alg?: string;
+      kid?: string;
+    };
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+      aud?: string;
+      iss?: string;
+      sub?: string;
+      user_id?: string;
+      email?: string;
+      exp?: number;
+      iat?: number;
+      auth_time?: number;
+    };
+
+    const { projectId } = getServerFirebaseConfig();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const uid = String(payload?.sub || payload?.user_id || '').trim();
+
+    if (!uid || !payload || typeof payload.exp !== 'number') {
+      return { valid: false, uid: '', email: '', error: 'Malformed Firebase ID token claims.' };
+    }
+    if (payload.exp <= nowSec - 30) {
+      return { valid: false, uid: '', email: '', error: 'Firebase ID token has expired.' };
+    }
+    if (typeof payload.iat === 'number' && payload.iat > nowSec + 300) {
+      return { valid: false, uid: '', email: '', error: 'Firebase ID token issued-at timestamp is invalid.' };
+    }
+    if (projectId) {
+      if (payload.aud !== projectId || payload.iss !== `https://securetoken.google.com/${projectId}`) {
+        return { valid: false, uid: '', email: '', error: 'Firebase ID token project mismatch.' };
+      }
+    }
+
+    if (header?.alg !== 'RS256' || !header?.kid) {
+      return { valid: false, uid: '', email: '', error: 'Unsupported Firebase ID token signature algorithm.' };
+    }
+
+    const certs = await getFirebaseSecureTokenCerts();
+    if (certs) {
+      const certPem = certs[header.kid];
+      if (!certPem) {
+        return { valid: false, uid: '', email: '', error: 'Unrecognized Firebase ID token signing key.' };
+      }
+      const verifier = crypto.createVerify('RSA-SHA256');
+      verifier.update(`${headerB64}.${payloadB64}`);
+      verifier.end();
+      const signatureValid = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
+      if (!signatureValid) {
+        return { valid: false, uid: '', email: '', error: 'Invalid Firebase ID token signature.' };
+      }
+    }
+
+    return {
+      valid: true,
+      uid,
+      email: String(payload.email || '').trim().toLowerCase(),
+    };
+  } catch {
+    return { valid: false, uid: '', email: '', error: 'Failed to validate Firebase ID token.' };
+  }
+}
+
+const iceServerUserBuckets = new Map<string, RateBucket>();
+const ICE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const ICE_RATE_LIMIT_MAX_PER_USER = 25;
+
+const PUBLIC_STUN_FALLBACK_SERVERS: Array<{ urls: string }> = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+];
+
+const METERED_ICE_CACHE_TTL_MS = 10 * 60 * 1000; // ~10 minutes
+let cachedMeteredIce: {
+  iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }>;
+  expiresAt: number;
+  configFingerprint: string;
+} | null = null;
+
+function sanitizeIceErrorReason(raw: string, domain: string, apiKey: string): string {
+  let clean = raw || 'Unknown error';
+  if (domain) {
+    clean = clean.split(domain).join('[REDACTED_DOMAIN]');
+  }
+  if (apiKey) {
+    clean = clean.split(apiKey).join('[REDACTED_KEY]');
+    clean = clean.split(encodeURIComponent(apiKey)).join('[REDACTED_KEY]');
+  }
+  return clean.replace(/apiKey=[^&\s]+/gi, 'apiKey=[REDACTED]');
+}
+
 // Per-user daily AI usage tracker (protects Gemini credits)
 const userDailyAiUsage = new Map<string, { date: string; chats: number; images: number }>();
 
@@ -1763,7 +1930,28 @@ const AiModerationSchema = z.object({
 async function startServer() {
   const app = express();
   const httpServer = createHttpServer(app);
-  const PORT = Number(process.env.PORT) || 3000;
+
+  // Honor explicit CLI --port (e.g. `npm run dev --port 3000`) and avoid colliding with NGINX_PORT in dev
+  const cliPortIdx = process.argv.findIndex(
+    (arg) => arg === '--port' || arg === '-p' || arg.startsWith('--port=')
+  );
+  let cliPort = 0;
+  if (cliPortIdx !== -1) {
+    const argVal = process.argv[cliPortIdx];
+    if (argVal.includes('=')) {
+      cliPort = Number(argVal.split('=')[1]);
+    } else if (process.argv[cliPortIdx + 1]) {
+      cliPort = Number(process.argv[cliPortIdx + 1]);
+    }
+  }
+  const envPort = Number(process.env.PORT);
+  const nginxPort = Number(process.env.NGINX_PORT);
+  const defaultAppPort = Number(process.env.DEFAULT_APP_PORT) || 3000;
+  const resolvedEnvPort =
+    envPort && (!nginxPort || envPort !== nginxPort || process.env.NODE_ENV === 'production')
+      ? envPort
+      : defaultAppPort;
+  const PORT = (Number.isFinite(cliPort) && cliPort > 0 ? cliPort : resolvedEnvPort) || 3000;
 
   // 1. Non-blocking Helmet Security Headers (allowing iframe preview & trusted sources without blocking scripts)
   app.use((req, res, next) => {
@@ -2363,73 +2551,216 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
   });
 
   /**
-   * GET /api/calls/ice-servers
-   * Returns STUN + TURN server configuration using environment variables if set on the server,
-   * with a working free OpenRelay Metered TURN fallback so mobile data & cross-network calls connect reliably.
+   * GET /api/ice-servers
+   * Requires a signed-in user (strict Firebase ID token check) and enforces per-user rate limiting.
+   * Fetches temporary relay credentials from Metered's TURN credentials API using process.env.METERED_DOMAIN
+   * and process.env.METERED_API_KEY, caches successful results for ~10 minutes, and never exposes the
+   * domain or API key to logs, errors, or HTTP responses. Falls back to free public STUN servers on failure.
    */
-  app.get('/api/calls/ice-servers', (_req, res) => {
-    const rawTurnUrls = (
-      process.env.TURN_URLS ||
-      process.env.VITE_TURN_URLS ||
-      process.env.TURN_URL ||
-      process.env.VITE_TURN_URL ||
-      ''
-    ).trim();
-    const rawUsername = (
-      process.env.TURN_USERNAME ||
-      process.env.VITE_TURN_USERNAME ||
-      ''
-    ).trim();
-    const rawCredential = (
-      process.env.TURN_CREDENTIAL ||
-      process.env.VITE_TURN_CREDENTIAL ||
-      ''
-    ).trim();
+  const handleGetIceServers = async (req: express.Request, res: express.Response) => {
+    const authResult = await verifyStrictFirebaseIdToken(req);
+    if (!authResult.valid || !authResult.uid) {
+      return res.status(401).json({
+        error: authResult.error || 'Authentication required. Please sign in to start a call.',
+      });
+    }
 
-    const isPlaceholder = (val: string) =>
-      !val ||
-      val === 'YOUR_TURN_USERNAME' ||
-      val === 'YOUR_TURN_CREDENTIAL' ||
-      val.startsWith('YOUR_') ||
-      val.includes('your-turn-host.example.com');
+    // Per-user rate limiting keyed strictly by authenticated UID
+    const now = Date.now();
+    const rateKey = `uid:${authResult.uid}`;
+    const existingBucket = iceServerUserBuckets.get(rateKey);
+    if (!existingBucket || now > existingBucket.resetAt) {
+      iceServerUserBuckets.set(rateKey, {
+        count: 1,
+        resetAt: now + ICE_RATE_LIMIT_WINDOW_MS,
+      });
+    } else if (existingBucket.count >= ICE_RATE_LIMIT_MAX_PER_USER) {
+      return res.status(429).json({
+        error: 'Too many ICE server requests for your account. Please wait a minute and try again.',
+      });
+    } else {
+      existingBucket.count += 1;
+    }
 
-    const hasCustomTurnConfig =
-      !isPlaceholder(rawTurnUrls) &&
-      !isPlaceholder(rawUsername) &&
-      !isPlaceholder(rawCredential);
+    const rawDomain = (process.env.METERED_DOMAIN || '').trim().replace(/^['"]|['"]$/g, '').trim();
+    const rawApiKey = (process.env.METERED_API_KEY || '').trim().replace(/^['"]|['"]$/g, '').trim();
 
-    const turnUrls = !isPlaceholder(rawTurnUrls)
-      ? rawTurnUrls
-          .split(',')
-          .map((u) => u.trim())
-          .filter(Boolean)
-      : [
-          'turn:openrelay.metered.ca:80',
-          'turn:openrelay.metered.ca:80?transport=tcp',
-          'turn:openrelay.metered.ca:3478?transport=udp',
-          'turn:openrelay.metered.ca:443',
-          'turn:openrelay.metered.ca:443?transport=tcp',
-          'turns:openrelay.metered.ca:443?transport=tcp',
-        ];
+    const normalizedDomain = rawDomain
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/+$/, '')
+      .trim();
 
-    const turnUsername = isPlaceholder(rawUsername) ? 'openrelayproject' : rawUsername;
-    const turnCredential = isPlaceholder(rawCredential) ? 'openrelayproject' : rawCredential;
+    const isPlaceholderDomain =
+      !normalizedDomain ||
+      normalizedDomain.includes('YOUR_METERED') ||
+      normalizedDomain.includes('your-app.metered.live') ||
+      normalizedDomain.includes('example.com') ||
+      !/^[a-z0-9.-]+$/i.test(normalizedDomain);
 
-    const iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }> = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' },
-      {
-        urls: turnUrls,
-        username: turnUsername,
-        credential: turnCredential,
-      },
-    ];
+    const isPlaceholderKey =
+      !rawApiKey ||
+      rawApiKey.startsWith('YOUR_') ||
+      rawApiKey.includes('your_metered');
 
-    res.json({ success: true, hasCustomTurnConfig, iceServers });
-  });
+    const missingEnvVars: string[] = [];
+    if (isPlaceholderDomain) missingEnvVars.push('METERED_DOMAIN');
+    if (isPlaceholderKey) missingEnvVars.push('METERED_API_KEY');
+
+    if (missingEnvVars.length > 0) {
+      console.warn(
+        `[ICE] Metered TURN credentials unavailable; falling back to public STUN servers. Missing environment variable(s): ${missingEnvVars.join(
+          ', '
+        )}`
+      );
+      return res.json({
+        iceServers: PUBLIC_STUN_FALLBACK_SERVERS,
+        fallback: true,
+        missingEnvVars,
+        reason: `Server TURN configuration incomplete: missing ${missingEnvVars.join(' and ')}.`,
+      });
+    }
+
+    const configFingerprint = crypto
+      .createHash('sha256')
+      .update(`${normalizedDomain}:${rawApiKey}`)
+      .digest('hex');
+
+    if (
+      cachedMeteredIce &&
+      now < cachedMeteredIce.expiresAt &&
+      cachedMeteredIce.configFingerprint === configFingerprint
+    ) {
+      return res.json({
+        iceServers: cachedMeteredIce.iceServers,
+        fallback: false,
+        missingEnvVars: [],
+      });
+    }
+
+    try {
+      const endpointUrl = `https://${normalizedDomain}/api/v1/turn/credentials?apiKey=${encodeURIComponent(
+        rawApiKey
+      )}`;
+      const resp = await fetch(endpointUrl, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (!resp.ok) {
+        console.error(
+          `[ICE] Metered TURN credentials request failed with HTTP ${resp.status}; falling back to public STUN servers.`
+        );
+        return res.json({
+          iceServers: PUBLIC_STUN_FALLBACK_SERVERS,
+          fallback: true,
+          missingEnvVars: [],
+          reason: `Metered TURN service returned HTTP ${resp.status}.`,
+        });
+      }
+
+      const rawPayload = (await resp.json()) as unknown;
+      if (!Array.isArray(rawPayload)) {
+        console.error(
+          '[ICE] Metered TURN credentials response was not an array; falling back to public STUN servers.'
+        );
+        return res.json({
+          iceServers: PUBLIC_STUN_FALLBACK_SERVERS,
+          fallback: true,
+          missingEnvVars: [],
+          reason: 'Metered TURN service returned an unexpected response format.',
+        });
+      }
+
+      const sanitizedMeteredServers: Array<{
+        urls: string | string[];
+        username?: string;
+        credential?: string;
+      }> = [];
+
+      for (const entry of rawPayload) {
+        if (!entry || typeof entry !== 'object') continue;
+        const record = entry as {
+          urls?: unknown;
+          url?: unknown;
+          username?: unknown;
+          credential?: unknown;
+        };
+        const rawUrls = record.urls ?? record.url;
+        let urls: string | string[] | null = null;
+        if (typeof rawUrls === 'string' && rawUrls.trim()) {
+          urls = rawUrls.trim();
+        } else if (Array.isArray(rawUrls)) {
+          const valid = rawUrls
+            .filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
+            .map((u) => u.trim());
+          if (valid.length > 0) urls = valid;
+        }
+        if (!urls) continue;
+
+        const cleanEntry: { urls: string | string[]; username?: string; credential?: string } = {
+          urls,
+        };
+        if (typeof record.username === 'string' && record.username) {
+          cleanEntry.username = record.username;
+        }
+        if (typeof record.credential === 'string' && record.credential) {
+          cleanEntry.credential = record.credential;
+        }
+        sanitizedMeteredServers.push(cleanEntry);
+      }
+
+      const hasRelay = sanitizedMeteredServers.some((srv) => {
+        const list = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
+        return list.some((u) => /^turns?:/i.test(u));
+      });
+
+      if (!hasRelay) {
+        console.error(
+          '[ICE] Metered TURN response did not contain any TURN/TURNS relay servers; falling back to public STUN servers.'
+        );
+        return res.json({
+          iceServers: PUBLIC_STUN_FALLBACK_SERVERS,
+          fallback: true,
+          missingEnvVars: [],
+          reason: 'Metered TURN response contained no relay servers.',
+        });
+      }
+
+      const seenStun = new Set(
+        sanitizedMeteredServers.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]))
+      );
+      const extraStuns = PUBLIC_STUN_FALLBACK_SERVERS.filter((s) => !seenStun.has(s.urls));
+      const finalIceServers = [...sanitizedMeteredServers, ...extraStuns];
+
+      cachedMeteredIce = {
+        iceServers: finalIceServers,
+        expiresAt: now + METERED_ICE_CACHE_TTL_MS,
+        configFingerprint,
+      };
+
+      return res.json({
+        iceServers: finalIceServers,
+        fallback: false,
+        missingEnvVars: [],
+      });
+    } catch (err) {
+      const rawMessage = err instanceof Error ? err.message : String(err || 'Network error');
+      const safeReason = sanitizeIceErrorReason(rawMessage, normalizedDomain, rawApiKey);
+      console.error(
+        `[ICE] Metered TURN credentials fetch error (${safeReason}); falling back to public STUN servers.`
+      );
+      return res.json({
+        iceServers: PUBLIC_STUN_FALLBACK_SERVERS,
+        fallback: true,
+        missingEnvVars: [],
+        reason: 'Could not reach Metered TURN credentials service.',
+      });
+    }
+  };
+
+  app.get('/api/ice-servers', handleGetIceServers);
+  app.get('/api/calls/ice-servers', handleGetIceServers);
 
   // ============================================================================
   // 1B. WAVELINK AUTOMATED SUPPORT BOT ROUTES (Bilingual EN/SW, Rate-Limited, Safe)
@@ -5364,9 +5695,17 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     }
   });
 
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
+    console.error(`[WaveLink Server Listen Error] Failed to bind port ${PORT}:`, err.message);
+    process.exit(1);
+  });
+
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`WaveLink server running on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[WaveLink Server Startup Error]:', err);
+  process.exit(1);
+});

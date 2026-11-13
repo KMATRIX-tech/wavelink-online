@@ -1,5 +1,4 @@
 import { firebaseConfig } from '../firebase';
-import { logTurnEnvStartupWarning } from './webrtcConfig';
 
 export interface FrontendEnvValidationResult {
   isValid: boolean;
@@ -12,7 +11,6 @@ export interface FrontendEnvValidationResult {
  * Shows a clear, friendly error description if any essential parameter is missing.
  */
 export function validateFrontendEnvironment(): FrontendEnvValidationResult {
-  logTurnEnvStartupWarning();
   const missingKeys: string[] = [];
 
   const requiredKeys: Array<{ key: string; val: unknown }> = [

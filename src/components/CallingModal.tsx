@@ -20,10 +20,11 @@ import {
   Check,
   Maximize2,
   Minimize2,
+  AlertTriangle,
 } from 'lucide-react';
 import { CallRecipient } from '../types';
 import { useAuth } from '../context/AuthContext';
-import { db, cleanFirestoreData } from '../firebase';
+import { auth, db, cleanFirestoreData } from '../firebase';
 import {
   doc,
   setDoc,
@@ -37,9 +38,9 @@ import { sendWelinkChatMessage } from '../services/geminiService';
 import { sendNotification } from '../services/notificationService';
 import { Avatar } from './Avatar';
 import {
-  buildIceServersFromEnv,
+  fetchIceServersForCall,
+  hasRelayIceServer,
   extractIceCandidateInfo,
-  logTurnEnvStartupWarning
 } from '../utils/webrtcConfig';
 
 interface LegacyChatContact {
@@ -66,6 +67,7 @@ export interface CallingModalProps {
 type CallLifecycleState =
   | 'ringing'
   | 'connecting'
+  | 'reconnecting'
   | 'connected'
   | 'no-answer'
   | 'declined'
@@ -124,8 +126,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     initialIsIncoming ? 'connecting' : 'ringing'
   );
   const [statusMessage, setStatusMessage] = useState<string>(
-    initialIsIncoming ? 'Connecting...' : 'Ringing...'
+    initialIsIncoming ? 'Connecting' : 'Connecting'
   );
+  const [connectionQuality, setConnectionQuality] = useState<'good' | 'weak'>('good');
+  const [isStunFallback, setIsStunFallback] = useState(false);
+  const [failureNotice, setFailureNotice] = useState<string | null>(null);
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(normalizedMode === 'voice');
@@ -198,6 +203,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const remoteCandidatesUnsubRef = useRef<(() => void) | null>(null);
   const ringingTimeoutRef = useRef<number | null>(null);
   const connectionTimeoutRef = useRef<number | null>(null);
+  const statsIntervalRef = useRef<number | null>(null);
+  const lastPacketSampleRef = useRef<{ received: number; lost: number } | null>(null);
   const recognitionRef = useRef<any>(null);
 
   const [activeCallId, setActiveCallId] = useState<string>(() => {
@@ -226,6 +233,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       window.clearTimeout(disconnectedTimerRef.current);
       disconnectedTimerRef.current = null;
     }
+    if (statsIntervalRef.current) {
+      window.clearInterval(statsIntervalRef.current);
+      statsIntervalRef.current = null;
+    }
+    lastPacketSampleRef.current = null;
   }, []);
 
   const cleanupWebRTC = useCallback(() => {
@@ -338,9 +350,9 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     }
   }, [callState, hasRemoteVideoTrack, isVideoOff, isSpeakerOn]);
 
-  // Call duration timer starts ONLY when peer connection state is actually 'connected'
+  // Call duration timer runs while call is active (connected or reconnecting mid-call)
   useEffect(() => {
-    if (callState !== 'connected') return;
+    if (callState !== 'connected' && callState !== 'reconnecting') return;
     const interval = window.setInterval(() => {
       setCallDuration((prev) => prev + 1);
     }, 1000);
@@ -415,12 +427,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     isCleaningUpRef.current = false;
     isCallDocReadyRef.current = effectiveIsIncoming;
 
-    logTurnEnvStartupWarning();
+    let networkChangeHandler: (() => void) | null = null;
+    let offlineHandler: (() => void) | null = null;
+    const navConnection = (navigator as Navigator & { connection?: EventTarget & { effectiveType?: string } })
+      .connection;
 
     const logFinalFailure = (reason: string) => {
       const typesList = Array.from(gatheredCandidateTypesRef.current);
       const relayMissingNote = !gatheredRelayCandidateRef.current
-        ? ' | TURN server not reachable (no relay candidates gathered)'
+        ? ' | TURN relay server not reachable (no relay candidates gathered)'
         : '';
       if (!gatheredRelayCandidateRef.current) {
         console.error('[CALL] TURN server not reachable — no relay ICE candidates were gathered.');
@@ -454,6 +469,9 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     const initializeCall = async () => {
       cleanupWebRTC();
       setCallDuration(0);
+      setConnectionQuality('good');
+      setFailureNotice(null);
+      setIsStunFallback(false);
 
       console.log(
         `[CALL] Starting call setup (role=${
@@ -461,39 +479,26 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         }, mode=${normalizedMode}, callId=${activeCallId}, attempt=${retryAttempt + 1})`
       );
 
-      // 1. Resolve STUN + TURN servers (Vite env vars take priority; server used if custom configured or client missing env vars)
-      const envConfig = buildIceServersFromEnv();
-      let iceServers = envConfig.iceServers;
-      let resolvedTurnUrls = envConfig.turnUrls;
-
+      // 1. Fetch ICE servers from authenticated GET /api/ice-servers before every call
+      let idToken = '';
       try {
-        const res = await fetch('/api/calls/ice-servers');
-        if (res.ok) {
-          const data = await res.json();
-          if (
-            Array.isArray(data?.iceServers) &&
-            data.iceServers.length > 0 &&
-            (!envConfig.hasCustomTurnEnv || data.hasCustomTurnConfig)
-          ) {
-            if (!envConfig.hasCustomTurnEnv) {
-              iceServers = data.iceServers;
-              const turnEntry = data.iceServers.find((s: RTCIceServer) => s.username || s.credential);
-              resolvedTurnUrls = Array.isArray(turnEntry?.urls)
-                ? turnEntry.urls
-                : turnEntry?.urls
-                ? [turnEntry.urls]
-                : [];
-            }
-          }
+        const activeAuthUser = auth.currentUser || currentUser;
+        if (activeAuthUser) {
+          idToken = await activeAuthUser.getIdToken();
         }
       } catch {
-        // Fallback cleanly to client env ICE servers
+        // handled by fetchIceServersForCall fallback
       }
 
+      const iceConfigResult = await fetchIceServersForCall(idToken);
+      const iceServers = iceConfigResult.iceServers;
+      const relayAvailable = hasRelayIceServer(iceServers) && !iceConfigResult.isFallback;
+      setIsStunFallback(!relayAvailable);
+
       console.log('[CALL] RTCPeerConnection ICE servers configured:', {
-        hasCustomTurnEnv: envConfig.hasCustomTurnEnv,
-        stunCount: iceServers.filter((s) => !s.username).length,
-        turnUrls: resolvedTurnUrls,
+        relayAvailable,
+        isFallback: !relayAvailable,
+        serverCount: iceServers.length,
       });
 
       if (isCancelled) return;
@@ -542,10 +547,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         localVideoRef.current.play().catch(() => {});
       }
 
-      // 3. Create PeerConnection with STUN + TURN and iceCandidatePoolSize: 10
+      // 3. Create PeerConnection with Metered ICE servers, iceCandidatePoolSize: 4, and relay UDP/TCP/TLS 443 support
       const pc = new RTCPeerConnection({
         iceServers,
-        iceCandidatePoolSize: 10,
+        iceCandidatePoolSize: 4,
+        iceTransportPolicy: 'all',
       });
       pcRef.current = pc;
 
@@ -625,15 +631,88 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         effectiveIsIncoming ? 'callerCandidates' : 'calleeCandidates'
       );
 
-      let startConnectionTimer: (label: string) => void = () => {};
+      let startConnectionTimer: (label: string, resetExisting?: boolean) => void = () => {};
 
-      // Helper to perform automatic ICE restart (up to 3 times) before showing "Connection failed"
+      const startQualityMonitor = () => {
+        if (statsIntervalRef.current) {
+          window.clearInterval(statsIntervalRef.current);
+        }
+        statsIntervalRef.current = window.setInterval(async () => {
+          if (isCancelled || !pcRef.current || callStateRef.current !== 'connected') return;
+          try {
+            const stats = await pcRef.current.getStats();
+            let activeRttSec: number | null = null;
+            let totalReceived = 0;
+            let totalLost = 0;
+
+            stats.forEach((report) => {
+              if (
+                report.type === 'candidate-pair' &&
+                report.state === 'succeeded' &&
+                (report.nominated || report.selected)
+              ) {
+                if (typeof report.currentRoundTripTime === 'number') {
+                  activeRttSec = report.currentRoundTripTime;
+                }
+              }
+              if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.kind === 'video')) {
+                totalReceived += Number(report.packetsReceived || 0);
+                totalLost += Number(report.packetsLost || 0);
+              }
+            });
+
+            let intervalLossRatio = 0;
+            const prev = lastPacketSampleRef.current;
+            if (prev) {
+              const deltaReceived = Math.max(0, totalReceived - prev.received);
+              const deltaLost = Math.max(0, totalLost - prev.lost);
+              const totalDelta = deltaReceived + deltaLost;
+              if (totalDelta >= 10) {
+                intervalLossRatio = deltaLost / totalDelta;
+              }
+            }
+            lastPacketSampleRef.current = { received: totalReceived, lost: totalLost };
+
+            const netType = navConnection?.effectiveType;
+            const isSlowCell = netType === '2g' || netType === 'slow-2g';
+            const isWeak =
+              isSlowCell ||
+              (activeRttSec !== null && activeRttSec > 0.45) ||
+              intervalLossRatio > 0.08;
+            const isHealthy =
+              !isSlowCell &&
+              (activeRttSec === null || activeRttSec < 0.35) &&
+              intervalLossRatio <= 0.05;
+
+            if (isWeak) {
+              setConnectionQuality('weak');
+            } else if (isHealthy) {
+              setConnectionQuality('good');
+            }
+          } catch {
+            // ignore getStats errors on closing peer connections
+          }
+        }, 2500);
+      };
+
+      // Helper to perform automatic ICE restart when network drops or changes
       const triggerAutomaticIceRestart = async (reason: string) => {
         if (isCancelled || isCleaningUpRef.current || !pcRef.current) return;
         if (isRestartingIceRef.current) return;
+        if (
+          callStateRef.current === 'failed' ||
+          callStateRef.current === 'ended' ||
+          callStateRef.current === 'no-answer' ||
+          callStateRef.current === 'declined'
+        ) {
+          return;
+        }
 
-        if (iceRestartCountRef.current >= 3) {
-          logFinalFailure(`ICE restart limit (3/3) reached (${reason})`);
+        if (iceRestartCountRef.current >= 4) {
+          logFinalFailure(`ICE restart limit reached (${reason})`);
+          setFailureNotice(
+            'Your network connection was interrupted and could not recover. Tap Try again to reconnect.'
+          );
           updateLifecycleState('failed', 'Connection failed');
           return;
         }
@@ -643,13 +722,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         const attempt = iceRestartCountRef.current;
 
         console.log(
-          `[CALL] ICE restart ${attempt}/3 triggered (reason=${reason}, relayGathered=${gatheredRelayCandidateRef.current})`
+          `[CALL] Automatic ICE restart #${attempt} triggered (reason=${reason}, relayGathered=${gatheredRelayCandidateRef.current})`
         );
 
-        if (callStateRef.current !== 'connected') {
-          updateLifecycleState('connecting', 'Connecting...');
+        if (callStateRef.current === 'connected' || callStateRef.current === 'reconnecting') {
+          updateLifecycleState('reconnecting', 'Reconnecting');
+        } else {
+          updateLifecycleState('connecting', 'Connecting');
         }
-        startConnectionTimer(`ice-restart-${attempt}`);
+        startConnectionTimer(`ice-restart-${attempt}`, reason === 'network-change' || reason === 'ice-disconnected' || reason === 'ice-failed');
 
         try {
           if (typeof pcRef.current.restartIce === 'function') {
@@ -676,7 +757,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               iceRestartCount: attempt,
               updatedAt: new Date().toISOString(),
             });
-            console.log(`[CALL] ICE restart offer (${attempt}/3) created and written to Firestore`);
+            console.log(`[CALL] ICE restart offer #${attempt} created and written to Firestore`);
           } else {
             // Callee requests caller to send ICE-restart offer to prevent SDP glare
             await updateDoc(callDocRef, {
@@ -684,44 +765,42 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               iceRestartReason: reason,
               updatedAt: new Date().toISOString(),
             });
-            console.log(`[CALL] Callee requested ICE restart (${attempt}/3) from caller`);
+            console.log(`[CALL] Callee requested ICE restart #${attempt} from caller`);
           }
         } catch (err) {
-          console.warn(`[CALL] ICE restart attempt ${attempt}/3 failed:`, err);
+          console.warn(`[CALL] ICE restart attempt #${attempt} failed:`, err);
         } finally {
           window.setTimeout(() => {
             isRestartingIceRef.current = false;
-          }, 2500);
+          }, 2000);
         }
       };
 
-      startConnectionTimer = (label: string) => {
+      // 15-second connection timeout with friendly message and Try again button
+      startConnectionTimer = (label: string, resetExisting = false) => {
         if (connectionTimeoutRef.current) {
+          if (!resetExisting) return;
           window.clearTimeout(connectionTimeoutRef.current);
         }
-        console.log(`[CALL] Starting 20s connection timer (${label})`);
+        console.log(`[CALL] Starting 15s connection timeout (${label})`);
         connectionTimeoutRef.current = window.setTimeout(() => {
+          connectionTimeoutRef.current = null;
           if (isCancelled || !pcRef.current) return;
           if (callStateRef.current !== 'connected') {
             const currIce = pcRef.current.iceConnectionState;
             const currConn = pcRef.current.connectionState;
-            console.warn(
-              `[CALL] 20s connection timer expired (${label}) | iceConnectionState=${currIce}, connectionState=${currConn}, relayGathered=${gatheredRelayCandidateRef.current}`
+            logFinalFailure(`15s connection timeout (${label}, ice=${currIce}, conn=${currConn})`);
+            setFailureNotice(
+              !gatheredRelayCandidateRef.current
+                ? "Couldn't connect within 15 seconds. Some mobile networks block direct calls — check your connection and try again."
+                : "Couldn't establish a stable connection within 15 seconds. Check your internet and try again."
             );
-            if (!gatheredRelayCandidateRef.current) {
-              console.warn('[CALL] TURN server not reachable (no relay ICE candidates gathered)');
-            }
-            if (iceRestartCountRef.current < 3) {
-              triggerAutomaticIceRestart(`20s-timeout-${label}`);
-            } else {
-              logFinalFailure(`20s timeout after 3 ICE restarts (ice=${currIce}, conn=${currConn})`);
-              updateLifecycleState('failed', 'Connection failed');
-            }
+            updateLifecycleState('failed', 'Connection timed out');
           }
-        }, 20000);
+        }, 15000);
       };
 
-      // 6. Monitor ICE gathering, iceConnectionState, and connectionState
+      // 6. Monitor ICE gathering, iceConnectionState, connectionState, and browser network changes
       pc.onicegatheringstatechange = () => {
         if (!pcRef.current || isCancelled) return;
         const gathering = pcRef.current.iceGatheringState;
@@ -772,27 +851,46 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                 gatheredCandidateTypesRef.current
               ).join(', ')}]`
             );
+            setFailureNotice(null);
+            setConnectionQuality('good');
             updateLifecycleState('connected', 'Connected');
+            startQualityMonitor();
           }
         } else if (connState === 'connecting' || iceState === 'checking') {
-          if (callStateRef.current !== 'connected' && callStateRef.current !== 'ringing') {
-            updateLifecycleState('connecting', 'Connecting...');
+          if (
+            callStateRef.current !== 'connected' &&
+            callStateRef.current !== 'ringing' &&
+            callStateRef.current !== 'reconnecting'
+          ) {
+            updateLifecycleState('connecting', 'Connecting');
           }
-        } else if (iceState === 'disconnected') {
+        } else if (iceState === 'disconnected' || connState === 'disconnected') {
+          if (callStateRef.current === 'connected') {
+            updateLifecycleState('reconnecting', 'Reconnecting');
+          }
           if (disconnectedTimerRef.current) {
             window.clearTimeout(disconnectedTimerRef.current);
           }
           disconnectedTimerRef.current = window.setTimeout(() => {
             if (!pcRef.current || isCancelled) return;
             const currentIce = pcRef.current.iceConnectionState;
-            if (currentIce === 'disconnected' || currentIce === 'failed') {
-              triggerAutomaticIceRestart(`ice-${currentIce}`);
+            const currentConn = pcRef.current.connectionState;
+            if (
+              currentIce === 'disconnected' ||
+              currentIce === 'failed' ||
+              currentConn === 'disconnected' ||
+              currentConn === 'failed'
+            ) {
+              triggerAutomaticIceRestart('ice-disconnected');
             }
-          }, 1500);
+          }, 1200);
         } else if (iceState === 'failed' || connState === 'failed') {
           if (disconnectedTimerRef.current) {
             window.clearTimeout(disconnectedTimerRef.current);
             disconnectedTimerRef.current = null;
+          }
+          if (callStateRef.current === 'connected') {
+            updateLifecycleState('reconnecting', 'Reconnecting');
           }
           triggerAutomaticIceRestart(`state-${iceState === 'failed' ? 'ice-failed' : 'conn-failed'}`);
         }
@@ -800,6 +898,31 @@ export const CallingModal: React.FC<CallingModalProps> = ({
 
       pc.onconnectionstatechange = handlePeerStateUpdate;
       pc.oniceconnectionstatechange = handlePeerStateUpdate;
+
+      networkChangeHandler = () => {
+        if (isCancelled || isCleaningUpRef.current || !pcRef.current) return;
+        if (
+          callStateRef.current === 'connected' ||
+          callStateRef.current === 'connecting' ||
+          callStateRef.current === 'reconnecting'
+        ) {
+          console.log('[CALL] Network drop/change detected -> running automatic ICE restart');
+          if (callStateRef.current === 'connected') {
+            updateLifecycleState('reconnecting', 'Reconnecting');
+          }
+          triggerAutomaticIceRestart('network-change');
+        }
+      };
+      offlineHandler = () => {
+        if (isCancelled || isCleaningUpRef.current) return;
+        if (callStateRef.current === 'connected' || callStateRef.current === 'connecting') {
+          updateLifecycleState('reconnecting', 'Reconnecting');
+          startConnectionTimer('offline-recovery', true);
+        }
+      };
+      window.addEventListener('online', networkChangeHandler);
+      window.addEventListener('offline', offlineHandler);
+      navConnection?.addEventListener?.('change', networkChangeHandler);
 
       // 7. Gather & write local ICE candidates to our own subcollection
       pc.onicecandidate = async (event: RTCPeerConnectionIceEvent) => {
@@ -901,7 +1024,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
 
       // 8. Exact Signaling Order through Firestore
       if (!effectiveIsIncoming) {
-        updateLifecycleState('ringing', 'Ringing...');
+        updateLifecycleState('ringing', 'Connecting');
 
         const offer = await pc.createOffer({
           offerToReceiveAudio: true,
@@ -962,6 +1085,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           if (isCancelled) return;
           if (callStateRef.current === 'ringing') {
             console.log('[CALL] 30s ringing timeout -> No answer');
+            setFailureNotice('No answer right now. Tap Try again to call back.');
             updateLifecycleState('no-answer', 'No answer');
             try {
               await updateDoc(callDocRef, {
@@ -980,11 +1104,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
 
           if (data.status === 'declined' || data.status === 'rejected') {
             clearTimers();
+            setFailureNotice(`${userMetaRef.current.recipientName} declined the call.`);
             updateLifecycleState('declined', 'No answer');
             return;
           }
           if (data.status === 'missed' || data.status === 'no_answer') {
             clearTimers();
+            setFailureNotice('No answer right now. Tap Try again to call back.');
             updateLifecycleState('no-answer', 'No answer');
             return;
           }
@@ -1000,7 +1126,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               window.clearTimeout(ringingTimeoutRef.current);
               ringingTimeoutRef.current = null;
             }
-            updateLifecycleState('connecting', 'Connecting...');
+            updateLifecycleState('connecting', 'Connecting');
             startConnectionTimer('caller-accepted');
           }
 
@@ -1027,8 +1153,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               ringingTimeoutRef.current = null;
             }
 
-            if (callStateRef.current !== 'connected') {
-              updateLifecycleState('connecting', 'Connecting...');
+            if (callStateRef.current !== 'connected' && callStateRef.current !== 'reconnecting') {
+              updateLifecycleState('connecting', 'Connecting');
               startConnectionTimer('caller-after-answer');
             }
 
@@ -1042,12 +1168,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             } catch (err) {
               console.error('[CALL] Caller setRemoteDescription(answer) failed:', err);
               logFinalFailure(`Caller setRemoteDescription failed: ${err instanceof Error ? err.message : String(err)}`);
+              setFailureNotice('Connection setup failed. Please try again.');
               updateLifecycleState('failed', 'Connection failed');
             }
           }
         });
       } else {
-        updateLifecycleState('connecting', 'Connecting...');
+        updateLifecycleState('connecting', 'Connecting');
         startConnectionTimer('receiver-accept');
         startRemoteCandidatesListener();
 
@@ -1133,18 +1260,27 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     initializeCall().catch((err) => {
       logFinalFailure(`Fatal call initialization error: ${err instanceof Error ? err.message : String(err)}`);
       if (!isCancelled) {
+        setFailureNotice('Unable to initialize call audio/network. Tap Try again.');
         updateLifecycleState('failed', 'Connection failed');
       }
     });
 
     return () => {
       isCancelled = true;
+      if (networkChangeHandler) {
+        window.removeEventListener('online', networkChangeHandler);
+        navConnection?.removeEventListener?.('change', networkChangeHandler);
+      }
+      if (offlineHandler) {
+        window.removeEventListener('offline', offlineHandler);
+      }
       cleanupWebRTC();
     };
   }, [
     activeCallId,
     cleanupWebRTC,
     clearTimers,
+    currentUser,
     effectiveIsIncoming,
     normalizedMode,
     retryAttempt,
@@ -1185,9 +1321,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     const nextCallId = `call_${resolvedUserId}_${resolvedRecipientId}_${Date.now()}`;
     initialOfferRef.current = undefined;
     isCleaningUpRef.current = false;
+    setFailureNotice(null);
+    setConnectionQuality('good');
     setEffectiveIsIncoming(false);
     setActiveCallId(nextCallId);
-    updateLifecycleState('ringing', 'Ringing...');
+    updateLifecycleState('ringing', 'Connecting');
     setRetryAttempt((prev) => prev + 1);
   };
 
@@ -1333,13 +1471,26 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const liveStatusLabel =
+    callState === 'connected'
+      ? connectionQuality === 'weak'
+        ? 'Weak connection'
+        : 'Connected'
+      : callState === 'reconnecting'
+      ? 'Reconnecting'
+      : callState === 'connecting' || callState === 'ringing'
+      ? 'Connecting'
+      : statusMessage;
+
   const headerTimeOrStatus =
-    callState === 'connected' ? formatDuration(callDuration) : statusMessage;
+    callState === 'connected' || callState === 'reconnecting'
+      ? `${liveStatusLabel} • ${formatDuration(callDuration)}`
+      : liveStatusLabel;
 
   const showRemoteVideo =
     normalizedMode === 'video' &&
     hasRemoteVideoTrack &&
-    (callState === 'connected' || callState === 'connecting');
+    (callState === 'connected' || callState === 'connecting' || callState === 'reconnecting');
 
   return (
     <div ref={containerRef} className="wavelink-call-overlay">
@@ -1347,7 +1498,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
       <div className="wavelink-call-shell">
-        {/* TOP HEADER: On phones (<768px) shows ONLY the person's name and the call time/status */}
+        {/* TOP HEADER: On phones (<768px) shows ONLY the person's name and the live status/timer */}
         <header className="wavelink-call-header">
           <div className="flex items-center justify-between gap-3 w-full">
             <div className="flex items-center gap-2.5 min-w-0">
@@ -1365,16 +1516,34 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                 <h2 className="font-bold text-base truncate leading-tight">
                   {resolvedRecipientName}
                 </h2>
-                <div className="flex items-center gap-1.5 text-xs font-semibold text-cyan-400 lg:text-cyan-300">
+                <div
+                  className={`flex items-center gap-1.5 text-xs font-semibold ${
+                    callState === 'connected' && connectionQuality === 'good'
+                      ? 'text-emerald-300'
+                      : callState === 'connected' && connectionQuality === 'weak'
+                      ? 'text-amber-300'
+                      : callState === 'reconnecting'
+                      ? 'text-amber-300'
+                      : callState === 'failed' ||
+                        callState === 'no-answer' ||
+                        callState === 'declined'
+                      ? 'text-rose-300'
+                      : 'text-cyan-400 lg:text-cyan-300'
+                  }`}
+                >
                   <span
                     className={`w-2 h-2 rounded-full shrink-0 ${
-                      callState === 'connected'
+                      callState === 'connected' && connectionQuality === 'good'
                         ? 'bg-emerald-400 animate-pulse'
+                        : callState === 'connected' && connectionQuality === 'weak'
+                        ? 'bg-amber-400 animate-pulse'
+                        : callState === 'reconnecting'
+                        ? 'bg-amber-400 animate-ping'
                         : callState === 'failed' ||
                           callState === 'no-answer' ||
                           callState === 'declined'
                         ? 'bg-rose-500'
-                        : 'bg-amber-400 animate-ping'
+                        : 'bg-cyan-400 animate-ping'
                     }`}
                   />
                   <span className="truncate font-mono">{headerTimeOrStatus}</span>
@@ -1467,11 +1636,25 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                   {resolvedRecipientName}
                 </h3>
 
-                {/* Retry / Close actions when call fails or goes unanswered */}
+                {/* Friendly STUN-only fallback notice when TURN relay is unavailable */}
+                {isStunFallback &&
+                  callState !== 'failed' &&
+                  callState !== 'no-answer' &&
+                  callState !== 'declined' && (
+                    <div className="mt-2 max-w-xs px-3 py-1.5 rounded-xl bg-amber-500/15 border border-amber-400/35 text-amber-200 text-[11px] leading-snug flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+                      <span>Calls may not connect on some mobile networks without relay servers.</span>
+                    </div>
+                  )}
+
+                {/* Try again / Close actions when call fails or goes unanswered */}
                 {(callState === 'failed' ||
                   callState === 'no-answer' ||
                   callState === 'declined') && (
-                  <div className="mt-5 flex flex-col items-center gap-3 max-w-xs">
+                  <div className="mt-4 flex flex-col items-center gap-3 max-w-xs">
+                    {failureNotice && (
+                      <p className="text-xs text-slate-300 leading-relaxed">{failureNotice}</p>
+                    )}
                     <div className="flex items-center gap-3">
                       <button
                         type="button"
@@ -1479,7 +1662,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                         className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 transition-all cursor-pointer"
                       >
                         <RotateCcw className="w-4 h-4" />
-                        <span>Retry</span>
+                        <span>Try again</span>
                       </button>
                       <button
                         type="button"
@@ -1491,6 +1674,14 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                     </div>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* Non-intrusive bottom pill during active video if STUN-only fallback is active */}
+            {showRemoteVideo && isStunFallback && (
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-[90%] px-3 py-1.5 rounded-full bg-amber-950/85 border border-amber-400/40 text-amber-200 text-[11px] font-medium flex items-center gap-1.5 shadow-lg">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+                <span className="truncate">STUN fallback: calls may not connect on some mobile networks.</span>
               </div>
             )}
 
