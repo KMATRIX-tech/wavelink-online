@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { flushSync } from 'react-dom';
 import { useAuth } from '../context/AuthContext';
 import {
   db,
@@ -21,18 +22,31 @@ import {
   getDocs,
   limit,
   limitToLast,
+  where,
   arrayUnion,
   arrayRemove,
   serverTimestamp
 } from 'firebase/firestore';
-import { ChannelMessage, UserProfile, CallRecipient, ChatGroup, TypingStatusEntry, ChatChannelMeta } from '../types';
+import {
+  ChannelMessage,
+  UserProfile,
+  CallRecipient,
+  ChatGroup,
+  TypingStatusEntry,
+  ChatChannelMeta,
+  ChatThemePreference,
+  SharedChatThemeSuggestion
+} from '../types';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { CrystalBadge } from './CrystalBadge';
 import {
   compressImage,
   validateVideoFileSize,
   cloneVideoFileToMemory,
-  uploadVideoChunkedToServer
+  uploadVideoChunkedToServer,
+  uploadChatFileToCloudinary,
+  compressAndUploadChatThemePhoto,
+  formatVideoFileSize
 } from '../utils/mediaStorage';
 import {
   Send,
@@ -81,10 +95,19 @@ import {
   PanelRight,
   Bell,
   BellOff,
-  FileText
+  FileText,
+  Pencil,
+  Paperclip,
+  Palette
 } from 'lucide-react';
 import { ADMIN_EMAIL, isSuperAdminEmail, getAuthHeaders } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
+import { ChatThemePickerModal } from './ChatThemePickerModal';
+import {
+  ChatThemeBadgeIcon,
+  computeChatThemeVars,
+  getChatThemeDisplayName
+} from '../utils/chatThemes';
 import { sendNotification } from '../services/notificationService';
 import {
   detectUpgradeIdea,
@@ -104,6 +127,7 @@ import { Avatar } from './Avatar';
 import { usePresence, usePresenceManager } from '../context/PresenceContext';
 import { formatPresenceSubtitle } from '../utils/presenceFormat';
 import { useLanguage } from '../context/LanguageContext';
+import { useTheme } from '../context/ThemeContext';
 
 // Module-level in-memory caches so user profiles, avatars, and groups are read once and reused across tab switches
 const chatProfileMemoryCache = new Map<string, UserProfile>();
@@ -156,7 +180,7 @@ const VoiceNoteBubblePlayer: React.FC<VoiceNoteBubblePlayerProps> = ({ src, dura
 
   return (
     <div
-      className={`px-3 py-2.5 rounded-2xl flex items-center gap-3 w-full min-w-[210px] max-w-[300px] transition ${
+      className={`wavelink-convo-voice-bar px-3 py-2.5 rounded-2xl flex items-center gap-2.5 w-full min-w-[200px] max-w-[300px] transition ${
         isOwn
           ? 'bg-black/15 border border-white/25 text-white'
           : 'bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)]'
@@ -189,11 +213,18 @@ const VoiceNoteBubblePlayer: React.FC<VoiceNoteBubblePlayerProps> = ({ src, dura
         type="button"
         onClick={togglePlay}
         aria-label={isPlaying ? 'Pause voice note' : 'Play voice note'}
-        className={`w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center shrink-0 shadow-xs transition active:scale-95 cursor-pointer ${
+        style={
           isOwn
-            ? 'bg-white text-[var(--accent-primary)] hover:bg-white/90'
-            : 'bg-[var(--accent-primary)] text-white hover:opacity-90'
-        }`}
+            ? {
+                backgroundColor: 'var(--chat-sent-text, #FFFFFF)',
+                color: 'var(--chat-accent-primary, var(--accent-primary))'
+              }
+            : {
+                backgroundColor: 'var(--chat-accent-primary, var(--accent-primary))',
+                color: '#FFFFFF'
+              }
+        }
+        className="w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center shrink-0 shadow-xs transition active:scale-95 cursor-pointer hover:opacity-90"
       >
         {isPlaying ? <Pause size={16} className="fill-current" /> : <Play size={16} className="fill-current ml-0.5" />}
       </button>
@@ -217,19 +248,19 @@ const VoiceNoteBubblePlayer: React.FC<VoiceNoteBubblePlayerProps> = ({ src, dura
                 } ${
                   isOwn
                     ? isPlayed
-                      ? 'bg-white'
-                      : 'bg-white/45 hover:bg-white/75'
+                      ? 'bg-current'
+                      : 'bg-current opacity-40 hover:opacity-75'
                     : isPlayed
                     ? 'bg-[var(--accent-primary)]'
-                    : 'bg-[var(--text-secondary)]/35 hover:bg-[var(--accent-primary)]/60'
+                    : 'bg-slate-400/45 hover:bg-[var(--accent-primary)]/60'
                 }`}
                 title="Seek voice note"
               />
             );
           })}
         </div>
-        <div className="flex items-center justify-between text-[11px] font-mono font-bold leading-none">
-          <span className={isOwn ? 'text-white/90' : 'text-[var(--text-secondary)]'}>
+        <div className="hidden md:flex items-center justify-between text-[11px] font-mono font-bold leading-none">
+          <span className={isOwn ? 'opacity-90' : 'opacity-75'}>
             {isPlaying ? 'Playing...' : 'Voice note'}
           </span>
           <span className="tabular-nums">
@@ -237,6 +268,10 @@ const VoiceNoteBubblePlayer: React.FC<VoiceNoteBubblePlayerProps> = ({ src, dura
           </span>
         </div>
       </div>
+
+      <span className="flex md:hidden items-center text-[11px] font-mono font-bold tabular-nums shrink-0 pr-0.5 opacity-90">
+        {formatVoiceDuration(displaySeconds)}
+      </span>
     </div>
   );
 };
@@ -359,7 +394,34 @@ const formatVoiceDuration = (totalSeconds?: number): string => {
   const safeSecs = Math.max(0, Math.floor(totalSeconds || 0));
   const mins = Math.floor(safeSecs / 60);
   const secs = safeSecs % 60;
-  return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+  return `${mins < 10 ? '0' : ''}${mins}:${secs < 10 ? '0' : ''}${secs}`;
+};
+
+const getCalendarDayKey = (ms: number): string => {
+  if (!ms) return '';
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+};
+
+const formatChatDateLabel = (ms: number): string => {
+  if (!ms) return 'Today';
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return 'Today';
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const msgDayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((todayStart - msgDayStart) / 86400000);
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Yesterday';
+  if (diffDays > 1 && diffDays < 7) {
+    return d.toLocaleDateString([], { weekday: 'long' });
+  }
+  return d.toLocaleDateString([], {
+    month: 'short',
+    day: 'numeric',
+    ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {})
+  });
 };
 
 interface ChatPersonGridCardProps {
@@ -550,11 +612,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     isSubAdmin,
     canTalkToAdmin,
     isProEffective,
+    updateUserProfile,
     toggleBlockUser,
     reportContent,
     showGlobalToast
   } = useAuth();
   const { language } = useLanguage();
+  const { activeTheme, isDarkTheme } = useTheme();
   const { getCachedIsOnline, setTyping: setRtdbTyping, subscribeTyping: subscribeRtdbTyping } =
     usePresenceManager();
   const [isBotReplying, setIsBotReplying] = useState(false);
@@ -625,9 +689,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   // Media upload & voice note recording in chat
   const [chatMediaUrl, setChatMediaUrl] = useState<string>('');
   const [chatMediaUrls, setChatMediaUrls] = useState<string[]>([]);
-  const [chatMediaType, setChatMediaType] = useState<'image' | 'video' | 'audio' | 'none'>('none');
+  const [chatMediaType, setChatMediaType] = useState<'image' | 'video' | 'audio' | 'file' | 'none'>('none');
+  const [chatFileName, setChatFileName] = useState<string>('');
+  const [chatFileSize, setChatFileSize] = useState<number>(0);
   const [chatMediaNotice, setChatMediaNotice] = useState<string | null>(null);
+  const [chatUploadProgress, setChatUploadProgress] = useState<number | null>(null);
   const chatFileRef = useRef<HTMLInputElement | null>(null);
+  const chatAnyFileRef = useRef<HTMLInputElement | null>(null);
+
+  // Mobile (< 768px) two-state bottom bar + hold-to-record refs
+  const [isMobileComposerOpen, setIsMobileComposerOpen] = useState<boolean>(false);
+  const micHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wasMicHeldRef = useRef<boolean>(false);
 
   // Voice Note MediaRecorder & Speech-to-Text state & refs
   const [isRecordingVoice, setIsRecordingVoice] = useState<boolean>(false);
@@ -645,12 +718,61 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   // Popups, pickers, reactions, lightbox & desktop right panel
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showGifPicker, setShowGifPicker] = useState(false);
+  const [showMobileAttachTray, setShowMobileAttachTray] = useState(false);
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
+  const [isThemePickerOpen, setIsThemePickerOpen] = useState(false);
+  const [previewChatTheme, setPreviewChatTheme] = useState<ChatThemePreference | null>(null);
   const [showDesktopRightPanel, setShowDesktopRightPanel] = useState(true);
   const [reactionMenuMsgId, setReactionMenuMsgId] = useState<string | null>(null);
   const [lightboxPhotoUrl, setLightboxPhotoUrl] = useState<string | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const swipeTouchStartRef = useRef<{ x: number; y: number; msgId: string } | null>(null);
+
+  // Per-chat theme preferences cached locally + synced from already-subscribed userProfile
+  const [localChatThemes, setLocalChatThemes] = useState<Record<string, ChatThemePreference>>(() => {
+    try {
+      if (typeof window !== 'undefined' && currentUser?.uid) {
+        const raw = localStorage.getItem(`wavelink_chat_themes_${currentUser.uid}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') return parsed;
+        }
+      }
+    } catch {
+      // ignore localStorage read errors
+    }
+    return userProfile?.chatThemes || {};
+  });
+
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    if (userProfile?.chatThemes && typeof userProfile.chatThemes === 'object') {
+      setLocalChatThemes(userProfile.chatThemes);
+      try {
+        localStorage.setItem(
+          `wavelink_chat_themes_${currentUser.uid}`,
+          JSON.stringify(userProfile.chatThemes)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    } else {
+      try {
+        const raw = localStorage.getItem(`wavelink_chat_themes_${currentUser.uid}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') setLocalChatThemes(parsed);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }, [currentUser?.uid, userProfile?.chatThemes]);
+
+  useEffect(() => {
+    setPreviewChatTheme(null);
+    setIsThemePickerOpen(false);
+  }, [activeChannel]);
 
   const [groups, setGroups] = useState<ChatGroup[]>(() =>
     chatGroupsMemoryCache.length > 0 ? chatGroupsMemoryCache : []
@@ -697,9 +819,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const chatShellRef = useRef<HTMLDivElement | null>(null);
   const messagesListRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const mobileChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const isInputFocusedRef = useRef<boolean>(false);
   const wasKeyboardOpenRef = useRef<boolean>(false);
+  const isLoadingOlderRef = useRef<boolean>(false);
+  const prevScrollHeightRef = useRef<number>(0);
+  const isNearBottomRef = useRef<boolean>(true);
+  const lastScrolledChannelRef = useRef<string>('');
 
   // Per-channel mute preference persisted locally
   const [mutedChannelIds, setMutedChannelIds] = useState<string[]>(() => {
@@ -1018,7 +1145,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   useEffect(() => {
     if (!currentUser?.uid) return;
 
-    const channelsQuery = query(collection(db, 'channels'), limit(convoFetchLimit));
+    const channelsQuery = query(
+      collection(db, 'channels'),
+      where('participants', 'array-contains', currentUser.uid),
+      limit(convoFetchLimit)
+    );
     const unsub = onSnapshot(
       channelsQuery,
       (snapshot) => {
@@ -1307,9 +1438,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     };
   }, [activeChannel, subscribeRtdbTyping]);
 
+  const autoGrowChatInput = (el?: HTMLTextAreaElement | null) => {
+    const targets = el ? [el] : [chatInputRef.current, mobileChatInputRef.current];
+    targets.forEach((target) => {
+      if (!target) return;
+      target.style.height = 'auto';
+      target.style.height = `${Math.min(120, Math.max(44, target.scrollHeight))}px`;
+    });
+  };
+
   // Handle input text change with automatic typing start/stop lifecycle
-  const handleInputTextChange = (nextText: string) => {
+  const handleInputTextChange = (nextText: string, el?: HTMLTextAreaElement | null) => {
     setInputText(nextText);
+    if (typeof window !== 'undefined') {
+      window.requestAnimationFrame(() => autoGrowChatInput(el));
+    }
     if (!activeChannel || !currentUser?.uid) return;
 
     if (typingStopTimeoutRef.current) {
@@ -1413,25 +1556,33 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
   const activeChannelTypingUsers = getActiveTypingUsersForChannel(activeChannel);
 
-  // Auto-scroll chat gently when someone starts typing
+  // Auto-scroll chat gently when someone starts typing (only if already near bottom)
   useEffect(() => {
-    if (activeChannelTypingUsers.length > 0) {
+    if (activeChannelTypingUsers.length > 0 && isNearBottomRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   }, [activeChannelTypingUsers.length]);
 
-  // Reset message limit to 30 whenever active channel changes
+  // Reset message limit to 30 and scroll/composer state whenever active channel changes
   useEffect(() => {
     setMessageLimit(30);
+    isLoadingOlderRef.current = false;
+    prevScrollHeightRef.current = 0;
+    isNearBottomRef.current = true;
+    lastScrolledChannelRef.current = '';
+    setIsMobileComposerOpen(false);
+    setShowMobileAttachTray(false);
   }, [activeChannel]);
 
-  // 3. Real-time onSnapshot message listener for active conversation (only open chat)
-  // Loads strictly only the latest 30 messages (with "Load older messages" option)
+  // 3. Real-time onSnapshot message listener ONLY while the conversation screen is actually open
+  // Loads strictly only the latest 30 messages (auto-loads +30 on scroll to top)
   useEffect(() => {
     setMessages([]);
     setChatLoadError(null);
     setReactionMenuMsgId(null);
-    if (!activeChannel) {
+    const isMobileConvoHidden =
+      typeof window !== 'undefined' && window.innerWidth < 1024 && showMobileChannels;
+    if (!activeChannel || isMobileConvoHidden) {
       setIsLoadingMessages(false);
       return;
     }
@@ -1469,18 +1620,37 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       // Deterministic chronological sort by server timestamp (with createdAt fallback)
       combined.sort((a, b) => getMessageTimestampMs(a) - getMessageTimestampMs(b));
 
-      const myCount = combined.filter((m) => m.senderId === currentUser?.uid).length;
-      const otherCount = combined.length - myCount;
-      console.log(
-        `[WaveLink Chat] Loaded ${combined.length} messages (limit=${messageLimit}) in "${activeChannel}" — sent: ${myCount}, received: ${otherCount}`
-      );
-
       setChatLoadError(null);
       setMessages(combined);
       setIsLoadingMessages(false);
-      setTimeout(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-      }, 80);
+
+      const isChannelInitialLoad = lastScrolledChannelRef.current !== activeChannel;
+      if (isLoadingOlderRef.current) {
+        isLoadingOlderRef.current = false;
+        window.requestAnimationFrame(() => {
+          const el = messagesListRef.current;
+          if (el && prevScrollHeightRef.current > 0) {
+            const delta = el.scrollHeight - prevScrollHeightRef.current;
+            el.scrollTop = Math.max(0, delta);
+            prevScrollHeightRef.current = 0;
+          }
+        });
+      } else if (isChannelInitialLoad || isNearBottomRef.current) {
+        lastScrolledChannelRef.current = activeChannel;
+        window.requestAnimationFrame(() => {
+          const el = messagesListRef.current;
+          if (el) {
+            el.scrollTo({
+              top: el.scrollHeight,
+              behavior: isChannelInitialLoad ? 'auto' : 'smooth'
+            });
+          } else {
+            messagesEndRef.current?.scrollIntoView({
+              behavior: isChannelInitialLoad ? 'auto' : 'smooth'
+            });
+          }
+        });
+      }
     };
 
     const handleListenerError = (err: any) => {
@@ -1522,7 +1692,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     return () => {
       unsub();
     };
-  }, [activeChannel, isDirectMessage, currentUser?.uid, messageLimit, retryTrigger]);
+  }, [activeChannel, isDirectMessage, showMobileChannels, currentUser?.uid, messageLimit, retryTrigger]);
+
+  // Automatically load 30 older messages when scrolled near top & track stick-to-bottom state
+  const handleMessagesScroll = () => {
+    const el = messagesListRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceFromBottom < 120;
+
+    if (
+      el.scrollTop <= 28 &&
+      messages.length >= messageLimit &&
+      !isLoadingMessages &&
+      !isLoadingOlderRef.current
+    ) {
+      isLoadingOlderRef.current = true;
+      prevScrollHeightRef.current = el.scrollHeight;
+      setMessageLimit((prev) => prev + 30);
+    }
+  };
 
   // 4. Track & broadcast lastSeen timestamp and per-message readBy receipts in Firestore
   useEffect(() => {
@@ -1746,6 +1935,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
     try {
       setChatMediaNotice(null);
+      setChatUploadProgress(0);
       if (imageFiles.length > 0 && !isVideo) {
         e.target.value = '';
         const uploadedUrls: string[] = [];
@@ -1753,10 +1943,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
           const imgFile = imageFiles[i];
           setChatMediaNotice(
             imageFiles.length > 1
-              ? `Uploading photo ${i + 1} of ${imageFiles.length}...`
-              : 'Uploading photo...'
+              ? `Uploading photo ${i + 1} of ${imageFiles.length} to Cloudinary...`
+              : 'Uploading photo to Cloudinary...'
           );
           const uploadedUrl = await compressImage(imgFile, 1280, 1280, 0.85, (pct) => {
+            setChatUploadProgress(pct);
             setChatMediaNotice(
               imageFiles.length > 1
                 ? `Uploading photo ${i + 1}/${imageFiles.length} (${pct}%)...`
@@ -1767,19 +1958,24 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             uploadedUrls.push(uploadedUrl);
           }
         }
+        setChatUploadProgress(null);
         if (uploadedUrls.length > 0) {
           setChatMediaType('image');
           setChatMediaUrl(uploadedUrls[0]);
           setChatMediaUrls(uploadedUrls);
+          setChatFileName('');
+          setChatFileSize(0);
           setChatMediaNotice(null);
+          setIsMobileComposerOpen(true);
         } else {
-          setChatMediaNotice('Could not upload photo. Please try again.');
+          setChatMediaNotice('Could not upload photo to Cloudinary. Please try again.');
         }
       } else {
         const canUploadLarge = Boolean(isProEffective || isAdmin);
         const validation = validateVideoFileSize(firstFile, canUploadLarge);
         if (!validation.valid) {
           e.target.value = '';
+          setChatUploadProgress(null);
           setChatMediaNotice(validation.error || 'Video exceeds your plan upload limit.');
           return;
         }
@@ -1789,21 +1985,62 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         setChatMediaNotice('Uploading video (0%)...');
         const chatVidId = `chatvid_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
         const cloudUrl = await uploadVideoChunkedToServer(chatVidId, safeVideo, (pct) => {
+          setChatUploadProgress(pct);
           setChatMediaNotice(`Uploading video (${pct}%)...`);
         });
+        setChatUploadProgress(null);
         if (cloudUrl && cloudUrl.startsWith('http')) {
           setChatMediaType('video');
           setChatMediaUrl(cloudUrl);
           setChatMediaUrls([cloudUrl]);
+          setChatFileName('');
+          setChatFileSize(0);
           setChatMediaNotice(null);
+          setIsMobileComposerOpen(true);
         } else {
-          setChatMediaNotice('Could not upload video. Please try again.');
+          setChatMediaNotice('Could not upload video to Cloudinary. Please try again.');
         }
       }
     } catch (err: any) {
       console.error('Error uploading chat media:', err);
+      setChatUploadProgress(null);
       setChatMediaNotice(
         err instanceof Error ? err.message : 'Could not upload media. Please try again.'
+      );
+    }
+  };
+
+  // Handle general file/document attachment upload to Cloudinary
+  const handleChatAnyFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    if (file.type.startsWith('image/') || file.type.startsWith('video/')) {
+      setChatMediaNotice('Use Photo / Video for images and videos, or pick a document/file.');
+      return;
+    }
+
+    try {
+      setChatMediaNotice(`Uploading ${file.name}...`);
+      setChatUploadProgress(5);
+      const uploaded = await uploadChatFileToCloudinary(file, (pct) => {
+        setChatUploadProgress(pct);
+        setChatMediaNotice(`Uploading ${file.name} (${pct}%)...`);
+      });
+      setChatUploadProgress(null);
+      setChatMediaType('file');
+      setChatMediaUrl(uploaded.secureUrl);
+      setChatMediaUrls([]);
+      setChatFileName(uploaded.fileName);
+      setChatFileSize(uploaded.fileSize);
+      setChatMediaNotice(null);
+      setIsMobileComposerOpen(true);
+    } catch (err: any) {
+      console.error('Error uploading chat file:', err);
+      setChatUploadProgress(null);
+      setChatMediaNotice(
+        err instanceof Error ? err.message : 'Could not upload file. Please try again.'
       );
     }
   };
@@ -1960,8 +2197,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               setChatMediaType('audio');
               setChatMediaUrl(cloudAudioUrl);
               setChatMediaUrls([cloudAudioUrl]);
+              setChatFileName('');
+              setChatFileSize(0);
               setVoiceNoteDuration(finalSecs);
               setChatMediaNotice(null);
+              setIsMobileComposerOpen(true);
             } else {
               setChatMediaNotice('Could not upload recorded voice note.');
             }
@@ -2104,6 +2344,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         ? '[GIF]'
         : chatMediaType === 'audio'
         ? `🎤 Voice note (${formatVoiceDuration(voiceNoteDuration)})`
+        : chatMediaType === 'file'
+        ? `📎 ${chatFileName || 'Attachment'}`
         : chatMediaUrls.length > 1
         ? `📷 ${chatMediaUrls.length} Photos`
         : chatMediaUrl
@@ -2144,6 +2386,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
         if (chatMediaType === 'audio') {
           data.audioUrl = chatMediaUrl;
           data.audioDuration = voiceNoteDuration || 1;
+        }
+        if (chatMediaType === 'file') {
+          data.fileName = chatFileName || 'Attachment';
+          data.fileSize = chatFileSize || 0;
         }
       }
       if (customGifUrl) {
@@ -2243,15 +2489,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
       broadcastTypingStatus(false);
 
       setInputText('');
+      if (chatInputRef.current) {
+        chatInputRef.current.style.height = '44px';
+      }
+      if (mobileChatInputRef.current) {
+        mobileChatInputRef.current.style.height = '44px';
+      }
       setChatMediaUrl('');
       setChatMediaUrls([]);
       setChatMediaType('none');
+      setChatFileName('');
+      setChatFileSize(0);
       setVoiceNoteDuration(0);
       voiceTranscriptRef.current = '';
       if (chatFileRef.current) chatFileRef.current.value = '';
+      if (chatAnyFileRef.current) chatAnyFileRef.current.value = '';
       setReplyingTo(null);
       setShowEmojiPicker(false);
       setShowGifPicker(false);
+      setShowMobileAttachTray(false);
+      setIsMobileComposerOpen(false);
 
       // If messaging the dedicated WaveLink Support Bot, invoke server Gemini responder
       const botPromptText =
@@ -2717,6 +2974,294 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     }
   };
 
+  // Resolve active conversation theme + any pending shared suggestion from partner/admin
+  const savedActiveChatTheme: ChatThemePreference | null = activeChannel
+    ? localChatThemes[activeChannel] || null
+    : null;
+  const effectiveActiveChatTheme: ChatThemePreference | null = isThemePickerOpen
+    ? previewChatTheme
+    : savedActiveChatTheme;
+  const computedChatTheme = computeChatThemeVars(
+    effectiveActiveChatTheme,
+    activeTheme,
+    isDarkTheme
+  );
+
+  const activeSuggestedTheme: SharedChatThemeSuggestion | null = activeChannel
+    ? isDirectMessage
+      ? channelMetaMap[activeChannel]?.suggestedTheme || null
+      : activeGroup?.suggestedTheme || null
+    : null;
+
+  const showSuggestedThemeBanner = Boolean(
+    activeSuggestedTheme &&
+      currentUser?.uid &&
+      activeSuggestedTheme.suggestedBy !== currentUser.uid &&
+      !(activeSuggestedTheme.acceptedBy || []).includes(currentUser.uid) &&
+      !(activeSuggestedTheme.declinedBy || []).includes(currentUser.uid)
+  );
+
+  // Subtle system line when theme changes
+  const writeChatThemeSystemLine = async (
+    targetChannelId: string,
+    text: string,
+    visibleToUid?: string
+  ) => {
+    if (!currentUser || !targetChannelId) return;
+    try {
+      const msgId = `sys_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const nowIso = new Date().toISOString();
+      const rawOtherId = isDirectMessage
+        ? directRecipient?.id || getOtherDmParticipantId(targetChannelId, currentUser.uid)
+        : '';
+      const participants = isDirectMessage
+        ? Array.from(new Set([currentUser.uid, rawOtherId].filter(Boolean))).sort()
+        : Array.from(new Set(activeGroup?.memberIds || [currentUser.uid]));
+      const senderDisplayName = userProfile?.displayName || currentUser.displayName || 'Waver';
+
+      const sysData: Record<string, any> = {
+        id: msgId,
+        conversationId: targetChannelId,
+        channelId: targetChannelId,
+        senderId: currentUser.uid,
+        receiverId: isDirectMessage ? rawOtherId : targetChannelId,
+        participants,
+        senderEmail: currentUser.email || 'user',
+        senderName: senderDisplayName,
+        text,
+        mediaType: 'none',
+        isEdited: false,
+        isDeleted: false,
+        isSystem: true,
+        readBy: [currentUser.uid],
+        timestamp: serverTimestamp(),
+        createdAt: nowIso
+      };
+      if (visibleToUid) {
+        sysData.visibleTo = visibleToUid;
+      }
+      const docRef = isDirectMessage
+        ? doc(db, 'channels', targetChannelId, 'messages', msgId)
+        : doc(db, 'groups', targetChannelId, 'messages', msgId);
+      await setDoc(docRef, cleanFirestoreData(sysData));
+    } catch (err) {
+      console.warn('[WaveLink Chat] System theme line notice:', err);
+    }
+  };
+
+  const persistUserChatThemesMap = async (nextMap: Record<string, ChatThemePreference>) => {
+    if (!currentUser?.uid) return;
+    setLocalChatThemes(nextMap);
+    try {
+      localStorage.setItem(
+        `wavelink_chat_themes_${currentUser.uid}`,
+        JSON.stringify(nextMap)
+      );
+    } catch {
+      // ignore storage quota errors
+    }
+    await updateUserProfile({ chatThemes: nextMap });
+  };
+
+  const handleSaveChatTheme = async (params: {
+    preference: ChatThemePreference;
+    shareWithOthers: boolean;
+    customPhotoFile: File | null;
+  }) => {
+    if (!currentUser?.uid || !activeChannel) return;
+    const { preference, shareWithOthers, customPhotoFile } = params;
+
+    let finalPhotoUrl = preference.customBgUrl;
+    if (customPhotoFile) {
+      const uploaded = await compressAndUploadChatThemePhoto({
+        uid: currentUser.uid,
+        conversationId: activeChannel,
+        file: customPhotoFile
+      });
+      finalPhotoUrl = uploaded.downloadUrl;
+    }
+
+    const nowIso = new Date().toISOString();
+    const isEffectivelyDefault =
+      preference.themeId === 'default' && !preference.accentColor && !finalPhotoUrl;
+
+    const nextMap = { ...localChatThemes };
+    let cleanPref: ChatThemePreference | null = null;
+    if (isEffectivelyDefault) {
+      delete nextMap[activeChannel];
+    } else {
+      cleanPref = {
+        themeId: preference.themeId || 'default',
+        ...(preference.accentColor ? { accentColor: preference.accentColor } : {}),
+        ...(finalPhotoUrl ? { customBgUrl: finalPhotoUrl } : {}),
+        ...(finalPhotoUrl
+          ? { bgDarkness: Math.max(0, Math.min(85, Number(preference.bgDarkness ?? 35))) }
+          : {}),
+        updatedAt: nowIso
+      };
+      nextMap[activeChannel] = cleanPref;
+    }
+
+    await persistUserChatThemesMap(nextMap);
+
+    if (shareWithOthers && !isChattingWithSupportBot) {
+      const sharerName = userProfile?.displayName || currentUser.displayName || 'Someone';
+      const suggestion: SharedChatThemeSuggestion = {
+        themeId: cleanPref?.themeId || 'default',
+        ...(cleanPref?.accentColor ? { accentColor: cleanPref.accentColor } : {}),
+        ...(cleanPref?.customBgUrl ? { customBgUrl: cleanPref.customBgUrl } : {}),
+        ...(typeof cleanPref?.bgDarkness === 'number'
+          ? { bgDarkness: cleanPref.bgDarkness }
+          : {}),
+        suggestedBy: currentUser.uid,
+        suggestedByName: sharerName,
+        suggestedAt: nowIso,
+        acceptedBy: [currentUser.uid],
+        declinedBy: []
+      };
+
+      if (isDirectMessage) {
+        const otherUid =
+          directRecipient?.id || getOtherDmParticipantId(activeChannel, currentUser.uid);
+        const participants = Array.from(
+          new Set([currentUser.uid, otherUid].filter(Boolean))
+        ).sort();
+        await setDoc(
+          doc(db, 'channels', activeChannel),
+          cleanFirestoreData({
+            id: activeChannel,
+            conversationId: activeChannel,
+            participants,
+            suggestedTheme: suggestion,
+            updatedAt: nowIso
+          }),
+          { merge: true }
+        );
+      } else if (activeGroup && isCurrentUserGroupAdmin) {
+        await updateDoc(doc(db, 'groups', activeChannel), cleanFirestoreData({
+          suggestedTheme: suggestion,
+          updatedAt: nowIso
+        }));
+      }
+    }
+
+    const themeLabel = getChatThemeDisplayName(cleanPref?.themeId || 'default');
+    const systemText = isEffectivelyDefault
+      ? 'You reset the theme to Default'
+      : `You changed the theme to ${themeLabel}`;
+
+    await writeChatThemeSystemLine(
+      activeChannel,
+      shareWithOthers && !isChattingWithSupportBot
+        ? `${userProfile?.displayName?.split(' ')[0] || 'Someone'} suggested the ${themeLabel} theme`
+        : systemText,
+      shareWithOthers && !isChattingWithSupportBot ? undefined : currentUser.uid
+    );
+
+    showGlobalToast(
+      shareWithOthers
+        ? `Saved ${themeLabel} theme and shared suggestion.`
+        : `Chat theme set to ${themeLabel}.`
+    );
+  };
+
+  const handleResetChatTheme = async () => {
+    if (!currentUser?.uid || !activeChannel) return;
+    const nextMap = { ...localChatThemes };
+    delete nextMap[activeChannel];
+    await persistUserChatThemesMap(nextMap);
+    await writeChatThemeSystemLine(
+      activeChannel,
+      'You reset the theme to Default',
+      currentUser.uid
+    );
+    showGlobalToast('Chat theme reset to default.');
+  };
+
+  const handleAcceptSuggestedTheme = async () => {
+    if (!currentUser?.uid || !activeChannel || !activeSuggestedTheme) return;
+    const nowIso = new Date().toISOString();
+    const isEffectivelyDefault =
+      activeSuggestedTheme.themeId === 'default' &&
+      !activeSuggestedTheme.accentColor &&
+      !activeSuggestedTheme.customBgUrl;
+
+    const nextMap = { ...localChatThemes };
+    if (isEffectivelyDefault) {
+      delete nextMap[activeChannel];
+    } else {
+      nextMap[activeChannel] = {
+        themeId: activeSuggestedTheme.themeId || 'default',
+        ...(activeSuggestedTheme.accentColor
+          ? { accentColor: activeSuggestedTheme.accentColor }
+          : {}),
+        ...(activeSuggestedTheme.customBgUrl
+          ? { customBgUrl: activeSuggestedTheme.customBgUrl }
+          : {}),
+        ...(typeof activeSuggestedTheme.bgDarkness === 'number'
+          ? { bgDarkness: activeSuggestedTheme.bgDarkness }
+          : {}),
+        updatedAt: nowIso
+      };
+    }
+    await persistUserChatThemesMap(nextMap);
+
+    const updatedSuggestion: SharedChatThemeSuggestion = {
+      ...activeSuggestedTheme,
+      acceptedBy: Array.from(
+        new Set([...(activeSuggestedTheme.acceptedBy || []), currentUser.uid])
+      ),
+      declinedBy: (activeSuggestedTheme.declinedBy || []).filter(
+        (id) => id !== currentUser.uid
+      )
+    };
+
+    if (isDirectMessage) {
+      await setDoc(
+        doc(db, 'channels', activeChannel),
+        cleanFirestoreData({ suggestedTheme: updatedSuggestion, updatedAt: nowIso }),
+        { merge: true }
+      );
+    } else if (activeGroup) {
+      await updateDoc(
+        doc(db, 'groups', activeChannel),
+        cleanFirestoreData({ suggestedTheme: updatedSuggestion, updatedAt: nowIso })
+      );
+    }
+
+    const themeLabel = getChatThemeDisplayName(activeSuggestedTheme.themeId);
+    await writeChatThemeSystemLine(
+      activeChannel,
+      `You changed the theme to ${themeLabel}`,
+      currentUser.uid
+    );
+    showGlobalToast(`Applied ${themeLabel} chat theme.`);
+  };
+
+  const handleDeclineSuggestedTheme = async () => {
+    if (!currentUser?.uid || !activeChannel || !activeSuggestedTheme) return;
+    const nowIso = new Date().toISOString();
+    const updatedSuggestion: SharedChatThemeSuggestion = {
+      ...activeSuggestedTheme,
+      declinedBy: Array.from(
+        new Set([...(activeSuggestedTheme.declinedBy || []), currentUser.uid])
+      )
+    };
+
+    if (isDirectMessage) {
+      await setDoc(
+        doc(db, 'channels', activeChannel),
+        cleanFirestoreData({ suggestedTheme: updatedSuggestion, updatedAt: nowIso }),
+        { merge: true }
+      );
+    } else if (activeGroup) {
+      await updateDoc(
+        doc(db, 'groups', activeChannel),
+        cleanFirestoreData({ suggestedTheme: updatedSuggestion, updatedAt: nowIso })
+      );
+    }
+  };
+
   // Filter & sort conversations so unread or recent conversations surface cleanly
   const filteredGroups = groups
     .filter((g) => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -2794,7 +3339,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
   const visibleMembersList = filteredMembers.slice(0, convoDisplayLimit);
   const isActiveChannelMuted = Boolean(activeChannel && mutedChannelIds.includes(activeChannel));
   const sharedPhotosInChat = messages.flatMap((m) => {
-    if (m.isDeleted || m.mediaType === 'audio' || m.mediaType === 'video') return [];
+    if (m.isDeleted || m.mediaType === 'audio' || m.mediaType === 'video' || m.mediaType === 'file') return [];
     if (m.mediaUrls && m.mediaUrls.length > 0) return m.mediaUrls;
     if (m.mediaUrl) return [m.mediaUrl];
     return [];
@@ -2805,11 +3350,22 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     ): {
       id: string;
       url: string;
-      type: 'Video clip' | 'Voice note';
+      type: string;
       senderName: string;
       createdAt: string;
     }[] => {
       if (m.isDeleted) return [];
+      if (m.mediaType === 'file' && m.mediaUrl) {
+        return [
+          {
+            id: m.id,
+            url: m.mediaUrl,
+            type: m.fileName || 'Attachment',
+            senderName: m.senderName,
+            createdAt: m.createdAt
+          }
+        ];
+      }
       if (m.mediaType === 'video' && m.mediaUrl) {
         return [
           {
@@ -2843,6 +3399,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
     setReplyingTo(null);
     setReactionMenuMsgId(null);
     setShowHeaderMenu(false);
+    setShowMobileAttachTray(false);
+    setIsMobileComposerOpen(false);
     setShowMobileChannels(false);
   };
 
@@ -3207,6 +3765,22 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                                   {group.name}
                                 </span>
                                 <div className="flex items-center gap-1.5 shrink-0">
+                                  {(localChatThemes[group.id]?.themeId &&
+                                    localChatThemes[group.id]?.themeId !== 'default') ||
+                                  localChatThemes[group.id]?.customBgUrl ||
+                                  localChatThemes[group.id]?.accentColor ? (
+                                    <span
+                                      className="w-5 h-5 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] inline-flex items-center justify-center shrink-0"
+                                      title={`Chat theme: ${getChatThemeDisplayName(
+                                        localChatThemes[group.id]?.themeId
+                                      )}`}
+                                    >
+                                      <ChatThemeBadgeIcon
+                                        themeId={localChatThemes[group.id]?.themeId}
+                                        size={11}
+                                      />
+                                    </span>
+                                  ) : null}
                                   {timeLabel && (
                                     <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
                                       {timeLabel}
@@ -3380,6 +3954,22 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                               </span>
 
                               <div className="flex items-center gap-1.5 shrink-0">
+                                {(localChatThemes[dmId]?.themeId &&
+                                  localChatThemes[dmId]?.themeId !== 'default') ||
+                                localChatThemes[dmId]?.customBgUrl ||
+                                localChatThemes[dmId]?.accentColor ? (
+                                  <span
+                                    className="w-5 h-5 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] inline-flex items-center justify-center shrink-0"
+                                    title={`Chat theme: ${getChatThemeDisplayName(
+                                      localChatThemes[dmId]?.themeId
+                                    )}`}
+                                  >
+                                    <ChatThemeBadgeIcon
+                                      themeId={localChatThemes[dmId]?.themeId}
+                                      size={11}
+                                    />
+                                  </span>
+                                ) : null}
                                 {compactTime && (
                                   <span
                                     className={`text-[11px] font-semibold ${
@@ -3485,6 +4075,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             SCREEN 2: CONVERSATION SCREEN (Mobile Full-Screen; Desktop Middle Column)
            ===================================================================== */}
         <div
+          style={activeChannel ? computedChatTheme.styleVars : undefined}
+          data-chat-themed={activeChannel && computedChatTheme.hasCustomTheme ? 'true' : undefined}
+          data-chat-animated={activeChannel && computedChatTheme.isAnimatedPattern ? 'true' : undefined}
+          data-chat-photo={activeChannel && computedChatTheme.hasCustomPhoto ? 'true' : undefined}
           className={`wavelink-mobile-conversation-screen wavelink-chat-center-col flex-1 flex-col min-w-0 h-full bg-[var(--bg-canvas)] ${
             isMobileListScreenVisible ? 'hidden lg:flex' : 'flex'
           }`}
@@ -3545,13 +4139,317 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           ) : (
             <>
-          {/* Conversation Header: Avatar with ring, name, verified tick, Active now, bio/interests, voice, video & menu */}
-          <div className="px-3 py-2.5 sm:px-4 sm:py-3 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] flex items-center justify-between gap-2 shrink-0 relative z-20">
-            <div className="flex items-center gap-2.5 min-w-0">
+          {/* Mobile (< 768px) Floating Rounded Header Card */}
+          <div className="flex md:hidden wavelink-mobile-convo-header items-center justify-between gap-1.5">
+            <div className="flex items-center gap-1.5 min-w-0 flex-1">
               <button
                 type="button"
-                onClick={() => setShowMobileChannels(true)}
-                className="lg:hidden min-w-[44px] min-h-[44px] px-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] hover:border-[var(--accent-primary)] flex items-center justify-center gap-1 text-xs font-extrabold shrink-0 cursor-pointer"
+                onClick={() => {
+                  setShowMobileChannels(true);
+                  setActiveChannel('');
+                  setShowHeaderMenu(false);
+                  setShowMobileAttachTray(false);
+                  setIsMobileComposerOpen(false);
+                }}
+                className="wavelink-mobile-convo-header-btn bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer"
+                title="Back to Conversations"
+                aria-label="Back to Conversations"
+              >
+                <ArrowLeft size={19} className="text-[var(--accent-primary)]" />
+              </button>
+
+              {activeGroup ? (
+                <button
+                  type="button"
+                  onClick={() => setIsGroupInfoOpen(true)}
+                  className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer"
+                >
+                  <div className="wavelink-mobile-convo-avatar-ring">
+                    <img
+                      src={activeGroup.logoUrl || PRESET_LOGOS[0].url}
+                      alt={activeGroup.name}
+                      className="w-9 h-9 rounded-full object-cover bg-[var(--bg-surface)] border border-[var(--bg-surface)]"
+                    />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="font-extrabold text-sm text-[var(--text-primary)] truncate leading-tight">
+                      {activeGroup.name}
+                    </h2>
+                    {activeChannelTypingUsers.length > 0 ? (
+                      <p className="text-[11px] text-emerald-600 dark:text-emerald-400 font-extrabold truncate flex items-center gap-1 mt-0.5 leading-tight">
+                        <span className="inline-flex items-center gap-0.5">
+                          <span className="w-1 h-1 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                          <span className="w-1 h-1 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                          <span className="w-1 h-1 rounded-full bg-emerald-500 animate-bounce" />
+                        </span>
+                        <span>typing...</span>
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-[var(--text-secondary)] font-semibold truncate flex items-center gap-1 mt-0.5 leading-tight">
+                        <span className="w-2 h-2 rounded-full bg-[#22c55e] shrink-0" />
+                        <span className="truncate">
+                          {(() => {
+                            const onlineMembers = (activeGroup.memberIds || []).filter((id) =>
+                              getCachedIsOnline(id)
+                            ).length;
+                            const totalMembers = activeGroup.memberIds?.length || 1;
+                            return onlineMembers > 0
+                              ? `${onlineMembers} online • ${totalMembers}`
+                              : `${totalMembers} members`;
+                          })()}
+                        </span>
+                      </p>
+                    )}
+                  </div>
+                </button>
+              ) : directRecipient ? (
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <div className="wavelink-mobile-convo-avatar-ring relative">
+                    <Avatar
+                      uid={directRecipient.id}
+                      src={
+                        directRecipient.photoURL ||
+                        `https://api.dicebear.com/7.x/shapes/svg?seed=${directRecipient.id}`
+                      }
+                      alt={directRecipient.displayName}
+                      fallbackName={directRecipient.displayName}
+                      size={36}
+                      showStatus={false}
+                      onlyWhenVisible={false}
+                      targetProfile={directRecipient}
+                      priority={true}
+                      imageClassName="border border-[var(--bg-surface)]"
+                    />
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="wavelink-convo-header-title min-w-0 truncate">
+                      <CrystalBadge
+                        email={directRecipient.email}
+                        name={directRecipient.displayName}
+                        isPro={directRecipient.isPro}
+                        hasBlueStar={directRecipient.hasBlueStar || directRecipient.isPro}
+                        isSubAdmin={
+                          directRecipient.isSubAdmin || directRecipient.role === 'sub_admin'
+                        }
+                        size="sm"
+                      />
+                    </div>
+                    {activeChannelTypingUsers.length > 0 ? (
+                      <p className="text-[11px] text-emerald-600 dark:text-emerald-400 font-extrabold truncate flex items-center gap-1 mt-0.5 leading-tight">
+                        <span className="inline-flex items-center gap-0.5">
+                          <span className="w-1 h-1 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                          <span className="w-1 h-1 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                          <span className="w-1 h-1 rounded-full bg-emerald-500 animate-bounce" />
+                        </span>
+                        <span>typing...</span>
+                      </p>
+                    ) : (
+                      <p
+                        className={`text-[11px] font-bold truncate flex items-center gap-1.5 mt-0.5 leading-tight ${
+                          isChattingWithSupportBot || directRecipientPresence.status === 'online'
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-[var(--text-secondary)]'
+                        }`}
+                      >
+                        <span
+                          className={`w-2 h-2 rounded-full shrink-0 ${
+                            isChattingWithSupportBot || directRecipientPresence.status === 'online'
+                              ? 'bg-[#22c55e]'
+                              : 'bg-slate-400'
+                          }`}
+                        />
+                        <span className="truncate">
+                          {isChattingWithSupportBot
+                            ? 'Online'
+                            : directRecipientStatusText || 'Offline'}
+                        </span>
+                      </p>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0 relative">
+              {isDirectMessage && directRecipient && !isChattingWithSupportBot && (
+                isBlockedFromAdminChat ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowPaymentModal(true)}
+                    className="min-w-[44px] min-h-[44px] px-2.5 rounded-full bg-amber-500/15 border border-amber-400/50 text-amber-600 dark:text-amber-300 text-[11px] font-extrabold flex items-center gap-1 shrink-0 cursor-pointer"
+                    title="Try Pro to message or call Admin"
+                  >
+                    <Lock size={13} />
+                    <span>Pro</span>
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onOpenCall('video', {
+                          id: directRecipient.id,
+                          name: directRecipient.displayName,
+                          photoURL: directRecipient.photoURL
+                        })
+                      }
+                      className="wavelink-mobile-convo-header-btn text-white shadow-xs cursor-pointer"
+                      style={{
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }}
+                      title="Start Video Call"
+                      aria-label="Start Video Call"
+                    >
+                      <Video size={18} />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onOpenCall('voice', {
+                          id: directRecipient.id,
+                          name: directRecipient.displayName,
+                          photoURL: directRecipient.photoURL
+                        })
+                      }
+                      className="wavelink-mobile-convo-header-btn bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer"
+                      title="Start Voice Call"
+                      aria-label="Start Voice Call"
+                    >
+                      <PhoneCall size={18} className="text-emerald-500" />
+                    </button>
+                  </>
+                )
+              )}
+
+              <button
+                type="button"
+                onClick={() => setShowHeaderMenu((prev) => !prev)}
+                className="wavelink-mobile-convo-header-btn bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer"
+                title="Conversation menu"
+                aria-label="Conversation menu"
+              >
+                <MoreVertical size={18} />
+              </button>
+
+              {showHeaderMenu && (
+                <div className="absolute right-0 top-12 w-56 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-40 space-y-1">
+                  {activeChannel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowHeaderMenu(false);
+                        setPreviewChatTheme(savedActiveChatTheme);
+                        setIsThemePickerOpen(true);
+                      }}
+                      className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <Palette size={15} className="text-[var(--accent-primary)]" />
+                      <span>Chat theme</span>
+                    </button>
+                  )}
+
+                  {activeChannel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toggleMuteChannel(activeChannel);
+                        setShowHeaderMenu(false);
+                      }}
+                      className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center gap-2.5 cursor-pointer"
+                    >
+                      {isActiveChannelMuted ? (
+                        <Bell size={15} className="text-[var(--accent-primary)]" />
+                      ) : (
+                        <BellOff size={15} className="text-[var(--accent-primary)]" />
+                      )}
+                      <span>
+                        {isActiveChannelMuted ? 'Unmute Notifications' : 'Mute Notifications'}
+                      </span>
+                    </button>
+                  )}
+
+                  {activeGroup && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsGroupInfoOpen(true);
+                          setShowHeaderMenu(false);
+                        }}
+                        className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center gap-2.5 cursor-pointer"
+                      >
+                        <Info size={15} className="text-[var(--accent-primary)]" />
+                        <span>Group Info &amp; Members</span>
+                      </button>
+                      {isCurrentUserMember && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowHeaderMenu(false);
+                            handleExitGroup(activeGroup);
+                          }}
+                          className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-rose-600 hover:bg-rose-500/10 flex items-center gap-2.5 cursor-pointer"
+                        >
+                          <LogOut size={15} />
+                          <span>Exit Group</span>
+                        </button>
+                      )}
+                    </>
+                  )}
+
+                  {isDirectMessage &&
+                    directRecipient &&
+                    !isChattingWithSupportBot &&
+                    !isSuperAdminEmail(directRecipient.email, directRecipient.role) && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            toggleBlockUser(directRecipient.id);
+                            setShowHeaderMenu(false);
+                          }}
+                          className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-rose-500/10 hover:text-rose-600 flex items-center gap-2.5 cursor-pointer"
+                        >
+                          <Ban size={15} className="text-rose-500" />
+                          <span>{isRecipientBlocked ? 'Unblock User' : 'Block User'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowHeaderMenu(false);
+                            reportContent({
+                              targetType: 'user',
+                              targetId: directRecipient.id,
+                              targetAuthorId: directRecipient.id,
+                              targetSummary: `${directRecipient.displayName} (${directRecipient.username || directRecipient.email})`,
+                              reason: 'Reported user from Direct Messages'
+                            });
+                          }}
+                          className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-amber-600 hover:bg-amber-500/10 flex items-center gap-2.5 cursor-pointer"
+                        >
+                          <Flag size={15} />
+                          <span>Report User</span>
+                        </button>
+                      </>
+                    )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Conversation Header (>= 768px Tablet & Desktop) */}
+          <div className="hidden md:flex wavelink-desktop-convo-header min-h-[60px] px-2.5 py-2 sm:px-4 sm:py-3 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] items-center justify-between gap-1.5 sm:gap-2 shrink-0 relative z-20">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowMobileChannels(true);
+                  setActiveChannel('');
+                }}
+                className="lg:hidden min-w-[44px] min-h-[44px] px-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] hover:border-[var(--accent-primary)] flex items-center justify-center shrink-0 cursor-pointer"
                 title="Back to Conversations"
                 aria-label="Back to Conversations"
               >
@@ -3561,7 +4459,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               {activeGroup ? (
                 <div
                   onClick={() => setIsGroupInfoOpen(true)}
-                  className="flex items-center gap-2.5 sm:gap-3 cursor-pointer group/title min-w-0"
+                  className="flex items-center gap-2 sm:gap-3 cursor-pointer group/title min-w-0 flex-1"
                 >
                   <div
                     className="relative p-[2px] rounded-2xl shrink-0"
@@ -3573,15 +4471,15 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                     <img
                       src={activeGroup.logoUrl || PRESET_LOGOS[0].url}
                       alt={activeGroup.name}
-                      className="w-10 h-10 rounded-[14px] object-cover bg-[var(--bg-surface)]"
+                      className="w-9 h-9 sm:w-10 sm:h-10 rounded-[14px] object-cover bg-[var(--bg-surface)]"
                     />
                   </div>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 flex-nowrap min-w-0">
                       <h2 className="font-extrabold text-sm sm:text-base text-[var(--text-primary)] truncate">
                         {activeGroup.name}
                       </h2>
-                      <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[var(--text-secondary)]">
+                      <span className="hidden sm:inline-flex items-center gap-1 text-[11px] font-bold text-[var(--text-secondary)] shrink-0">
                         <Users size={11} className="text-[var(--accent-primary)]" />
                         <span>
                           {(() => {
@@ -3597,7 +4495,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       </span>
                     </div>
                     {activeChannelTypingUsers.length > 0 ? (
-                      <p className="text-xs text-emerald-600 dark:text-emerald-400 truncate flex items-center gap-1.5 font-extrabold mt-0.5">
+                      <p className="text-[11px] sm:text-xs text-emerald-600 dark:text-emerald-400 truncate flex items-center gap-1.5 font-extrabold">
                         <span>
                           {activeChannelTypingUsers.length === 1
                             ? `${activeChannelTypingUsers[0].name} is typing...`
@@ -3605,14 +4503,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         </span>
                       </p>
                     ) : (
-                      <p className="text-xs text-[var(--text-secondary)] truncate mt-0.5">
-                        {activeGroup.description || 'Tap header for group members & info'}
+                      <p className="text-[11px] sm:text-xs text-[var(--text-secondary)] truncate">
+                        {activeGroup.description || `${activeGroup.memberIds?.length || 1} members`}
                       </p>
                     )}
                   </div>
                 </div>
               ) : directRecipient ? (
-                <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+                <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
                   <div className="relative shrink-0">
                     <div
                       className="p-[2px] rounded-full"
@@ -3629,7 +4527,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         }
                         alt={directRecipient.displayName}
                         fallbackName={directRecipient.displayName}
-                        size={42}
+                        size={38}
                         showStatus={!isChattingWithSupportBot}
                         onlyWhenVisible={false}
                         targetProfile={directRecipient}
@@ -3645,21 +4543,23 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                     )}
                   </div>
 
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <CrystalBadge
-                        email={directRecipient.email}
-                        name={directRecipient.displayName}
-                        isPro={directRecipient.isPro}
-                        hasBlueStar={directRecipient.hasBlueStar || directRecipient.isPro}
-                        isSubAdmin={
-                          directRecipient.isSubAdmin || directRecipient.role === 'sub_admin'
-                        }
-                        size="md"
-                      />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 flex-nowrap min-w-0">
+                      <div className="wavelink-convo-header-title min-w-0 truncate">
+                        <CrystalBadge
+                          email={directRecipient.email}
+                          name={directRecipient.displayName}
+                          isPro={directRecipient.isPro}
+                          hasBlueStar={directRecipient.hasBlueStar || directRecipient.isPro}
+                          isSubAdmin={
+                            directRecipient.isSubAdmin || directRecipient.role === 'sub_admin'
+                          }
+                          size="md"
+                        />
+                      </div>
                       {directRecipientStatusText && (
                         <span
-                          className={`inline-flex items-center gap-1 text-[11px] font-extrabold ${
+                          className={`hidden sm:inline-flex items-center gap-1 text-[11px] font-extrabold shrink-0 ${
                             isChattingWithSupportBot || directRecipientPresence.status === 'online'
                               ? 'text-emerald-600 dark:text-emerald-400'
                               : 'text-[var(--text-secondary)]'
@@ -3776,6 +4676,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
               {showHeaderMenu && (
                 <div className="absolute right-0 top-13 w-56 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-40 space-y-1">
+                  {activeChannel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowHeaderMenu(false);
+                        setPreviewChatTheme(savedActiveChatTheme);
+                        setIsThemePickerOpen(true);
+                      }}
+                      className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <Palette size={15} className="text-[var(--accent-primary)]" />
+                      <span>Chat theme</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     onClick={() => {
@@ -3921,14 +4836,61 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           )}
 
+          {/* Subtle Shared/Suggested Theme Prompt Banner */}
+          {showSuggestedThemeBanner && activeSuggestedTheme && (
+            <div className="mx-3 mt-2 px-3.5 py-2.5 rounded-2xl bg-[var(--bg-surface)]/95 border border-[var(--border-hairline)] shadow-sm flex flex-wrap items-center justify-between gap-2 shrink-0 z-20 backdrop-blur-md">
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <ChatThemeBadgeIcon themeId={activeSuggestedTheme.themeId} size={15} className="shrink-0" />
+                <span className="text-xs font-bold text-[var(--text-primary)] truncate">
+                  {activeSuggestedTheme.suggestedByName.split(' ')[0]} suggested the{' '}
+                  <strong className="text-[var(--accent-primary)]">
+                    {getChatThemeDisplayName(activeSuggestedTheme.themeId)}
+                  </strong>{' '}
+                  theme for this chat. Use it?
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleDeclineSuggestedTheme}
+                  className="min-h-[36px] px-3 py-1 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[11px] font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+                >
+                  No thanks
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAcceptSuggestedTheme}
+                  className="min-h-[36px] px-3.5 py-1 rounded-xl text-white text-[11px] font-extrabold shadow-2xs cursor-pointer"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  Accept
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Messages Stream — Theme-aware spacious canvas */}
           <div
             ref={messagesListRef}
+            onScroll={handleMessagesScroll}
             onClick={() => {
               if (reactionMenuMsgId) setReactionMenuMsgId(null);
               if (showHeaderMenu) setShowHeaderMenu(false);
+              if (showMobileAttachTray) setShowMobileAttachTray(false);
+              if (
+                isMobileComposerOpen &&
+                !inputText.trim() &&
+                !chatMediaUrl &&
+                !showEmojiPicker &&
+                !showGifPicker
+              ) {
+                setIsMobileComposerOpen(false);
+              }
             }}
-            className="wavelink-chat-messages-list flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 bg-[var(--bg-canvas)]"
+            className="wavelink-chat-messages-list wavelink-mobile-convo-messages flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4 bg-[var(--bg-canvas)]"
           >
             <QuotaExceededBanner compact={true} className="mb-2" />
 
@@ -3936,7 +4898,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
               <div className="w-full flex justify-center py-1">
                 <button
                   type="button"
-                  onClick={() => setMessageLimit((prev) => prev + 30)}
+                  onClick={() => {
+                    isLoadingOlderRef.current = true;
+                    prevScrollHeightRef.current = messagesListRef.current?.scrollHeight || 0;
+                    setMessageLimit((prev) => prev + 30);
+                  }}
                   className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-2xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold transition active:scale-95 shadow-2xs cursor-pointer"
                 >
                   <History size={14} className="text-[var(--accent-primary)]" />
@@ -3997,12 +4963,45 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   }
                 }
 
-                return messages.map((msg) => {
+                return messages.map((msg, idx) => {
+                  const visibleToUid = (msg as any).visibleTo as string | undefined;
+                  if (visibleToUid && visibleToUid !== currentUser?.uid) {
+                    return null;
+                  }
+
                   const isOwn = msg.senderId === currentUser?.uid;
+                  const msgMs = getMessageTimestampMs(msg) || Date.parse(msg.createdAt || '') || 0;
+                  const dayKey = getCalendarDayKey(msgMs);
+                  const prevMsg = idx > 0 ? messages[idx - 1] : null;
+                  const prevMs = prevMsg
+                    ? getMessageTimestampMs(prevMsg) || Date.parse(prevMsg.createdAt || '') || 0
+                    : 0;
+                  const prevDayKey = prevMsg ? getCalendarDayKey(prevMs) : '';
+                  const showDateSeparator = Boolean(dayKey && (idx === 0 || dayKey !== prevDayKey));
+
+                  if (msg.isSystem) {
+                    return (
+                      <React.Fragment key={msg.id}>
+                        {showDateSeparator && (
+                          <div className="flex md:hidden justify-center py-1">
+                            <span className="wavelink-mobile-convo-date-pill">
+                              {formatChatDateLabel(msgMs)}
+                            </span>
+                          </div>
+                        )}
+                        <div className="w-full flex justify-center py-0.5 px-2">
+                          <span className="wavelink-convo-system-pill inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-[var(--bg-surface)]/85 border border-[var(--border-hairline)] text-[var(--text-secondary)] shadow-2xs text-center">
+                            <Palette size={11} className="shrink-0 opacity-80" />
+                            <span>{msg.text}</span>
+                          </span>
+                        </div>
+                      </React.Fragment>
+                    );
+                  }
+
                   const isEditing = editingMessageId === msg.id;
                   const receipt = isOwn && !msg.isDeleted ? getReadReceiptInfo(msg) : null;
                   const isLatestSeenOwn = isOwn && msg.id === latestSeenOwnMessageId;
-                  const msgMs = getMessageTimestampMs(msg);
                   const timeString = (msgMs ? new Date(msgMs) : new Date(msg.createdAt)).toLocaleTimeString([], {
                     hour: '2-digit',
                     minute: '2-digit'
@@ -4010,7 +5009,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   const photoList =
                     msg.mediaUrls && msg.mediaUrls.length > 0
                       ? msg.mediaUrls
-                      : msg.mediaUrl && msg.mediaType !== 'audio' && msg.mediaType !== 'video'
+                      : msg.mediaUrl &&
+                        msg.mediaType !== 'audio' &&
+                        msg.mediaType !== 'video' &&
+                        msg.mediaType !== 'file'
                       ? [msg.mediaUrl]
                       : [];
                   const reactionEntries = (
@@ -4018,9 +5020,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   ).filter(([, uids]) => Array.isArray(uids) && uids.length > 0);
 
                   return (
-                    <div
-                      key={msg.id}
-                      onTouchStart={(e) => {
+                    <React.Fragment key={msg.id}>
+                      {showDateSeparator && (
+                        <div className="flex md:hidden justify-center py-1">
+                          <span className="wavelink-mobile-convo-date-pill">
+                            {formatChatDateLabel(msgMs)}
+                          </span>
+                        </div>
+                      )}
+                      <div
+                        onTouchStart={(e) => {
                         const touch = e.touches[0];
                         if (!touch) return;
                         swipeTouchStartRef.current = {
@@ -4083,12 +5092,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                           isOwn ? 'items-end self-end' : 'items-start self-start'
                         }`}
                       >
-                        {/* Sender Name on group or received messages */}
+                        {/* Sender Name on group or received messages (hidden in mobile DM via .wavelink-mobile-convo-dm-sender) */}
                         {(!isOwn || !isDirectMessage) && (
                           <div
                             className={`flex items-center gap-1.5 mb-1 px-1 ${
                               isOwn ? 'justify-end' : 'justify-start'
-                            }`}
+                            } ${isDirectMessage && !isOwn ? 'wavelink-mobile-convo-dm-sender' : ''}`}
                           >
                             <CrystalBadge
                               email={msg.senderEmail}
@@ -4142,17 +5151,17 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                             !msg.isDeleted && isOwn
                               ? {
                                   background:
-                                    'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
-                                  color: '#FFFFFF'
+                                    'var(--chat-sent-bg, linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)))',
+                                  color: 'var(--chat-sent-text, #FFFFFF)'
                                 }
                               : undefined
                           }
-                          className={`w-full max-w-full rounded-3xl px-4 py-3 text-base sm:text-[15px] leading-relaxed relative break-words [overflow-wrap:anywhere] transition ${
+                          className={`w-full max-w-full rounded-3xl px-4 py-3 text-base sm:text-[15px] leading-relaxed relative break-words [overflow-wrap:break-word] transition ${
                             msg.isDeleted
                               ? 'italic bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-secondary)]'
                               : isOwn
-                              ? 'text-white rounded-br-md shadow-sm'
-                              : 'bg-[var(--bg-surface)] text-[var(--text-primary)] rounded-bl-md border border-[var(--border-hairline)] shadow-xs'
+                              ? 'wavelink-convo-bubble--sent text-white rounded-br-md shadow-sm'
+                              : 'wavelink-convo-bubble--received bg-[var(--bg-surface)] text-[var(--text-primary)] rounded-bl-md border border-[var(--border-hairline)] shadow-xs'
                           }`}
                         >
                           {isEditing ? (
@@ -4197,7 +5206,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
                               {/* Video Attachment */}
                               {msg.mediaType === 'video' && msg.mediaUrl && !msg.isDeleted && (
-                                <div className="mb-2 rounded-2xl overflow-hidden w-full max-w-sm">
+                                <div className="wavelink-convo-media mb-2 rounded-2xl overflow-hidden w-full max-w-sm">
                                   <video
                                     src={msg.mediaUrl}
                                     controls
@@ -4206,10 +5215,46 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                                 </div>
                               )}
 
+                              {/* File / Document Attachment */}
+                              {msg.mediaType === 'file' && msg.mediaUrl && !msg.isDeleted && (
+                                <a
+                                  href={msg.mediaUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className={`wavelink-convo-file-card mb-2 flex items-center gap-2.5 p-2.5 rounded-2xl border transition ${
+                                    isOwn
+                                      ? 'bg-black/15 border-white/25 text-white hover:bg-black/25'
+                                      : 'bg-[var(--bg-subtle)] border-[var(--border-hairline)] text-[var(--text-primary)] hover:border-[var(--accent-primary)]'
+                                  }`}
+                                >
+                                  <div
+                                    className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+                                      isOwn
+                                        ? 'bg-white/20 text-white'
+                                        : 'bg-[var(--accent-primary)]/15 text-[var(--accent-primary)]'
+                                    }`}
+                                  >
+                                    <FileText size={18} />
+                                  </div>
+                                  <div className="min-w-0 flex-1">
+                                    <p className="text-xs font-extrabold truncate">
+                                      {msg.fileName || 'Attachment'}
+                                    </p>
+                                    {msg.fileSize ? (
+                                      <p className="text-[10px] opacity-75">
+                                        {formatVideoFileSize(msg.fileSize)} • Tap to open
+                                      </p>
+                                    ) : (
+                                      <p className="text-[10px] opacity-75">Tap to open</p>
+                                    )}
+                                  </div>
+                                </a>
+                              )}
+
                               {/* Shared Photos: Stacked / Grid Group inside the Bubble */}
                               {photoList.length > 0 && !msg.isDeleted && (
                                 <div
-                                  className={`mb-2 overflow-hidden rounded-2xl ${
+                                  className={`wavelink-convo-media mb-2 overflow-hidden rounded-2xl ${
                                     photoList.length === 1
                                       ? 'w-full max-w-xs'
                                       : 'grid grid-cols-2 gap-1.5 w-full max-w-xs'
@@ -4239,7 +5284,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
                               {/* GIF Attachment */}
                               {msg.gifUrl && !msg.isDeleted && (
-                                <div className="mb-2 rounded-2xl overflow-hidden max-w-xs">
+                                <div className="wavelink-convo-media mb-2 rounded-2xl overflow-hidden max-w-xs">
                                   <img
                                     src={msg.gifUrl}
                                     alt="GIF reaction"
@@ -4252,12 +5297,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                               {/* Message Text */}
                               {msg.text && (
                                 <p
-                                  className={`whitespace-pre-wrap break-words ${
+                                  className={`wavelink-convo-bubble-text whitespace-pre-wrap break-words ${
                                     msg.isDeleted
                                       ? 'text-[var(--text-secondary)]'
                                       : isOwn
-                                      ? 'text-white'
-                                      : 'text-[var(--text-primary)]'
+                                      ? 'text-[color:var(--chat-sent-text,#FFFFFF)]'
+                                      : 'text-[color:var(--chat-received-text,var(--text-primary))]'
                                   }`}
                                 >
                                   {msg.text}
@@ -4297,7 +5342,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
 
                         {/* Time & Double-Tick Read Status Under Each Bubble + Quick Actions */}
                         <div
-                          className={`mt-1 flex items-center gap-2 px-1 text-[11px] text-[var(--text-secondary)] select-none ${
+                          className={`wavelink-convo-msg-meta mt-1 flex items-center gap-2 px-1 text-[11px] text-[var(--text-secondary)] select-none ${
                             isOwn ? 'justify-end' : 'justify-start'
                           }`}
                         >
@@ -4392,6 +5437,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                         )}
                       </div>
                     </div>
+                  </React.Fragment>
                   );
                 });
               })()
@@ -4479,21 +5525,34 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           )}
 
-          {/* Media Upload Notice */}
+          {/* Media Upload Progress / Notice */}
           {chatMediaNotice && (
-            <div className="px-4 py-2 bg-amber-500/15 border-t border-amber-400/40 flex items-center justify-between gap-2 text-xs text-[var(--text-primary)] font-bold shrink-0">
-              <span>{chatMediaNotice}</span>
-              <button
-                type="button"
-                onClick={() => setChatMediaNotice(null)}
-                className="p-1 shrink-0 cursor-pointer"
-              >
-                <X size={14} />
-              </button>
+            <div className="px-4 py-2 bg-amber-500/15 border-t border-amber-400/40 space-y-1.5 text-xs text-[var(--text-primary)] font-bold shrink-0">
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 break-words">{chatMediaNotice}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setChatMediaNotice(null);
+                    setChatUploadProgress(null);
+                  }}
+                  className="p-1 shrink-0 cursor-pointer"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+              {chatUploadProgress !== null && (
+                <div className="w-full h-1.5 rounded-full bg-black/10 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[var(--accent-primary)] transition-all duration-200"
+                    style={{ width: `${Math.max(5, chatUploadProgress)}%` }}
+                  />
+                </div>
+              )}
             </div>
           )}
 
-          {/* Selected Photo Grid / Voice Note Preview Bar */}
+          {/* Selected Photo Grid / Video / File / Voice Note Preview Bar */}
           {chatMediaUrl && (
             <div className="p-3 bg-[var(--bg-subtle)] border-t border-[var(--border-hairline)] flex items-center justify-between gap-3 shrink-0">
               {chatMediaType === 'audio' ? (
@@ -4506,7 +5565,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 </div>
               ) : (
                 <div className="flex items-center gap-3 min-w-0">
-                  {chatMediaType === 'video' ? (
+                  {chatMediaType === 'file' ? (
+                    <div className="w-12 h-12 rounded-2xl bg-[var(--accent-primary)]/15 text-[var(--accent-primary)] flex items-center justify-center shrink-0">
+                      <FileText size={20} />
+                    </div>
+                  ) : chatMediaType === 'video' ? (
                     <div className="w-12 h-12 bg-black rounded-2xl flex items-center justify-center text-white shrink-0">
                       <Film size={20} />
                     </div>
@@ -4524,14 +5587,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   )}
                   <div className="min-w-0">
                     <span className="text-xs font-extrabold text-[var(--text-primary)] block truncate">
-                      {chatMediaType === 'video'
+                      {chatMediaType === 'file'
+                        ? chatFileName || 'File Ready'
+                        : chatMediaType === 'video'
                         ? 'Video Ready'
                         : chatMediaUrls.length > 1
                         ? `${chatMediaUrls.length} Photos Ready`
                         : 'Photo Ready'}
                     </span>
                     <span className="text-[11px] text-[var(--text-secondary)]">
-                      Tap Send to share
+                      {chatMediaType === 'file' && chatFileSize > 0
+                        ? `${formatVideoFileSize(chatFileSize)} • Tap Send to share`
+                        : 'Tap Send to share'}
                     </span>
                   </div>
                 </div>
@@ -4542,6 +5609,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                   setChatMediaUrl('');
                   setChatMediaUrls([]);
                   setChatMediaType('none');
+                  setChatFileName('');
+                  setChatFileSize(0);
                   setVoiceNoteDuration(0);
                 }}
                 className="min-w-[40px] min-h-[40px] p-2 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-secondary)] hover:text-rose-500 flex items-center justify-center shrink-0 cursor-pointer"
@@ -4552,8 +5621,360 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           )}
 
-          {/* Fixed Bottom Input Bar above the keyboard: Emoji, GIF, Attach, Mic, Rounded Field, Colorful Send */}
-          <div className="wavelink-chat-input-bar p-2 sm:p-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] shrink-0">
+          {/* Shared hidden file inputs for mobile & desktop pickers */}
+          <input
+            type="file"
+            ref={chatFileRef}
+            onChange={handleChatFileSelect}
+            accept="image/*,video/*"
+            multiple
+            className="hidden"
+          />
+          <input
+            type="file"
+            ref={chatAnyFileRef}
+            onChange={handleChatAnyFileSelect}
+            className="hidden"
+          />
+
+          {/* MOBILE (< 768px) TWO-STATE BOTTOM BAR */}
+          <div className="md:hidden wavelink-mobile-convo-bottom-bar">
+            {showEmojiPicker && (
+              <div className="absolute bottom-18 left-3 right-3 p-3 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-2xl z-40 grid grid-cols-6 gap-2">
+                {EMOJI_LIST.map((em) => (
+                  <button
+                    key={em}
+                    type="button"
+                    onClick={() => {
+                      handleInputTextChange(inputText + em, mobileChatInputRef.current);
+                      setShowEmojiPicker(false);
+                    }}
+                    className="min-h-[44px] text-lg p-1.5 hover:scale-125 transition-transform rounded-xl hover:bg-[var(--bg-subtle)] cursor-pointer"
+                  >
+                    {em}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {showGifPicker && (
+              <div className="absolute bottom-18 left-3 right-3 p-3 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-2xl z-40 max-h-60 overflow-y-auto">
+                <div className="flex items-center justify-between pb-2 mb-2 border-b border-[var(--border-hairline)]">
+                  <span className="text-xs font-extrabold text-[var(--text-primary)]">
+                    Pick a GIF
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowGifPicker(false)}
+                    className="min-w-[36px] min-h-[36px] flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] p-1 cursor-pointer"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {CURATED_GIFS.map((g) => (
+                    <button
+                      key={g.title}
+                      type="button"
+                      onClick={() => handleSendMessage(g.url)}
+                      className="rounded-2xl overflow-hidden hover:opacity-90 transition border border-[var(--border-hairline)] cursor-pointer"
+                    >
+                      <img
+                        src={g.url}
+                        alt={g.title}
+                        className="h-20 w-full object-cover"
+                      />
+                      <span className="text-[10px] font-semibold text-[var(--text-secondary)] truncate block py-1 px-1.5 bg-[var(--bg-subtle)]">
+                        {g.title}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {showMobileAttachTray && (
+              <div className="absolute bottom-18 left-3 right-3 p-2.5 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-2xl z-40 grid grid-cols-2 gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMobileAttachTray(false);
+                    chatFileRef.current?.click();
+                  }}
+                  className="min-h-[48px] px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-2 active:scale-95 transition cursor-pointer"
+                >
+                  <ImageIcon size={18} className="text-[var(--accent-primary)]" />
+                  <span>Photo / Video</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMobileAttachTray(false);
+                    chatAnyFileRef.current?.click();
+                  }}
+                  className="min-h-[48px] px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-2 active:scale-95 transition cursor-pointer"
+                >
+                  <Paperclip size={18} className="text-[var(--accent-secondary)]" />
+                  <span>File / Document</span>
+                </button>
+              </div>
+            )}
+
+            {isBlockedFromAdminChat ? (
+              <div className="p-3 bg-[var(--bg-surface)] rounded-3xl border border-[var(--border-hairline)] shadow-lg flex items-center justify-between gap-2.5">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-10 h-10 rounded-2xl bg-amber-500 text-white flex items-center justify-center shrink-0">
+                    <Lock size={16} />
+                  </div>
+                  <div className="min-w-0">
+                    <span className="font-extrabold text-xs text-[var(--text-primary)] block truncate">
+                      Pro Feature
+                    </span>
+                    <p className="text-[11px] text-[var(--text-secondary)] truncate">
+                      Try Pro to message Admin
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowPaymentModal(true)}
+                  className="min-h-[44px] px-4 rounded-full text-white font-extrabold text-xs flex items-center gap-1.5 shadow-xs shrink-0 cursor-pointer"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                >
+                  <Star size={13} className="fill-white" />
+                  <span>Try Pro</span>
+                </button>
+              </div>
+            ) : isRecordingVoice ? (
+              <div className="flex items-center justify-between gap-2 p-2 rounded-full bg-[var(--bg-surface)] border border-rose-400/50 shadow-lg animate-in fade-in duration-150">
+                <div className="flex items-center gap-2 min-w-0 pl-2">
+                  <span className="relative flex h-3 w-3 shrink-0">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-600" />
+                  </span>
+                  <span className="text-xs font-extrabold text-[var(--text-primary)] truncate">
+                    Recording
+                  </span>
+                  <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-500 tabular-nums shrink-0">
+                    {formatVoiceDuration(recordingSeconds)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={cancelVoiceRecording}
+                    className="min-w-[44px] min-h-[44px] px-3 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-bold text-rose-500 flex items-center justify-center gap-1 cursor-pointer"
+                    aria-label="Cancel voice recording"
+                  >
+                    <Trash2 size={15} />
+                    <span>Cancel</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={stopVoiceRecording}
+                    className="min-w-[44px] min-h-[44px] px-4 rounded-full text-xs font-extrabold text-white flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                    aria-label="Finish voice recording"
+                  >
+                    <Square size={12} className="fill-white" />
+                    <span>Done</span>
+                  </button>
+                </div>
+              </div>
+            ) : !isMobileComposerOpen && !chatMediaUrl ? (
+              /* DEFAULT STATE: Rounded bottom bar with 3 round buttons: +, Pencil, Mic */
+              <div className="wavelink-mobile-convo-dock">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMobileAttachTray((p) => !p);
+                    setShowEmojiPicker(false);
+                    setShowGifPicker(false);
+                  }}
+                  className={`wavelink-mobile-convo-dock-btn cursor-pointer ${
+                    showMobileAttachTray
+                      ? 'bg-[var(--accent-primary)] text-white shadow-sm'
+                      : 'bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)]'
+                  }`}
+                  title="Attach photo, video or file"
+                  aria-label="Attach photo, video or file"
+                >
+                  <Plus
+                    size={21}
+                    className={
+                      showMobileAttachTray
+                        ? 'rotate-45 transition-transform duration-200'
+                        : 'transition-transform duration-200'
+                    }
+                  />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMobileAttachTray(false);
+                    flushSync(() => {
+                      setIsMobileComposerOpen(true);
+                    });
+                    mobileChatInputRef.current?.focus();
+                  }}
+                  className="wavelink-mobile-convo-dock-btn text-white shadow-md cursor-pointer"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                  }}
+                  title="Write a message"
+                  aria-label="Write a message"
+                >
+                  <Pencil size={20} />
+                </button>
+
+                <button
+                  type="button"
+                  onPointerDown={() => {
+                    setShowMobileAttachTray(false);
+                    wasMicHeldRef.current = false;
+                    if (micHoldTimerRef.current) clearTimeout(micHoldTimerRef.current);
+                    micHoldTimerRef.current = setTimeout(() => {
+                      wasMicHeldRef.current = true;
+                      startVoiceRecording();
+                    }, 180);
+                  }}
+                  onPointerUp={() => {
+                    if (micHoldTimerRef.current) {
+                      clearTimeout(micHoldTimerRef.current);
+                      micHoldTimerRef.current = null;
+                    }
+                    if (wasMicHeldRef.current) {
+                      wasMicHeldRef.current = false;
+                      stopVoiceRecording();
+                    } else if (!isRecordingVoice) {
+                      startVoiceRecording();
+                    }
+                  }}
+                  onPointerCancel={() => {
+                    if (micHoldTimerRef.current) {
+                      clearTimeout(micHoldTimerRef.current);
+                      micHoldTimerRef.current = null;
+                    }
+                  }}
+                  className="wavelink-mobile-convo-dock-btn bg-[var(--bg-subtle)] text-rose-500 border border-[var(--border-hairline)] cursor-pointer select-none"
+                  title="Hold to record a voice note"
+                  aria-label="Hold to record a voice note"
+                >
+                  <Mic size={21} />
+                </button>
+              </div>
+            ) : (
+              /* EXPANDED TEXT FIELD STATE: Rounded text field (with Emoji + GIF inside) + circular Send button */
+              <div className="wavelink-mobile-convo-composer animate-in fade-in slide-in-from-bottom-1 duration-200">
+                <div className="wavelink-mobile-convo-field">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowEmojiPicker((p) => !p);
+                      setShowGifPicker(false);
+                      setShowMobileAttachTray(false);
+                    }}
+                    className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--accent-primary)] hover:bg-[var(--bg-subtle)] shrink-0 cursor-pointer"
+                    title="Emoji"
+                    aria-label="Add Emoji"
+                  >
+                    <Smile size={20} />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowGifPicker((p) => !p);
+                      setShowEmojiPicker(false);
+                      setShowMobileAttachTray(false);
+                    }}
+                    className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-full flex items-center justify-center text-[11px] font-black text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] shrink-0 cursor-pointer"
+                    title="GIF"
+                    aria-label="Add GIF"
+                  >
+                    GIF
+                  </button>
+
+                  <textarea
+                    ref={mobileChatInputRef}
+                    rows={1}
+                    data-chat-input="true"
+                    value={inputText}
+                    onChange={(e) => handleInputTextChange(e.target.value, e.currentTarget)}
+                    onFocus={() => {
+                      isInputFocusedRef.current = true;
+                      setShowMobileAttachTray(false);
+                      window.dispatchEvent(
+                        new CustomEvent('wavelink:chat-input-focus', {
+                          detail: { focused: true }
+                        })
+                      );
+                      window.setTimeout(() => {
+                        window.visualViewport?.dispatchEvent(new Event('resize'));
+                        if (messagesListRef.current) {
+                          messagesListRef.current.scrollTop = messagesListRef.current.scrollHeight;
+                        }
+                      }, 120);
+                    }}
+                    onBlur={() => {
+                      isInputFocusedRef.current = false;
+                      window.dispatchEvent(
+                        new CustomEvent('wavelink:chat-input-focus', {
+                          detail: { focused: false }
+                        })
+                      );
+                      if (isCurrentlyTypingRef.current) {
+                        broadcastTypingStatus(false);
+                      }
+                      window.setTimeout(() => {
+                        window.visualViewport?.dispatchEvent(new Event('resize'));
+                      }, 120);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage();
+                      }
+                    }}
+                    placeholder={
+                      activeGroup
+                        ? `Message ${activeGroup.name}...`
+                        : directRecipient
+                        ? `Message ${directRecipient.displayName.split(' ')[0]}...`
+                        : 'Message...'
+                    }
+                    className="flex-1 min-w-0 resize-none overflow-y-auto"
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => handleSendMessage()}
+                  disabled={!inputText.trim() && !chatMediaUrl}
+                  className={`wavelink-mobile-convo-send cursor-pointer ${
+                    inputText.trim() || chatMediaUrl
+                      ? 'wavelink-mobile-convo-send--active active:scale-95'
+                      : 'wavelink-mobile-convo-send--idle'
+                  }`}
+                  title="Send message"
+                  aria-label="Send message"
+                >
+                  <Send size={19} />
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* TABLET & DESKTOP (>= 768px) Fixed Bottom Input Bar — completely untouched */}
+          <div className="hidden md:block wavelink-chat-input-bar p-2 sm:p-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] shrink-0">
             {/* Popover Emoji Picker */}
             {showEmojiPicker && (
               <div className="absolute bottom-20 left-2 right-2 sm:right-auto sm:w-80 p-3 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-2xl z-30 grid grid-cols-6 sm:grid-cols-8 gap-2">
@@ -4679,64 +6100,116 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 </div>
               </div>
             ) : (
-              <div className="flex items-center gap-1 sm:gap-1.5 w-full min-w-0">
-                <input
-                  type="file"
-                  ref={chatFileRef}
-                  onChange={handleChatFileSelect}
-                  accept="image/*,video/*"
-                  multiple
-                  className="hidden"
-                />
+              <div className="w-full">
+                {/* Expandable Mobile Media Tray (< 640px) so the typing box stays roomy at 360px */}
+                {showMobileAttachTray && (
+                  <div className="sm:hidden mb-2 flex items-center gap-2 px-2 py-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowEmojiPicker((p) => !p);
+                        setShowGifPicker(false);
+                        setShowMobileAttachTray(false);
+                      }}
+                      className="min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Smile size={17} className="text-[var(--accent-primary)]" />
+                      <span>Emoji</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowGifPicker((p) => !p);
+                        setShowEmojiPicker(false);
+                        setShowMobileAttachTray(false);
+                      }}
+                      className="min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-black flex items-center justify-center cursor-pointer"
+                    >
+                      GIF
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMobileAttachTray(false);
+                        chatFileRef.current?.click();
+                      }}
+                      className="flex-1 min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <ImageIcon size={17} className="text-[var(--accent-secondary)]" />
+                      <span>Photo/Video</span>
+                    </button>
+                  </div>
+                )}
 
-                {/* Emoji Button */}
+                <div className="flex items-end gap-1.5 w-full min-w-0">
+                {/* Mobile-only compact '+' toggle (44x44) keeping 360px input box spacious */}
                 <button
                   type="button"
                   onClick={() => {
-                    setShowEmojiPicker((p) => !p);
+                    setShowMobileAttachTray((p) => !p);
+                    setShowEmojiPicker(false);
                     setShowGifPicker(false);
                   }}
-                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
-                  title="Emoji"
-                  aria-label="Add Emoji"
+                  className={`sm:hidden w-11 h-11 min-w-[44px] min-h-[44px] rounded-2xl border flex items-center justify-center transition shrink-0 cursor-pointer ${
+                    showMobileAttachTray
+                      ? 'bg-[var(--accent-primary)] border-[var(--accent-primary)] text-white'
+                      : 'bg-[var(--bg-subtle)] border-[var(--border-hairline)] text-[var(--text-primary)]'
+                  }`}
+                  title="Media, GIF & Emoji"
+                  aria-label="Open media and emoji tools"
                 >
-                  <Smile size={18} className="text-[var(--accent-primary)]" />
+                  <Plus size={20} className={showMobileAttachTray ? 'rotate-45 transition-transform' : 'transition-transform'} />
                 </button>
 
-                {/* GIF Button */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowGifPicker((p) => !p);
-                    setShowEmojiPicker(false);
-                  }}
-                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[11px] font-black text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
-                  title="GIF"
-                  aria-label="Add GIF"
-                >
-                  GIF
-                </button>
+                {/* Tablet & Desktop inline Emoji / GIF / Attach buttons (>= 44px touch targets) */}
+                <div className="hidden sm:flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowEmojiPicker((p) => !p);
+                      setShowGifPicker(false);
+                    }}
+                    className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                    title="Emoji"
+                    aria-label="Add Emoji"
+                  >
+                    <Smile size={18} className="text-[var(--accent-primary)]" />
+                  </button>
 
-                {/* Attach Photos/Video Button */}
-                <button
-                  type="button"
-                  onClick={() => chatFileRef.current?.click()}
-                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
-                  title="Attach photos or video"
-                  aria-label="Attach photos or video"
-                >
-                  <ImageIcon size={18} className="text-[var(--accent-secondary)]" />
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowGifPicker((p) => !p);
+                      setShowEmojiPicker(false);
+                    }}
+                    className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[11px] font-black text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                    title="GIF"
+                    aria-label="Add GIF"
+                  >
+                    GIF
+                  </button>
 
-                {/* Rounded Message Input Field (Enter to send, Shift+Enter for new line) */}
+                  <button
+                    type="button"
+                    onClick={() => chatFileRef.current?.click()}
+                    className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] flex items-center justify-center transition shrink-0 cursor-pointer"
+                    title="Attach photos or video"
+                    aria-label="Attach photos or video"
+                  >
+                    <ImageIcon size={18} className="text-[var(--accent-secondary)]" />
+                  </button>
+                </div>
+
+                {/* Auto-growing Rounded Message Input Field */}
                 <textarea
                   ref={chatInputRef}
                   rows={1}
                   data-chat-input="true"
                   value={inputText}
-                  onChange={(e) => handleInputTextChange(e.target.value)}
+                  onChange={(e) => handleInputTextChange(e.target.value, e.currentTarget)}
                   onFocus={() => {
                     isInputFocusedRef.current = true;
+                    setShowMobileAttachTray(false);
                     window.dispatchEvent(
                       new CustomEvent('wavelink:chat-input-focus', {
                         detail: { focused: true }
@@ -4776,21 +6249,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                       ? `Message ${directRecipient.displayName.split(' ')[0]}...`
                       : 'Message...'
                   }
-                  className="flex-1 min-w-0 min-h-[44px] max-h-28 py-2.5 px-3.5 rounded-3xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 resize-none leading-snug transition"
+                  className="flex-1 min-w-0 min-h-[44px] max-h-[120px] py-2.5 px-3.5 rounded-3xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 resize-none overflow-y-auto leading-snug transition"
                 />
 
-                {/* Voice Note Mic Button */}
+                {/* Voice Note Mic Button (>= 44x44) */}
                 <button
                   type="button"
                   onClick={startVoiceRecording}
-                  className="w-10 h-11 min-w-[40px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-rose-400 border border-[var(--border-hairline)] text-rose-500 flex items-center justify-center transition shrink-0 cursor-pointer"
+                  className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] hover:border-rose-400 border border-[var(--border-hairline)] text-rose-500 flex items-center justify-center transition shrink-0 cursor-pointer"
                   title="Record voice note"
                   aria-label="Record voice note"
                 >
                   <Mic size={18} />
                 </button>
 
-                {/* Colorful Gradient Send Button */}
+                {/* Colorful Gradient Send Button (>= 44x44) */}
                 <button
                   type="button"
                   onClick={() => handleSendMessage()}
@@ -4805,6 +6278,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
                 >
                   <Send size={18} />
                 </button>
+                </div>
               </div>
             )}
           </div>
@@ -5641,6 +7115,39 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({ onOpenCall, 
             </div>
           </div>
         </div>
+      )}
+
+      {/* Per-Chat Theme Picker Bottom Sheet (mobile) / Popup Modal (desktop) */}
+      {isThemePickerOpen && activeChannel && (
+        <ChatThemePickerModal
+          isOpen={isThemePickerOpen}
+          conversationId={activeChannel}
+          conversationTitle={
+            activeGroup
+              ? activeGroup.name
+              : directRecipient
+              ? directRecipient.displayName
+              : 'Conversation'
+          }
+          isGroup={Boolean(activeGroup)}
+          isGroupAdmin={Boolean(isCurrentUserGroupAdmin)}
+          canShare={!isChattingWithSupportBot}
+          isPro={Boolean(isProEffective)}
+          initialPreference={savedActiveChatTheme}
+          appActiveTheme={activeTheme}
+          onPreviewChange={setPreviewChatTheme}
+          onSave={handleSaveChatTheme}
+          onResetToDefault={handleResetChatTheme}
+          onOpenProUpgrade={() => {
+            setIsThemePickerOpen(false);
+            setPreviewChatTheme(null);
+            setShowPaymentModal(true);
+          }}
+          onClose={() => {
+            setPreviewChatTheme(null);
+            setIsThemePickerOpen(false);
+          }}
+        />
       )}
 
       {/* Subscription Checkout Modal */}

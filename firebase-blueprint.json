@@ -15,6 +15,7 @@
         "warningMessage": { "type": "string", "maxLength": 500 },
         "isBanned": { "type": "boolean" },
         "savedPostIds": { "type": "array" },
+        "chatThemes": { "type": "object" },
         "isSubAdmin": { "type": "boolean" },
         "role": { "type": "string", "enum": ["super_admin", "sub_admin", "user"] },
         "hasBlueStar": { "type": "boolean" },
@@ -189,6 +190,7 @@
         "replyToSenderName": { "type": "string" },
         "isEdited": { "type": "boolean" },
         "isDeleted": { "type": "boolean" },
+        "isSystem": { "type": "boolean" },
         "readBy": { "type": "array" },
         "lastSeenAt": { "type": "string" },
         "createdAt": { "type": "string" },
@@ -211,6 +213,7 @@
         "adminIds": { "type": "array" },
         "memberIds": { "type": "array" },
         "lastSeen": { "type": "object" },
+        "suggestedTheme": { "type": "object" },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },

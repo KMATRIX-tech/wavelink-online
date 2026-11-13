@@ -8,8 +8,8 @@ import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LanguageProvider, useLanguage } from './context/LanguageContext';
 import { PresenceProvider } from './context/PresenceContext';
-import { db, testConnection } from './firebase';
-import { collection, query, where, limit, onSnapshot, updateDoc, doc, getDoc } from 'firebase/firestore';
+import { db, cleanFirestoreData, testConnection } from './firebase';
+import { collection, query, where, limit, onSnapshot, updateDoc, setDoc, doc, getDoc, serverTimestamp } from 'firebase/firestore';
 import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
 import { ActiveTab, CallRecipient } from './types';
@@ -26,7 +26,7 @@ import { VideosHubView } from './components/VideosHubView';
 import { TrendingChallengesView } from './components/TrendingChallengesView';
 import { InterestPickerModal, hasUserCompletedOrSkippedInterests } from './components/InterestPickerModal';
 import { AnnouncementsView } from './components/AnnouncementsView';
-import { ChatChannelsView } from './components/ChatChannelsView';
+import { ChatChannelsView, computeDmConversationId } from './components/ChatChannelsView';
 import { UserDirectoryView } from './components/UserDirectoryView';
 import { AdminDashboard } from './components/AdminDashboard';
 import AdminGuard from './components/AdminGuard';
@@ -44,7 +44,7 @@ import { SimpleModeProvider } from './context/SimpleModeContext';
 import { FirstTimeTourModal } from './components/FirstTimeTourModal';
 import { HelpModal } from './components/HelpModal';
 import { CelebrationBanner } from './components/CelebrationBanner';
-import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles } from 'lucide-react';
+import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles, Volume2, VolumeX, MessageSquare, Send, X } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 
 interface IncomingCallData {
@@ -120,6 +120,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   });
   const [isHelpOpen, setIsHelpOpen] = useState(false);
 
+  const [isRingtoneMuted, setIsRingtoneMuted] = useState(false);
+  const [incomingAcceptMode, setIncomingAcceptMode] = useState<'video' | 'voice'>('video');
+  const [showCustomQuickReply, setShowCustomQuickReply] = useState(false);
+  const [customQuickReplyText, setCustomQuickReplyText] = useState('');
+  const [incomingBgError, setIncomingBgError] = useState(false);
+
   const ringtoneStopRef = useRef<(() => void) | null>(null);
   const handledCallIdsRef = useRef<Set<string>>(new Set());
 
@@ -127,6 +133,13 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     if (ringtoneStopRef.current) {
       ringtoneStopRef.current();
       ringtoneStopRef.current = null;
+    }
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      try {
+        navigator.vibrate(0);
+      } catch {
+        // ignore vibration errors on unsupported browsers
+      }
     }
   }, []);
 
@@ -150,12 +163,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     };
   }, []);
 
-  // Sync user's saved appearanceTheme, language, and dataSaverEnabled from Firestore across devices
-  useEffect(() => {
-    if (userProfile?.appearanceTheme && userProfile.appearanceTheme !== appearanceTheme) {
-      setAppearanceTheme(userProfile.appearanceTheme);
-    }
-  }, [userProfile?.appearanceTheme, appearanceTheme, setAppearanceTheme]);
+  // ThemeContext directly syncs appearanceTheme from Firestore without overwriting in-flight saves
 
   useEffect(() => {
     if (userProfile?.language && (userProfile.language === 'sw' || userProfile.language === 'en') && userProfile.language !== language) {
@@ -308,13 +316,41 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     };
   }, []);
 
-  // Ringtone ONLY for the person receiving the call; stops immediately on accept, decline, or call end
+  // Ringtone + vibration ONLY for the person receiving the call; stops immediately on mute, accept, decline, or call end
   const isReceivingRingingCall = Boolean(
     incomingCall && !activeCall && incomingCall.callerId !== currentUser?.uid
   );
 
+  // Reset incoming UI state whenever a new incoming call arrives
   useEffect(() => {
-    if (!isReceivingRingingCall) {
+    if (!incomingCall) {
+      setShowCustomQuickReply(false);
+      setCustomQuickReplyText('');
+      setIncomingBgError(false);
+      return;
+    }
+    setIsRingtoneMuted(false);
+    setIncomingAcceptMode(incomingCall.callType === 'voice' ? 'voice' : 'video');
+    setShowCustomQuickReply(false);
+    setCustomQuickReplyText('');
+    setIncomingBgError(false);
+  }, [incomingCall?.callId, incomingCall?.callType]);
+
+  // Prevent Esc key from dismissing incoming call screen accidentally
+  useEffect(() => {
+    if (!isReceivingRingingCall) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isReceivingRingingCall]);
+
+  useEffect(() => {
+    if (!isReceivingRingingCall || isRingtoneMuted) {
       stopIncomingRingtone();
       return;
     }
@@ -324,11 +360,28 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     let audioCtx: AudioContext | null = null;
     let activeOscillators: OscillatorNode[] = [];
 
+    const triggerIncomingVibrate = () => {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        try {
+          navigator.vibrate([420, 220, 420]);
+        } catch {
+          // ignore
+        }
+      }
+    };
+
     const cleanupAudio = () => {
       isPlaying = false;
       if (timer) {
         clearTimeout(timer);
         timer = null;
+      }
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        try {
+          navigator.vibrate(0);
+        } catch {
+          // ignore
+        }
       }
       activeOscillators.forEach((osc) => {
         try {
@@ -349,11 +402,11 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
     try {
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtxClass) {
-        audioCtx = new AudioCtxClass();
+      const startChimeLoop = () => {
+        if (!isPlaying) return;
+        triggerIncomingVibrate();
 
-        const playChime = () => {
-          if (!isPlaying || !audioCtx || audioCtx.state === 'closed') return;
+        if (AudioCtxClass && audioCtx && audioCtx.state !== 'closed') {
           try {
             if (audioCtx.state === 'suspended') {
               audioCtx.resume().catch(() => {});
@@ -391,14 +444,17 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           } catch {
             // chime synth error
           }
+        }
 
-          if (isPlaying) {
-            timer = setTimeout(playChime, 2400);
-          }
-        };
+        if (isPlaying) {
+          timer = setTimeout(startChimeLoop, 2400);
+        }
+      };
 
-        playChime();
+      if (AudioCtxClass) {
+        audioCtx = new AudioCtxClass();
       }
+      startChimeLoop();
     } catch {
       // AudioContext unavailable
     }
@@ -406,7 +462,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     return () => {
       cleanupAudio();
     };
-  }, [isReceivingRingingCall, stopIncomingRingtone]);
+  }, [isReceivingRingingCall, isRingtoneMuted, stopIncomingRingtone]);
 
   // 30-second receiver-side auto-timeout in case caller disconnected abruptly while ringing
   useEffect(() => {
@@ -492,12 +548,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     const qByReceiverId = query(
       collection(db, 'calls'),
       where('receiverId', '==', currentUser.uid),
-      limit(5)
+      limit(30)
     );
     const qByReceiver = query(
       collection(db, 'calls'),
       where('receiver', '==', currentUser.uid),
-      limit(5)
+      limit(30)
     );
 
     let docsByReceiverId: Array<{ id: string; data: () => any }> = [];
@@ -570,14 +626,15 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
-            if (data.signalType === 'offer' && !handledCallIdsRef.current.has(data.callId)) {
+            const callerId = data.fromUserId || data.senderId;
+            if (data.signalType === 'offer' && callerId && !handledCallIdsRef.current.has(data.callId)) {
               setIncomingCall((prev) => ({
                 callId: data.callId,
-                callerId: data.senderId,
-                callerName: data.senderName || prev?.callerName || 'WaveLink Member',
-                callerPhotoURL: data.senderPhotoURL || prev?.callerPhotoURL,
+                callerId,
+                callerName: data.fromName || data.senderName || prev?.callerName || 'WaveLink Member',
+                callerPhotoURL: data.fromPhotoURL || data.senderPhotoURL || prev?.callerPhotoURL,
                 callType: data.callType || prev?.callType || 'video',
-                offer: data.sdp || prev?.offer
+                offer: data.signalData || data.sdp || prev?.offer
               }));
             } else if (data.signalType === 'end' || data.signalType === 'declined') {
               stopIncomingRingtone();
@@ -610,16 +667,18 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     });
   };
 
-  const handleAcceptIncomingCall = () => {
+  const handleAcceptIncomingCall = (overrideMode?: 'video' | 'voice') => {
     if (!incomingCall) return;
     stopIncomingRingtone();
     const { callId, callerId, callerName, callerPhotoURL, callType, offer } = incomingCall;
+    const chosenMode =
+      overrideMode || (callType === 'video' ? incomingAcceptMode : 'voice');
     handledCallIdsRef.current.add(callId);
     setIncomingCall(null);
     setIsWelinkOpen(false);
 
     setActiveCall({
-      type: callType,
+      type: chosenMode,
       recipient: {
         id: callerId,
         name: callerName,
@@ -662,6 +721,66 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       };
     } catch {
       // ws send error
+    }
+  };
+
+  const handleQuickReplyDecline = async (rawMessage: string) => {
+    const replyText = rawMessage.trim();
+    if (!incomingCall || !replyText || !currentUser?.uid) return;
+    const targetCallerId = incomingCall.callerId;
+    handleDeclineIncomingCall();
+
+    try {
+      const dmChannelId = computeDmConversationId(currentUser.uid, targetCallerId);
+      const nowIso = new Date().toISOString();
+      const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const senderDisplayName =
+        userProfile?.displayName || currentUser.displayName || 'Waver';
+      const senderAvatar =
+        userProfile?.photoURL ||
+        currentUser.photoURL ||
+        `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`;
+      const participants = [currentUser.uid, targetCallerId].sort();
+
+      await setDoc(
+        doc(db, 'channels', dmChannelId, 'messages', msgId),
+        cleanFirestoreData({
+          id: msgId,
+          channelId: dmChannelId,
+          conversationId: dmChannelId,
+          participants,
+          senderId: currentUser.uid,
+          receiverId: targetCallerId,
+          senderName: senderDisplayName,
+          senderAvatar,
+          text: replyText,
+          mediaType: 'none',
+          isEdited: false,
+          isDeleted: false,
+          readBy: [currentUser.uid],
+          timestamp: serverTimestamp(),
+          createdAt: nowIso
+        })
+      );
+
+      setDoc(
+        doc(db, 'channels', dmChannelId),
+        {
+          id: dmChannelId,
+          conversationId: dmChannelId,
+          participants,
+          lastMessageText: replyText,
+          lastMessageSenderId: currentUser.uid,
+          lastMessageSenderName: senderDisplayName,
+          lastMessageAt: nowIso,
+          lastSeen: { [currentUser.uid]: nowIso },
+          timestamp: serverTimestamp(),
+          updatedAt: nowIso
+        },
+        { merge: true }
+      ).catch(() => {});
+    } catch (err) {
+      console.warn('[CALL] Failed to send quick reply message:', err);
     }
   };
 
@@ -909,8 +1028,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         hasUnreadNotifications={unreadNotificationIds.length > 0}
       />
 
-      {/* Single Floating Assistant Button (opens WELINK AI Assistant or Live Talk) */}
-      {!isWelinkOpen && !activeCall && (
+      {/* Single Floating Assistant Button (hidden on Chat so it never overlaps Send/menu buttons on phones) */}
+      {!isWelinkOpen && !activeCall && activeTab !== 'chat' && (
         <button
           type="button"
           onClick={() => handleOpenWelink('chat')}
@@ -930,59 +1049,220 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         initialMode={welinkInitialMode}
       />
 
-      {/* Full-Screen Incoming Call Notification Popup */}
-      {incomingCall && !activeCall && (
-        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center p-6 bg-stone-950/90 backdrop-blur-xl animate-fade-in">
-          <div className="w-full max-w-md bg-white rounded-3xl p-8 shadow-2xl border border-stone-200 text-center space-y-6">
-            <div className="relative mx-auto w-28 h-28">
-              <div className="absolute inset-0 rounded-full bg-emerald-500/25 animate-ping" />
+      {/* Full-Screen / Centered Incoming Call Screen */}
+      {incomingCall && !activeCall && (() => {
+        const hasRealPhoto = Boolean(
+          incomingCall.callerPhotoURL &&
+            !incomingCall.callerPhotoURL.includes('dicebear.com') &&
+            !incomingBgError
+        );
+        const quickReplies = [
+          'Busy right now, please wait',
+          "In a meeting, I'll call after",
+          "Can't talk, text me!"
+        ];
+
+        return (
+          <div className="wavelink-incoming-call-overlay" role="dialog" aria-modal="true" aria-label="Incoming call">
+            {hasRealPhoto ? (
               <img
-                src={
-                  incomingCall.callerPhotoURL ||
-                  `https://api.dicebear.com/7.x/shapes/svg?seed=${incomingCall.callerId}`
-                }
-                alt={incomingCall.callerName}
-                className="w-full h-full rounded-full object-cover ring-4 ring-emerald-500 shadow-lg relative bg-white"
+                src={incomingCall.callerPhotoURL}
+                alt=""
+                aria-hidden="true"
+                onError={() => setIncomingBgError(true)}
+                className="wavelink-incoming-call-bg"
               />
-              <div className="absolute -bottom-1 -right-1 p-2.5 rounded-full bg-emerald-500 text-white shadow-md">
-                {incomingCall.callType === 'video' ? <Video size={18} /> : <PhoneCall size={18} />}
+            ) : (
+              <div className="wavelink-incoming-call-bg wavelink-call-theme-gradient" aria-hidden="true" />
+            )}
+            <div className="wavelink-incoming-call-scrim" aria-hidden="true" />
+
+            <div className="wavelink-incoming-call-card">
+              {/* Top-right mute ringtone speaker toggle */}
+              <button
+                type="button"
+                onClick={() => setIsRingtoneMuted((prev) => !prev)}
+                aria-label={isRingtoneMuted ? 'Unmute ringtone' : 'Mute ringtone'}
+                title={isRingtoneMuted ? 'Unmute ringtone' : 'Mute ringtone'}
+                className="wavelink-incoming-call-mute-btn"
+              >
+                {isRingtoneMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+              </button>
+
+              {/* Caller avatar & identity near the top */}
+              <div className="flex flex-col items-center pt-4 lg:pt-1">
+                <div className="relative mx-auto w-[120px] h-[120px] flex items-center justify-center">
+                  <div
+                    className="absolute inset-0 rounded-full wavelink-call-pulse-ring"
+                    style={{
+                      border: '2px solid color-mix(in srgb, var(--accent-primary) 75%, #22c55e)'
+                    }}
+                  />
+                  <div
+                    className="absolute -inset-2 rounded-full wavelink-call-pulse-ring--delayed"
+                    style={{
+                      border: '2px solid color-mix(in srgb, var(--accent-secondary) 60%, #ffffff)'
+                    }}
+                  />
+                  <img
+                    src={
+                      incomingCall.callerPhotoURL ||
+                      `https://api.dicebear.com/7.x/shapes/svg?seed=${incomingCall.callerId}`
+                    }
+                    alt={incomingCall.callerName}
+                    className="w-[120px] h-[120px] rounded-full object-cover shadow-2xl relative bg-slate-900"
+                    style={{
+                      boxShadow: '0 0 0 3px color-mix(in srgb, var(--accent-primary) 75%, #ffffff), 0 18px 40px rgba(0, 0, 0, 0.5)'
+                    }}
+                  />
+                </div>
+
+                <h3 className="mt-5 text-2xl sm:text-[1.65rem] font-extrabold text-white tracking-tight max-w-[85vw] truncate">
+                  {incomingCall.callerName}
+                </h3>
+
+                <div className="mt-1.5 inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-white/10 border border-white/15 text-xs font-semibold text-white/90">
+                  {incomingCall.callType === 'video' ? (
+                    <Video size={14} className="shrink-0 text-emerald-300" />
+                  ) : (
+                    <PhoneCall size={14} className="shrink-0 text-emerald-300" />
+                  )}
+                  <span>
+                    {incomingCall.callType === 'video'
+                      ? 'Incoming video call'
+                      : 'Incoming voice call'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Quick reply messages (declines call & sends DM) */}
+              <div className="w-full flex flex-col items-center">
+                {!showCustomQuickReply ? (
+                  <div className="wavelink-incoming-call-replies">
+                    {quickReplies.map((msg) => (
+                      <button
+                        key={msg}
+                        type="button"
+                        onClick={() => handleQuickReplyDecline(msg)}
+                        className="wavelink-incoming-call-reply-btn inline-flex items-center gap-1.5"
+                      >
+                        <MessageSquare size={13} className="opacity-75 shrink-0" />
+                        <span>{msg}</span>
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setShowCustomQuickReply(true)}
+                      className="wavelink-incoming-call-reply-btn inline-flex items-center gap-1.5"
+                    >
+                      <MessageSquare size={13} className="opacity-75 shrink-0" />
+                      <span>Custom</span>
+                    </button>
+                  </div>
+                ) : (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handleQuickReplyDecline(customQuickReplyText);
+                    }}
+                    className="w-full max-w-sm flex items-center gap-2 my-2 bg-white/12 border border-white/25 rounded-full p-1.5 backdrop-blur-md"
+                  >
+                    <input
+                      type="text"
+                      value={customQuickReplyText}
+                      onChange={(e) => setCustomQuickReplyText(e.target.value)}
+                      placeholder="Type a quick reply..."
+                      autoFocus
+                      maxLength={180}
+                      className="flex-1 min-w-0 bg-transparent px-3 py-1.5 text-sm text-white placeholder-white/60 focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowCustomQuickReply(false)}
+                      aria-label="Cancel custom reply"
+                      className="w-9 h-9 rounded-full flex items-center justify-center text-white/75 hover:text-white hover:bg-white/10"
+                    >
+                      <X size={16} />
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={!customQuickReplyText.trim()}
+                      aria-label="Send quick reply and decline"
+                      className="w-9 h-9 rounded-full flex items-center justify-center bg-white text-slate-950 disabled:opacity-40"
+                    >
+                      <Send size={15} />
+                    </button>
+                  </form>
+                )}
+              </div>
+
+              {/* Bottom Accept/Reject controls + Video/Voice-only choice for video calls */}
+              <div className="w-full flex flex-col items-center">
+                {incomingCall.callType === 'video' && (
+                  <div className="wavelink-incoming-call-mode-toggle" role="group" aria-label="Answer mode">
+                    <button
+                      type="button"
+                      onClick={() => setIncomingAcceptMode('video')}
+                      className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-colors ${
+                        incomingAcceptMode === 'video'
+                          ? 'bg-white text-slate-950 shadow-sm'
+                          : 'text-white/80 hover:text-white'
+                      }`}
+                    >
+                      Accept with video
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIncomingAcceptMode('voice')}
+                      className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-colors ${
+                        incomingAcceptMode === 'voice'
+                          ? 'bg-white text-slate-950 shadow-sm'
+                          : 'text-white/80 hover:text-white'
+                      }`}
+                    >
+                      Accept voice only
+                    </button>
+                  </div>
+                )}
+
+                <div className="wavelink-incoming-call-actions">
+                  <div className="flex flex-col items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleAcceptIncomingCall(incomingAcceptMode)}
+                      aria-label={t('call.answer')}
+                      className="wavelink-incoming-call-btn wavelink-incoming-call-btn--accept"
+                    >
+                      {incomingCall.callType === 'video' && incomingAcceptMode === 'video' ? (
+                        <Video size={28} />
+                      ) : (
+                        <PhoneCall size={28} />
+                      )}
+                    </button>
+                    <span className="text-xs font-bold text-white/90">
+                      {t('call.answer') || 'Accept'}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-col items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleDeclineIncomingCall}
+                      aria-label={t('call.decline')}
+                      className="wavelink-incoming-call-btn wavelink-incoming-call-btn--reject"
+                    >
+                      <PhoneOff size={28} />
+                    </button>
+                    <span className="text-xs font-bold text-white/90">
+                      {t('call.decline') || 'Reject'}
+                    </span>
+                  </div>
+                </div>
               </div>
             </div>
-
-            <div>
-              <span className="inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-extrabold uppercase tracking-wider mb-2">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                <span>Incoming {incomingCall.callType === 'video' ? 'Video' : 'Voice'} Call</span>
-              </span>
-              <h3 className="text-2xl font-black text-stone-900 tracking-tight">
-                {incomingCall.callerName}
-              </h3>
-              <p className="text-xs sm:text-sm text-stone-500 mt-1">
-                Calling you on WaveLink • Tap Accept to connect
-              </p>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4 pt-2">
-              <button
-                type="button"
-                onClick={handleDeclineIncomingCall}
-                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
-              >
-                <PhoneOff size={18} />
-                <span>{t('call.decline')}</span>
-              </button>
-              <button
-                type="button"
-                onClick={handleAcceptIncomingCall}
-                className="min-h-[48px] py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition active:scale-95 animate-pulse cursor-pointer"
-              >
-                <PhoneCall size={18} />
-                <span>{t('call.answer')}</span>
-              </button>
-            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* WebRTC Video & Voice Calling Overlay Modal */}
       {activeCall && !isWelinkOpen && (

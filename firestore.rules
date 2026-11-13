@@ -147,7 +147,18 @@ service cloud.firestore {
         isValidOptionalString(data, 'coverPresetId', 80) &&
         isValidOptionalString(data, 'coverType', 32) &&
         isValidOptionalString(data, 'pinnedPostId', 160) &&
-        (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:image/.*'));
+        isValidOptionalString(data, 'appearanceTheme', 40) &&
+        isValidOptionalString(data, 'language', 16) &&
+        isValidOptionalString(data, 'panAfricanLanguage', 24) &&
+        isValidOptionalString(data, 'countryCode', 12) &&
+        isValidOptionalString(data, 'regionName', 80) &&
+        isValidOptionalString(data, 'preferredCurrency', 12) &&
+        isValidOptionalString(data, 'patternFrame', 32) &&
+        isValidOptionalString(data, 'proBorderEffect', 32) &&
+        isValidOptionalString(data, 'proAccentColor', 32) &&
+        isValidOptionalString(data, 'proBadge', 32) &&
+        (!('chatThemes' in data) || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
+        (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*'));
     }
 
     // Check if the authenticated user is a Pro member, verified by Admin, or an Admin
@@ -162,69 +173,53 @@ service cloud.firestore {
       );
     }
 
-    // Enforce that custom profile cover fields can only be set or changed by Pro/Admin users
-    function isSafeCustomCoverWrite(incoming, existing) {
-      return isUserProOrAdmin() || (
-        (!('coverImageUrl' in incoming) ||
-          (existing != null && 'coverImageUrl' in existing && incoming.coverImageUrl == existing.coverImageUrl) ||
-          incoming.coverImageUrl == '') &&
-        (!('coverPresetId' in incoming) ||
-          (existing != null && 'coverPresetId' in existing && incoming.coverPresetId == existing.coverPresetId) ||
-          incoming.coverPresetId == 'theme-default') &&
-        (!('coverType' in incoming) ||
-          (existing != null && 'coverType' in existing && incoming.coverType == existing.coverType) ||
-          incoming.coverType == 'default')
-      );
-    }
-
-    // Protect RBAC, contact verification flags, Pro status, custom covers, badges, and points from unauthorized client self-escalation
-    // Enforce that no user can create or complete a user profile without a verified email in Firebase Auth
+    // Protect RBAC, contact verification flags, Pro status, badges, and points from unauthorized client self-escalation
     function isSafeUserProfileCreate(userId) {
       let data = request.resource.data;
       return isOwner(userId) &&
-        isEmailVerified() &&
         isValidUserProfilePayload(data) &&
         (!('uid' in data) || data.uid == userId) &&
         (!('role' in data) || data.role == 'user' || isSuperAdmin()) &&
+        (!('admin' in data) || data.admin == false || isSuperAdmin()) &&
+        (!('isOwner' in data) || data.isOwner == false || isSuperAdmin()) &&
         (!('isSubAdmin' in data) || data.isSubAdmin == false || isSuperAdmin()) &&
         (!('isBot' in data) || data.isBot == false) &&
+        (!('isBanned' in data) || data.isBanned == false) &&
         (!('isPro' in data) || data.isPro == false || isAdmin()) &&
         (!('hasBlueStar' in data) || data.hasBlueStar == false || isAdmin()) &&
         (!('isVerifiedByAdmin' in data) || data.isVerifiedByAdmin == false || isAdmin()) &&
-        isSafeCustomCoverWrite(data, null) &&
-        // Email verification must match Firebase Auth token email_verified; phone verification is disabled
         (!('emailVerified' in data) || data.emailVerified == isEmailVerified()) &&
         (!('phoneVerified' in data) || data.phoneVerified == false) &&
         (!('isContactVerified' in data) || data.isContactVerified == isEmailVerified()) &&
-        (!('points' in data) || (data.points is number && data.points >= 0 && data.points <= 500)) &&
-        (!('wavePoints' in data) || (data.wavePoints is number && data.wavePoints >= 0 && data.wavePoints <= 500));
+        (!('points' in data) || (data.points is number && data.points >= 0 && data.points <= 50)) &&
+        (!('wavePoints' in data) || (data.wavePoints is number && data.wavePoints >= 0 && data.wavePoints <= 50));
     }
 
+    // Users can update ONLY their own safe profile fields (photo, cover, bio, displayName, username, theme, language, settings),
+    // and NEVER role, admin, sub-admin, Pro, verified badges, ban state, or points.
     function isSafeUserProfileUpdate(userId) {
       let incoming = request.resource.data;
       let existing = resource.data;
       return isOwner(userId) &&
-        isEmailVerified() &&
         isValidUserProfilePayload(incoming) &&
         (!('uid' in incoming) || incoming.uid == userId) &&
-        // Block non-admins from editing their own role, sub-admin status, or Pro/Verification flags
-        (!('role' in incoming) || (existing != null && incoming.role == existing.role) || incoming.role == 'user') &&
-        (!('isSubAdmin' in incoming) || (existing != null && incoming.isSubAdmin == existing.isSubAdmin) || incoming.isSubAdmin == false) &&
-        (!('isPro' in incoming) || (existing != null && 'isPro' in existing && incoming.isPro == existing.isPro) || incoming.isPro == false) &&
-        (!('hasBlueStar' in incoming) || (existing != null && 'hasBlueStar' in existing && incoming.hasBlueStar == existing.hasBlueStar) || incoming.hasBlueStar == false) &&
-        (!('isVerifiedByAdmin' in incoming) || (existing != null && 'isVerifiedByAdmin' in existing && incoming.isVerifiedByAdmin == existing.isVerifiedByAdmin) || incoming.isVerifiedByAdmin == false) &&
-        (!('isBot' in incoming) || incoming.isBot == false) &&
-        // Block non-Pro users from setting or modifying custom cover fields (coverImageUrl, coverPresetId, coverType)
-        isSafeCustomCoverWrite(incoming, existing) &&
-        // Email verification must match Firebase Auth token email_verified; phone verification is disabled
-        (!('emailVerified' in incoming) || incoming.emailVerified == isEmailVerified() || (existing != null && 'emailVerified' in existing && incoming.emailVerified == existing.emailVerified)) &&
-        (!('phoneVerified' in incoming) || (existing != null && 'phoneVerified' in existing && incoming.phoneVerified == existing.phoneVerified) || incoming.phoneVerified == false) &&
-        (!('isContactVerified' in incoming) || incoming.isContactVerified == isEmailVerified() || (existing != null && 'isContactVerified' in existing && incoming.isContactVerified == existing.isContactVerified)) &&
-        // Block non-admins from unbanning themselves
-        (!('isBanned' in incoming) || (existing != null && incoming.isBanned == existing.isBanned) || incoming.isBanned == false) &&
-        // Prevent arbitrary point inflation (daily check-in & Spark rewards bounded to <= 100 per update)
-        (!('points' in incoming) || (existing != null && 'points' in existing ? incoming.points <= existing.points + 100 : incoming.points <= 500)) &&
-        (!('wavePoints' in incoming) || (existing != null && 'wavePoints' in existing ? incoming.wavePoints <= existing.wavePoints + 100 : incoming.wavePoints <= 500));
+        !incoming.diff(existing).affectedKeys().hasAny([
+          'role',
+          'admin',
+          'isSubAdmin',
+          'isPro',
+          'hasBlueStar',
+          'isVerifiedByAdmin',
+          'isOwner',
+          'isBanned',
+          'points',
+          'wavePoints',
+          'isBot',
+          '_serverGrantKey',
+          'emailVerified',
+          'phoneVerified',
+          'isContactVerified'
+        ]);
     }
 
     // Validate Feed Post payload on create & update (never allow base64 video in Firestore; enforce 60s Free / 90s Pro duration)
@@ -311,6 +306,11 @@ service cloud.firestore {
 
       // Phase 5: Private Creator Stats subcollection — strictly only the owner of the account can see or update their own stats
       match /privateStats/{statDocId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Per-Chat Theme Preferences subcollection — strictly only the owning user can read/write their own chat settings
+      match /chatSettings/{settingId} {
         allow read, write: if isOwner(userId);
       }
     }
@@ -512,11 +512,38 @@ service cloud.firestore {
       allow update, delete: if isSuperAdmin();
     }
 
-    // User-created groups & group messages (Chats readable only by group members)
+    // Helper: check if the authenticated user is a Group Admin or Creator (or platform Admin)
+    function isGroupAdmin(groupId) {
+      return isSignedIn() && (
+        isAdmin() ||
+        (exists(/databases/$(database)/documents/groups/$(groupId)) && (
+          get(/databases/$(database)/documents/groups/$(groupId)).data.creatorId == request.auth.uid ||
+          request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.get('adminIds', [])
+        ))
+      );
+    }
+
+    // Helper: verify group suggestedTheme updates:
+    // - Group admins/creator can set or clear suggestedTheme
+    // - Non-admin group members can only accept/decline an existing suggestion without altering its theme or suggester
+    function isValidGroupSuggestedThemeUpdate(groupId) {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return !changed.hasAny(['suggestedTheme']) ||
+        isGroupAdmin(groupId) || (
+          isGroupMember(groupId) &&
+          resource.data.suggestedTheme != null &&
+          request.resource.data.suggestedTheme != null &&
+          request.resource.data.suggestedTheme.themeId == resource.data.suggestedTheme.themeId &&
+          request.resource.data.suggestedTheme.suggestedBy == resource.data.suggestedTheme.suggestedBy &&
+          request.resource.data.suggestedTheme.suggestedAt == resource.data.suggestedTheme.suggestedAt
+        );
+    }
+
+    // User-created groups & group messages (Chats & suggested group themes readable/writable only by group members)
     match /groups/{groupId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn() && request.resource.data.creatorId == request.auth.uid;
-      allow update: if isGroupMember(groupId);
+      allow update: if isGroupMember(groupId) && isValidGroupSuggestedThemeUpdate(groupId);
       allow delete: if isSignedIn() && (resource.data.creatorId == request.auth.uid || isAdmin());
 
       match /messages/{messageId} {
@@ -531,9 +558,10 @@ service cloud.firestore {
       }
     }
 
-    // Real-Time Direct Messages & Official Updates Channel (Messages readable and creatable strictly only by conversation participants)
+    // Real-Time Direct Messages & Official Updates Channel (Strictly only conversation participants can read/write metadata or shared themes)
     match /channels/{channelId} {
-      allow read: if isSignedIn();
+      allow get: if isDmMember(channelId);
+      allow list: if isSignedIn() && request.auth.uid in resource.data.participants;
       allow write: if channelId == 'official_updates' ? isAdmin() : (
         isDmMember(channelId) ||
         (isSignedIn() && request.auth.uid in request.resource.data.get('participants', []))
@@ -666,34 +694,50 @@ service cloud.firestore {
     }
 
     // Live Video & Voice Calls (Strictly only the caller and the receiver can read and update the call and its ICE candidate subcollections)
+    function isCallParticipantData(d) {
+      return d != null && (
+        d.get('callerId', '') == request.auth.uid ||
+        d.get('receiverId', '') == request.auth.uid ||
+        d.get('caller', '') == request.auth.uid ||
+        d.get('receiver', '') == request.auth.uid
+      );
+    }
+
     function isCallParticipant(callId) {
       return isSignedIn() &&
-        exists(/databases/$(database)/documents/calls/$(callId)) && (
-          get(/databases/$(database)/documents/calls/$(callId)).data.callerId == request.auth.uid ||
-          get(/databases/$(database)/documents/calls/$(callId)).data.receiverId == request.auth.uid ||
-          get(/databases/$(database)/documents/calls/$(callId)).data.caller == request.auth.uid ||
-          get(/databases/$(database)/documents/calls/$(callId)).data.receiver == request.auth.uid
-        );
+        exists(/databases/$(database)/documents/calls/$(callId)) &&
+        isCallParticipantData(get(/databases/$(database)/documents/calls/$(callId)).data);
     }
 
     match /calls/{callId} {
-      allow create: if isSignedIn() && (
-        request.resource.data.callerId == request.auth.uid ||
-        request.resource.data.caller == request.auth.uid
+      allow get: if isSignedIn() && isValidId(callId) && (
+        resource == null || isCallParticipantData(resource.data)
       );
-      allow read, update, delete: if isSignedIn() && (
-        resource.data.callerId == request.auth.uid ||
-        resource.data.receiverId == request.auth.uid ||
-        resource.data.caller == request.auth.uid ||
-        resource.data.receiver == request.auth.uid
-      );
+      allow list: if isSignedIn() && isCallParticipantData(resource.data);
+      allow create: if isSignedIn() &&
+        isValidId(callId) &&
+        (request.resource.data.get('callerId', '') == request.auth.uid ||
+         request.resource.data.get('caller', '') == request.auth.uid) &&
+        ((request.resource.data.get('receiverId', '') is string && request.resource.data.get('receiverId', '').size() > 0) ||
+         (request.resource.data.get('receiver', '') is string && request.resource.data.get('receiver', '').size() > 0));
+      allow update: if isSignedIn() &&
+        isValidId(callId) &&
+        resource != null &&
+        isCallParticipantData(resource.data) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['caller', 'callerId', 'receiver', 'receiverId']);
+      allow delete: if isSignedIn() &&
+        isValidId(callId) &&
+        resource != null &&
+        isCallParticipantData(resource.data);
 
       match /callerCandidates/{candidateId} {
-        allow read, create, update, delete: if isCallParticipant(callId);
+        allow get, create, update, delete: if isValidId(candidateId) && isCallParticipant(callId);
+        allow list: if isCallParticipant(callId);
       }
 
       match /calleeCandidates/{candidateId} {
-        allow read, create, update, delete: if isCallParticipant(callId);
+        allow get, create, update, delete: if isValidId(candidateId) && isCallParticipant(callId);
+        allow list: if isCallParticipant(callId);
       }
     }
   }

@@ -3,7 +3,7 @@ import { APPEARANCE_THEMES, useTheme } from '../context/ThemeContext';
 import { useLanguage } from '../context/LanguageContext';
 import { useAuth } from '../context/AuthContext';
 import { AppearanceTheme } from '../types';
-import { Check, Sparkles, Eye, RotateCcw, Zap } from 'lucide-react';
+import { Check, Sparkles, Eye, RotateCcw, Zap, AlertCircle } from 'lucide-react';
 
 interface ThemePickerPanelProps {
   compact?: boolean;
@@ -18,8 +18,12 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
     appearanceTheme,
     previewTheme,
     activeTheme,
+    isSavingTheme,
+    themeSaveError,
     setPreviewTheme,
     saveAppearanceTheme,
+    retrySaveTheme,
+    clearThemeSaveError,
     isLiteMode,
     toggleLiteMode
   } = useTheme();
@@ -31,9 +35,11 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
   const currentMeta =
     APPEARANCE_THEMES.find((t) => t.id === activeTheme) || APPEARANCE_THEMES[0];
   const hasUnsavedPreview = Boolean(previewTheme && previewTheme !== appearanceTheme);
+  const savingBusy = isSaving || isSavingTheme;
 
   const handlePreview = (themeId: AppearanceTheme) => {
     setSavedNotice(null);
+    clearThemeSaveError();
     if (themeId === appearanceTheme) {
       setPreviewTheme(null);
     } else {
@@ -46,18 +52,20 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
     setIsSaving(true);
     setSavedNotice(null);
     try {
-      await saveAppearanceTheme(target);
-      const pickedMeta = APPEARANCE_THEMES.find((t) => t.id === target);
-      const themeLabel =
-        language === 'sw' ? pickedMeta?.nameSw || pickedMeta?.name : pickedMeta?.name;
-      const msg =
-        language === 'sw'
-          ? `Muonekano wa "${themeLabel}" umehifadhiwa kwenye akaunti yako! ✨`
-          : `"${themeLabel}" theme saved to your profile! ✨`;
-      setSavedNotice(msg);
-      showGlobalToast?.(msg);
-      if (onThemeSaved) {
-        onThemeSaved(target);
+      const result = await saveAppearanceTheme(target);
+      if (result.success) {
+        const pickedMeta = APPEARANCE_THEMES.find((t) => t.id === target);
+        const themeLabel =
+          language === 'sw' ? pickedMeta?.nameSw || pickedMeta?.name : pickedMeta?.name;
+        const msg =
+          language === 'sw'
+            ? `Muonekano wa "${themeLabel}" umehifadhiwa kwenye akaunti yako! ✨`
+            : `"${themeLabel}" theme saved to your profile! ✨`;
+        setSavedNotice(msg);
+        showGlobalToast?.(msg);
+        if (onThemeSaved) {
+          onThemeSaved(target);
+        }
       }
     } finally {
       setIsSaving(false);
@@ -67,6 +75,7 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
   const handleCancelPreview = () => {
     setPreviewTheme(null);
     setSavedNotice(null);
+    clearThemeSaveError();
   };
 
   return (
@@ -256,7 +265,28 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
         </button>
       </div>
 
-      {savedNotice && (
+      {themeSaveError && (
+        <div
+          role="alert"
+          className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/35 text-rose-700 dark:text-rose-200 text-xs font-bold flex items-center justify-between gap-3 flex-wrap"
+        >
+          <span className="flex items-start gap-2 min-w-0 flex-1">
+            <AlertCircle size={16} className="shrink-0 mt-0.5 text-rose-500" />
+            <span className="break-words">{themeSaveError}</span>
+          </span>
+          <button
+            type="button"
+            disabled={savingBusy}
+            onClick={() => void retrySaveTheme()}
+            className="min-h-[44px] px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-50"
+          >
+            <RotateCcw size={13} />
+            <span>{language === 'sw' ? 'Jaribu Tena' : 'Retry'}</span>
+          </button>
+        </div>
+      )}
+
+      {savedNotice && !themeSaveError && (
         <div className="p-3 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs font-bold flex items-center justify-between gap-2">
           <span className="flex items-center gap-2">
             <Check size={15} className="shrink-0" />

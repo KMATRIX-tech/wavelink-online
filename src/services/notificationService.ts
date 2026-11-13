@@ -1,4 +1,4 @@
-import { db, auth, cleanFirestoreData, getAuthHeaders } from '../firebase';
+import { db, auth, cleanFirestoreData, getAuthHeaders, sanitizeAvatarUrlForFirestore } from '../firebase';
 import {
   collection,
   doc,
@@ -97,6 +97,7 @@ export async function sendNotification(params: SendNotificationParams): Promise<
         ? `New message from ${actorName}`
         : params.title;
 
+    const rawActorPhoto = params.actorPhotoURL || params.actorAvatar || currentAuthUser?.photoURL;
     const notifId = `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const notification: AppNotification = {
       id: notifId,
@@ -106,8 +107,9 @@ export async function sendNotification(params: SendNotificationParams): Promise<
       actorUsername:
         params.actorUsername ||
         (currentAuthUser?.email ? `@${currentAuthUser.email.split('@')[0]}` : undefined),
-      actorPhotoURL:
-        params.actorPhotoURL || params.actorAvatar || currentAuthUser?.photoURL || undefined,
+      actorPhotoURL: rawActorPhoto
+        ? sanitizeAvatarUrlForFirestore(rawActorPhoto, actorId)
+        : undefined,
       type: params.type,
       title: safeTitle,
       body: safeBody,

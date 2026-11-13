@@ -100,15 +100,14 @@ import { inviteFriends, sharePost } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
 import {
   compressProfileImageToBlob,
-  deleteOldProfileMediaFromStorage,
   ProfileStorageUploadError,
-  uploadProfileMediaToFirebaseStorage,
+  uploadProfileImageToCloudinary,
   validateProfileImageFile
 } from '../utils/mediaStorage';
 import { validateStrongPassword } from '../utils/security';
 import {
   db,
-  formatFirebaseStorageImageError,
+  formatCloudinaryUploadError,
   formatEmailVerificationError,
   extractSafeFirebaseAuthCode,
   fetchUserProfileCached,
@@ -301,7 +300,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     deleteMyAccount,
     signOut
   } = useAuth();
-  const { appearanceTheme, setAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
+  const { appearanceTheme, setAppearanceTheme, saveAppearanceTheme, isBatterySaver, setBatterySaver } = useTheme();
   const { language, setLanguage, t } = useLanguage();
   const { isSimpleMode, toggleSimpleMode } = useSimpleMode();
   const { enabled: isDataSaverOn, setEnabled: setDataSaverOn, formattedSaved } = useDataSaver();
@@ -573,6 +572,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [profileSaveError, setProfileSaveError] = useState<string | null>(null);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [avatarUploadProgress, setAvatarUploadProgress] = useState(0);
   const [avatarUploadError, setAvatarUploadError] = useState<{
@@ -730,21 +730,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     userProfile?.lastDailyRewardAmount ??
     DAILY_REWARD_SCHEDULE[(currentStreak - 1) % DAILY_REWARD_SCHEDULE.length];
 
-  const handleSelectAppearanceTheme = async (themeId: AppearanceTheme, isProOnly: boolean) => {
-    if (isProOnly && !isProUser && !isAdmin) {
-      setGentleProNote('Try Pro to unlock the Sunset and River appearance themes.');
-      return;
-    }
+  const handleSelectAppearanceTheme = async (themeId: AppearanceTheme, _isProOnly: boolean) => {
     setGentleProNote(null);
-    setAppearanceTheme(themeId);
-    try {
-      await updateUserProfile({ appearanceTheme: themeId });
-    } catch (err) {
-      console.error('Failed to save appearance theme to profile:', err);
+    const result = await saveAppearanceTheme(themeId);
+    if (!result.success && result.error) {
+      setGentleProNote(`Could not save theme (${result.error}).`);
     }
   };
 
-  // File upload for profile picture directly to Firebase Storage (`users/{uid}/avatars/...`)
+  // File upload for profile picture directly to Cloudinary (monarcking72)
   const uploadAvatarFileToFirebase = async (file: File) => {
     setAvatarUploadError(null);
     setAvatarUploadProgress(0);
@@ -755,7 +749,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         validation.error || 'Only image files (JPG, PNG, WebP, or GIF) are allowed.';
       setAvatarUploadError({
         message: msg,
-        code: validation.errorCode || 'storage/invalid-file-type'
+        code: validation.errorCode || 'cloudinary/invalid-file-type'
       });
       setLastFailedAvatarFile(null);
       return;
@@ -764,7 +758,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     if (!currentUser?.uid) {
       setAvatarUploadError({
         message: 'Please sign in before uploading a profile photo.',
-        code: 'storage/unauthenticated'
+        code: 'cloudinary/unauthenticated'
       });
       return;
     }
@@ -777,7 +771,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         targetMaxBytes: 250 * 1024,
         mimeType: 'image/jpeg'
       });
-      const uploaded = await uploadProfileMediaToFirebaseStorage({
+      const uploaded = await uploadProfileImageToCloudinary({
         uid: currentUser.uid,
         folder: 'avatars',
         blob: compressedBlob,
@@ -785,15 +779,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         onProgress: (pct) => setAvatarUploadProgress(pct)
       });
 
-      const previousAvatarUrl = userProfile?.photoURL || photoURL;
       setPhotoURL(uploaded.downloadUrl);
       await updateUserProfile({ photoURL: uploaded.downloadUrl });
       setLastFailedAvatarFile(null);
-
-      // Delete old avatar only AFTER Firestore document update succeeds
-      if (previousAvatarUrl && previousAvatarUrl !== uploaded.downloadUrl) {
-        await deleteOldProfileMediaFromStorage(previousAvatarUrl);
-      }
     } catch (err: any) {
       if (err instanceof ProfileStorageUploadError) {
         console.error('[WaveLink Avatar Upload Failed]', {
@@ -803,7 +791,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         });
         setAvatarUploadError({ message: err.friendlyMessage, code: err.code });
       } else {
-        const formatted = formatFirebaseStorageImageError(err, { action: 'upload-avatar' });
+        const formatted = formatCloudinaryUploadError(err, { action: 'upload-avatar' });
         setAvatarUploadError({ message: formatted.friendlyMessage, code: formatted.code });
       }
       setLastFailedAvatarFile(file);
@@ -819,10 +807,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     await uploadAvatarFileToFirebase(file);
   };
 
-  const handleSaveProfile = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const saveProfileChanges = async () => {
     setIsSaving(true);
     setSaveSuccess(false);
+    setProfileSaveError(null);
 
     try {
       const trimmedAvatar = photoURL.trim();
@@ -842,11 +830,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       });
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to update profile:', err);
+      const code = err?.code ? ` (${err.code})` : '';
+      setProfileSaveError(
+        `${err?.message || 'Could not save profile changes to Firestore.'}${code}`
+      );
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveProfileChanges();
   };
 
   const handleSavePrivacySettings = async (e: React.FormEvent) => {
@@ -1257,21 +1254,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setTimeout(() => setInviteToast(null), 2600);
   };
 
-  // Save custom cover handler (Pro only)
+  // Save custom cover handler
   const handleSaveCustomCover = async (coverData: {
     coverType: UserProfile['coverType'];
     coverPresetId?: UserProfile['coverPresetId'];
     coverImageUrl?: string;
   }) => {
-    const previousCoverUrl = userProfile?.coverImageUrl;
     await updateUserProfile({
       coverType: coverData.coverType,
       coverPresetId: coverData.coverPresetId,
       coverImageUrl: coverData.coverImageUrl
     });
-    if (previousCoverUrl && previousCoverUrl !== coverData.coverImageUrl) {
-      await deleteOldProfileMediaFromStorage(previousCoverUrl);
-    }
     setInviteToast({
       message:
         language === 'sw' ? 'Jalada la wasifu limehifadhiwa!' : 'Profile cover updated!',
@@ -1679,19 +1672,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <span>{language === 'sw' ? 'Shiriki wasifu' : 'Share profile'}</span>
                     </button>
 
-                    {isProUser && (
-                      <button
-                        type="button"
-                        onClick={() => setIsCoverModalOpen(true)}
-                        title={language === 'sw' ? 'Badili Jalada la Pro' : 'Change Pro Cover'}
-                        className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Camera size={15} className="text-amber-500" />
-                        <span className="hidden sm:inline">
-                          {language === 'sw' ? 'Jalada' : 'Cover'}
-                        </span>
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => setIsCoverModalOpen(true)}
+                      title={language === 'sw' ? 'Badili Jalada' : 'Change Cover'}
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Camera size={15} className="text-[var(--accent-primary)]" />
+                      <span className="hidden sm:inline">
+                        {language === 'sw' ? 'Jalada' : 'Cover'}
+                      </span>
+                    </button>
                   </>
                 ) : (
                   <>
@@ -4090,6 +4081,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-center gap-2 font-semibold">
                 <CheckCircle2 size={16} className="text-[#0D9488] shrink-0" />
                 <span>Profile saved!</span>
+              </div>
+            )}
+
+            {profileSaveError && (
+              <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-3 flex-wrap">
+                <span className="font-semibold">{profileSaveError}</span>
+                <button
+                  type="button"
+                  onClick={() => saveProfileChanges()}
+                  disabled={isSaving}
+                  className="min-h-[36px] px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                >
+                  <RotateCcw size={13} />
+                  <span>Retry</span>
+                </button>
               </div>
             )}
 

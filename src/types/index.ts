@@ -16,6 +16,41 @@ export type AppearanceTheme =
   | 'river'
   | 'sunrise';
 
+export type ChatThemeId =
+  | 'default'
+  | 'hearts'
+  | 'midnight'
+  | 'neon'
+  | 'camo'
+  | 'ocean'
+  | 'sunset'
+  | 'flowers'
+  | 'racing'
+  | 'galaxy'
+  | 'clouds'
+  | 'forest'
+  | 'minimal';
+
+export interface ChatThemePreference {
+  themeId: ChatThemeId;
+  accentColor?: string;
+  customBgUrl?: string;
+  bgDarkness?: number; // 0 to 85 percentage scrim over custom background photo
+  updatedAt?: string;
+}
+
+export interface SharedChatThemeSuggestion {
+  themeId: ChatThemeId;
+  accentColor?: string;
+  customBgUrl?: string;
+  bgDarkness?: number;
+  suggestedBy: string;
+  suggestedByName: string;
+  suggestedAt: string;
+  acceptedBy?: string[];
+  declinedBy?: string[];
+}
+
 export type KangaPatternFrame = 'none' | 'kanga-gold' | 'kitenge-teal' | 'savanna-weave';
 
 export type AfricanCountryCode =
@@ -129,6 +164,7 @@ export interface UserProfile {
   blockedUserIds?: string[];
   closeFriendIds?: string[];
   appearanceTheme?: AppearanceTheme;
+  chatThemes?: Record<string, ChatThemePreference>;
   privacySettings?: UserPrivacySettings;
   notificationSettings?: UserNotificationSettings;
   termsAgreement?: UserTermsAgreement;
@@ -482,7 +518,9 @@ export interface ChannelMessage {
   text: string;
   mediaUrl?: string;
   mediaUrls?: string[];
-  mediaType?: 'image' | 'video' | 'audio' | 'none';
+  mediaType?: 'image' | 'video' | 'audio' | 'file' | 'none';
+  fileName?: string;
+  fileSize?: number;
   audioUrl?: string;
   audioDuration?: number;
   gifUrl?: string;
@@ -492,6 +530,7 @@ export interface ChannelMessage {
   reactions?: Record<string, string[]>;
   isEdited?: boolean;
   isDeleted?: boolean;
+  isSystem?: boolean;
   isBotReply?: boolean;
   botLogId?: string;
   reportedBadReply?: boolean;
@@ -521,6 +560,7 @@ export interface ChatChannelMeta {
   unreadCounts?: Record<string, number>;
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
+  suggestedTheme?: SharedChatThemeSuggestion | null;
   updatedAt?: string;
 }
 
@@ -548,6 +588,7 @@ export interface ChatGroup {
   lastMessageAt?: string;
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
+  suggestedTheme?: SharedChatThemeSuggestion | null;
   createdAt: string;
   updatedAt?: string;
 }

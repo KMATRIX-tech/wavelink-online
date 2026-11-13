@@ -112,23 +112,23 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
         </div>
       )}
 
-      <div className="w-full max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-14 sm:h-16 gap-2 sm:gap-4">
+      <div className="w-full max-w-7xl mx-auto px-2 sm:px-6 lg:px-8">
+        <div className="flex items-center justify-between h-14 sm:h-16 gap-1.5 sm:gap-4 min-w-0">
           {/* 1. Left: Single Logo & Brand Mark */}
           <div
             onClick={() => {
               triggerHaptic('tab');
               if (onNavigateTab) onNavigateTab('feed');
             }}
-            className="flex items-center gap-2 cursor-pointer select-none shrink-0"
+            className="flex items-center gap-1.5 sm:gap-2 cursor-pointer select-none shrink-0"
             role="button"
             tabIndex={0}
             aria-label="WaveLink Home"
           >
-            <div className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shadow-xs">
+            <div className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shadow-xs shrink-0">
               <Waves size={16} />
             </div>
-            <span className="font-extrabold text-base sm:text-lg tracking-tight text-[#1C1917] dark:text-stone-100">
+            <span className="hidden min-[400px]:inline font-extrabold text-base sm:text-lg tracking-tight text-[#1C1917] dark:text-stone-100">
               Wave<span className="text-[#2563EB]">Link</span>
             </span>
           </div>
@@ -136,7 +136,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
           {/* 2. Center: One Search Box that expands when tapped */}
           <div
             ref={searchContainerRef}
-            className={`transition-all duration-200 ${
+            className={`min-w-0 transition-all duration-200 ${
               isSearchExpanded
                 ? 'flex-1 max-w-lg'
                 : 'flex-1 max-w-xs sm:max-w-sm md:max-w-md'
@@ -164,7 +164,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
           </div>
 
           {/* 3. Right: Exactly 5 items visible (Points Chip, Country/Lang, More Menu, Bell, Avatar) */}
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             {/* Item 1: Points Chip */}
             <button
               type="button"
@@ -173,7 +173,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 if (onNavigateTab) onNavigateTab('settings');
               }}
               title={`${pointsCount} WavePoints`}
-              className="min-h-[38px] px-2.5 py-1 rounded-xl bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border border-amber-200/80 dark:border-amber-800/60 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+              className="min-h-[36px] sm:min-h-[38px] px-1.5 sm:px-2.5 py-1 rounded-xl bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border border-amber-200/80 dark:border-amber-800/60 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
             >
               <Sparkles size={13} className="text-amber-600 shrink-0" />
               <span className="tabular-nums">{pointsCount}</span>
@@ -189,13 +189,13 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   setIsLangCountryOpen((prev) => !prev);
                   setIsMoreMenuOpen(false);
                 }}
-                className="min-h-[38px] px-2 sm:px-2.5 py-1 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+                className="min-h-[36px] sm:min-h-[38px] px-1.5 sm:px-2.5 py-1 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
                 title={`${countryMeta.flag} ${countryMeta.nameEn} · ${language === 'sw' ? 'Kiswahili' : 'English'}`}
                 aria-label="Country and Language"
                 aria-expanded={isLangCountryOpen}
               >
                 <span>{countryMeta.flag}</span>
-                <span className="text-[11px] font-bold">{language.toUpperCase()}</span>
+                <span className="hidden min-[380px]:inline text-[11px] font-bold">{language.toUpperCase()}</span>
               </button>
 
               {isLangCountryOpen && (

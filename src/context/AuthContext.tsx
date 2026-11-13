@@ -15,7 +15,7 @@ import {
   EmailAuthProvider,
   reauthenticateWithCredential
 } from 'firebase/auth';
-import { doc, getDoc, setDoc, deleteDoc, collection, query, where, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
 import {
   auth,
   db,
@@ -40,6 +40,7 @@ import {
   KangaPatternFrame,
   PointTransactionType,
   AppearanceTheme,
+  ChatThemePreference,
   UserPrivacySettings,
   UserNotificationSettings,
   UserTermsAgreement,
@@ -338,6 +339,7 @@ interface AuthContextType {
     coverType?: ProfileCoverType;
     pinnedPostId?: string;
     storyHighlights?: StoryHighlightItem[];
+    chatThemes?: Record<string, ChatThemePreference>;
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
   toggleBlockUser: (targetUserId: string) => Promise<boolean>;
@@ -766,7 +768,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAdminCheckFailedReason(null);
         }
 
-        // Non-blocking presence + daily reward sync
+        // Non-blocking presence sync (never write protected role/Pro/points fields from non-admin client)
         setDoc(
           userDocRef,
           cleanFirestoreData({
@@ -775,8 +777,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             ...(isOwnerEmail ? { email: user.email || cleanUserEmail, role: 'admin', isOwner: true } : {}),
             ...(customName ? { displayName: customName } : {}),
             ...(customUsername ? { username: customUsername } : {}),
-            ...rewardFields,
-            ...(localPro ? { isPro: true, hasBlueStar: true, proBadge: data.proBadge || 'verified' } : {})
+            loginStreak: rewardFields.loginStreak,
+            lastDailyRewardDate: rewardFields.lastDailyRewardDate,
+            lastDailyRewardAmount: rewardFields.lastDailyRewardAmount,
+            totalLoginDays: rewardFields.totalLoginDays,
+            ...(isEffectiveAdmin ? { points: rewardFields.points, wavePoints: rewardFields.wavePoints } : {})
           }),
           { merge: true }
         ).catch(() => {});
@@ -821,10 +826,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       showGlobalToast(`🎁 Daily Login Bonus: +${pointsAwarded} WavePoints! (${rewardFields.loginStreak}-Day Streak 🔥)`);
     }
     try {
+      const { points: _pts, wavePoints: _wpts, ...safeRewardFields } = rewardFields;
+      const rewardWritePayload = isAdmin ? rewardFields : safeRewardFields;
       await setDoc(
         doc(db, 'users', currentUser.uid),
         cleanFirestoreData({
-          ...rewardFields,
+          ...rewardWritePayload,
           updatedAt: new Date().toISOString()
         }),
         { merge: true }
@@ -919,14 +926,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     );
 
     try {
+      const txPayload: Record<string, any> = {
+        pointTransactions: updatedTxs,
+        updatedAt: nowIso
+      };
+      if (isAdmin) {
+        txPayload.points = newBalance;
+        txPayload.wavePoints = newBalance;
+      }
       await setDoc(
         doc(db, 'users', uid),
-        cleanFirestoreData({
-          points: newBalance,
-          wavePoints: newBalance,
-          pointTransactions: updatedTxs,
-          updatedAt: nowIso
-        }),
+        cleanFirestoreData(txPayload),
         { merge: true }
       );
     } catch (err) {
@@ -1378,39 +1388,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     coverType?: ProfileCoverType;
     pinnedPostId?: string;
     storyHighlights?: StoryHighlightItem[];
+    chatThemes?: Record<string, ChatThemePreference>;
   }) => {
     if (!currentUser) return;
     try {
       const userRef = doc(db, 'users', currentUser.uid);
-
-      // Guard custom cover fields so only Pro/Admin/Verified users can set custom covers
-      const isUserCurrentlyPro =
-        Boolean(
-          currentUser?.email && currentUser.email.trim().toLowerCase() === 'keylanmbilinyi5@gmail.com'
-        ) ||
-        Boolean((userProfile as any)?.isOwner) ||
-        customClaimRole === 'admin' ||
-        customClaimRole === 'sub_admin' ||
-        serverVerifiedRole === 'admin' ||
-        serverVerifiedRole === 'super_admin' ||
-        serverVerifiedRole === 'sub_admin' ||
-        userProfile?.role === 'admin' ||
-        userProfile?.role === 'super_admin' ||
-        userProfile?.role === 'sub_admin' ||
-        Boolean(userProfile?.isSubAdmin) ||
-        Boolean(userProfile?.isPro) ||
-        Boolean(userProfile?.hasBlueStar) ||
-        Boolean(userProfile?.isVerifiedByAdmin);
-
-      if (
-        !isUserCurrentlyPro &&
-        (data.coverImageUrl !== undefined ||
-          (data.coverPresetId !== undefined && data.coverPresetId !== 'theme-default') ||
-          (data.coverType !== undefined && data.coverType !== 'default'))
-      ) {
-        showGlobalToast('Upgrade to WaveLink Pro to set a custom profile cover.');
-        throw new Error('Upgrade to WaveLink Pro to set a custom profile cover.');
-      }
 
       // Clean username formatting
       let formattedUsername = data.username?.trim();
@@ -1508,9 +1490,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (data.storyHighlights !== undefined && Array.isArray(data.storyHighlights)) {
         updatePayload.storyHighlights = data.storyHighlights.slice(0, 20);
       }
+      if (data.chatThemes !== undefined && data.chatThemes && typeof data.chatThemes === 'object') {
+        updatePayload.chatThemes = data.chatThemes;
+      }
 
       const sanitized = cleanFirestoreData(updatePayload);
-      await setDoc(userRef, sanitized, { merge: true });
+      if (data.chatThemes !== undefined) {
+        try {
+          await updateDoc(userRef, sanitized);
+        } catch {
+          await setDoc(userRef, sanitized, { merge: true });
+        }
+      } else {
+        await setDoc(userRef, sanitized, { merge: true });
+      }
 
       if (data.displayName || data.photoURL) {
         await fbUpdateProfile(currentUser, {

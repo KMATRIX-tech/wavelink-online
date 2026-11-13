@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { AppearanceTheme } from '../types';
 import { useAuth } from './AuthContext';
 
@@ -210,15 +210,24 @@ export function normalizeAppearanceTheme(raw?: string | null): AppearanceTheme {
   return 'ocean';
 }
 
+export interface SaveThemeResult {
+  success: boolean;
+  error?: string;
+}
+
 interface ThemeContextType {
   theme: 'light' | 'dark';
   appearanceTheme: AppearanceTheme;
   previewTheme: AppearanceTheme | null;
   activeTheme: AppearanceTheme;
   isDarkTheme: boolean;
+  isSavingTheme: boolean;
+  themeSaveError: string | null;
   setAppearanceTheme: (theme: AppearanceTheme) => void;
   setPreviewTheme: (theme: AppearanceTheme | null) => void;
-  saveAppearanceTheme: (theme: AppearanceTheme) => Promise<void>;
+  saveAppearanceTheme: (theme: AppearanceTheme) => Promise<SaveThemeResult>;
+  retrySaveTheme: () => Promise<SaveThemeResult>;
+  clearThemeSaveError: () => void;
   toggleTheme: () => void;
   isBatterySaver: boolean;
   setBatterySaver: (enabled: boolean) => void;
@@ -234,9 +243,13 @@ const ThemeContext = createContext<ThemeContextType>({
   previewTheme: null,
   activeTheme: 'ocean',
   isDarkTheme: false,
+  isSavingTheme: false,
+  themeSaveError: null,
   setAppearanceTheme: () => {},
   setPreviewTheme: () => {},
-  saveAppearanceTheme: async () => {},
+  saveAppearanceTheme: async () => ({ success: true }),
+  retrySaveTheme: async () => ({ success: true }),
+  clearThemeSaveError: () => {},
   toggleTheme: () => {},
   isBatterySaver: false,
   setBatterySaver: () => {},
@@ -249,7 +262,7 @@ const ThemeContext = createContext<ThemeContextType>({
 export const useTheme = () => useContext(ThemeContext);
 
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { userProfile, updateUserProfile } = useAuth();
+  const { currentUser, userProfile, updateUserProfile } = useAuth();
 
   const [appearanceTheme, setAppearanceThemeState] = useState<AppearanceTheme>(() => {
     if (typeof window !== 'undefined') {
@@ -262,6 +275,16 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   });
 
   const [previewTheme, setPreviewThemeState] = useState<AppearanceTheme | null>(null);
+  const [isSavingTheme, setIsSavingTheme] = useState(false);
+  const [themeSaveError, setThemeSaveError] = useState<string | null>(null);
+
+  // Prevents stale Firestore onSnapshot events from reverting a newly selected theme
+  const pendingSaveRef = useRef<{
+    theme: AppearanceTheme;
+    inFlight: boolean;
+    savedAt: number;
+    failed: boolean;
+  } | null>(null);
 
   const [isBatterySaver, setIsBatterySaverState] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
@@ -273,12 +296,35 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return false;
   });
 
-  // Sync from user profile in Firestore when loaded
+  // Sync from user profile in Firestore ONLY when no newer local selection is in-flight / recently saved / failed
   useEffect(() => {
-    if (userProfile?.appearanceTheme) {
-      const normalized = normalizeAppearanceTheme(userProfile.appearanceTheme);
-      setAppearanceThemeState(normalized);
-      localStorage.setItem('wavelink_appearance_theme', normalized);
+    if (!userProfile?.appearanceTheme) return;
+    const remoteTheme = normalizeAppearanceTheme(userProfile.appearanceTheme);
+    const pending = pendingSaveRef.current;
+
+    if (pending) {
+      // If a Firestore save failed, keep user's local selection until they retry or switch
+      if (pending.failed && remoteTheme !== pending.theme) {
+        return;
+      }
+      // While save is in-flight or within 15s grace window waiting for snapshot propagation, ignore older snapshots
+      if (
+        (pending.inFlight || Date.now() - pending.savedAt < 15000) &&
+        remoteTheme !== pending.theme
+      ) {
+        return;
+      }
+      // Once Firestore echoes back our newly saved theme, clear the pending lock
+      if (remoteTheme === pending.theme) {
+        pendingSaveRef.current = null;
+      }
+    }
+
+    setAppearanceThemeState(remoteTheme);
+    try {
+      localStorage.setItem('wavelink_appearance_theme', remoteTheme);
+    } catch {
+      // ignore storage errors
     }
   }, [userProfile?.appearanceTheme]);
 
@@ -314,27 +360,81 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const normalized = normalizeAppearanceTheme(nextTheme);
     setPreviewThemeState(null);
     setAppearanceThemeState(normalized);
-    localStorage.setItem('wavelink_appearance_theme', normalized);
+    try {
+      localStorage.setItem('wavelink_appearance_theme', normalized);
+    } catch {
+      // ignore storage errors
+    }
   }, []);
 
   const setPreviewTheme = useCallback((nextPreview: AppearanceTheme | null) => {
     setPreviewThemeState(nextPreview ? normalizeAppearanceTheme(nextPreview) : null);
   }, []);
 
+  const clearThemeSaveError = useCallback(() => {
+    setThemeSaveError(null);
+  }, []);
+
   const saveAppearanceTheme = useCallback(
-    async (nextTheme: AppearanceTheme) => {
+    async (nextTheme: AppearanceTheme): Promise<SaveThemeResult> => {
       const normalized = normalizeAppearanceTheme(nextTheme);
+      pendingSaveRef.current = {
+        theme: normalized,
+        inFlight: true,
+        savedAt: Date.now(),
+        failed: false
+      };
       setPreviewThemeState(null);
       setAppearanceThemeState(normalized);
-      localStorage.setItem('wavelink_appearance_theme', normalized);
+      setThemeSaveError(null);
+      try {
+        localStorage.setItem('wavelink_appearance_theme', normalized);
+      } catch {
+        // ignore storage errors
+      }
+
+      if (!currentUser) {
+        pendingSaveRef.current.inFlight = false;
+        return { success: true };
+      }
+
+      setIsSavingTheme(true);
       try {
         await updateUserProfile({ appearanceTheme: normalized });
-      } catch (err) {
-        console.error('Failed to save appearanceTheme to Firestore:', err);
+        if (pendingSaveRef.current && pendingSaveRef.current.theme === normalized) {
+          pendingSaveRef.current.inFlight = false;
+          pendingSaveRef.current.savedAt = Date.now();
+          pendingSaveRef.current.failed = false;
+        }
+        return { success: true };
+      } catch (err: any) {
+        const rawMsg =
+          err instanceof Error
+            ? err.message
+            : typeof err?.code === 'string'
+            ? err.code
+            : 'Failed to save theme to your profile.';
+        const friendlyMsg =
+          rawMsg.toLowerCase().includes('permission')
+            ? `Theme save blocked (${rawMsg}). Check Firestore rules for users/${currentUser.uid} and tap Retry.`
+            : `Could not save theme (${rawMsg}). Tap Retry to sync to your account.`;
+        console.error('[WaveLink Theme] Failed to save appearanceTheme to Firestore:', err);
+        if (pendingSaveRef.current && pendingSaveRef.current.theme === normalized) {
+          pendingSaveRef.current.inFlight = false;
+          pendingSaveRef.current.failed = true;
+        }
+        setThemeSaveError(friendlyMsg);
+        return { success: false, error: friendlyMsg };
+      } finally {
+        setIsSavingTheme(false);
       }
     },
-    [updateUserProfile]
+    [currentUser, updateUserProfile]
   );
+
+  const retrySaveTheme = useCallback(async (): Promise<SaveThemeResult> => {
+    return saveAppearanceTheme(appearanceTheme);
+  }, [appearanceTheme, saveAppearanceTheme]);
 
   const toggleTheme = useCallback(() => {
     const order: AppearanceTheme[] = [
@@ -369,9 +469,13 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         previewTheme,
         activeTheme,
         isDarkTheme,
+        isSavingTheme,
+        themeSaveError,
         setAppearanceTheme,
         setPreviewTheme,
         saveAppearanceTheme,
+        retrySaveTheme,
+        clearThemeSaveError,
         toggleTheme,
         isBatterySaver,
         setBatterySaver,

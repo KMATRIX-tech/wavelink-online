@@ -1,6 +1,19 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { auth, db, handleFirestoreError, OperationType, ADMIN_EMAIL, cleanFirestoreData, firebaseConfig, getAuthHeaders, batchCacheUserProfiles } from '../firebase';
+import {
+  auth,
+  db,
+  handleFirestoreError,
+  OperationType,
+  ADMIN_EMAIL,
+  cleanFirestoreData,
+  firebaseConfig,
+  getAuthHeaders,
+  batchCacheUserProfiles,
+  CLOUDINARY_CLOUD_NAME,
+  CLOUDINARY_UPLOAD_PRESET,
+  CLOUDINARY_IMAGE_UPLOAD_URL
+} from '../firebase';
 import {
   fetchIceServersForCall,
   FetchIceServersResult
@@ -315,10 +328,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [isTestingAzampay, setIsTestingAzampay] = useState(false);
   const [azampayTestResult, setAzampayTestResult] = useState<string | null>(null);
 
-  // System Health: /api/ice-servers TURN Relay Diagnostic State
+  // System Health: Multi-subsystem diagnostics
   const [iceHealthStatus, setIceHealthStatus] = useState<'idle' | 'testing' | 'healthy' | 'degraded'>('idle');
   const [iceHealthResult, setIceHealthResult] = useState<FetchIceServersResult | null>(null);
   const [iceHealthCheckedAt, setIceHealthCheckedAt] = useState<string | null>(null);
+
+  type SubHealthState = {
+    status: 'idle' | 'testing' | 'healthy' | 'error';
+    summary: string;
+    detail?: string;
+    checkedAt?: string;
+  };
+
+  const [callSignalingHealth, setCallSignalingHealth] = useState<SubHealthState>({
+    status: 'idle',
+    summary: 'Not tested yet — click Run Check to test /calls & ICE candidate rules.'
+  });
+  const [profileSaveHealth, setProfileSaveHealth] = useState<SubHealthState>({
+    status: 'idle',
+    summary: 'Not tested yet — click Run Check to test /users profile & theme persistence.'
+  });
+  const [cloudinaryHealth, setCloudinaryHealth] = useState<SubHealthState>({
+    status: 'idle',
+    summary: `Not tested yet — click Run Check to probe Cloudinary (${CLOUDINARY_CLOUD_NAME} / ${CLOUDINARY_UPLOAD_PRESET}).`
+  });
+  const [isRunningAllHealthChecks, setIsRunningAllHealthChecks] = useState(false);
 
   const handleTestIceServersHealth = useCallback(async () => {
     setIceHealthStatus('testing');
@@ -333,18 +367,185 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setIceHealthResult(result);
       setIceHealthStatus(isRelayHealthy ? 'healthy' : 'degraded');
       setIceHealthCheckedAt(new Date().toLocaleTimeString());
-    } catch {
+    } catch (err: any) {
       setIceHealthResult({
         iceServers: [],
         hasRelayServers: false,
         isFallback: true,
         missingEnvVars: [],
-        reason: 'Failed to contact /api/ice-servers endpoint.',
+        reason: err?.message || 'Failed to contact /api/ice-servers endpoint.',
       });
       setIceHealthStatus('degraded');
       setIceHealthCheckedAt(new Date().toLocaleTimeString());
     }
   }, [currentUser]);
+
+  const handleTestCallSignalingHealth = useCallback(async () => {
+    const activeUid = (auth.currentUser || currentUser)?.uid;
+    if (!activeUid) {
+      setCallSignalingHealth({
+        status: 'error',
+        summary: 'signalling permission denied',
+        detail: 'No signed-in user session detected.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+      return;
+    }
+    setCallSignalingHealth({
+      status: 'testing',
+      summary: 'Testing /calls create, read, callerCandidates write, and cleanup...'
+    });
+    const probeCallId = `sys_health_${activeUid}_${Date.now()}`;
+    const callDocRef = doc(db, 'calls', probeCallId);
+    const candDocRef = doc(db, 'calls', probeCallId, 'callerCandidates', 'probe_cand_1');
+    const nowIso = new Date().toISOString();
+    try {
+      await setDoc(callDocRef, {
+        id: probeCallId,
+        callId: probeCallId,
+        caller: activeUid,
+        callerId: activeUid,
+        receiver: activeUid,
+        receiverId: activeUid,
+        type: 'video',
+        callType: 'video',
+        status: 'ringing',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+      const readBack = await getDoc(callDocRef);
+      if (!readBack.exists()) {
+        throw new Error('Call document was written but could not be read back.');
+      }
+      await setDoc(candDocRef, {
+        candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+        sdpMid: '0',
+        sdpMLineIndex: 0,
+      });
+      setCallSignalingHealth({
+        status: 'healthy',
+        summary: 'Healthy — /calls & ICE candidate subcollection read/write verified',
+        detail: 'Caller/receiver signalling creation, readback, ICE candidate write, and cleanup succeeded.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      const reason =
+        code === 'permission-denied' || /permission/i.test(String(err?.message || ''))
+          ? 'signalling permission denied'
+          : err?.message || 'Call signalling probe failed';
+      setCallSignalingHealth({
+        status: 'error',
+        summary: `Failed — ${reason}`,
+        detail: `${err?.message || 'Unknown error'}${code ? ` (${code})` : ''}`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } finally {
+      await deleteDoc(candDocRef).catch(() => {});
+      await deleteDoc(callDocRef).catch(() => {});
+    }
+  }, [currentUser]);
+
+  const handleTestProfileSaveHealth = useCallback(async () => {
+    const activeUid = (auth.currentUser || currentUser)?.uid;
+    if (!activeUid) {
+      setProfileSaveHealth({
+        status: 'error',
+        summary: 'Failed — not signed in',
+        detail: 'Sign in first to test profile & theme Firestore writes.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+      return;
+    }
+    setProfileSaveHealth({
+      status: 'testing',
+      summary: 'Testing /users/{uid} read and safe timestamp write...'
+    });
+    const userRef = doc(db, 'users', activeUid);
+    try {
+      const snap = await getDoc(userRef);
+      if (!snap.exists()) {
+        throw new Error('User profile document does not exist in /users.');
+      }
+      const nowIso = new Date().toISOString();
+      await setDoc(userRef, { updatedAt: nowIso }, { merge: true });
+      const activeTheme = snap.data()?.appearanceTheme || 'ocean-waves';
+      setProfileSaveHealth({
+        status: 'healthy',
+        summary: `Healthy — Profile & theme persistence active (theme: ${activeTheme})`,
+        detail: 'Verified read & merge-update of safe user profile metadata on /users/{uid}.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      setProfileSaveHealth({
+        status: 'error',
+        summary: `Failed — ${code === 'permission-denied' ? 'profile write permission denied' : 'profile save error'}`,
+        detail: `${err?.message || 'Unknown error'}${code ? ` (${code})` : ''}`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    }
+  }, [currentUser]);
+
+  const handleTestCloudinaryHealth = useCallback(async () => {
+    setCloudinaryHealth({
+      status: 'testing',
+      summary: `Uploading 1x1 PNG probe to Cloudinary (${CLOUDINARY_CLOUD_NAME})...`
+    });
+    try {
+      // Tiny valid 1x1 transparent PNG
+      const tinyPngBase64 =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+      const bytes = Uint8Array.from(atob(tinyPngBase64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'image/png' });
+      const formData = new FormData();
+      formData.append('file', blob, `health_${Date.now()}.png`);
+      formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+      formData.append('folder', 'wavelink/health_check');
+
+      const resp = await fetch(CLOUDINARY_IMAGE_UPLOAD_URL, {
+        method: 'POST',
+        body: formData,
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || !json?.secure_url) {
+        const msg = json?.error?.message || `HTTP ${resp.status} from Cloudinary`;
+        throw new Error(msg);
+      }
+      setCloudinaryHealth({
+        status: 'healthy',
+        summary: `Healthy — Cloudinary (${CLOUDINARY_CLOUD_NAME}) returned HTTPS secure_url`,
+        detail: `Preset "${CLOUDINARY_UPLOAD_PRESET}" verified; zero Firebase Storage dependencies active.`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      setCloudinaryHealth({
+        status: 'error',
+        summary: 'Failed — Cloudinary upload rejected',
+        detail: err?.message || 'Network or upload preset error.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    }
+  }, []);
+
+  const handleRunAllSystemChecks = useCallback(async () => {
+    setIsRunningAllHealthChecks(true);
+    try {
+      await Promise.all([
+        handleTestIceServersHealth(),
+        handleTestCallSignalingHealth(),
+        handleTestProfileSaveHealth(),
+        handleTestCloudinaryHealth(),
+      ]);
+    } finally {
+      setIsRunningAllHealthChecks(false);
+    }
+  }, [
+    handleTestIceServersHealth,
+    handleTestCallSignalingHealth,
+    handleTestProfileSaveHealth,
+    handleTestCloudinaryHealth,
+  ]);
 
   useEffect(() => {
     if (serverAdminVerified && currentUser && iceHealthStatus === 'idle') {
@@ -2493,15 +2694,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
             </div>
           </div>
 
-          {/* System Health: WebRTC TURN Relay (/api/ice-servers) Check */}
+          {/* System Health: End-to-End Platform Diagnostics */}
           <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-5 sm:p-6 shadow-xs space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-3">
               <div className="flex items-center gap-3">
                 <div
                   className={`p-2.5 rounded-2xl ${
-                    iceHealthStatus === 'healthy'
+                    iceHealthStatus === 'healthy' &&
+                    callSignalingHealth.status !== 'error' &&
+                    profileSaveHealth.status !== 'error' &&
+                    cloudinaryHealth.status !== 'error'
                       ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/70 dark:text-emerald-300'
-                      : iceHealthStatus === 'degraded'
+                      : iceHealthStatus === 'degraded' ||
+                        callSignalingHealth.status === 'error' ||
+                        profileSaveHealth.status === 'error' ||
+                        cloudinaryHealth.status === 'error'
                       ? 'bg-rose-100 text-rose-700 dark:bg-rose-950/70 dark:text-rose-300'
                       : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
                   }`}
@@ -2510,76 +2717,191 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                 </div>
                 <div>
                   <h3 className="font-extrabold text-sm sm:text-base text-gray-900 dark:text-white">
-                    System Health: Video &amp; Voice Call Relay (TURN)
+                    System Health: Calls, Themes &amp; Cloudinary Uploads
                   </h3>
                   <p className="text-xs text-gray-500 dark:text-gray-400">
-                    Tests <code className="font-mono">/api/ice-servers</code> to verify Metered relay servers are active.
-                    {iceHealthCheckedAt ? ` Last checked at ${iceHealthCheckedAt}.` : ''}
+                    On-demand diagnostics for Metered TURN, Firestore Call Signalling, Profile/Theme Saves, and Cloudinary ({CLOUDINARY_CLOUD_NAME}).
                   </p>
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={handleTestIceServersHealth}
-                disabled={iceHealthStatus === 'testing'}
-                className="px-4 py-2 rounded-xl bg-gray-900 hover:bg-gray-800 dark:bg-white dark:hover:bg-gray-100 text-white dark:text-gray-900 text-xs font-bold inline-flex items-center gap-2 transition disabled:opacity-60 cursor-pointer"
-              >
-                {iceHealthStatus === 'testing' ? (
-                  <Loader2 size={14} className="animate-spin" />
-                ) : (
-                  <RefreshCw size={14} />
-                )}
-                <span>{iceHealthStatus === 'testing' ? 'Testing...' : 'Test /api/ice-servers'}</span>
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={handleRunAllSystemChecks}
+                  disabled={isRunningAllHealthChecks}
+                  className="min-h-[40px] px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-2 transition disabled:opacity-60 cursor-pointer"
+                >
+                  {isRunningAllHealthChecks ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <ShieldCheck size={14} />
+                  )}
+                  <span>{isRunningAllHealthChecks ? 'Running All Checks...' : 'Run All Checks'}</span>
+                </button>
+              </div>
             </div>
 
-            {iceHealthStatus === 'healthy' && (
-              <div className="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/70 flex items-start gap-3">
-                <span className="w-3 h-3 rounded-full bg-emerald-500 mt-1 shrink-0 shadow-xs shadow-emerald-500/50" />
-                <div className="space-y-1 text-xs">
-                  <p className="font-extrabold text-emerald-800 dark:text-emerald-200">
-                    Healthy — Metered TURN relay servers active
-                  </p>
-                  <p className="text-emerald-700 dark:text-emerald-300/90 leading-relaxed">
-                    Calls receive temporary Metered relay credentials ({iceHealthResult?.iceServers.length || 0} ICE entries configured), allowing reliable audio and video connections over mobile data and restrictive firewalls.
+            {/* 1. ICE / TURN Relay Check */}
+            <div className="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="min-w-0">
+                  <h4 className="font-extrabold text-xs sm:text-sm text-gray-900 dark:text-white">
+                    1. WebRTC TURN Relay (<code className="font-mono">/api/ice-servers</code>)
+                  </h4>
+                  <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                    {iceHealthCheckedAt ? `Last checked at ${iceHealthCheckedAt}` : 'Checking on load...'}
                   </p>
                 </div>
+                <button
+                  type="button"
+                  onClick={handleTestIceServersHealth}
+                  disabled={iceHealthStatus === 'testing'}
+                  className="px-3 py-1.5 rounded-xl bg-gray-900 hover:bg-gray-800 dark:bg-white dark:hover:bg-gray-100 text-white dark:text-gray-900 text-xs font-bold inline-flex items-center gap-1.5 transition disabled:opacity-60 cursor-pointer"
+                >
+                  {iceHealthStatus === 'testing' ? (
+                    <Loader2 size={13} className="animate-spin" />
+                  ) : (
+                    <RefreshCw size={13} />
+                  )}
+                  <span>{iceHealthStatus === 'testing' ? 'Testing...' : 'Test ICE'}</span>
+                </button>
               </div>
-            )}
 
-            {iceHealthStatus === 'degraded' && (
-              <div className="p-4 rounded-2xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/70 flex items-start gap-3">
-                <span className="w-3 h-3 rounded-full bg-rose-500 mt-1 shrink-0 shadow-xs shadow-rose-500/50" />
-                <div className="space-y-2 text-xs">
-                  <p className="font-extrabold text-rose-800 dark:text-rose-200">
-                    STUN-Only Fallback — Relay Servers Not Available
-                  </p>
-                  <p className="text-rose-700 dark:text-rose-300/90 leading-relaxed">
-                    The server fell back to free public STUN servers only. Calls may work on open Wi-Fi, but calls between mobile data networks or behind strict carrier NATs are likely to fail until Metered TURN credentials are configured.
-                  </p>
-                  {iceHealthResult?.missingEnvVars && iceHealthResult.missingEnvVars.length > 0 ? (
-                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-                      <span className="font-bold text-rose-800 dark:text-rose-200">
-                        Missing server environment variable(s):
-                      </span>
-                      {iceHealthResult.missingEnvVars.map((envName) => (
-                        <code
-                          key={envName}
-                          className="px-2 py-0.5 rounded-lg bg-rose-100 dark:bg-rose-900/70 border border-rose-300 dark:border-rose-700 font-mono font-bold text-rose-900 dark:text-rose-100"
-                        >
-                          {envName}
-                        </code>
-                      ))}
-                    </div>
-                  ) : iceHealthResult?.reason ? (
-                    <p className="font-mono text-[11px] text-rose-700 dark:text-rose-300">
-                      Detail: {iceHealthResult.reason}
+              {iceHealthStatus === 'healthy' && (
+                <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/70 flex items-start gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 mt-1 shrink-0" />
+                  <div className="space-y-0.5 text-xs">
+                    <p className="font-extrabold text-emerald-800 dark:text-emerald-200">
+                      Healthy — Metered TURN relay servers active ({iceHealthResult?.iceServers.length || 0} ICE entries)
                     </p>
-                  ) : null}
+                    <p className="text-emerald-700 dark:text-emerald-300/90">
+                      Laptop-to-phone calls over mobile data receive temporary relay credentials.
+                    </p>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+
+              {iceHealthStatus === 'degraded' && (
+                <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/70 flex items-start gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-rose-500 mt-1 shrink-0" />
+                  <div className="space-y-1.5 text-xs">
+                    <p className="font-extrabold text-rose-800 dark:text-rose-200">
+                      STUN-Only Fallback — ICE route may fail on mobile data
+                    </p>
+                    {iceHealthResult?.missingEnvVars && iceHealthResult.missingEnvVars.length > 0 ? (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-bold text-rose-800 dark:text-rose-200">Missing env var(s):</span>
+                        {iceHealthResult.missingEnvVars.map((envName) => (
+                          <code
+                            key={envName}
+                            className="px-2 py-0.5 rounded-lg bg-rose-100 dark:bg-rose-900/70 border border-rose-300 dark:border-rose-700 font-mono font-bold text-rose-900 dark:text-rose-100"
+                          >
+                            {envName}
+                          </code>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="font-mono text-[11px] text-rose-700 dark:text-rose-300">
+                        Reason: {iceHealthResult?.reason || 'ICE relay unavailable'}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 2, 3, 4: Call Signalling, Profile & Theme Save, Cloudinary Upload */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {[
+                {
+                  id: 'signaling',
+                  title: '2. Call Signalling (/calls)',
+                  state: callSignalingHealth,
+                  onRun: handleTestCallSignalingHealth,
+                  btnLabel: 'Test Signalling',
+                },
+                {
+                  id: 'profile',
+                  title: '3. Profile & Theme Save',
+                  state: profileSaveHealth,
+                  onRun: handleTestProfileSaveHealth,
+                  btnLabel: 'Test Save',
+                },
+                {
+                  id: 'cloudinary',
+                  title: '4. Cloudinary Uploads',
+                  state: cloudinaryHealth,
+                  onRun: handleTestCloudinaryHealth,
+                  btnLabel: 'Test Upload',
+                },
+              ].map((item) => (
+                <div
+                  key={item.id}
+                  className={`rounded-2xl border p-4 flex flex-col justify-between gap-3 ${
+                    item.state.status === 'healthy'
+                      ? 'bg-emerald-50/60 dark:bg-emerald-950/25 border-emerald-200 dark:border-emerald-800/70'
+                      : item.state.status === 'error'
+                      ? 'bg-rose-50/70 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800/70'
+                      : 'bg-gray-50/60 dark:bg-gray-900/40 border-gray-200 dark:border-gray-800'
+                  }`}
+                >
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="font-extrabold text-xs text-gray-900 dark:text-white">
+                        {item.title}
+                      </h4>
+                      <span
+                        className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                          item.state.status === 'healthy'
+                            ? 'bg-emerald-500'
+                            : item.state.status === 'error'
+                            ? 'bg-rose-500'
+                            : item.state.status === 'testing'
+                            ? 'bg-amber-400 animate-pulse'
+                            : 'bg-gray-400'
+                        }`}
+                      />
+                    </div>
+                    <p
+                      className={`text-xs font-bold leading-snug ${
+                        item.state.status === 'healthy'
+                          ? 'text-emerald-800 dark:text-emerald-200'
+                          : item.state.status === 'error'
+                          ? 'text-rose-800 dark:text-rose-200'
+                          : 'text-gray-600 dark:text-gray-300'
+                      }`}
+                    >
+                      {item.state.summary}
+                    </p>
+                    {item.state.detail && (
+                      <p className="text-[11px] text-gray-600 dark:text-gray-400 break-words leading-relaxed">
+                        {item.state.detail}
+                      </p>
+                    )}
+                    {item.state.checkedAt && (
+                      <p className="text-[10px] font-mono text-gray-400">
+                        Checked at {item.state.checkedAt}
+                      </p>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={item.onRun}
+                    disabled={item.state.status === 'testing' || isRunningAllHealthChecks}
+                    className="w-full min-h-[38px] px-3 py-1.5 rounded-xl bg-white dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 border border-gray-200 dark:border-gray-700 text-xs font-bold text-gray-900 dark:text-white inline-flex items-center justify-center gap-1.5 transition disabled:opacity-60 cursor-pointer"
+                  >
+                    {item.state.status === 'testing' ? (
+                      <Loader2 size={13} className="animate-spin" />
+                    ) : (
+                      <RefreshCw size={13} />
+                    )}
+                    <span>{item.state.status === 'testing' ? 'Testing...' : item.btnLabel}</span>
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}

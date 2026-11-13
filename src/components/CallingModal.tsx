@@ -21,10 +21,19 @@ import {
   Maximize2,
   Minimize2,
   AlertTriangle,
+  ChevronUp,
+  MessageSquare,
+  Smile,
+  Monitor,
+  MonitorOff,
+  MoreHorizontal,
+  PhoneCall,
+  Send,
+  X,
 } from 'lucide-react';
-import { CallRecipient } from '../types';
+import { CallRecipient, ChannelMessage } from '../types';
 import { useAuth } from '../context/AuthContext';
-import { auth, db, cleanFirestoreData } from '../firebase';
+import { auth, db, cleanFirestoreData, sanitizeAvatarUrlForFirestore } from '../firebase';
 import {
   doc,
   setDoc,
@@ -33,10 +42,15 @@ import {
   onSnapshot,
   collection,
   addDoc,
+  query,
+  orderBy,
+  limit,
+  serverTimestamp,
 } from 'firebase/firestore';
 import { sendWelinkChatMessage } from '../services/geminiService';
 import { sendNotification } from '../services/notificationService';
 import { Avatar } from './Avatar';
+import { computeDmConversationId } from './ChatChannelsView';
 import {
   fetchIceServersForCall,
   hasRelayIceServer,
@@ -79,6 +93,136 @@ interface TranscriptEntry {
   speaker: string;
   text: string;
   timestamp: string;
+}
+
+class CallInitError extends Error {
+  reasonCode: string;
+  userDetail: string;
+
+  constructor(reasonCode: string, userDetail: string) {
+    super(`${reasonCode}: ${userDetail}`);
+    this.name = 'CallInitError';
+    this.reasonCode = reasonCode;
+    this.userDetail = userDetail;
+  }
+}
+
+function getDomErrorName(err: unknown): string {
+  if (!err || typeof err !== 'object') return '';
+  return String((err as { name?: unknown; code?: unknown }).name || (err as { code?: unknown }).code || '');
+}
+
+function classifyMediaFailure(err: unknown, device: 'microphone' | 'camera'): { reasonCode: string; detail: string } {
+  const errName = getDomErrorName(err);
+  const rawMsg = err instanceof Error ? err.message : String(err || '');
+
+  if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || /permission|denied|not allowed/i.test(rawMsg)) {
+    return device === 'microphone'
+      ? {
+          reasonCode: 'no microphone permission',
+          detail: 'Microphone access was denied. Enable microphone permission in your browser settings and tap Try again.',
+        }
+      : {
+          reasonCode: 'no camera permission',
+          detail: 'Camera access was denied — continuing with voice only.',
+        };
+  }
+  if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError' || /not found|requested device not found/i.test(rawMsg)) {
+    return device === 'microphone'
+      ? {
+          reasonCode: 'microphone unavailable',
+          detail: 'No microphone was detected on this device.',
+        }
+      : {
+          reasonCode: 'camera unavailable',
+          detail: 'No camera detected on this device — continuing with voice only.',
+        };
+  }
+  if (errName === 'NotReadableError' || errName === 'TrackStartError' || errName === 'AbortError') {
+    return device === 'microphone'
+      ? {
+          reasonCode: 'microphone busy',
+          detail: 'Your microphone is currently in use by another app or tab. Close it and tap Try again.',
+        }
+      : {
+          reasonCode: 'camera busy',
+          detail: 'Camera is currently in use by another app — continuing with voice only.',
+        };
+  }
+  return {
+    reasonCode: device === 'microphone' ? 'microphone error' : 'camera error',
+    detail: rawMsg || `Unable to access ${device}.`,
+  };
+}
+
+function classifySignalingFailure(err: unknown): { reasonCode: string; detail: string } {
+  const code = String((err as { code?: unknown } | null)?.code || '');
+  const rawMsg = err instanceof Error ? err.message : String(err || '');
+  if (code === 'permission-denied' || /permission[-_ ]denied|missing or insufficient permissions/i.test(rawMsg)) {
+    return {
+      reasonCode: 'signalling permission denied',
+      detail: 'Firestore denied permission to read/write this call session. Ensure you are signed in and part of the call.',
+    };
+  }
+  if (code === 'unavailable' || /offline|network|failed to get document/i.test(rawMsg)) {
+    return {
+      reasonCode: 'signalling network unreachable',
+      detail: 'Could not reach Firestore call signalling service. Check your internet connection and tap Try again.',
+    };
+  }
+  return {
+    reasonCode: 'signalling failed',
+    detail: rawMsg || 'Call signalling failed unexpectedly.',
+  };
+}
+
+function sendCallSignalOverWs(payload: {
+  callId: string;
+  targetUserId: string;
+  fromUserId: string;
+  fromName: string;
+  fromPhotoURL?: string;
+  callType: 'video' | 'voice';
+  signalType: 'offer' | 'answer' | 'end' | 'declined';
+  signalData?: RTCSessionDescriptionInit;
+}): void {
+  if (typeof window === 'undefined' || !payload.targetUserId || payload.targetUserId === payload.fromUserId) return;
+  try {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
+    const timer = window.setTimeout(() => {
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+    }, 3500);
+    ws.onopen = () => {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'call:signal',
+            ...payload,
+          })
+        );
+      } catch {
+        // ignore
+      }
+      window.setTimeout(() => {
+        window.clearTimeout(timer);
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }, 250);
+    };
+    ws.onerror = () => {
+      window.clearTimeout(timer);
+    };
+  } catch {
+    // WebSocket signaling is best-effort alongside Firestore
+  }
 }
 
 export const CallingModal: React.FC<CallingModalProps> = ({
@@ -131,6 +275,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const [connectionQuality, setConnectionQuality] = useState<'good' | 'weak'>('good');
   const [isStunFallback, setIsStunFallback] = useState(false);
   const [failureNotice, setFailureNotice] = useState<string | null>(null);
+  const [failureReasonLabel, setFailureReasonLabel] = useState<string | null>(null);
+  const [mediaWarningReason, setMediaWarningReason] = useState<string | null>(null);
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(normalizedMode === 'voice');
@@ -139,6 +285,24 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const [hasRemoteVideoTrack, setHasRemoteVideoTrack] = useState(false);
   const [retryAttempt, setRetryAttempt] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // UI-only call screen states (does not alter WebRTC / signaling logic)
+  const [isOfferPosted, setIsOfferPosted] = useState(false);
+  const [isRemoteVideoPaused, setIsRemoteVideoPaused] = useState(false);
+  const [remoteAvatarError, setRemoteAvatarError] = useState(false);
+  const [showMobileControls, setShowMobileControls] = useState(true);
+  const [activePopover, setActivePopover] = useState<'mic' | 'cam' | 'emoji' | 'more' | null>(null);
+  const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
+  const [videoInputs, setVideoInputs] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioId, setSelectedAudioId] = useState<string>('');
+  const [selectedVideoId, setSelectedVideoId] = useState<string>('');
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [showInCallChat, setShowInCallChat] = useState(false);
+  const [inCallChatText, setInCallChatText] = useState('');
+  const [inCallMessages, setInCallMessages] = useState<ChannelMessage[]>([]);
+  const [floatingReactions, setFloatingReactions] = useState<Array<{ id: string; emoji: string; leftPct: number }>>([]);
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const [pipOffset, setPipOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
   // Live Captions & Meeting Notes
   const [isCaptionsActive, setIsCaptionsActive] = useState(false);
@@ -152,6 +316,23 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const pipRef = useRef<HTMLDivElement | null>(null);
+  const cameraTrackBeforeShareRef = useRef<MediaStreamTrack | null>(null);
+  const remoteMuteTimerRef = useRef<number | null>(null);
+  const pipDragRef = useRef<{
+    active: boolean;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    moved: boolean;
+  } | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -165,6 +346,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const addedCandidateIdsRef = useRef<Set<string>>(new Set());
   const gatheredCandidateTypesRef = useRef<Set<string>>(new Set());
   const gatheredRelayCandidateRef = useRef<boolean>(false);
+  const relayAvailableRef = useRef<boolean>(false);
 
   // Offer/Answer deduplication & ICE restart counters
   const lastAppliedAnswerSdpRef = useRef<string | null>(null);
@@ -319,6 +501,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     iceRestartCountRef.current = 0;
     isRestartingIceRef.current = false;
     setHasRemoteVideoTrack(false);
+    setIsRemoteVideoPaused(false);
+    if (remoteMuteTimerRef.current) {
+      window.clearTimeout(remoteMuteTimerRef.current);
+      remoteMuteTimerRef.current = null;
+    }
+    if (cameraTrackBeforeShareRef.current) {
+      try {
+        cameraTrackBeforeShareRef.current.stop();
+      } catch {
+        // ignore
+      }
+      cameraTrackBeforeShareRef.current = null;
+    }
+    setIsScreenSharing(false);
   }, [clearTimers]);
 
   // Keep local & remote media elements synced with their streams
@@ -421,6 +617,94 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     };
   }, [isCaptionsActive, callState]);
 
+  // Prevent accidental Esc close & show browser leave confirmation during active/ringing calls
+  useEffect(() => {
+    const isOngoingCall =
+      callState === 'ringing' ||
+      callState === 'connecting' ||
+      callState === 'reconnecting' ||
+      callState === 'connected';
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!isOngoingCall) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (activePopover) {
+        setActivePopover(null);
+        return;
+      }
+      if (showMinutesDrawer) {
+        setShowMinutesDrawer(false);
+        return;
+      }
+      if (isOngoingCall) {
+        setShowLeaveConfirm(true);
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [callState, activePopover, showMinutesDrawer]);
+
+  // Load media device lists for desktop mic & camera device pickers
+  const refreshMediaDevices = useCallback(async () => {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setAudioInputs(devices.filter((d) => d.kind === 'audioinput'));
+      setVideoInputs(devices.filter((d) => d.kind === 'videoinput'));
+    } catch {
+      // ignore enumerateDevices failure
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshMediaDevices();
+    const mediaDevices = navigator.mediaDevices;
+    if (mediaDevices && 'addEventListener' in mediaDevices) {
+      mediaDevices.addEventListener('devicechange', refreshMediaDevices);
+      return () => {
+        mediaDevices.removeEventListener('devicechange', refreshMediaDevices);
+      };
+    }
+  }, [refreshMediaDevices]);
+
+  // Subscribe to DM messages ONLY when desktop in-call chat drawer is opened (zero idle reads)
+  useEffect(() => {
+    if (!showInCallChat) return;
+    const myUid = (auth.currentUser || currentUser)?.uid || resolvedUserId;
+    if (!myUid || !resolvedRecipientId) return;
+    const dmId = computeDmConversationId(myUid, resolvedRecipientId);
+    const q = query(
+      collection(db, 'channels', dmId, 'messages'),
+      orderBy('createdAt', 'desc'),
+      limit(25)
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: ChannelMessage[] = [];
+        snap.forEach((d) => {
+          list.push({ id: d.id, ...(d.data() as Omit<ChannelMessage, 'id'>) });
+        });
+        list.reverse();
+        setInCallMessages(list);
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [showInCallChat, currentUser, resolvedUserId, resolvedRecipientId]);
+
   // Main WebRTC signaling and connection lifecycle
   useEffect(() => {
     let isCancelled = false;
@@ -432,13 +716,17 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     const navConnection = (navigator as Navigator & { connection?: EventTarget & { effectiveType?: string } })
       .connection;
 
-    const logFinalFailure = (reason: string) => {
+    const logFinalFailure = (reason: string, options?: { checkIceRelay?: boolean }) => {
+      const checkIceRelay = options?.checkIceRelay !== false;
       const typesList = Array.from(gatheredCandidateTypesRef.current);
-      const relayMissingNote = !gatheredRelayCandidateRef.current
-        ? ' | TURN relay server not reachable (no relay candidates gathered)'
-        : '';
-      if (!gatheredRelayCandidateRef.current) {
-        console.error('[CALL] TURN server not reachable — no relay ICE candidates were gathered.');
+      let relayMissingNote = '';
+      if (checkIceRelay && !gatheredRelayCandidateRef.current) {
+        if (relayAvailableRef.current) {
+          relayMissingNote = ' | TURN relay server not reachable (no relay candidates gathered)';
+          console.error('[CALL] TURN server not reachable — no relay ICE candidates were gathered.');
+        } else {
+          relayMissingNote = ' | STUN-only fallback active (no TURN relay configured)';
+        }
       }
       console.error(
         `[CALL] Final reason for failure: ${reason} | gatheredCandidateTypes=[${
@@ -471,7 +759,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       setCallDuration(0);
       setConnectionQuality('good');
       setFailureNotice(null);
+      setFailureReasonLabel(null);
+      setMediaWarningReason(null);
       setIsStunFallback(false);
+      setIsOfferPosted(false);
+      setIsRemoteVideoPaused(false);
+      setShowMobileControls(true);
+
+      const activeAuthUser = auth.currentUser || currentUser;
+      if (!activeAuthUser?.uid) {
+        throw new CallInitError(
+          'signalling permission denied',
+          'You must be signed in before starting or answering a call.'
+        );
+      }
 
       console.log(
         `[CALL] Starting call setup (role=${
@@ -482,10 +783,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       // 1. Fetch ICE servers from authenticated GET /api/ice-servers before every call
       let idToken = '';
       try {
-        const activeAuthUser = auth.currentUser || currentUser;
-        if (activeAuthUser) {
-          idToken = await activeAuthUser.getIdToken();
-        }
+        idToken = await activeAuthUser.getIdToken();
       } catch {
         // handled by fetchIceServersForCall fallback
       }
@@ -493,47 +791,96 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       const iceConfigResult = await fetchIceServersForCall(idToken);
       const iceServers = iceConfigResult.iceServers;
       const relayAvailable = hasRelayIceServer(iceServers) && !iceConfigResult.isFallback;
+      relayAvailableRef.current = relayAvailable;
       setIsStunFallback(!relayAvailable);
 
       console.log('[CALL] RTCPeerConnection ICE servers configured:', {
         relayAvailable,
         isFallback: !relayAvailable,
+        reason: iceConfigResult.reason || null,
         serverCount: iceServers.length,
       });
+      if (!relayAvailable) {
+        console.warn(
+          '[CALL] /api/ice-servers using STUN-only fallback (no TURN relay configured):',
+          iceConfigResult.reason || 'Server TURN configuration unavailable'
+        );
+      }
 
       if (isCancelled) return;
 
-      // 2. Acquire local media stream BEFORE creating offer or answer
-      let localStream: MediaStream | null = null;
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video:
-            normalizedMode === 'video'
-              ? {
-                  facingMode: 'user',
-                  width: { ideal: 1280 },
-                  height: { ideal: 720 },
-                }
-              : false,
-        });
-        console.log(
-          '[CALL] Local media stream acquired:',
-          localStream.getTracks().map((t) => `${t.kind}:${t.label}`)
+      // 2. Acquire local media stream BEFORE creating offer or answer (mic & camera checked separately)
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        throw new CallInitError(
+          'microphone unavailable',
+          'Browser blocked camera/microphone APIs. Open WaveLink over HTTPS and grant permission.'
         );
-      } catch (mediaErr) {
-        console.warn('[CALL] Primary getUserMedia failed, trying audio-only fallback:', mediaErr);
+      }
+
+      let localStream: MediaStream | null = null;
+      const audioConstraints: MediaTrackConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+
+      if (normalizedMode === 'video') {
         try {
-          localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-          setIsVideoOff(true);
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints,
+            video: {
+              facingMode: 'user',
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          });
+        } catch (primaryErr) {
+          const primaryName = getDomErrorName(primaryErr);
+          if (primaryName === 'OverconstrainedError') {
+            try {
+              localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+            } catch (relaxedErr) {
+              // Fall through to audio-only below
+              console.warn('[CALL] Relaxed video getUserMedia failed:', relaxedErr);
+            }
+          }
+
+          if (!localStream) {
+            // Try audio-only first so we can separate microphone errors from camera errors
+            try {
+              localStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+              setIsVideoOff(true);
+              const camDiag = classifyMediaFailure(primaryErr, 'camera');
+              setMediaWarningReason(camDiag.reasonCode);
+              console.warn(`[CALL] Video fallback to audio-only (${camDiag.reasonCode}):`, primaryErr);
+            } catch (audioErr) {
+              const micDiag = classifyMediaFailure(audioErr, 'microphone');
+              console.error(`[CALL] Microphone acquisition failed (${micDiag.reasonCode}):`, audioErr);
+              throw new CallInitError(micDiag.reasonCode, micDiag.detail);
+            }
+          }
+        }
+      } else {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints,
+            video: false,
+          });
         } catch (audioErr) {
-          console.error('[CALL] Could not access microphone/camera:', audioErr);
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          } catch (fallbackAudioErr) {
+            const micDiag = classifyMediaFailure(fallbackAudioErr || audioErr, 'microphone');
+            console.error(`[CALL] Voice call microphone failed (${micDiag.reasonCode}):`, fallbackAudioErr);
+            throw new CallInitError(micDiag.reasonCode, micDiag.detail);
+          }
         }
       }
+
+      console.log(
+        '[CALL] Local media stream acquired:',
+        localStream.getTracks().map((t) => `${t.kind}:${t.label}`)
+      );
 
       if (isCancelled) {
         localStream?.getTracks().forEach((t) => t.stop());
@@ -548,11 +895,19 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       }
 
       // 3. Create PeerConnection with Metered ICE servers, iceCandidatePoolSize: 4, and relay UDP/TCP/TLS 443 support
-      const pc = new RTCPeerConnection({
-        iceServers,
-        iceCandidatePoolSize: 4,
-        iceTransportPolicy: 'all',
-      });
+      let pc: RTCPeerConnection;
+      try {
+        pc = new RTCPeerConnection({
+          iceServers,
+          iceCandidatePoolSize: 4,
+          iceTransportPolicy: 'all',
+        });
+      } catch (pcErr) {
+        throw new CallInitError(
+          'peer connection failed',
+          pcErr instanceof Error ? pcErr.message : 'Unable to create WebRTC peer connection.'
+        );
+      }
       pcRef.current = pc;
 
       // Create one MediaStream for the remote person
@@ -566,13 +921,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       }
 
       // 4. Add local tracks to PeerConnection BEFORE creating offer or answer
-      if (localStream) {
+      if (localStream && pc.signalingState !== 'closed') {
         localStream.getTracks().forEach((track) => {
           pc.addTrack(track, localStream!);
         });
         console.log('[CALL] Local tracks added BEFORE createOffer/createAnswer');
-      } else {
-        console.warn('[CALL] Proceeding without local tracks (receive-only fallback)');
       }
 
       // 5. Handle incoming remote tracks (add every track to the single remote MediaStream)
@@ -597,9 +950,29 @@ export const CallingModal: React.FC<CallingModalProps> = ({
 
         if (event.track.kind === 'video') {
           setHasRemoteVideoTrack(true);
+          setIsRemoteVideoPaused(Boolean(event.track.muted));
           event.track.onunmute = () => {
+            if (remoteMuteTimerRef.current) {
+              window.clearTimeout(remoteMuteTimerRef.current);
+              remoteMuteTimerRef.current = null;
+            }
+            setIsRemoteVideoPaused(false);
             setHasRemoteVideoTrack(true);
             remoteVideoRef.current?.play().catch(() => {});
+          };
+          event.track.onmute = () => {
+            if (remoteMuteTimerRef.current) {
+              window.clearTimeout(remoteMuteTimerRef.current);
+            }
+            remoteMuteTimerRef.current = window.setTimeout(() => {
+              if (event.track.muted || event.track.readyState === 'ended') {
+                setIsRemoteVideoPaused(true);
+              }
+            }, 1500);
+          };
+          event.track.onended = () => {
+            setIsRemoteVideoPaused(true);
+            setHasRemoteVideoTrack(false);
           };
         }
 
@@ -710,8 +1083,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
 
         if (iceRestartCountRef.current >= 4) {
           logFinalFailure(`ICE restart limit reached (${reason})`);
+          setFailureReasonLabel(!gatheredRelayCandidateRef.current ? 'ICE route failed' : 'peer connection failed');
           setFailureNotice(
-            'Your network connection was interrupted and could not recover. Tap Try again to reconnect.'
+            !gatheredRelayCandidateRef.current
+              ? 'No working ICE/TURN route could be established between devices. Check mobile network or TURN relay settings.'
+              : 'Your peer-to-peer connection dropped and could not recover. Tap Try again to reconnect.'
           );
           updateLifecycleState('failed', 'Connection failed');
           return;
@@ -790,10 +1166,12 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             const currIce = pcRef.current.iceConnectionState;
             const currConn = pcRef.current.connectionState;
             logFinalFailure(`15s connection timeout (${label}, ice=${currIce}, conn=${currConn})`);
+            const isIceProblem = !gatheredRelayCandidateRef.current || currIce === 'checking' || currIce === 'failed' || currIce === 'new';
+            setFailureReasonLabel(isIceProblem ? 'ICE route failed' : 'peer connection failed');
             setFailureNotice(
               !gatheredRelayCandidateRef.current
-                ? "Couldn't connect within 15 seconds. Some mobile networks block direct calls — check your connection and try again."
-                : "Couldn't establish a stable connection within 15 seconds. Check your internet and try again."
+                ? 'ICE route failed within 15s (no TURN relay candidates gathered). Mobile networks may block direct peer connections.'
+                : 'ICE route timed out after 15 seconds. Check both internet connections and tap Try again.'
             );
             updateLifecycleState('failed', 'Connection timed out');
           }
@@ -806,7 +1184,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         const gathering = pcRef.current.iceGatheringState;
         console.log(`[CALL] iceGatheringState changed -> ${gathering}`);
         if (gathering === 'complete' && !gatheredRelayCandidateRef.current) {
-          console.warn('[CALL] TURN server not reachable — ICE gathering completed without any relay candidate.');
+          if (relayAvailableRef.current) {
+            console.warn('[CALL] TURN server not reachable — ICE gathering completed without any relay candidate.');
+          } else {
+            console.log('[CALL] ICE gathering completed (STUN-only mode, no TURN relay configured).');
+          }
         }
       };
 
@@ -930,7 +1312,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         if (!event.candidate) {
           console.log('[CALL] End of local ICE candidates signaled');
           if (!gatheredRelayCandidateRef.current) {
-            console.warn('[CALL] TURN server not reachable — no relay candidate gathered.');
+            if (relayAvailableRef.current) {
+              console.warn('[CALL] TURN server not reachable — no relay candidate gathered.');
+            } else {
+              console.log('[CALL] End of local ICE candidates (STUN-only mode, no TURN relay configured).');
+            }
           }
           return;
         }
@@ -1018,57 +1404,95 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           },
           (err) => {
             console.warn('[CALL] Remote ICE candidates listener error:', err);
+            const sigErr = classifySignalingFailure(err);
+            if (sigErr.reasonCode === 'signalling permission denied' && callStateRef.current !== 'connected') {
+              clearTimers();
+              setFailureReasonLabel(sigErr.reasonCode);
+              setFailureNotice(sigErr.detail);
+              updateLifecycleState('failed', 'Connection failed');
+            }
           }
         );
       };
 
-      // 8. Exact Signaling Order through Firestore
+      // 8. Exact Signaling Order through Firestore (+ instant WebSocket relay supplement)
       if (!effectiveIsIncoming) {
         updateLifecycleState('ringing', 'Connecting');
 
-        const offer = await pc.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: normalizedMode === 'video',
-        });
-        console.log(`[CALL] Offer created (sdpLength=${offer.sdp?.length || 0})`);
-        await pc.setLocalDescription(offer);
-        console.log('[CALL] Local description set (offer)');
+        let offer: RTCSessionDescriptionInit;
+        try {
+          offer = await pc.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: normalizedMode === 'video',
+          });
+          console.log(`[CALL] Offer created (sdpLength=${offer.sdp?.length || 0})`);
+          await pc.setLocalDescription(offer);
+          console.log('[CALL] Local description set (offer)');
+        } catch (sdpErr) {
+          throw new CallInitError(
+            'peer connection failed',
+            sdpErr instanceof Error ? sdpErr.message : 'Could not create WebRTC call offer.'
+          );
+        }
 
         const nowIso = new Date().toISOString();
         const meta = userMetaRef.current;
-        await setDoc(
-          callDocRef,
-          cleanFirestoreData({
-            id: activeCallId,
-            callId: activeCallId,
-            caller: meta.userId,
-            callerId: meta.userId,
-            callerName: meta.userName,
-            callerPhotoURL: meta.userAvatar,
-            receiver: meta.recipientId,
-            receiverId: meta.recipientId,
-            receiverName: meta.recipientName,
-            receiverPhotoURL: meta.recipientAvatar,
-            type: normalizedMode,
-            callType: normalizedMode,
-            status: 'ringing',
-            offer: {
-              type: offer.type,
-              sdp: offer.sdp,
-            },
-            createdAt: nowIso,
-            updatedAt: nowIso,
-          }),
-          { merge: true }
-        );
+        const resolvedCallerUid = activeAuthUser.uid;
+        const safeCallerPhoto = sanitizeAvatarUrlForFirestore(meta.userAvatar, resolvedCallerUid);
+        const safeReceiverPhoto = sanitizeAvatarUrlForFirestore(meta.recipientAvatar, meta.recipientId);
+        try {
+          await setDoc(
+            callDocRef,
+            cleanFirestoreData({
+              id: activeCallId,
+              callId: activeCallId,
+              caller: resolvedCallerUid,
+              callerId: resolvedCallerUid,
+              callerName: meta.userName,
+              callerPhotoURL: safeCallerPhoto,
+              receiver: meta.recipientId,
+              receiverId: meta.recipientId,
+              receiverName: meta.recipientName,
+              receiverPhotoURL: safeReceiverPhoto,
+              type: normalizedMode,
+              callType: normalizedMode,
+              status: 'ringing',
+              offer: {
+                type: offer.type,
+                sdp: offer.sdp,
+              },
+              createdAt: nowIso,
+              updatedAt: nowIso,
+            })
+          );
+        } catch (signalingErr) {
+          const sigDiag = classifySignalingFailure(signalingErr);
+          console.error(`[CALL] Firestore call create failed (${sigDiag.reasonCode}):`, signalingErr);
+          throw new CallInitError(sigDiag.reasonCode, sigDiag.detail);
+        }
         console.log('[CALL] Call document written with offer:', activeCallId);
+        if (!isCancelled) {
+          setIsOfferPosted(true);
+        }
 
-        if (meta.recipientId && meta.recipientId !== meta.userId) {
+        // Instant WebSocket call:signal offer supplement so phone UI rings immediately
+        sendCallSignalOverWs({
+          callId: activeCallId,
+          targetUserId: meta.recipientId,
+          fromUserId: resolvedCallerUid,
+          fromName: meta.userName,
+          fromPhotoURL: safeCallerPhoto,
+          callType: normalizedMode,
+          signalType: 'offer',
+          signalData: { type: offer.type, sdp: offer.sdp },
+        });
+
+        if (meta.recipientId && meta.recipientId !== resolvedCallerUid) {
           sendNotification({
             recipientId: meta.recipientId,
-            actorId: meta.userId,
+            actorId: resolvedCallerUid,
             actorName: meta.userName,
-            actorPhotoURL: meta.userAvatar,
+            actorPhotoURL: safeCallerPhoto,
             type: 'incoming_call',
             title: normalizedMode === 'video' ? 'Incoming Video Call 📞' : 'Incoming Voice Call 📞',
             body: `${meta.userName} is calling you on WaveLink. Tap to answer.`,
@@ -1098,81 +1522,103 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           }
         }, 30000);
 
-        callDocUnsubRef.current = onSnapshot(callDocRef, async (snapshot) => {
-          const data = snapshot.data();
-          if (!data || isCancelled || !pcRef.current) return;
+        callDocUnsubRef.current = onSnapshot(
+          callDocRef,
+          async (snapshot) => {
+            const data = snapshot.data();
+            if (!data || isCancelled || !pcRef.current) return;
 
-          if (data.status === 'declined' || data.status === 'rejected') {
-            clearTimers();
-            setFailureNotice(`${userMetaRef.current.recipientName} declined the call.`);
-            updateLifecycleState('declined', 'No answer');
-            return;
-          }
-          if (data.status === 'missed' || data.status === 'no_answer') {
-            clearTimers();
-            setFailureNotice('No answer right now. Tap Try again to call back.');
-            updateLifecycleState('no-answer', 'No answer');
-            return;
-          }
-          if (data.status === 'ended' && !isCleaningUpRef.current) {
-            clearTimers();
-            updateLifecycleState('ended', 'Call ended');
-            onCloseRef.current();
-            return;
-          }
-
-          if (data.status === 'accepted' && callStateRef.current === 'ringing') {
-            if (ringingTimeoutRef.current) {
-              window.clearTimeout(ringingTimeoutRef.current);
-              ringingTimeoutRef.current = null;
+            if (data.status === 'declined' || data.status === 'rejected') {
+              clearTimers();
+              setFailureReasonLabel('call declined');
+              setFailureNotice(`${userMetaRef.current.recipientName} declined the call.`);
+              updateLifecycleState('declined', 'No answer');
+              return;
             }
-            updateLifecycleState('connecting', 'Connecting');
-            startConnectionTimer('caller-accepted');
-          }
-
-          // Handle ICE restart request initiated by callee
-          if (
-            data.iceRestartRequestedAt &&
-            data.iceRestartRequestedAt !== lastIceRestartRequestRef.current
-          ) {
-            lastIceRestartRequestRef.current = data.iceRestartRequestedAt;
-            console.log('[CALL] Caller received ICE restart request from callee');
-            triggerAutomaticIceRestart('callee-requested');
-          }
-
-          if (
-            data.answer &&
-            data.answer.sdp &&
-            data.answer.sdp !== lastAppliedAnswerSdpRef.current
-          ) {
-            lastAppliedAnswerSdpRef.current = data.answer.sdp;
-            console.log(`[CALL] Answer received (sdpLength=${data.answer.sdp.length})`);
-
-            if (ringingTimeoutRef.current) {
-              window.clearTimeout(ringingTimeoutRef.current);
-              ringingTimeoutRef.current = null;
+            if (data.status === 'missed' || data.status === 'no_answer') {
+              clearTimers();
+              setFailureReasonLabel('no answer');
+              setFailureNotice('No answer right now. Tap Try again to call back.');
+              updateLifecycleState('no-answer', 'No answer');
+              return;
+            }
+            if (data.status === 'ended' && !isCleaningUpRef.current) {
+              clearTimers();
+              updateLifecycleState('ended', 'Call ended');
+              onCloseRef.current();
+              return;
             }
 
-            if (callStateRef.current !== 'connected' && callStateRef.current !== 'reconnecting') {
+            if (data.status === 'accepted' && callStateRef.current === 'ringing') {
+              if (ringingTimeoutRef.current) {
+                window.clearTimeout(ringingTimeoutRef.current);
+                ringingTimeoutRef.current = null;
+              }
               updateLifecycleState('connecting', 'Connecting');
-              startConnectionTimer('caller-after-answer');
+              startConnectionTimer('caller-accepted');
             }
 
-            try {
-              await pcRef.current.setRemoteDescription(
-                new RTCSessionDescription(data.answer as RTCSessionDescriptionInit)
-              );
-              hasRemoteDescriptionRef.current = true;
-              console.log('[CALL] Caller setRemoteDescription(answer) complete');
-              await drainQueuedIceCandidates(pcRef.current);
-            } catch (err) {
-              console.error('[CALL] Caller setRemoteDescription(answer) failed:', err);
-              logFinalFailure(`Caller setRemoteDescription failed: ${err instanceof Error ? err.message : String(err)}`);
-              setFailureNotice('Connection setup failed. Please try again.');
+            // Handle ICE restart request initiated by callee
+            if (
+              data.iceRestartRequestedAt &&
+              data.iceRestartRequestedAt !== lastIceRestartRequestRef.current
+            ) {
+              lastIceRestartRequestRef.current = data.iceRestartRequestedAt;
+              console.log('[CALL] Caller received ICE restart request from callee');
+              triggerAutomaticIceRestart('callee-requested');
+            }
+
+            if (
+              data.answer &&
+              data.answer.sdp &&
+              data.answer.sdp !== lastAppliedAnswerSdpRef.current
+            ) {
+              lastAppliedAnswerSdpRef.current = data.answer.sdp;
+              console.log(`[CALL] Answer received (sdpLength=${data.answer.sdp.length})`);
+
+              if (ringingTimeoutRef.current) {
+                window.clearTimeout(ringingTimeoutRef.current);
+                ringingTimeoutRef.current = null;
+              }
+
+              if (callStateRef.current !== 'connected' && callStateRef.current !== 'reconnecting') {
+                updateLifecycleState('connecting', 'Connecting');
+                startConnectionTimer('caller-after-answer');
+              }
+
+              try {
+                await pcRef.current.setRemoteDescription(
+                  new RTCSessionDescription(data.answer as RTCSessionDescriptionInit)
+                );
+                hasRemoteDescriptionRef.current = true;
+                console.log('[CALL] Caller setRemoteDescription(answer) complete');
+                await drainQueuedIceCandidates(pcRef.current);
+              } catch (err) {
+                console.error('[CALL] Caller setRemoteDescription(answer) failed:', err);
+                logFinalFailure(`Caller setRemoteDescription failed: ${err instanceof Error ? err.message : String(err)}`);
+                setFailureReasonLabel('peer connection failed');
+                setFailureNotice(
+                  err instanceof Error
+                    ? `Peer connection setup failed (${err.message}). Tap Try again.`
+                    : 'Peer connection setup failed. Tap Try again.'
+                );
+                updateLifecycleState('failed', 'Connection failed');
+              }
+            }
+          },
+          (err) => {
+            const sigDiag = classifySignalingFailure(err);
+            logFinalFailure(`Caller callDoc listener failed (${sigDiag.reasonCode}): ${sigDiag.detail}`, {
+              checkIceRelay: false,
+            });
+            if (!isCancelled) {
+              clearTimers();
+              setFailureReasonLabel(sigDiag.reasonCode);
+              setFailureNotice(sigDiag.detail);
               updateLifecycleState('failed', 'Connection failed');
             }
           }
-        });
+        );
       } else {
         updateLifecycleState('connecting', 'Connecting');
         startConnectionTimer('receiver-accept');
@@ -1196,20 +1642,39 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             console.log('[CALL] Callee local description set (answer)');
 
             const nowIso = new Date().toISOString();
-            await updateDoc(callDocRef, {
-              answer: {
-                type: answer.type,
-                sdp: answer.sdp,
-              },
-              status: 'accepted',
-              acceptedAt: nowIso,
-              updatedAt: nowIso,
-            });
+            try {
+              await updateDoc(callDocRef, {
+                answer: {
+                  type: answer.type,
+                  sdp: answer.sdp,
+                },
+                status: 'accepted',
+                acceptedAt: nowIso,
+                updatedAt: nowIso,
+              });
+            } catch (sigErr) {
+              const sigDiag = classifySignalingFailure(sigErr);
+              logFinalFailure(`Callee answer write failed (${sigDiag.reasonCode}): ${sigDiag.detail}`, {
+                checkIceRelay: false,
+              });
+              setFailureReasonLabel(sigDiag.reasonCode);
+              setFailureNotice(sigDiag.detail);
+              updateLifecycleState('failed', 'Connection failed');
+              return;
+            }
             console.log('[CALL] Callee wrote answer to call document');
             await flushPendingLocalCandidates();
           } catch (err) {
             console.error('[CALL] Callee failed to answer offer:', err);
-            logFinalFailure(`Callee answer creation failed: ${err instanceof Error ? err.message : String(err)}`);
+            logFinalFailure(`Callee answer creation failed: ${err instanceof Error ? err.message : String(err)}`, {
+              checkIceRelay: false,
+            });
+            setFailureReasonLabel('peer connection failed');
+            setFailureNotice(
+              err instanceof Error
+                ? `Peer connection answer failed (${err.message}). Tap Try again.`
+                : 'Peer connection failed while answering. Tap Try again.'
+            );
             updateLifecycleState('failed', 'Connection failed');
           }
         };
@@ -1224,43 +1689,80 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               await processOfferAndCreateAnswer(snapData.offer as RTCSessionDescriptionInit);
             }
           } catch (err) {
-            console.warn('[CALL] Callee initial getDoc failed:', err);
+            const sigDiag = classifySignalingFailure(err);
+            console.warn(`[CALL] Callee initial getDoc failed (${sigDiag.reasonCode}):`, err);
+            if (sigDiag.reasonCode === 'signalling permission denied') {
+              clearTimers();
+              setFailureReasonLabel(sigDiag.reasonCode);
+              setFailureNotice(sigDiag.detail);
+              updateLifecycleState('failed', 'Connection failed');
+              return;
+            }
           }
         }
 
-        callDocUnsubRef.current = onSnapshot(callDocRef, async (snapshot) => {
-          const data = snapshot.data();
-          if (!data || isCancelled) return;
+        callDocUnsubRef.current = onSnapshot(
+          callDocRef,
+          async (snapshot) => {
+            const data = snapshot.data();
+            if (!data || isCancelled) return;
 
-          if (
-            (data.status === 'ended' ||
-              data.status === 'missed' ||
-              data.status === 'no_answer' ||
-              data.status === 'declined') &&
-            !isCleaningUpRef.current
-          ) {
-            clearTimers();
-            updateLifecycleState('ended', 'Call ended');
-            onCloseRef.current();
-            return;
-          }
+            if (
+              (data.status === 'ended' ||
+                data.status === 'missed' ||
+                data.status === 'no_answer' ||
+                data.status === 'declined') &&
+              !isCleaningUpRef.current
+            ) {
+              clearTimers();
+              updateLifecycleState('ended', 'Call ended');
+              onCloseRef.current();
+              return;
+            }
 
-          if (
-            data.offer?.sdp &&
-            data.offer.sdp !== lastProcessedOfferSdpRef.current
-          ) {
-            console.log('[CALL] Callee detected new/restarted offer');
-            hasRemoteDescriptionRef.current = false;
-            await processOfferAndCreateAnswer(data.offer as RTCSessionDescriptionInit);
+            if (
+              data.offer?.sdp &&
+              data.offer.sdp !== lastProcessedOfferSdpRef.current
+            ) {
+              console.log('[CALL] Callee detected new/restarted offer');
+              hasRemoteDescriptionRef.current = false;
+              await processOfferAndCreateAnswer(data.offer as RTCSessionDescriptionInit);
+            }
+          },
+          (err) => {
+            const sigDiag = classifySignalingFailure(err);
+            logFinalFailure(`Callee callDoc listener failed (${sigDiag.reasonCode}): ${sigDiag.detail}`, {
+              checkIceRelay: false,
+            });
+            if (!isCancelled) {
+              clearTimers();
+              setFailureReasonLabel(sigDiag.reasonCode);
+              setFailureNotice(sigDiag.detail);
+              updateLifecycleState('failed', 'Connection failed');
+            }
           }
-        });
+        );
       }
     };
 
     initializeCall().catch((err) => {
-      logFinalFailure(`Fatal call initialization error: ${err instanceof Error ? err.message : String(err)}`);
+      const reasonCode =
+        err instanceof CallInitError
+          ? err.reasonCode
+          : classifySignalingFailure(err).reasonCode;
+      const detail =
+        err instanceof CallInitError
+          ? err.userDetail
+          : err instanceof Error
+          ? err.message
+          : 'Unable to initialize call.';
+      logFinalFailure(`Fatal call initialization error [${reasonCode}]: ${detail}`, {
+        checkIceRelay: false,
+      });
+      cleanupWebRTC();
       if (!isCancelled) {
-        setFailureNotice('Unable to initialize call audio/network. Tap Try again.');
+        setFailureReasonLabel(reasonCode);
+        setFailureNotice(detail);
         updateLifecycleState('failed', 'Connection failed');
       }
     });
@@ -1290,6 +1792,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const handleEndCall = async () => {
     isCleaningUpRef.current = true;
     console.log('[CALL] Ending call by user action');
+    const meta = userMetaRef.current;
+    sendCallSignalOverWs({
+      callId: activeCallId,
+      targetUserId: meta.recipientId,
+      fromUserId: (auth.currentUser || currentUser)?.uid || meta.userId,
+      fromName: meta.userName,
+      callType: normalizedMode,
+      signalType: 'end',
+    });
     try {
       await updateDoc(doc(db, 'calls', activeCallId), {
         status: 'ended',
@@ -1318,10 +1829,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       // ignore
     }
 
-    const nextCallId = `call_${resolvedUserId}_${resolvedRecipientId}_${Date.now()}`;
+    const activeUid = (auth.currentUser || currentUser)?.uid || resolvedUserId;
+    const nextCallId = `call_${activeUid}_${resolvedRecipientId}_${Date.now()}`;
     initialOfferRef.current = undefined;
     isCleaningUpRef.current = false;
     setFailureNotice(null);
+    setFailureReasonLabel(null);
+    setMediaWarningReason(null);
     setConnectionQuality('good');
     setEffectiveIsIncoming(false);
     setActiveCallId(nextCallId);
@@ -1465,6 +1979,314 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  // Switch Microphone Input Device cleanly via sender.replaceTrack
+  const handleSelectAudioDevice = async (deviceId: string) => {
+    setActivePopover(null);
+    if (!deviceId) return;
+    try {
+      const nextStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: deviceId },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      const nextAudioTrack = nextStream.getAudioTracks()[0];
+      if (!nextAudioTrack) return;
+      nextAudioTrack.enabled = !isMuted;
+
+      if (pcRef.current) {
+        const audioSender = pcRef.current
+          .getSenders()
+          .find((s) => s.track && s.track.kind === 'audio');
+        if (audioSender) {
+          await audioSender.replaceTrack(nextAudioTrack);
+        }
+      }
+      if (localStreamRef.current) {
+        localStreamRef.current.getAudioTracks().forEach((old) => {
+          localStreamRef.current?.removeTrack(old);
+          old.stop();
+        });
+        localStreamRef.current.addTrack(nextAudioTrack);
+      } else {
+        localStreamRef.current = nextStream;
+      }
+      setSelectedAudioId(deviceId);
+    } catch (err) {
+      console.warn('[WaveLink WebRTC] Could not switch microphone:', err);
+    }
+  };
+
+  // Switch Camera Input Device cleanly via sender.replaceTrack
+  const handleSelectVideoDevice = async (deviceId: string) => {
+    setActivePopover(null);
+    if (!deviceId) return;
+    try {
+      const nextStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: deviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+      const nextVideoTrack = nextStream.getVideoTracks()[0];
+      if (!nextVideoTrack) return;
+
+      if (pcRef.current) {
+        const videoSender = pcRef.current
+          .getSenders()
+          .find((s) => s.track && s.track.kind === 'video');
+        if (videoSender) {
+          await videoSender.replaceTrack(nextVideoTrack);
+        }
+      }
+      if (localStreamRef.current) {
+        localStreamRef.current.getVideoTracks().forEach((old) => {
+          localStreamRef.current?.removeTrack(old);
+          old.stop();
+        });
+        localStreamRef.current.addTrack(nextVideoTrack);
+      } else {
+        localStreamRef.current = nextStream;
+      }
+      if (localVideoRef.current && localStreamRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current;
+        localVideoRef.current.muted = true;
+      }
+      setIsScreenSharing(false);
+      setIsVideoOff(false);
+      setSelectedVideoId(deviceId);
+    } catch (err) {
+      console.warn('[WaveLink WebRTC] Could not switch camera:', err);
+    }
+  };
+
+  // Toggle Screen Share (Desktop) cleanly via getDisplayMedia + sender.replaceTrack
+  const stopScreenShareAndRestoreCamera = useCallback(async () => {
+    try {
+      let restoreTrack = cameraTrackBeforeShareRef.current;
+      if (!restoreTrack || restoreTrack.readyState === 'ended') {
+        if (normalizedMode === 'video') {
+          const camStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+          restoreTrack = camStream.getVideoTracks()[0] || null;
+        } else {
+          restoreTrack = null;
+        }
+      }
+
+      if (pcRef.current) {
+        const videoSender = pcRef.current
+          .getSenders()
+          .find((s) => s.track && s.track.kind === 'video');
+        if (videoSender && restoreTrack) {
+          await videoSender.replaceTrack(restoreTrack);
+        }
+      }
+
+      if (localStreamRef.current) {
+        localStreamRef.current.getVideoTracks().forEach((t) => {
+          if (t !== restoreTrack) {
+            localStreamRef.current?.removeTrack(t);
+            t.stop();
+          }
+        });
+        if (restoreTrack && !localStreamRef.current.getVideoTracks().includes(restoreTrack)) {
+          localStreamRef.current.addTrack(restoreTrack);
+        }
+      }
+
+      if (localVideoRef.current && localStreamRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current;
+        localVideoRef.current.muted = true;
+      }
+      cameraTrackBeforeShareRef.current = null;
+    } catch (err) {
+      console.warn('[WaveLink WebRTC] Restore camera after screen share:', err);
+    } finally {
+      setIsScreenSharing(false);
+    }
+  }, [normalizedMode]);
+
+  const handleToggleScreenShare = async () => {
+    if (isScreenSharing) {
+      await stopScreenShareAndRestoreCamera();
+      return;
+    }
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getDisplayMedia) return;
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      });
+      const screenTrack = displayStream.getVideoTracks()[0];
+      if (!screenTrack) return;
+
+      const currentCamTrack = localStreamRef.current?.getVideoTracks()[0] || null;
+      if (currentCamTrack) {
+        cameraTrackBeforeShareRef.current = currentCamTrack;
+      }
+
+      if (pcRef.current) {
+        const videoSender = pcRef.current
+          .getSenders()
+          .find((s) => s.track && s.track.kind === 'video');
+        if (videoSender) {
+          await videoSender.replaceTrack(screenTrack);
+        } else {
+          pcRef.current.addTrack(screenTrack, displayStream);
+        }
+      }
+
+      if (localStreamRef.current) {
+        localStreamRef.current.getVideoTracks().forEach((t) => {
+          localStreamRef.current?.removeTrack(t);
+        });
+        localStreamRef.current.addTrack(screenTrack);
+      } else {
+        localStreamRef.current = displayStream;
+      }
+
+      if (localVideoRef.current && localStreamRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current;
+        localVideoRef.current.muted = true;
+      }
+
+      screenTrack.onended = () => {
+        stopScreenShareAndRestoreCamera();
+      };
+
+      setIsScreenSharing(true);
+      setIsVideoOff(false);
+      setActivePopover(null);
+    } catch (err) {
+      console.warn('[WaveLink WebRTC] Screen share cancelled or unavailable:', err);
+    }
+  };
+
+  const handleSendInCallMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = inCallChatText.trim();
+    const myUid = (auth.currentUser || currentUser)?.uid || resolvedUserId;
+    if (!text || !myUid || !resolvedRecipientId) return;
+
+    setInCallChatText('');
+    try {
+      const dmChannelId = computeDmConversationId(myUid, resolvedRecipientId);
+      const nowIso = new Date().toISOString();
+      const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const participants = [myUid, resolvedRecipientId].sort();
+
+      await setDoc(
+        doc(db, 'channels', dmChannelId, 'messages', msgId),
+        cleanFirestoreData({
+          id: msgId,
+          channelId: dmChannelId,
+          conversationId: dmChannelId,
+          participants,
+          senderId: myUid,
+          receiverId: resolvedRecipientId,
+          senderName: resolvedUserName,
+          senderAvatar: sanitizeAvatarUrlForFirestore(resolvedUserAvatar, myUid),
+          text,
+          mediaType: 'none',
+          isEdited: false,
+          isDeleted: false,
+          readBy: [myUid],
+          timestamp: serverTimestamp(),
+          createdAt: nowIso,
+        })
+      );
+
+      setDoc(
+        doc(db, 'channels', dmChannelId),
+        {
+          id: dmChannelId,
+          conversationId: dmChannelId,
+          participants,
+          lastMessageText: text,
+          lastMessageSenderId: myUid,
+          lastMessageSenderName: resolvedUserName,
+          lastMessageAt: nowIso,
+          lastSeen: { [myUid]: nowIso },
+          timestamp: serverTimestamp(),
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      ).catch(() => {});
+    } catch (err) {
+      console.warn('[CALL] Could not send in-call DM message:', err);
+    }
+  };
+
+  const handleTriggerEmojiReaction = (emoji: string) => {
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const leftPct = 22 + Math.floor(Math.random() * 56);
+    setFloatingReactions((prev) => [...prev, { id, emoji, leftPct }]);
+    setActivePopover(null);
+    window.setTimeout(() => {
+      setFloatingReactions((prev) => prev.filter((item) => item.id !== id));
+    }, 1550);
+  };
+
+  // Draggable PiP Pointer Events (Mouse + Touch, clamped strictly inside stage)
+  const handlePipPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    const pipEl = pipRef.current;
+    const stageEl = stageRef.current;
+    if (!pipEl || !stageEl) return;
+
+    const pipRect = pipEl.getBoundingClientRect();
+    const stageRect = stageEl.getBoundingClientRect();
+    const pad = 10;
+
+    // Base un-translated rect bounds
+    const baseLeft = pipRect.left - pipOffset.x;
+    const baseTop = pipRect.top - pipOffset.y;
+
+    pipEl.setPointerCapture?.(e.pointerId);
+    pipDragRef.current = {
+      active: true,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      originX: pipOffset.x,
+      originY: pipOffset.y,
+      minX: stageRect.left + pad - baseLeft,
+      maxX: stageRect.right - pad - (baseLeft + pipRect.width),
+      minY: stageRect.top + pad - baseTop,
+      maxY: stageRect.bottom - pad - (baseTop + pipRect.height),
+      moved: false,
+    };
+  };
+
+  const handlePipPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = pipDragRef.current;
+    if (!drag || !drag.active) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      drag.moved = true;
+    }
+    const clampedX = Math.max(drag.minX, Math.min(drag.maxX, drag.originX + dx));
+    const clampedY = Math.max(drag.minY, Math.min(drag.maxY, drag.originY + dy));
+    setPipOffset({ x: clampedX, y: clampedY });
+  };
+
+  const handlePipPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = pipDragRef.current;
+    if (!drag) return;
+    e.stopPropagation();
+    pipRef.current?.releasePointerCapture?.(e.pointerId);
+    pipDragRef.current = null;
+  };
+
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -1475,22 +2297,54 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     callState === 'connected'
       ? connectionQuality === 'weak'
         ? 'Weak connection'
-        : 'Connected'
+        : formatDuration(callDuration)
       : callState === 'reconnecting'
-      ? 'Reconnecting'
-      : callState === 'connecting' || callState === 'ringing'
-      ? 'Connecting'
+      ? `Reconnecting • ${formatDuration(callDuration)}`
+      : callState === 'ringing' && !effectiveIsIncoming
+      ? isOfferPosted
+        ? 'Ringing...'
+        : 'Calling...'
+      : callState === 'connecting'
+      ? 'Connecting...'
       : statusMessage;
 
-  const headerTimeOrStatus =
-    callState === 'connected' || callState === 'reconnecting'
-      ? `${liveStatusLabel} • ${formatDuration(callDuration)}`
-      : liveStatusLabel;
+  const isOutgoingRingingOnly =
+    !effectiveIsIncoming && callState === 'ringing';
 
   const showRemoteVideo =
     normalizedMode === 'video' &&
     hasRemoteVideoTrack &&
+    !isRemoteVideoPaused &&
     (callState === 'connected' || callState === 'connecting' || callState === 'reconnecting');
+
+  const hasRealRemotePhoto = Boolean(
+    resolvedRecipientAvatar &&
+      !resolvedRecipientAvatar.includes('dicebear.com') &&
+      !remoteAvatarError
+  );
+
+  const isFailureTerminalState =
+    callState === 'failed' ||
+    callState === 'no-answer' ||
+    callState === 'declined';
+
+  const showSelfPip =
+    (normalizedMode === 'video' || isScreenSharing) &&
+    !isFailureTerminalState;
+
+  const handleStageTap = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isFailureTerminalState || isOutgoingRingingOnly) return;
+    const target = e.target as HTMLElement | null;
+    if (
+      target?.closest('button, input, textarea, [role="dialog"], .wavelink-call-local-pip, .wavelink-call-controls-bar, .wavelink-call-popover')
+    ) {
+      return;
+    }
+    if (activePopover) {
+      setActivePopover(null);
+    }
+    setShowMobileControls((prev) => !prev);
+  };
 
   return (
     <div ref={containerRef} className="wavelink-call-overlay">
@@ -1498,105 +2352,103 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
       <div className="wavelink-call-shell">
-        {/* TOP HEADER: On phones (<768px) shows ONLY the person's name and the live status/timer */}
-        <header className="wavelink-call-header">
+        {/* TOP HEADER:
+            - Mobile (<768px): Person's name + live call timer / status (auto-toggles on tap)
+            - Desktop (>=1024px): Clean top-left title ("Video Call with ..." / "Voice Call with ...") + peer name (no timer here) */}
+        <header
+          className={`wavelink-call-header ${
+            !showMobileControls && !isOutgoingRingingOnly && !isFailureTerminalState
+              ? 'wavelink-call-header--hidden'
+              : ''
+          }`}
+        >
           <div className="flex items-center justify-between gap-3 w-full">
             <div className="flex items-center gap-2.5 min-w-0">
-              <Avatar
-                uid={resolvedRecipientId}
-                src={resolvedRecipientAvatar}
-                alt={resolvedRecipientName}
-                fallbackName={resolvedRecipientName}
-                size={36}
-                showStatus={true}
-                onlyWhenVisible={false}
-                ringClassName="border border-cyan-500/40"
-              />
-              <div className="min-w-0">
-                <h2 className="font-bold text-base truncate leading-tight">
-                  {resolvedRecipientName}
-                </h2>
-                <div
-                  className={`flex items-center gap-1.5 text-xs font-semibold ${
-                    callState === 'connected' && connectionQuality === 'good'
-                      ? 'text-emerald-300'
-                      : callState === 'connected' && connectionQuality === 'weak'
-                      ? 'text-amber-300'
-                      : callState === 'reconnecting'
-                      ? 'text-amber-300'
-                      : callState === 'failed' ||
-                        callState === 'no-answer' ||
-                        callState === 'declined'
-                      ? 'text-rose-300'
-                      : 'text-cyan-400 lg:text-cyan-300'
-                  }`}
+              {/* Mobile avatar + name + timer */}
+              <div className="flex lg:hidden items-center gap-2.5 min-w-0">
+                <Avatar
+                  uid={resolvedRecipientId}
+                  src={resolvedRecipientAvatar}
+                  alt={resolvedRecipientName}
+                  fallbackName={resolvedRecipientName}
+                  size={36}
+                  showStatus={false}
+                  onlyWhenVisible={false}
+                  ringClassName="border border-white/40"
+                />
+                <div className="min-w-0">
+                  <h2 className="font-bold text-base truncate leading-tight text-white">
+                    {resolvedRecipientName}
+                  </h2>
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-white/85">
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        callState === 'connected' && connectionQuality === 'good'
+                          ? 'bg-emerald-400'
+                          : callState === 'connected' && connectionQuality === 'weak'
+                          ? 'bg-amber-400'
+                          : callState === 'reconnecting'
+                          ? 'bg-amber-400 animate-pulse'
+                          : isFailureTerminalState
+                          ? 'bg-rose-400'
+                          : 'bg-cyan-300 animate-pulse'
+                      }`}
+                    />
+                    <span className="truncate font-mono tabular-nums">{liveStatusLabel}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Desktop top-left clean call title & peer name */}
+              <div className="hidden lg:flex items-center gap-3 min-w-0">
+                <span
+                  className="inline-flex items-center justify-center w-9 h-9 rounded-2xl text-white shrink-0 border border-white/20"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                  }}
                 >
-                  <span
-                    className={`w-2 h-2 rounded-full shrink-0 ${
-                      callState === 'connected' && connectionQuality === 'good'
-                        ? 'bg-emerald-400 animate-pulse'
-                        : callState === 'connected' && connectionQuality === 'weak'
-                        ? 'bg-amber-400 animate-pulse'
-                        : callState === 'reconnecting'
-                        ? 'bg-amber-400 animate-ping'
-                        : callState === 'failed' ||
-                          callState === 'no-answer' ||
-                          callState === 'declined'
-                        ? 'bg-rose-500'
-                        : 'bg-cyan-400 animate-ping'
-                    }`}
-                  />
-                  <span className="truncate font-mono">{headerTimeOrStatus}</span>
+                  {normalizedMode === 'video' ? <Video size={17} /> : <PhoneCall size={17} />}
+                </span>
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-white/75 leading-none mb-1">
+                    {normalizedMode === 'video'
+                      ? `Video Call with ${resolvedRecipientName}`
+                      : `Voice Call with ${resolvedRecipientName}`}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <h2 className="font-extrabold text-lg truncate leading-tight text-white">
+                      {resolvedRecipientName}
+                    </h2>
+                    {callState === 'reconnecting' && (
+                      <span className="px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/40 text-amber-200 text-[11px] font-bold">
+                        Reconnecting
+                      </span>
+                    )}
+                    {connectionQuality === 'weak' && callState === 'connected' && (
+                      <span className="px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/40 text-amber-200 text-[11px] font-bold">
+                        Weak network
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
 
-            {/* Desktop-only badges & secondary actions (status is NOT repeated here) */}
+            {/* Desktop subtle encryption shield indicator only (no participant count or clutter) */}
             <div className="hidden lg:flex items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-800/80 border border-slate-700/70 text-[11px] font-semibold text-cyan-300">
-                <Shield className="w-3.5 h-3.5 text-cyan-400" />
-                E2E WebRTC
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-black/35 backdrop-blur-md border border-white/15 text-[11px] font-semibold text-white/85">
+                <Shield className="w-3.5 h-3.5 text-emerald-300" />
+                Encrypted
               </span>
-              <button
-                type="button"
-                onClick={() => setIsCaptionsActive((prev) => !prev)}
-                className={`p-2 rounded-xl border transition-colors ${
-                  isCaptionsActive
-                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
-                    : 'bg-slate-800/70 border-slate-700/60 text-slate-400 hover:text-white'
-                }`}
-                title="Live Captions"
-              >
-                <Captions className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                onClick={handleGenerateMinutes}
-                className="p-2 rounded-xl bg-slate-800/70 border border-slate-700/60 text-slate-400 hover:text-white transition-colors"
-                title="AI Call Notes"
-              >
-                <FileText className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                onClick={toggleFullscreen}
-                className="p-2 rounded-xl bg-slate-800/70 border border-slate-700/60 text-slate-400 hover:text-white transition-colors"
-                title="Toggle Fullscreen"
-              >
-                {isFullscreen ? (
-                  <Minimize2 className="w-4 h-4" />
-                ) : (
-                  <Maximize2 className="w-4 h-4" />
-                )}
-              </button>
             </div>
           </div>
         </header>
 
-        {/* STAGE: Full-screen on mobile with top-right self view; side-by-side panes on desktop */}
-        <div className="wavelink-call-stage">
-          {/* Remote Participant Pane */}
+        {/* STAGE: Full-bleed peer video (with blurred DP / theme gradient avatar fallback) + draggable local PiP */}
+        <div ref={stageRef} onClick={handleStageTap} className="wavelink-call-stage">
           <div className="wavelink-call-remote-pane">
+            {/* Always-mounted remote video element so audio/video tracks stay attached seamlessly */}
             <video
               ref={remoteVideoRef}
               autoPlay
@@ -1606,137 +2458,303 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               }`}
             />
 
-            {/* Avatar / Connecting / Failure Overlay when remote video isn't actively rendering */}
+            {/* Blurred DP / Theme Gradient Avatar Stage (Outgoing/Ringing, Voice Calls, Camera Off, or Failure) */}
             {!showRemoteVideo && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-gradient-to-b from-slate-900/90 via-slate-950/95 to-slate-950">
-                <div className="relative mb-4">
-                  {callState !== 'connected' &&
-                    callState !== 'failed' &&
-                    callState !== 'no-answer' &&
-                    callState !== 'declined' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center overflow-hidden">
+                {hasRealRemotePhoto ? (
+                  <img
+                    src={resolvedRecipientAvatar}
+                    alt=""
+                    aria-hidden="true"
+                    onError={() => setRemoteAvatarError(true)}
+                    className="absolute inset-0 w-full h-full object-cover scale-125 pointer-events-none"
+                    style={{ filter: 'blur(36px) saturate(1.25)' }}
+                  />
+                ) : (
+                  <div
+                    className="absolute inset-0 wavelink-call-theme-gradient pointer-events-none"
+                    aria-hidden="true"
+                  />
+                )}
+                <div
+                  className="absolute inset-0 pointer-events-none"
+                  style={{
+                    background:
+                      'linear-gradient(180deg, rgba(6,10,20,0.62) 0%, rgba(6,10,20,0.44) 45%, rgba(6,10,20,0.86) 100%)',
+                  }}
+                />
+
+                <div className="relative z-10 flex flex-col items-center">
+                  <div className="relative mb-5 w-[120px] h-[120px] flex items-center justify-center">
+                    {!isFailureTerminalState && callState !== 'connected' && (
                       <>
-                        <div className="absolute -inset-4 rounded-full bg-cyan-500/20 animate-ping" />
-                        <div className="absolute -inset-2 rounded-full bg-cyan-500/30 animate-pulse" />
+                        <div
+                          className="absolute inset-0 rounded-full wavelink-call-pulse-ring"
+                          style={{
+                            border:
+                              '2px solid color-mix(in srgb, var(--accent-primary) 78%, #38bdf8)',
+                          }}
+                        />
+                        <div
+                          className="absolute -inset-2 rounded-full wavelink-call-pulse-ring--delayed"
+                          style={{
+                            border:
+                              '2px solid color-mix(in srgb, var(--accent-secondary) 65%, #ffffff)',
+                          }}
+                        />
                       </>
                     )}
-                  <Avatar
-                    uid={resolvedRecipientId}
-                    src={resolvedRecipientAvatar}
-                    alt={resolvedRecipientName}
-                    fallbackName={resolvedRecipientName}
-                    size={96}
-                    showStatus={true}
-                    onlyWhenVisible={false}
-                    ringClassName="border-2 border-cyan-400/60 shadow-2xl"
-                  />
-                </div>
+                    <img
+                      src={resolvedRecipientAvatar}
+                      alt={resolvedRecipientName}
+                      className="w-[120px] h-[120px] rounded-full object-cover relative bg-slate-900"
+                      style={{
+                        boxShadow:
+                          '0 0 0 3px color-mix(in srgb, var(--accent-primary) 75%, #ffffff), 0 20px 44px rgba(0, 0, 0, 0.55)',
+                      }}
+                    />
+                  </div>
 
-                {/* Name only (status text is shown once in the header) */}
-                <h3 className="text-lg lg:text-2xl font-bold text-white mb-1 truncate max-w-[85vw]">
-                  {resolvedRecipientName}
-                </h3>
+                  <h3 className="text-2xl lg:text-[1.75rem] font-extrabold text-white tracking-tight truncate max-w-[82vw]">
+                    {resolvedRecipientName}
+                  </h3>
 
-                {/* Friendly STUN-only fallback notice when TURN relay is unavailable */}
-                {isStunFallback &&
-                  callState !== 'failed' &&
-                  callState !== 'no-answer' &&
-                  callState !== 'declined' && (
-                    <div className="mt-2 max-w-xs px-3 py-1.5 rounded-xl bg-amber-500/15 border border-amber-400/35 text-amber-200 text-[11px] leading-snug flex items-center gap-1.5">
-                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-300" />
-                      <span>Calls may not connect on some mobile networks without relay servers.</span>
+                  {!isFailureTerminalState && (
+                    <p className="mt-1.5 text-sm font-semibold text-white/85 tabular-nums">
+                      {callState === 'connected'
+                        ? normalizedMode === 'voice'
+                          ? `Voice call • ${formatDuration(callDuration)}`
+                          : `Camera off • ${formatDuration(callDuration)}`
+                        : liveStatusLabel}
+                    </p>
+                  )}
+
+                  {/* Camera notice fallback while voice continues */}
+                  {mediaWarningReason && !isFailureTerminalState && (
+                    <div className="mt-3 max-w-xs px-3.5 py-2 rounded-2xl bg-amber-500/20 border border-amber-300/40 text-amber-100 text-xs leading-snug flex items-center gap-2 backdrop-blur-md">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-amber-300" />
+                      <span>
+                        Camera notice: <strong>{mediaWarningReason}</strong> (voice active)
+                      </span>
                     </div>
                   )}
 
-                {/* Try again / Close actions when call fails or goes unanswered */}
-                {(callState === 'failed' ||
-                  callState === 'no-answer' ||
-                  callState === 'declined') && (
-                  <div className="mt-4 flex flex-col items-center gap-3 max-w-xs">
-                    {failureNotice && (
-                      <p className="text-xs text-slate-300 leading-relaxed">{failureNotice}</p>
-                    )}
-                    <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={handleRetryCall}
-                        className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 transition-all cursor-pointer"
-                      >
-                        <RotateCcw className="w-4 h-4" />
-                        <span>Try again</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleEndCall}
-                        className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-slate-800 hover:bg-slate-700 text-white font-semibold text-sm border border-slate-700 transition-all cursor-pointer"
-                      >
-                        <span>Close</span>
-                      </button>
+                  {/* STUN-only fallback notice */}
+                  {isStunFallback && !isFailureTerminalState && (
+                    <div className="mt-2.5 max-w-xs px-3.5 py-2 rounded-2xl bg-amber-500/20 border border-amber-300/40 text-amber-100 text-xs leading-snug flex items-center gap-2 backdrop-blur-md">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-amber-300" />
+                      <span>
+                        Calls may not connect on some mobile networks without relay servers.
+                      </span>
                     </div>
-                  </div>
-                )}
+                  )}
+
+                  {/* Failure / No answer / Declined Retry & Close */}
+                  {isFailureTerminalState && (
+                    <div className="mt-4 flex flex-col items-center gap-3 max-w-xs px-2">
+                      {failureReasonLabel && (
+                        <div className="px-3 py-1 rounded-full bg-rose-500/25 border border-rose-400/55 text-rose-100 text-[11px] font-bold uppercase tracking-wider">
+                          Reason: {failureReasonLabel}
+                        </div>
+                      )}
+                      {failureNotice && (
+                        <p className="text-xs sm:text-sm text-white/90 leading-relaxed">
+                          {failureNotice}
+                        </p>
+                      )}
+                      <div className="flex items-center gap-3 pt-1">
+                        <button
+                          type="button"
+                          onClick={handleRetryCall}
+                          className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-full text-white font-bold text-sm shadow-lg transition-transform active:scale-95 cursor-pointer"
+                          style={{
+                            background:
+                              'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                          }}
+                        >
+                          <RotateCcw className="w-4 h-4" />
+                          <span>Try again</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleEndCall}
+                          className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-white/15 hover:bg-white/25 text-white font-semibold text-sm border border-white/25 backdrop-blur-md transition-all cursor-pointer"
+                        >
+                          <span>Close</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
-            {/* Non-intrusive bottom pill during active video if STUN-only fallback is active */}
-            {showRemoteVideo && isStunFallback && (
-              <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-[90%] px-3 py-1.5 rounded-full bg-amber-950/85 border border-amber-400/40 text-amber-200 text-[11px] font-medium flex items-center gap-1.5 shadow-lg">
+            {/* Non-intrusive top pill during active video if camera warning or STUN-only fallback is active */}
+            {showRemoteVideo && (mediaWarningReason || isStunFallback) && (
+              <div className="absolute top-16 lg:top-4 left-1/2 -translate-x-1/2 z-20 max-w-[90%] px-3.5 py-1.5 rounded-full bg-amber-950/85 border border-amber-400/40 text-amber-100 text-[11px] font-medium flex items-center gap-1.5 shadow-lg backdrop-blur-md">
                 <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-300" />
-                <span className="truncate">STUN fallback: calls may not connect on some mobile networks.</span>
+                <span className="truncate">
+                  {mediaWarningReason
+                    ? `Camera notice: ${mediaWarningReason}`
+                    : 'STUN fallback: calls may not connect on some mobile networks.'}
+                </span>
               </div>
             )}
-
-            {/* Desktop participant label positioned cleanly at bottom-left so it never overlaps the header */}
-            <div className="hidden lg:flex items-center gap-2 absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold text-white">
-              <Radio className="w-3.5 h-3.5 text-cyan-400" />
-              <span>{resolvedRecipientName}</span>
-            </div>
           </div>
 
-          {/* Local Camera Pane: 100x140px PIP in top-right corner on phones; floating box in bottom-right corner on desktop */}
-          <div className="wavelink-call-local-pip">
+          {/* Floating Emoji Reaction Bursts */}
+          {floatingReactions.map((r) => (
+            <span
+              key={r.id}
+              className="wavelink-call-reaction-burst"
+              style={{ left: `${r.leftPct}%` }}
+              aria-hidden="true"
+            >
+              {r.emoji}
+            </span>
+          ))}
+
+          {/* Single Draggable Self-Video PiP (always mounted with localVideoRef when video/screen share active) */}
+          <div
+            ref={pipRef}
+            onPointerDown={handlePipPointerDown}
+            onPointerMove={handlePipPointerMove}
+            onPointerUp={handlePipPointerUp}
+            onPointerCancel={handlePipPointerUp}
+            style={{
+              transform: `translate3d(${pipOffset.x}px, ${pipOffset.y}px, 0)`,
+              display: showSelfPip ? undefined : 'none',
+            }}
+            className="wavelink-call-local-pip"
+            title="Drag to reposition your camera preview"
+          >
             <video
               ref={localVideoRef}
               autoPlay
               playsInline
               muted
               className={`wavelink-call-local-video ${
-                !isVideoOff && normalizedMode === 'video' ? 'opacity-100' : 'opacity-0'
+                !isVideoOff && (normalizedMode === 'video' || isScreenSharing)
+                  ? 'opacity-100'
+                  : 'opacity-0'
               }`}
             />
-            {(isVideoOff || normalizedMode === 'voice') && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/95 text-slate-400 p-2 text-center">
-                {resolvedUserAvatar ? (
-                  <Avatar
-                    uid={resolvedUserId}
-                    src={resolvedUserAvatar}
-                    alt={resolvedUserName}
-                    fallbackName={resolvedUserName}
-                    size={44}
-                    showStatus={true}
-                    onlyWhenVisible={false}
-                    targetProfile={userProfile}
-                    ringClassName="border border-slate-700"
-                  />
-                ) : (
-                  <VideoOff className="w-6 h-6 lg:w-7 lg:h-7 text-slate-500" />
-                )}
-                <span className="hidden lg:inline text-[11px] font-medium text-slate-400 mt-1.5">
-                  {isVideoOff ? 'Camera Off' : 'Voice Mode'}
+            {(isVideoOff && !isScreenSharing) && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/95 text-slate-300 p-2 text-center">
+                <Avatar
+                  uid={resolvedUserId}
+                  src={resolvedUserAvatar}
+                  alt={resolvedUserName}
+                  fallbackName={resolvedUserName}
+                  size={44}
+                  showStatus={false}
+                  onlyWhenVisible={false}
+                  targetProfile={userProfile}
+                  ringClassName="border border-white/30"
+                />
+                <span className="hidden lg:inline text-[11px] font-medium text-slate-300 mt-1.5">
+                  Camera Off
                 </span>
               </div>
             )}
-            <div className="hidden lg:flex items-center gap-1.5 absolute bottom-2 left-2.5 px-2.5 py-1 rounded-lg bg-slate-950/80 backdrop-blur-md border border-slate-800/80 text-[11px] font-semibold text-white">
-              <span>You</span>
+            <div className="hidden lg:flex items-center gap-1.5 absolute bottom-2 left-2 px-2 py-0.5 rounded-full bg-black/65 backdrop-blur-md border border-white/15 text-[11px] font-semibold text-white">
+              <span>{isScreenSharing ? 'Sharing screen' : 'You'}</span>
               {isMuted && <MicOff className="w-3 h-3 text-rose-400" />}
             </div>
           </div>
+
+          {/* Desktop 2-Person In-Call DM Chat Mini Drawer */}
+          {showInCallChat && (
+            <div
+              className="hidden lg:flex flex-col absolute bottom-24 right-6 z-40 w-80 max-h-[22rem] rounded-3xl bg-slate-950/92 backdrop-blur-xl border border-white/20 shadow-2xl overflow-hidden text-white"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-4 py-3 border-b border-white/12">
+                <div className="flex items-center gap-2 min-w-0">
+                  <MessageSquare size={15} className="text-cyan-300 shrink-0" />
+                  <span className="text-xs font-bold truncate">
+                    Chat with {resolvedRecipientName}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowInCallChat(false)}
+                  aria-label="Close chat"
+                  className="w-7 h-7 rounded-full flex items-center justify-center hover:bg-white/10 text-white/75 hover:text-white cursor-pointer"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto px-3.5 py-2.5 space-y-2 text-xs">
+                {inCallMessages.length === 0 ? (
+                  <p className="text-center text-white/50 py-6">
+                    Send a message to {resolvedRecipientName} without interrupting the call.
+                  </p>
+                ) : (
+                  inCallMessages.map((m) => {
+                    const isMine =
+                      m.senderId === ((auth.currentUser || currentUser)?.uid || resolvedUserId);
+                    return (
+                      <div
+                        key={m.id}
+                        className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}
+                      >
+                        <div
+                          className={`max-w-[82%] px-3 py-1.5 rounded-2xl leading-snug ${
+                            isMine
+                              ? 'text-white rounded-br-sm'
+                              : 'bg-white/15 text-white rounded-bl-sm'
+                          }`}
+                          style={
+                            isMine
+                              ? {
+                                  background:
+                                    'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                                }
+                              : undefined
+                          }
+                        >
+                          {m.text || (m.mediaType && m.mediaType !== 'none' ? `[${m.mediaType}]` : '')}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <form
+                onSubmit={handleSendInCallMessage}
+                className="flex items-center gap-1.5 p-2.5 border-t border-white/12 bg-black/25"
+              >
+                <input
+                  type="text"
+                  value={inCallChatText}
+                  onChange={(e) => setInCallChatText(e.target.value)}
+                  placeholder="Type a message..."
+                  maxLength={500}
+                  className="flex-1 min-w-0 bg-white/10 border border-white/15 rounded-full px-3 py-1.5 text-xs text-white placeholder-white/50 focus:outline-none focus:border-white/40"
+                />
+                <button
+                  type="submit"
+                  disabled={!inCallChatText.trim()}
+                  aria-label="Send message"
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-white disabled:opacity-40 cursor-pointer shrink-0"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                  }}
+                >
+                  <Send size={13} />
+                </button>
+              </form>
+            </div>
+          )}
         </div>
 
         {/* Live Captions Overlay (when active on desktop) */}
         {isCaptionsActive && transcript.length > 0 && (
-          <div className="hidden lg:block absolute bottom-24 left-1/2 -translate-x-1/2 z-30 max-w-xl w-full px-4">
-            <div className="bg-slate-950/85 backdrop-blur-md border border-slate-800 rounded-2xl px-4 py-2.5 text-center shadow-xl">
-              <p className="text-xs text-cyan-400 font-semibold">
+          <div className="hidden lg:block absolute bottom-24 left-1/2 -translate-x-1/2 z-30 max-w-xl w-full px-4 pointer-events-none">
+            <div className="bg-slate-950/85 backdrop-blur-md border border-white/15 rounded-2xl px-4 py-2.5 text-center shadow-xl">
+              <p className="text-xs text-cyan-300 font-semibold">
                 {transcript[transcript.length - 1].speaker}
               </p>
               <p className="text-sm text-white">
@@ -1746,73 +2764,437 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           </div>
         )}
 
-        {/* BOTTOM CONTROLS: Single row at the bottom with safe-area padding (mute, camera, flip camera, end call) */}
-        <footer className="wavelink-call-controls-bar">
-          {/* Mute / Unmute */}
-          <button
-            type="button"
-            onClick={toggleMute}
-            aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
-            className={`wavelink-call-control-btn ${
-              isMuted
-                ? 'bg-rose-500/25 border-rose-500/70 text-rose-300'
-                : 'bg-slate-800/90 border-slate-700/80 text-white hover:bg-slate-700'
-            }`}
-          >
-            {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-          </button>
+        {/* BOTTOM CONTROLS:
+            - Outgoing Ringing on Mobile/Tablet (<1024px): Single big red round End button
+            - Active/Connecting on Mobile/Tablet (<1024px): Floating rounded bar (Mute, Cam, Flip, Speaker, End) that hides on stage tap
+            - Desktop (>=1024px): Clean floating dark toolbar with Mic+picker, Cam+picker, Chat, Emoji, ScreenShare, More(...), Recording-style Timer, End */}
+        {!isFailureTerminalState && (
+          <>
+            {/* Mobile & Tablet Outgoing Ringing Solo End Button */}
+            {isOutgoingRingingOnly && (
+              <div className="lg:hidden absolute bottom-[calc(max(1.5rem,env(safe-area-inset-bottom,0px))+0.5rem)] left-1/2 -translate-x-1/2 z-35 flex flex-col items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleEndCall}
+                  aria-label="End call"
+                  className="wavelink-call-end-solo-btn"
+                >
+                  <PhoneOff className="w-7 h-7" />
+                </button>
+                <span className="text-xs font-bold text-white/90">End</span>
+              </div>
+            )}
 
-          {/* Camera On / Off */}
-          <button
-            type="button"
-            onClick={toggleCamera}
-            aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
-            className={`wavelink-call-control-btn ${
-              isVideoOff
-                ? 'bg-rose-500/25 border-rose-500/70 text-rose-300'
-                : 'bg-slate-800/90 border-slate-700/80 text-white hover:bg-slate-700'
-            }`}
-          >
-            {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
-          </button>
+            {/* Mobile & Tablet Active/Connecting Control Bar */}
+            {!isOutgoingRingingOnly && (
+              <footer
+                className={`lg:hidden wavelink-call-controls-bar ${
+                  !showMobileControls ? 'wavelink-call-controls-bar--hidden' : ''
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={toggleMute}
+                  aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
+                  className={`wavelink-call-control-btn ${
+                    isMuted
+                      ? 'bg-rose-500/30 border-rose-400/70 text-rose-200'
+                      : 'bg-white/14 border-white/20 text-white'
+                  }`}
+                >
+                  {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                </button>
 
-          {/* Flip Camera */}
-          <button
-            type="button"
-            onClick={handleFlipCamera}
-            aria-label="Flip camera"
-            className="wavelink-call-control-btn bg-slate-800/90 border-slate-700/80 text-white hover:bg-slate-700"
-          >
-            <SwitchCamera className="w-5 h-5" />
-          </button>
+                <button
+                  type="button"
+                  onClick={toggleCamera}
+                  aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
+                  className={`wavelink-call-control-btn ${
+                    isVideoOff
+                      ? 'bg-rose-500/30 border-rose-400/70 text-rose-200'
+                      : 'bg-white/14 border-white/20 text-white'
+                  }`}
+                >
+                  {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+                </button>
 
-          {/* Desktop-only Speaker toggle (hidden on phones so the 4 required controls sit in a clean single row) */}
-          <button
-            type="button"
-            onClick={toggleSpeaker}
-            aria-label={isSpeakerOn ? 'Mute speaker' : 'Unmute speaker'}
-            className={`hidden lg:inline-flex wavelink-call-control-btn ${
-              !isSpeakerOn
-                ? 'bg-amber-500/20 border-amber-500/60 text-amber-300'
-                : 'bg-slate-800/90 border-slate-700/80 text-white hover:bg-slate-700'
-            }`}
-          >
-            {isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
-          </button>
+                <button
+                  type="button"
+                  onClick={handleFlipCamera}
+                  aria-label="Flip camera"
+                  className="wavelink-call-control-btn bg-white/14 border-white/20 text-white"
+                >
+                  <SwitchCamera className="w-5 h-5" />
+                </button>
 
-          {/* End Call */}
-          <button
-            type="button"
-            onClick={handleEndCall}
-            aria-label="End call"
-            className="wavelink-call-control-btn bg-rose-600 hover:bg-rose-500 border-rose-500 text-white shadow-lg shadow-rose-600/30"
-          >
-            <PhoneOff className="w-5 h-5" />
-          </button>
-        </footer>
+                <button
+                  type="button"
+                  onClick={toggleSpeaker}
+                  aria-label={isSpeakerOn ? 'Mute speaker' : 'Unmute speaker'}
+                  className={`wavelink-call-control-btn ${
+                    !isSpeakerOn
+                      ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                      : 'bg-white/14 border-white/20 text-white'
+                  }`}
+                >
+                  {isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleEndCall}
+                  aria-label="End call"
+                  className="wavelink-call-control-btn bg-rose-600 hover:bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-600/35"
+                >
+                  <PhoneOff className="w-5 h-5" />
+                </button>
+              </footer>
+            )}
+
+            {/* Desktop (>= 1024px) Floating Dark Toolbar */}
+            <footer className="hidden lg:flex wavelink-call-controls-bar">
+              {/* Mic + Device Selector Chevron */}
+              <div className="wavelink-call-split-btn">
+                <div className="wavelink-call-tooltip-host">
+                  <button
+                    type="button"
+                    onClick={toggleMute}
+                    aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
+                    className={`wavelink-call-control-btn border-0 ${
+                      isMuted
+                        ? 'bg-rose-500/30 text-rose-200'
+                        : 'bg-transparent hover:bg-white/12 text-white'
+                    }`}
+                  >
+                    {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                  </button>
+                  <span className="wavelink-call-tooltip">
+                    {isMuted ? 'Unmute mic' : 'Mute mic'}
+                  </span>
+                </div>
+                <div className="wavelink-call-tooltip-host">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      refreshMediaDevices();
+                      setActivePopover((prev) => (prev === 'mic' ? null : 'mic'));
+                    }}
+                    aria-label="Choose microphone"
+                    className="w-7 h-10 rounded-full flex items-center justify-center text-white/75 hover:text-white hover:bg-white/12 cursor-pointer"
+                  >
+                    <ChevronUp size={15} />
+                  </button>
+                  <span className="wavelink-call-tooltip">Select microphone</span>
+                </div>
+
+                {activePopover === 'mic' && (
+                  <div className="wavelink-call-popover" onClick={(e) => e.stopPropagation()}>
+                    <p className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-white/55">
+                      Microphone
+                    </p>
+                    {audioInputs.length === 0 ? (
+                      <p className="px-2.5 py-2 text-xs text-white/70">Default microphone</p>
+                    ) : (
+                      audioInputs.map((dev, idx) => (
+                        <button
+                          key={dev.deviceId || idx}
+                          type="button"
+                          onClick={() => handleSelectAudioDevice(dev.deviceId)}
+                          className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-medium hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
+                        >
+                          <span className="truncate">
+                            {dev.label || `Microphone ${idx + 1}`}
+                          </span>
+                          {selectedAudioId === dev.deviceId && (
+                            <Check size={14} className="text-emerald-400 shrink-0" />
+                          )}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Camera + Device Selector Chevron */}
+              <div className="wavelink-call-split-btn">
+                <div className="wavelink-call-tooltip-host">
+                  <button
+                    type="button"
+                    onClick={toggleCamera}
+                    aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
+                    className={`wavelink-call-control-btn border-0 ${
+                      isVideoOff
+                        ? 'bg-rose-500/30 text-rose-200'
+                        : 'bg-transparent hover:bg-white/12 text-white'
+                    }`}
+                  >
+                    {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+                  </button>
+                  <span className="wavelink-call-tooltip">
+                    {isVideoOff ? 'Turn camera on' : 'Turn camera off'}
+                  </span>
+                </div>
+                <div className="wavelink-call-tooltip-host">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      refreshMediaDevices();
+                      setActivePopover((prev) => (prev === 'cam' ? null : 'cam'));
+                    }}
+                    aria-label="Choose camera"
+                    className="w-7 h-10 rounded-full flex items-center justify-center text-white/75 hover:text-white hover:bg-white/12 cursor-pointer"
+                  >
+                    <ChevronUp size={15} />
+                  </button>
+                  <span className="wavelink-call-tooltip">Select camera</span>
+                </div>
+
+                {activePopover === 'cam' && (
+                  <div className="wavelink-call-popover" onClick={(e) => e.stopPropagation()}>
+                    <p className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-white/55">
+                      Camera
+                    </p>
+                    {videoInputs.length === 0 ? (
+                      <p className="px-2.5 py-2 text-xs text-white/70">Default camera</p>
+                    ) : (
+                      videoInputs.map((dev, idx) => (
+                        <button
+                          key={dev.deviceId || idx}
+                          type="button"
+                          onClick={() => handleSelectVideoDevice(dev.deviceId)}
+                          className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-medium hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
+                        >
+                          <span className="truncate">{dev.label || `Camera ${idx + 1}`}</span>
+                          {selectedVideoId === dev.deviceId && (
+                            <Check size={14} className="text-emerald-400 shrink-0" />
+                          )}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Chat Toggle */}
+              <div className="wavelink-call-tooltip-host">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActivePopover(null);
+                    setShowInCallChat((prev) => !prev);
+                  }}
+                  aria-label="Toggle call chat"
+                  className={`wavelink-call-control-btn ${
+                    showInCallChat
+                      ? 'bg-white/25 border-white/35 text-white'
+                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                  }`}
+                >
+                  <MessageSquare className="w-[18px] h-[18px]" />
+                </button>
+                <span className="wavelink-call-tooltip">Chat</span>
+              </div>
+
+              {/* Emoji Reaction */}
+              <div className="wavelink-call-tooltip-host">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActivePopover((prev) => (prev === 'emoji' ? null : 'emoji'))
+                  }
+                  aria-label="Send reaction"
+                  className={`wavelink-call-control-btn ${
+                    activePopover === 'emoji'
+                      ? 'bg-white/25 border-white/35 text-white'
+                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                  }`}
+                >
+                  <Smile className="w-[19px] h-[19px]" />
+                </button>
+                <span className="wavelink-call-tooltip">Reactions</span>
+
+                {activePopover === 'emoji' && (
+                  <div
+                    className="wavelink-call-popover flex items-center justify-center gap-1.5"
+                    style={{ minWidth: 'max-content' }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {['👍', '❤️', '😂', '👏', '🔥', '🎉'].map((emo) => (
+                      <button
+                        key={emo}
+                        type="button"
+                        onClick={() => handleTriggerEmojiReaction(emo)}
+                        className="w-10 h-10 rounded-full hover:bg-white/15 text-xl flex items-center justify-center transition-transform hover:scale-110 cursor-pointer"
+                      >
+                        {emo}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Screen Share */}
+              <div className="wavelink-call-tooltip-host">
+                <button
+                  type="button"
+                  onClick={handleToggleScreenShare}
+                  aria-label={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
+                  className={`wavelink-call-control-btn ${
+                    isScreenSharing
+                      ? 'bg-emerald-500/30 border-emerald-400/70 text-emerald-200'
+                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                  }`}
+                >
+                  {isScreenSharing ? (
+                    <MonitorOff className="w-[18px] h-[18px]" />
+                  ) : (
+                    <Monitor className="w-[18px] h-[18px]" />
+                  )}
+                </button>
+                <span className="wavelink-call-tooltip">
+                  {isScreenSharing ? 'Stop share' : 'Share screen'}
+                </span>
+              </div>
+
+              {/* More (...) Menu (Speaker, Captions, AI Notes, Fullscreen) */}
+              <div className="wavelink-call-tooltip-host">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setActivePopover((prev) => (prev === 'more' ? null : 'more'))
+                  }
+                  aria-label="More call options"
+                  className={`wavelink-call-control-btn ${
+                    activePopover === 'more'
+                      ? 'bg-white/25 border-white/35 text-white'
+                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                  }`}
+                >
+                  <MoreHorizontal className="w-5 h-5" />
+                </button>
+                <span className="wavelink-call-tooltip">More options</span>
+
+                {activePopover === 'more' && (
+                  <div className="wavelink-call-popover" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toggleSpeaker();
+                        setActivePopover(null);
+                      }}
+                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        {isSpeakerOn ? <Volume2 size={15} /> : <VolumeX size={15} />}
+                        <span>{isSpeakerOn ? 'Mute speaker' : 'Unmute speaker'}</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsCaptionsActive((prev) => !prev);
+                        setActivePopover(null);
+                      }}
+                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Captions size={15} />
+                        <span>Live Captions</span>
+                      </span>
+                      {isCaptionsActive && <Check size={14} className="text-emerald-400" />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActivePopover(null);
+                        handleGenerateMinutes();
+                      }}
+                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center gap-2 cursor-pointer"
+                    >
+                      <FileText size={15} />
+                      <span>AI Call Notes</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toggleFullscreen();
+                        setActivePopover(null);
+                      }}
+                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center gap-2 cursor-pointer"
+                    >
+                      {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+                      <span>{isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Red Recording-Style Timer Badge */}
+              <div className="wavelink-call-rec-timer" title="Call duration">
+                <span
+                  className={`w-2 h-2 rounded-full bg-rose-500 ${
+                    callState === 'connected' ? 'animate-pulse' : ''
+                  }`}
+                />
+                <span>{formatDuration(callDuration)}</span>
+              </div>
+
+              {/* Red End Call Button */}
+              <div className="wavelink-call-tooltip-host">
+                <button
+                  type="button"
+                  onClick={handleEndCall}
+                  aria-label="End call"
+                  className="wavelink-call-control-btn bg-rose-600 hover:bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-600/35 px-4 !w-auto gap-1.5 font-bold text-xs"
+                >
+                  <PhoneOff className="w-4 h-4" />
+                  <span>End</span>
+                </button>
+                <span className="wavelink-call-tooltip">End call</span>
+              </div>
+            </footer>
+          </>
+        )}
       </div>
 
-      {/* AI Meeting Minutes Drawer (Desktop Optional Feature Preserved) */}
+      {/* Confirmation Dialog when pressing Esc during an active call */}
+      {showLeaveConfirm && (
+        <div
+          className="fixed inset-0 z-[110] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Leave call confirmation"
+        >
+          <div className="w-full max-w-sm rounded-3xl bg-slate-900 border border-white/20 p-6 shadow-2xl text-white text-center space-y-4">
+            <h3 className="text-lg font-extrabold">Leave this call?</h3>
+            <p className="text-xs sm:text-sm text-white/75 leading-relaxed">
+              Your call with {resolvedRecipientName} is still ongoing. Are you sure you want to hang up?
+            </p>
+            <div className="flex items-center justify-center gap-3 pt-1">
+              <button
+                type="button"
+                autoFocus
+                onClick={() => setShowLeaveConfirm(false)}
+                className="min-h-[44px] flex-1 px-4 py-2.5 rounded-full bg-white/15 hover:bg-white/25 border border-white/20 text-sm font-bold text-white cursor-pointer"
+              >
+                Stay in call
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLeaveConfirm(false);
+                  handleEndCall();
+                }}
+                className="min-h-[44px] flex-1 px-4 py-2.5 rounded-full bg-rose-600 hover:bg-rose-500 text-sm font-bold text-white cursor-pointer"
+              >
+                End call
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Meeting Minutes Drawer */}
       {showMinutesDrawer && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-5 shadow-2xl flex flex-col max-h-[80dvh]">

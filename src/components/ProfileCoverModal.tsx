@@ -14,11 +14,11 @@ import {
   ZoomIn
 } from 'lucide-react';
 import { AppearanceTheme, ProfileCoverPresetId, ProfileCoverType, UserProfile } from '../types';
-import { auth, formatFirebaseStorageImageError } from '../firebase';
+import { auth, formatCloudinaryUploadError } from '../firebase';
 import {
   compressProfileImageToBlob,
   ProfileStorageUploadError,
-  uploadProfileMediaToFirebaseStorage,
+  uploadProfileImageToCloudinary,
   validateProfileImageFile
 } from '../utils/mediaStorage';
 
@@ -281,34 +281,19 @@ export const ProfileCoverBanner: React.FC<ProfileCoverBannerProps> = ({
   profile,
   activeTheme,
   isOwnProfile,
-  isProUser,
   language,
-  onOpenCoverPicker,
-  onOpenUpgradePro
+  onOpenCoverPicker
 }) => {
-  const isTargetUserPro = Boolean(
-    profile?.isPro ||
-      profile?.hasBlueStar ||
-      profile?.isVerifiedByAdmin ||
-      profile?.role === 'admin' ||
-      profile?.role === 'super_admin' ||
-      profile?.role === 'sub_admin' ||
-      profile?.isSubAdmin
-  );
+  const coverType: ProfileCoverType =
+    profile?.coverType || (profile?.coverImageUrl ? 'image' : profile?.coverPresetId ? 'preset' : 'default');
 
-  const coverType: ProfileCoverType = isTargetUserPro
-    ? profile?.coverType || (profile?.coverImageUrl ? 'image' : profile?.coverPresetId ? 'preset' : 'default')
-    : 'default';
-
-  const presetId: ProfileCoverPresetId = isTargetUserPro
-    ? profile?.coverPresetId || 'theme-default'
-    : 'theme-default';
+  const presetId: ProfileCoverPresetId = profile?.coverPresetId || 'theme-default';
 
   const activePreset =
     BUILT_IN_COVER_PRESETS.find((p) => p.id === presetId) || BUILT_IN_COVER_PRESETS[0];
 
   const renderCoverSurface = () => {
-    if (isTargetUserPro && coverType === 'video' && profile?.coverImageUrl) {
+    if (coverType === 'video' && profile?.coverImageUrl) {
       return (
         <video
           src={profile.coverImageUrl}
@@ -321,7 +306,7 @@ export const ProfileCoverBanner: React.FC<ProfileCoverBannerProps> = ({
       );
     }
 
-    if (isTargetUserPro && coverType === 'image' && profile?.coverImageUrl) {
+    if ((coverType === 'image' || Boolean(profile?.coverImageUrl)) && profile?.coverImageUrl) {
       return (
         <img
           src={profile.coverImageUrl}
@@ -332,7 +317,7 @@ export const ProfileCoverBanner: React.FC<ProfileCoverBannerProps> = ({
       );
     }
 
-    if (isTargetUserPro && presetId !== 'theme-default') {
+    if (presetId !== 'theme-default') {
       const style: React.CSSProperties = {
         backgroundImage: activePreset.svgPattern
           ? `${activePreset.svgPattern}, ${activePreset.background}`
@@ -351,7 +336,7 @@ export const ProfileCoverBanner: React.FC<ProfileCoverBannerProps> = ({
       );
     }
 
-    // Default theme-aware cover for non-Pro users or default selection
+    // Default theme-aware cover
     return (
       <div
         className="w-full h-full relative"
@@ -374,40 +359,17 @@ export const ProfileCoverBanner: React.FC<ProfileCoverBannerProps> = ({
       {/* Soft gradient fade into the page */}
       <div className="wavelink-profile-cover-fade" />
 
-      {/* Own Profile Top-Right Cover Control: Pro Customize vs Non-Pro Locked Upgrade Button */}
+      {/* Own Profile Top-Right Cover Control */}
       {isOwnProfile && (
         <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
-          {isProUser ? (
-            <button
-              type="button"
-              onClick={onOpenCoverPicker}
-              className="min-h-[40px] px-3.5 py-2 rounded-full bg-black/55 hover:bg-black/75 text-white backdrop-blur-md border border-white/25 text-xs font-extrabold flex items-center gap-1.5 shadow-lg transition active:scale-95 cursor-pointer"
-            >
-              <Camera size={14} className="text-amber-300 shrink-0" />
-              <span>{language === 'sw' ? 'Badili Jalada' : 'Edit Cover'}</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={onOpenUpgradePro}
-              title={
-                language === 'sw'
-                  ? 'Boresha kwenda Pro kuweka picha ya jalada'
-                  : 'Upgrade to set a custom cover'
-              }
-              className="min-h-[40px] px-3.5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white backdrop-blur-md border border-amber-300/40 text-[11px] sm:text-xs font-extrabold flex items-center gap-1.5 shadow-lg transition active:scale-95 cursor-pointer"
-            >
-              <Lock size={13} className="text-amber-300 shrink-0" />
-              <span className="px-1.5 py-0.5 rounded-full bg-amber-400/25 text-amber-200 text-[10px] font-black uppercase">
-                Pro
-              </span>
-              <span>
-                {language === 'sw'
-                  ? 'Boresha kuweka jalada maalum'
-                  : 'Upgrade to set a custom cover'}
-              </span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onOpenCoverPicker}
+            className="min-h-[44px] px-3.5 py-2 rounded-full bg-black/55 hover:bg-black/75 text-white backdrop-blur-md border border-white/25 text-xs font-extrabold flex items-center gap-1.5 shadow-lg transition active:scale-95 cursor-pointer"
+          >
+            <Camera size={14} className="text-amber-300 shrink-0" />
+            <span>{language === 'sw' ? 'Badili Jalada' : 'Edit Cover'}</span>
+          </button>
         </div>
       )}
     </div>
@@ -528,12 +490,6 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
   };
 
   const handleSave = async () => {
-    if (!isProUser) {
-      onClose();
-      onOpenUpgradePro();
-      return;
-    }
-
     setIsSaving(true);
     setErrorMsg(null);
     setErrorCode(null);
@@ -572,14 +528,14 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
               ? 'Tafadhali chagua picha kwanza.'
               : 'Please select an image to upload first.'
           );
-          setErrorCode('storage/no-file-selected');
+          setErrorCode('cloudinary/no-file-selected');
           setIsSaving(false);
           return;
         }
 
         const resolvedUid = uid || auth.currentUser?.uid || '';
         const { blob } = await cropAndCompressCoverImage(loadedImage, panYPercent, zoomLevel);
-        const uploaded = await uploadProfileMediaToFirebaseStorage({
+        const uploaded = await uploadProfileImageToCloudinary({
           uid: resolvedUid,
           folder: 'covers',
           blob,
@@ -603,7 +559,7 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
         setErrorMsg(err.friendlyMessage);
         setErrorCode(err.code);
       } else {
-        const formatted = formatFirebaseStorageImageError(err, { action: 'save-cover' });
+        const formatted = formatCloudinaryUploadError(err, { action: 'save-cover' });
         setErrorMsg(formatted.friendlyMessage);
         setErrorCode(formatted.code);
       }

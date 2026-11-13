@@ -2,8 +2,7 @@ import {
   auth,
   db,
   storage,
-  resolvedStorageBucket,
-  formatFirebaseStorageImageError,
+  formatCloudinaryUploadError,
   getAuthHeaders,
   formatVideoUploadError,
   CLOUDINARY_CLOUD_NAME,
@@ -12,12 +11,7 @@ import {
   CLOUDINARY_IMAGE_UPLOAD_URL
 } from '../firebase';
 import { collection, doc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
-import {
-  ref,
-  uploadBytesResumable,
-  getDownloadURL,
-  deleteObject
-} from 'firebase/storage';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
 const DB_NAME = 'wavelink_media_db';
 const STORE_NAME = 'videos';
@@ -726,45 +720,30 @@ export async function compressProfileImageToBlob(
   }
 }
 
-export async function uploadProfileMediaToFirebaseStorage(params: {
+export async function uploadProfileImageToCloudinary(params: {
   uid: string;
   folder: 'covers' | 'avatars';
   blob: Blob;
   contentType?: string;
   onProgress?: (percentage: number) => void;
-}): Promise<{ downloadUrl: string; storagePath: string; bytes: number }> {
-  const { uid, folder, blob, onProgress } = params;
+}): Promise<{ downloadUrl: string; publicId: string; bytes: number }> {
+  const { uid, blob, onProgress } = params;
 
   if (!uid || !auth.currentUser || auth.currentUser.uid !== uid) {
-    const err = new ProfileStorageUploadError(
+    throw new ProfileStorageUploadError(
       'Please sign in before uploading an image.',
-      'storage/unauthenticated'
+      'cloudinary/unauthenticated'
     );
-    console.error('[WaveLink Firebase Storage Error]', { code: err.code, message: err.message });
-    throw err;
-  }
-
-  if (!storage || !resolvedStorageBucket) {
-    const err = new ProfileStorageUploadError(
-      'Firebase Storage bucket is not configured. Check VITE_FIREBASE_STORAGE_BUCKET and enable Storage in Firebase Console.',
-      'storage/bucket-not-configured'
-    );
-    console.error('[WaveLink Firebase Storage Error]', {
-      code: err.code,
-      bucket: resolvedStorageBucket,
-      message: err.message
-    });
-    throw err;
   }
 
   if (!blob || blob.size <= 0) {
-    throw new ProfileStorageUploadError('Selected image is empty.', 'storage/empty-file');
+    throw new ProfileStorageUploadError('Selected image is empty.', 'cloudinary/empty-file');
   }
 
   if (blob.size > MAX_PROFILE_IMAGE_UPLOAD_BYTES) {
     throw new ProfileStorageUploadError(
       'Image exceeds the 5 MB maximum upload size.',
-      'storage/file-too-large'
+      'cloudinary/file-too-large'
     );
   }
 
@@ -773,62 +752,20 @@ export async function uploadProfileMediaToFirebaseStorage(params: {
   if (!resolvedType.startsWith('image/')) {
     throw new ProfileStorageUploadError(
       'Only image files (JPG, PNG, WebP, GIF) can be uploaded.',
-      'storage/invalid-file-type'
+      'cloudinary/invalid-file-type'
     );
   }
 
-  const ext =
-    resolvedType === 'image/webp'
-      ? 'webp'
-      : resolvedType === 'image/png'
-      ? 'png'
-      : resolvedType === 'image/gif'
-      ? 'gif'
-      : 'jpg';
-  const fileName = `${folder === 'covers' ? 'cover' : 'avatar'}_${Date.now()}.${ext}`;
-  const storagePath = `users/${uid}/${folder}/${fileName}`;
-  const storageRef = ref(storage, storagePath);
-
   try {
-    if (onProgress) onProgress(2);
-    const uploadTask = uploadBytesResumable(storageRef, blob, {
-      contentType: resolvedType,
-      cacheControl: 'public,max-age=31536000'
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      uploadTask.on(
-        'state_changed',
-        (snapshot) => {
-          if (onProgress && snapshot.totalBytes > 0) {
-            const pct = Math.max(
-              2,
-              Math.min(96, Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 95))
-            );
-            onProgress(pct);
-          }
-        },
-        (uploadErr) => {
-          reject(uploadErr);
-        },
-        () => {
-          resolve();
-        }
-      );
-    });
-
-    const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
-    if (onProgress) onProgress(100);
-
+    const result = await uploadImageToCloudinary(blob, onProgress);
     return {
-      downloadUrl,
-      storagePath,
-      bytes: blob.size
+      downloadUrl: result.secureUrl,
+      publicId: result.publicId,
+      bytes: result.bytes || blob.size
     };
   } catch (err) {
-    const formatted = formatFirebaseStorageImageError(err, {
-      path: storagePath,
-      action: `upload-${folder}`
+    const formatted = formatCloudinaryUploadError(err, {
+      action: `upload-${params.folder}`
     });
     throw new ProfileStorageUploadError(
       formatted.friendlyMessage,
@@ -839,35 +776,12 @@ export async function uploadProfileMediaToFirebaseStorage(params: {
 }
 
 /**
- * Deletes a previously uploaded Firebase Storage profile cover/avatar URL or path.
- * Safely no-ops for external URLs (DiceBear, Google, Cloudinary, preset URLs) or already-removed files.
+ * Legacy cleanup no-op kept for signature safety; all uploads are hosted cleanly on Cloudinary.
  */
 export async function deleteOldProfileMediaFromStorage(
-  oldUrlOrPath?: string | null
+  _oldUrlOrPath?: string | null
 ): Promise<void> {
-  if (!oldUrlOrPath || typeof oldUrlOrPath !== 'string' || !storage) return;
-  const trimmed = oldUrlOrPath.trim();
-  if (!trimmed) return;
-
-  const isFirebaseStorageUrl =
-    trimmed.startsWith('users/') ||
-    trimmed.includes('firebasestorage.googleapis.com') ||
-    trimmed.includes('.firebasestorage.app');
-
-  if (!isFirebaseStorageUrl) return;
-
-  try {
-    const oldRef = ref(storage, trimmed);
-    await deleteObject(oldRef);
-  } catch (err: any) {
-    // Ignore storage/object-not-found or external/permission edge cases cleanly
-    if (err?.code && err.code !== 'storage/object-not-found') {
-      console.warn('[WaveLink Storage] Could not delete previous profile image:', {
-        code: err.code,
-        message: err.message
-      });
-    }
-  }
+  return;
 }
 
 /**
@@ -2367,3 +2281,191 @@ export const SAMPLE_VIDEOS: SampleClip[] = [
     url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyBlazes.mp4'
   }
 ];
+
+export const MAX_CHAT_FILE_BYTES = 20 * 1024 * 1024; // 20 MB cap for documents/files
+
+export function uploadChatFileToCloudinary(
+  file: File,
+  onProgress?: (percentage: number) => void
+): Promise<{ secureUrl: string; fileName: string; fileSize: number; publicId: string }> {
+  return new Promise((resolve, reject) => {
+    if (!file || file.size <= 0) {
+      reject(new Error('Selected file is empty.'));
+      return;
+    }
+    if (file.size > MAX_CHAT_FILE_BYTES) {
+      reject(new Error(`File exceeds the 20 MB limit (${formatVideoFileSize(file.size)}).`));
+      return;
+    }
+
+    const endpoint = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', endpoint, true);
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+    xhr.upload.onprogress = (event: ProgressEvent) => {
+      if (!onProgress) return;
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100))));
+      } else {
+        onProgress(50);
+      }
+    };
+
+    xhr.onload = () => {
+      const status = xhr.status || 0;
+      let parsed: any = null;
+      try {
+        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        parsed = null;
+      }
+
+      if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+        if (onProgress) onProgress(100);
+        resolve({
+          secureUrl: parsed.secure_url,
+          fileName: file.name || 'Attachment',
+          fileSize: file.size || Number(parsed.bytes) || 0,
+          publicId: String(parsed.public_id || `wavelink_file_${Date.now()}`)
+        });
+        return;
+      }
+
+      const errMsg =
+        parsed?.error?.message ||
+        (status ? `Cloudinary file upload HTTP ${status} error` : 'Cloudinary file upload failed');
+      reject(new Error(`File upload failed: ${errMsg}`));
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Network error while uploading file to Cloudinary.'));
+    };
+
+    xhr.onabort = () => {
+      reject(new Error('File upload was cancelled.'));
+    };
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+    xhr.send(formData);
+  });
+}
+
+export const CHAT_THEME_MAX_PHOTO_BYTES = 400 * 1024; // 400 KB strict Firebase Storage cap
+
+function loadImageElementFromFile(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Could not read the selected image file.'));
+    };
+    img.src = objectUrl;
+  });
+}
+
+function canvasToJpegBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          reject(new Error('Could not compress image in browser.'));
+        }
+      },
+      'image/jpeg',
+      quality
+    );
+  });
+}
+
+/**
+ * Crops/scales an image to chat aspect dimensions, iteratively compresses it strictly under 400 KB,
+ * and uploads it directly to Firebase Storage under the user's own folder:
+ * users/{uid}/chatThemes/{conversationId}_{timestamp}.jpg
+ */
+export async function compressAndUploadChatThemePhoto(params: {
+  uid: string;
+  conversationId: string;
+  file: File;
+}): Promise<{ downloadUrl: string; storagePath: string; fileSize: number }> {
+  const { uid, conversationId, file } = params;
+  if (!uid) {
+    throw new Error('Sign in required to upload a custom background.');
+  }
+  if (!file || (!file.type.startsWith('image/') && !/\.(png|jpe?g|webp|gif)$/i.test(file.name))) {
+    throw new Error('Please choose a valid image file (JPG, PNG, or WebP).');
+  }
+
+  const img = await loadImageElementFromFile(file);
+  const srcW = img.naturalWidth || img.width || 1080;
+  const srcH = img.naturalHeight || img.height || 1440;
+
+  // Iteratively scale & adjust JPEG quality until strictly under 400 KB
+  const maxDimensions = [1280, 1080, 860, 720];
+  const qualities = [0.84, 0.72, 0.60, 0.48, 0.36];
+  let finalBlob: Blob | null = null;
+
+  for (const maxDim of maxDimensions) {
+    const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
+    const targetW = Math.max(240, Math.round(srcW * scale));
+    const targetH = Math.max(240, Math.round(srcH * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Image processing is not supported on this device.');
+
+    ctx.fillStyle = '#0F172A';
+    ctx.fillRect(0, 0, targetW, targetH);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+
+    for (const q of qualities) {
+      const candidate = await canvasToJpegBlob(canvas, q);
+      finalBlob = candidate;
+      if (candidate.size < CHAT_THEME_MAX_PHOTO_BYTES) {
+        break;
+      }
+    }
+    if (finalBlob && finalBlob.size < CHAT_THEME_MAX_PHOTO_BYTES) {
+      break;
+    }
+  }
+
+  if (!finalBlob || finalBlob.size >= CHAT_THEME_MAX_PHOTO_BYTES) {
+    throw new Error('Photo is still too large after compression. Please choose a smaller image.');
+  }
+
+  const safeConvo = String(conversationId || 'chat')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 48);
+  const storagePath = `users/${uid}/chatThemes/${safeConvo}_${Date.now()}.jpg`;
+  const storageRef = ref(storage, storagePath);
+
+  await uploadBytes(storageRef, finalBlob, {
+    contentType: 'image/jpeg',
+    customMetadata: {
+      conversationId: safeConvo,
+      uploadedBy: uid
+    }
+  });
+
+  const downloadUrl = await getDownloadURL(storageRef);
+  return {
+    downloadUrl,
+    storagePath,
+    fileSize: finalBlob.size
+  };
+}
+

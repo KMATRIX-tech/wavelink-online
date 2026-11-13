@@ -9,22 +9,13 @@ import {
   doc,
   getDoc
 } from 'firebase/firestore';
-import { getStorage, type FirebaseStorage } from 'firebase/storage';
+import { getStorage } from 'firebase/storage';
 import { initializeAppCheck, ReCaptchaV3Provider, getToken as getAppCheckToken } from 'firebase/app-check';
 import firebaseAppletConfig from '../firebase-applet-config.json';
 import type { UserProfile } from './types';
 
-const envStorageBucket =
-  typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_STORAGE_BUCKET
-    ? String((import.meta as any).env.VITE_FIREBASE_STORAGE_BUCKET).trim()
-    : '';
-
-export const resolvedStorageBucket: string =
-  envStorageBucket || (firebaseAppletConfig as { storageBucket?: string }).storageBucket || '';
-
 export const firebaseConfig = {
-  ...firebaseAppletConfig,
-  ...(resolvedStorageBucket ? { storageBucket: resolvedStorageBucket } : {})
+  ...firebaseAppletConfig
 };
 
 // Silence transient WebChannel probe warnings so 10s offline fallback checks do not emit false-positive console errors
@@ -56,114 +47,48 @@ export const db = firestoreDb;
 
 export const auth = getAuth(app);
 
-// ============================================================================
-// FIREBASE STORAGE (Profile Covers & Profile Photos)
-// ============================================================================
-let storageInstance: FirebaseStorage | null = null;
-try {
-  if (resolvedStorageBucket) {
-    const bucketUrl = resolvedStorageBucket.startsWith('gs://')
-      ? resolvedStorageBucket
-      : `gs://${resolvedStorageBucket}`;
-    storageInstance = getStorage(app, bucketUrl);
-  } else {
-    console.warn(
-      '[WaveLink Storage] storageBucket is missing in firebase-applet-config.json and VITE_FIREBASE_STORAGE_BUCKET.'
-    );
-    storageInstance = getStorage(app);
-  }
-} catch (storageInitErr) {
-  console.error('[WaveLink Storage] Initialization failed:', storageInitErr);
-  storageInstance = null;
-}
+export const storage = getStorage(app);
 
-export const storage = storageInstance;
-
-export function formatFirebaseStorageImageError(
+// ============================================================================
+// CLOUDINARY UPLOAD ERROR FORMATTER (Zero Firebase Storage anywhere)
+// ============================================================================
+export function formatCloudinaryUploadError(
   error: unknown,
-  context?: { path?: string; action?: string }
+  context?: { action?: string }
 ): { code: string; message: string; friendlyMessage: string } {
-  const errObj = error as { code?: unknown; message?: unknown; customData?: unknown };
+  const errObj = error as { code?: unknown; message?: unknown };
   const rawCode = typeof errObj?.code === 'string' && errObj.code.trim() ? errObj.code.trim() : '';
   const rawMessage = error instanceof Error ? error.message : String(error || 'Unknown error');
-  const code =
-    rawCode ||
-    (rawMessage.toLowerCase().includes('cors') || rawMessage.toLowerCase().includes('preflight')
-      ? 'storage/cors-or-network'
-      : 'storage/unknown');
+  const lower = rawMessage.toLowerCase();
 
-  console.error('[WaveLink Firebase Storage Error]', {
+  let code = rawCode || 'cloudinary/upload-failed';
+  let friendlyMessage = rawMessage || 'Upload failed. Please tap Retry to try again.';
+
+  if (lower.includes('permission-denied') || lower.includes('insufficient permissions')) {
+    code = 'firestore/permission-denied';
+    friendlyMessage = 'Profile save blocked by Firestore permissions. Please sign in again and tap Retry.';
+  } else if (lower.includes('network') || lower.includes('failed to fetch')) {
+    code = 'cloudinary/network-error';
+    friendlyMessage = 'Network error while reaching Cloudinary. Check your internet connection and tap Retry.';
+  } else if (lower.includes('timeout')) {
+    code = 'cloudinary/timeout';
+    friendlyMessage = 'Upload timed out on a slow connection. Tap Retry to try again.';
+  } else if (lower.includes('preset') || lower.includes('unsigned')) {
+    code = 'cloudinary/preset-error';
+    friendlyMessage = `Cloudinary upload configuration error: ${rawMessage}`;
+  }
+
+  console.error('[WaveLink Cloudinary Upload Error]', {
     action: context?.action || 'upload',
-    path: context?.path,
-    bucket: resolvedStorageBucket || '(not set)',
     code,
     message: rawMessage,
-    customData: errObj?.customData,
     rawError: error
   });
-
-  if (code === 'storage/unauthorized' || rawMessage.toLowerCase().includes('permission')) {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage:
-        'Upload permission denied. Make sure you are signed in and Firebase Storage rules allow your account to write to your profile folder.'
-    };
-  }
-  if (code === 'storage/unauthenticated') {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage: 'Please sign in again before uploading an image.'
-    };
-  }
-  if (code === 'storage/canceled') {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage: 'Upload was cancelled. Tap Retry to try again.'
-    };
-  }
-  if (code === 'storage/retry-limit-exceeded') {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage:
-        'Upload timed out on a slow connection. Check your internet connection and tap Retry.'
-    };
-  }
-  if (code === 'storage/quota-exceeded') {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage: 'Firebase Storage quota reached. Check your Firebase project Storage plan.'
-    };
-  }
-  if (code === 'storage/invalid-argument' || code === 'storage/bucket-not-found' || !resolvedStorageBucket) {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage:
-        'Firebase Storage bucket is not configured or enabled yet. Check VITE_FIREBASE_STORAGE_BUCKET and Firebase Console Storage setup.'
-    };
-  }
-  if (
-    code === 'storage/cors-or-network' ||
-    rawMessage.toLowerCase().includes('network') ||
-    rawMessage.toLowerCase().includes('failed to fetch')
-  ) {
-    return {
-      code,
-      message: rawMessage,
-      friendlyMessage:
-        'Upload blocked by network or bucket CORS configuration. Check your connection and Firebase Storage CORS for this site.'
-    };
-  }
 
   return {
     code,
     message: rawMessage,
-    friendlyMessage: rawMessage || 'Image upload failed. Please tap Retry to try again.'
+    friendlyMessage
   };
 }
 
@@ -742,9 +667,16 @@ const AVATAR_URL_FIELD_NAMES = new Set([
   'authorPhotoURL',
   'photoURL',
   'senderPhotoURL',
+  'senderAvatar',
   'actorAvatar',
+  'actorPhotoURL',
   'viewerPhotoURL',
   'targetUserAvatar',
+  'callerPhotoURL',
+  'receiverPhotoURL',
+  'calleePhotoURL',
+  'fromPhotoURL',
+  'userAvatar',
 ]);
 
 /**
@@ -837,14 +769,32 @@ export function assertFirestoreDocumentSafe(obj: Record<string, any>, docLabel =
 export function cleanFirestoreData<T extends Record<string, any>>(obj: T): Partial<T> {
   const result: Record<string, any> = {};
   const fallbackSeed =
-    String(obj.authorId || obj.userId || obj.senderId || obj.uid || obj.id || 'waver');
+    String(
+      obj.authorId ||
+        obj.callerId ||
+        obj.caller ||
+        obj.actorId ||
+        obj.userId ||
+        obj.senderId ||
+        obj.uid ||
+        obj.id ||
+        'waver'
+    );
 
   for (const [key, value] of Object.entries(obj)) {
     if (value === undefined) continue;
 
     if (AVATAR_URL_FIELD_NAMES.has(key) && typeof value === 'string') {
       if (isForbiddenDataOrBlobUrl(value)) {
-        result[key] = sanitizeAvatarUrlForFirestore('', fallbackSeed);
+        const fieldSeed =
+          key === 'receiverPhotoURL' || key === 'calleePhotoURL'
+            ? String(obj.receiverId || obj.receiver || obj.calleeId || fallbackSeed)
+            : key === 'callerPhotoURL'
+            ? String(obj.callerId || obj.caller || fallbackSeed)
+            : key === 'actorPhotoURL' || key === 'actorAvatar'
+            ? String(obj.actorId || fallbackSeed)
+            : fallbackSeed;
+        result[key] = sanitizeAvatarUrlForFirestore('', fieldSeed);
         continue;
       }
     }

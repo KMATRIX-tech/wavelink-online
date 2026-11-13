@@ -2587,7 +2587,7 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
 
     const normalizedDomain = rawDomain
       .replace(/^https?:\/\//i, '')
-      .replace(/\/+$/, '')
+      .replace(/\/.*$/, '')
       .trim();
 
     const isPlaceholderDomain =
@@ -2660,7 +2660,12 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
       }
 
       const rawPayload = (await resp.json()) as unknown;
-      if (!Array.isArray(rawPayload)) {
+      const serverEntries = Array.isArray(rawPayload)
+        ? rawPayload
+        : Array.isArray((rawPayload as { iceServers?: unknown } | null)?.iceServers)
+        ? (rawPayload as { iceServers: unknown[] }).iceServers
+        : null;
+      if (!serverEntries) {
         console.error(
           '[ICE] Metered TURN credentials response was not an array; falling back to public STUN servers.'
         );
@@ -2678,7 +2683,7 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
         credential?: string;
       }> = [];
 
-      for (const entry of rawPayload) {
+      for (const entry of serverEntries) {
         if (!entry || typeof entry !== 'object') continue;
         const record = entry as {
           urls?: unknown;
