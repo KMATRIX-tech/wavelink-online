@@ -257,6 +257,86 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     };
   }, []);
 
+  // Global mobile (< 768px) visualViewport & text-input focus tracker across all screens (Feed, Comments, Studio, Chat, Reels)
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const isTextInputElement = (el: Element | null): el is HTMLElement => {
+      if (!el || !(el instanceof HTMLElement)) return false;
+      if (el.tagName === 'TEXTAREA' || el.getAttribute('contenteditable') === 'true') return true;
+      if (el.tagName === 'INPUT') {
+        const type = ((el as HTMLInputElement).type || 'text').toLowerCase();
+        return !['checkbox', 'radio', 'range', 'file', 'button', 'submit', 'color', 'hidden'].includes(type);
+      }
+      return false;
+    };
+
+    const syncViewportAndKeyboard = () => {
+      const vv = window.visualViewport;
+      const vvHeight = vv ? vv.height : window.innerHeight;
+      const vvOffsetTop = vv ? vv.offsetTop : 0;
+      const layoutHeight = document.documentElement.clientHeight || window.innerHeight;
+      const kbOffset = Math.max(0, Math.round(layoutHeight - vvHeight - vvOffsetTop));
+
+      document.documentElement.style.setProperty('--vv-height', `${Math.round(vvHeight)}px`);
+      document.documentElement.style.setProperty('--vv-offset-top', `${Math.round(vvOffsetTop)}px`);
+      document.documentElement.style.setProperty('--kb-offset', `${kbOffset}px`);
+
+      if (window.innerWidth < 768) {
+        const focusedInput = isTextInputElement(document.activeElement);
+        const isKbOpen = kbOffset > 75 || (focusedInput && kbOffset > 20);
+        document.documentElement.setAttribute('data-keyboard-open', isKbOpen ? 'true' : 'false');
+        if (focusedInput) {
+          document.documentElement.setAttribute('data-input-focused', 'true');
+        } else {
+          document.documentElement.removeAttribute('data-input-focused');
+        }
+      } else {
+        document.documentElement.removeAttribute('data-input-focused');
+      }
+    };
+
+    const handleGlobalFocusIn = (e: FocusEvent) => {
+      if (window.innerWidth >= 768) return;
+      const target = e.target as Element | null;
+      if (isTextInputElement(target)) {
+        document.documentElement.setAttribute('data-input-focused', 'true');
+        syncViewportAndKeyboard();
+        // Keep non-fixed bottom inputs (new post caption, inline comment reply, etc.) visible above keyboard
+        const insideSheetOrConvo = target.closest(
+          '.wavelink-comments-sheet, .wavelink-mobile-conversation-screen'
+        );
+        if (!insideSheetOrConvo) {
+          window.setTimeout(() => {
+            target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          }, 180);
+        }
+      }
+    };
+
+    const handleGlobalFocusOut = () => {
+      window.setTimeout(() => {
+        syncViewportAndKeyboard();
+      }, 90);
+    };
+
+    syncViewportAndKeyboard();
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', syncViewportAndKeyboard);
+    vv?.addEventListener('scroll', syncViewportAndKeyboard);
+    window.addEventListener('resize', syncViewportAndKeyboard);
+    document.addEventListener('focusin', handleGlobalFocusIn);
+    document.addEventListener('focusout', handleGlobalFocusOut);
+
+    return () => {
+      vv?.removeEventListener('resize', syncViewportAndKeyboard);
+      vv?.removeEventListener('scroll', syncViewportAndKeyboard);
+      window.removeEventListener('resize', syncViewportAndKeyboard);
+      document.removeEventListener('focusin', handleGlobalFocusIn);
+      document.removeEventListener('focusout', handleGlobalFocusOut);
+    };
+  }, []);
+
   // ThemeContext directly syncs appearanceTheme from Firestore without overwriting in-flight saves
 
   useEffect(() => {
@@ -1308,14 +1388,14 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         hasUnreadNotifications={unreadNotificationIds.length > 0}
       />
 
-      {/* Single Floating Assistant Button (hidden on Chat so it never overlaps Send/menu buttons on phones) */}
+      {/* Single Floating Assistant Button (hidden on Chat and when any bottom sheet or keyboard is open on phones) */}
       {!isWelinkOpen && !activeCall && activeTab !== 'chat' && (
         <button
           type="button"
           onClick={() => handleOpenWelink('chat')}
           aria-label="Open WELINK AI Assistant"
           title="WELINK AI Assistant"
-          className="fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 h-12 w-12 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-lg hover:shadow-xl hover:scale-105 transition-all active:scale-95 cursor-pointer group"
+          className="wavelink-floating-ai-btn fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 h-12 w-12 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-lg hover:shadow-xl hover:scale-105 transition-all duration-200 active:scale-95 cursor-pointer group"
         >
           <Sparkles size={20} className="transition-transform group-hover:rotate-12" />
         </button>

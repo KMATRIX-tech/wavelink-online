@@ -29,6 +29,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   const { t, language } = useLanguage();
   const [liveUnreadChat, setLiveUnreadChat] = useState<number>(unreadChatCount);
   const [isTypingInChat, setIsTypingInChat] = useState<boolean>(false);
+  const [isBottomSheetOpen, setIsBottomSheetOpen] = useState<boolean>(false);
   const [isHiddenOnScrollDown, setIsHiddenOnScrollDown] = useState<boolean>(false);
 
   useEffect(() => {
@@ -40,6 +41,36 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   }, [unreadChatCount]);
 
   useEffect(() => {
+    const isTextInputEl = (el: Element | null): boolean => {
+      if (!el || !(el instanceof HTMLElement)) return false;
+      if (el.tagName === 'TEXTAREA' || el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+        return true;
+      }
+      if (el.tagName === 'INPUT') {
+        const type = ((el as HTMLInputElement).type || 'text').toLowerCase();
+        return !['checkbox', 'radio', 'range', 'file', 'button', 'submit', 'color', 'hidden'].includes(type);
+      }
+      return false;
+    };
+
+    const syncFromDomState = () => {
+      if (typeof document === 'undefined') return;
+      const root = document.documentElement;
+      const sheetOpen =
+        root.getAttribute('data-bottom-sheet-open') === 'true' ||
+        Boolean(
+          document.querySelector(
+            '.wavelink-comments-overlay, .wavelink-share-overlay, .wavelink-chat-theme-overlay'
+          )
+        );
+      setIsBottomSheetOpen(sheetOpen);
+
+      const kbOpen = root.getAttribute('data-keyboard-open') === 'true';
+      const inputFocusedAttr = root.getAttribute('data-input-focused') === 'true';
+      const activeFocused = isTextInputEl(document.activeElement);
+      setIsTypingInChat(Boolean(kbOpen || inputFocusedAttr || activeFocused));
+    };
+
     const handleUnreadChatEvent = (e: Event) => {
       const custom = e as CustomEvent<{ count?: number }>;
       if (typeof custom.detail?.count === 'number') {
@@ -51,6 +82,17 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
       const custom = e as CustomEvent<{ focused?: boolean }>;
       if (typeof custom.detail?.focused === 'boolean') {
         setIsTypingInChat(custom.detail.focused);
+      } else {
+        syncFromDomState();
+      }
+    };
+
+    const handleBottomSheetEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ open?: boolean }>;
+      if (typeof custom.detail?.open === 'boolean') {
+        setIsBottomSheetOpen(custom.detail.open);
+      } else {
+        syncFromDomState();
       }
     };
 
@@ -64,61 +106,55 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     };
 
     const handleFocusIn = (e: FocusEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      const isInput =
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable;
-      if (
-        isInput &&
-        (target.closest('.wavelink-chat-input-bar') ||
-          target.closest('.wavelink-reel-comment-bar') ||
-          target.getAttribute('data-chat-input') === 'true')
-      ) {
+      const target = e.target as Element | null;
+      if (isTextInputEl(target)) {
         setIsTypingInChat(true);
       }
     };
 
-    const handleFocusOut = (e: FocusEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      if (
-        target.closest('.wavelink-chat-input-bar') ||
-        target.closest('.wavelink-reel-comment-bar') ||
-        target.getAttribute('data-chat-input') === 'true'
-      ) {
-        setTimeout(() => {
-          const active = document.activeElement as HTMLElement | null;
-          const stillInInput =
-            active &&
-            (active.closest('.wavelink-chat-input-bar') ||
-              active.closest('.wavelink-reel-comment-bar') ||
-              active.getAttribute('data-chat-input') === 'true');
-          if (!stillInInput) {
-            setIsTypingInChat(false);
-          }
-        }, 80);
-      }
+    const handleFocusOut = () => {
+      setTimeout(() => {
+        syncFromDomState();
+      }, 90);
     };
+
+    syncFromDomState();
+
+    const observer = new MutationObserver(() => {
+      syncFromDomState();
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: [
+        'data-bottom-sheet-open',
+        'data-keyboard-open',
+        'data-input-focused',
+        'data-mobile-chat-convo'
+      ]
+    });
 
     window.addEventListener('wavelink:unread-chat-count', handleUnreadChatEvent);
     window.addEventListener('wavelink:chat-input-focus', handleChatInputFocusEvent);
+    window.addEventListener('wavelink:bottom-sheet-state', handleBottomSheetEvent);
     window.addEventListener('wavelink:feed-scroll-direction', handleFeedScrollDirection);
     document.addEventListener('focusin', handleFocusIn);
     document.addEventListener('focusout', handleFocusOut);
+    window.visualViewport?.addEventListener('resize', syncFromDomState);
 
     return () => {
+      observer.disconnect();
       window.removeEventListener('wavelink:unread-chat-count', handleUnreadChatEvent);
       window.removeEventListener('wavelink:chat-input-focus', handleChatInputFocusEvent);
+      window.removeEventListener('wavelink:bottom-sheet-state', handleBottomSheetEvent);
       window.removeEventListener('wavelink:feed-scroll-direction', handleFeedScrollDirection);
       document.removeEventListener('focusin', handleFocusIn);
       document.removeEventListener('focusout', handleFocusOut);
+      window.visualViewport?.removeEventListener('resize', syncFromDomState);
     };
   }, []);
 
   const effectiveUnreadChat = Math.max(liveUnreadChat, unreadChatCount);
-  const shouldHideNav = isTypingInChat || isHiddenOnScrollDown;
+  const shouldHideNav = isTypingInChat || isBottomSheetOpen || isHiddenOnScrollDown;
 
   const navItems: {
     id: ActiveTab;
@@ -216,16 +252,21 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   return (
     <nav
       aria-label="Mobile Navigation"
+      aria-hidden={shouldHideNav ? 'true' : undefined}
       className={`wavelink-mobile-bottom-nav md:hidden fixed left-3 right-3 bottom-3 z-40 pointer-events-none transition-all duration-300 ease-out ${
         shouldHideNav
-          ? 'translate-y-24 opacity-0'
+          ? 'translate-y-28 opacity-0 pointer-events-none'
           : 'translate-y-0 opacity-100'
       }`}
       style={{
         paddingBottom: 'env(safe-area-inset-bottom, 0px)'
       }}
     >
-      <div className="wavelink-glass-pill-nav wavelink-float-gentle pointer-events-auto mx-auto max-w-[23rem] rounded-full px-3 py-1.5 flex items-center justify-between gap-1">
+      <div
+        className={`wavelink-glass-pill-nav wavelink-float-gentle mx-auto max-w-[23rem] rounded-full px-3 py-1.5 flex items-center justify-between gap-1 ${
+          shouldHideNav ? 'pointer-events-none' : 'pointer-events-auto'
+        }`}
+      >
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
           const isCreate = Boolean(item.isCenterCreate);

@@ -6,8 +6,7 @@ import {
   setDoc,
   deleteDoc,
   collection,
-  getDocs,
-  updateDoc
+  getDocs
 } from 'firebase/firestore';
 import { db, cleanFirestoreData, getAuthHeaders } from '../firebase';
 import { UserNotificationSettings, FcmDeviceTokenDoc, FcmTokenEntry } from '../types';
@@ -15,7 +14,6 @@ import { UserNotificationSettings, FcmDeviceTokenDoc, FcmTokenEntry } from '../t
 const LOCAL_TOKEN_KEY = 'wavelink_fcm_token';
 const LOCAL_TOKEN_ID_KEY = 'wavelink_fcm_token_id';
 const LOCAL_DEVICE_ID_KEY = 'wavelink_device_id';
-const MAX_DEVICES_PER_USER = 5;
 
 export const DEFAULT_NOTIFICATION_SETTINGS: UserNotificationSettings = {
   masterEnabled: true,
@@ -131,14 +129,15 @@ export async function getMessagingServiceWorkerRegistration(): Promise<ServiceWo
 }
 
 /**
- * Checks whether this browser device has a saved real FCM token in `userProfile.fcmTokens`.
+ * Checks whether this browser device has a saved real FCM token in `localStorage` or fallback profile data.
  */
 export function getDeviceSavedTokenFromUserDoc(
   userProfile?: { fcmTokens?: FcmTokenEntry[] } | null
 ): string | null {
+  const localToken = getSavedDeviceToken();
+  if (localToken) return localToken;
   if (!userProfile || !Array.isArray(userProfile.fcmTokens)) return null;
   const deviceId = getOrCreateDeviceId();
-  const localToken = getSavedDeviceToken();
 
   const match = userProfile.fcmTokens.find(
     (item) =>
@@ -146,25 +145,59 @@ export function getDeviceSavedTokenFromUserDoc(
       typeof item.token === 'string' &&
       item.token.trim().length > 0 &&
       !item.token.startsWith('fcm_web_') &&
-      (item.deviceId === deviceId || (Boolean(localToken) && item.token === localToken))
+      (item.deviceId === deviceId || item.deviceName === getDeviceDisplayName())
   );
   return match?.token || null;
 }
 
 /**
- * Fetches `users/{userId}.fcmTokens` directly from Firestore to verify whether this device has a saved token.
+ * Fetches `users/{userId}/fcmTokens` directly from Firestore to verify whether this device has a saved token.
  */
 export async function fetchDeviceTokenFromUserDoc(userId: string): Promise<{
   tokenInDoc: string | null;
   allTokens: FcmTokenEntry[];
 }> {
-  const userSnap = await getDoc(doc(db, 'users', userId));
-  const rawTokens =
-    userSnap.exists() && Array.isArray(userSnap.data()?.fcmTokens)
-      ? (userSnap.data()!.fcmTokens as FcmTokenEntry[])
-      : [];
-  const tokenInDoc = getDeviceSavedTokenFromUserDoc({ fcmTokens: rawTokens });
-  return { tokenInDoc, allTokens: rawTokens };
+  const snap = await getDocs(collection(db, 'users', userId, 'fcmTokens'));
+  const allTokens: FcmTokenEntry[] = [];
+  const localToken = getSavedDeviceToken();
+  const currentDeviceName = getDeviceDisplayName();
+  let tokenInDoc: string | null = null;
+
+  snap.forEach((docSnap) => {
+    const data = docSnap.data() || {};
+    const tok =
+      typeof data.token === 'string' && data.token.trim().length > 0
+        ? data.token.trim()
+        : docSnap.id;
+    if (!tok || tok.startsWith('fcm_web_')) return;
+
+    const entry: FcmTokenEntry = {
+      token: tok,
+      deviceId: typeof data.deviceId === 'string' ? data.deviceId : docSnap.id,
+      deviceName: typeof data.deviceName === 'string' ? data.deviceName : currentDeviceName,
+      platform: typeof data.platform === 'string' ? data.platform : 'web',
+      createdAt: typeof data.createdAt === 'string' ? data.createdAt : '',
+      lastUsedAt: typeof data.lastUsedAt === 'string' ? data.lastUsedAt : ''
+    };
+    allTokens.push(entry);
+
+    if (localToken && (tok === localToken || docSnap.id === localToken)) {
+      tokenInDoc = tok;
+    }
+  });
+
+  if (!tokenInDoc && getBrowserNotificationPermission() === 'granted') {
+    const byDevice = allTokens.find((item) => item.deviceName === currentDeviceName);
+    if (byDevice) {
+      tokenInDoc = byDevice.token;
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(LOCAL_TOKEN_KEY, byDevice.token);
+        localStorage.setItem(LOCAL_TOKEN_ID_KEY, byDevice.token);
+      }
+    }
+  }
+
+  return { tokenInDoc, allTokens };
 }
 
 export type NotificationStatusKind = 'on' | 'blocked' | 'not_set_up';
@@ -231,7 +264,28 @@ export async function syncNotificationSettingsToServer(
 }
 
 /**
- * Saves the user's NotificationSettings in Firestore (`users/{userId}`) and syncs to server.
+ * Loads the user's NotificationSettings from `users/{userId}/settings/notifications`.
+ */
+export async function fetchUserNotificationSettings(
+  userId: string,
+  fallbackSettings?: Partial<UserNotificationSettings>
+): Promise<UserNotificationSettings> {
+  if (!userId) {
+    return { ...DEFAULT_NOTIFICATION_SETTINGS, ...(fallbackSettings || {}) };
+  }
+  const snap = await getDoc(doc(db, 'users', userId, 'settings', 'notifications'));
+  if (snap.exists()) {
+    return {
+      ...DEFAULT_NOTIFICATION_SETTINGS,
+      ...(fallbackSettings || {}),
+      ...(snap.data() as Partial<UserNotificationSettings>)
+    };
+  }
+  return { ...DEFAULT_NOTIFICATION_SETTINGS, ...(fallbackSettings || {}) };
+}
+
+/**
+ * Saves the user's NotificationSettings in Firestore (`users/{userId}/settings/notifications`) and syncs to server.
  */
 export async function saveUserNotificationSettings(
   userId: string,
@@ -245,17 +299,19 @@ export async function saveUserNotificationSettings(
     updatedAt: new Date().toISOString()
   };
 
-  await updateDoc(doc(db, 'users', userId), {
-    notificationSettings: cleanFirestoreData(normalized),
-    updatedAt: normalized.updatedAt
-  });
+  await setDoc(
+    doc(db, 'users', userId, 'settings', 'notifications'),
+    cleanFirestoreData(normalized),
+    { merge: true }
+  );
 
   await syncNotificationSettingsToServer(userId, normalized);
 }
 
 /**
- * Upserts a real device FCM token into `users/{userId}.fcmTokens` (max 5 devices)
- * and keeps `users/{userId}/fcmTokens/{tokenId}` synced.
+ * Saves a real device FCM token in `users/{userId}/fcmTokens/{token}` with fields:
+ * token, deviceName, platform, createdAt, lastUsedAt.
+ * Does NOT write fcmTokens to the main user document.
  */
 async function persistTokenEntryForUser(
   userId: string,
@@ -265,81 +321,37 @@ async function persistTokenEntryForUser(
   const deviceName = getDeviceDisplayName();
   const platform = (navigator.platform || 'web').slice(0, 60);
   const nowIso = new Date().toISOString();
-  const tokenId = hashTokenToId(fcmToken);
+  const tokenId = fcmToken;
+  const tokenRef = doc(db, 'users', userId, 'fcmTokens', tokenId);
 
-  const userRef = doc(db, 'users', userId);
-  let existingTokens: FcmTokenEntry[] = [];
-  let userDocExists = false;
-  const userSnap = await getDoc(userRef);
-  if (userSnap.exists()) {
-    userDocExists = true;
-    if (Array.isArray(userSnap.data()?.fcmTokens)) {
-      existingTokens = userSnap.data()!.fcmTokens as FcmTokenEntry[];
+  let createdAt = nowIso;
+  try {
+    const existingSnap = await getDoc(tokenRef);
+    if (existingSnap.exists() && typeof existingSnap.data()?.createdAt === 'string') {
+      createdAt = existingSnap.data()!.createdAt;
     }
+  } catch {
+    // ignore read error; use nowIso
   }
 
-  const prevForDevice = existingTokens.find(
-    (item) => item && (item.deviceId === deviceId || item.token === fcmToken)
-  );
+  const tokenPayload = {
+    token: fcmToken,
+    deviceName,
+    platform,
+    createdAt,
+    lastUsedAt: nowIso
+  };
+
+  await setDoc(tokenRef, cleanFirestoreData(tokenPayload), { merge: true });
 
   const entry: FcmTokenEntry = {
     token: fcmToken,
     deviceId,
     deviceName,
     platform,
-    createdAt: prevForDevice?.createdAt || nowIso,
+    createdAt,
     lastUsedAt: nowIso
   };
-
-  const filtered = existingTokens.filter(
-    (item) =>
-      item &&
-      typeof item.token === 'string' &&
-      !item.token.startsWith('fcm_web_') &&
-      item.deviceId !== deviceId &&
-      item.token !== fcmToken
-  );
-
-  const nextArray = [entry, ...filtered].slice(0, MAX_DEVICES_PER_USER);
-
-  if (userDocExists) {
-    await updateDoc(userRef, {
-      fcmTokens: cleanFirestoreData(nextArray),
-      updatedAt: nowIso
-    });
-  } else {
-    await setDoc(
-      userRef,
-      {
-        uid: userId,
-        fcmTokens: cleanFirestoreData(nextArray),
-        updatedAt: nowIso
-      },
-      { merge: true }
-    );
-  }
-
-  // Also persist in subcollection for backwards compatibility & server test lookups
-  const tokenDoc: FcmDeviceTokenDoc = {
-    id: tokenId,
-    token: fcmToken,
-    userId,
-    deviceId,
-    deviceName,
-    platform,
-    userAgent: navigator.userAgent.slice(0, 240),
-    isIOS: isIOSDevice(),
-    isStandalone: isStandalonePWA(),
-    createdAt: entry.createdAt,
-    updatedAt: nowIso
-  };
-  await setDoc(
-    doc(db, 'users', userId, 'fcmTokens', tokenId),
-    cleanFirestoreData(tokenDoc),
-    { merge: true }
-  ).catch((subErr) => {
-    console.warn('[WaveLink Push] Subcollection token mirror skipped:', subErr);
-  });
 
   return { tokenId, entry };
 }
@@ -476,7 +488,7 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
     };
   }
 
-  // Step 4: Save FCM token to user document's fcmTokens array
+  // Step 4: Save FCM token to users/{uid}/fcmTokens/{token}
   let tokenId = '';
   let entry: FcmTokenEntry;
   try {
@@ -489,7 +501,7 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
       success: false,
       permission: 'granted',
       failedStep: 'save',
-      error: `Failed to save FCM token to your user document: ${saveErr?.message || String(saveErr)}`
+      error: `Failed to save FCM token to users/${userId}/fcmTokens: ${saveErr?.message || String(saveErr)}`
     };
   }
 
@@ -523,13 +535,12 @@ export async function requestPushPermissionAndSaveToken(userId: string): Promise
 }
 
 /**
- * Deletes the current device's FCM token from `users/{userId}.fcmTokens`, subcollection, server, and FCM SDK.
+ * Deletes the current device's FCM token from `users/{userId}/fcmTokens/{token}`, server, and FCM SDK.
  * Called on logout or when permission is revoked / user disables push on this device.
  */
 export async function removeCurrentDeviceFcmToken(userId?: string): Promise<void> {
   if (typeof window === 'undefined') return;
 
-  const deviceId = localStorage.getItem(LOCAL_DEVICE_ID_KEY);
   const savedToken = localStorage.getItem(LOCAL_TOKEN_KEY);
   const savedTokenId =
     localStorage.getItem(LOCAL_TOKEN_ID_KEY) || (savedToken ? hashTokenToId(savedToken) : null);
@@ -538,29 +549,15 @@ export async function removeCurrentDeviceFcmToken(userId?: string): Promise<void
   localStorage.removeItem(LOCAL_TOKEN_ID_KEY);
 
   if (userId) {
-    // 1. Remove from users/{userId}.fcmTokens array
-    try {
-      const userRef = doc(db, 'users', userId);
-      const snap = await getDoc(userRef);
-      if (snap.exists() && Array.isArray(snap.data()?.fcmTokens)) {
-        const currentArr = snap.data()!.fcmTokens as FcmTokenEntry[];
-        const nextArr = currentArr.filter(
-          (item) =>
-            item &&
-            item.deviceId !== deviceId &&
-            (!savedToken || item.token !== savedToken) &&
-            !String(item.token || '').startsWith('fcm_web_')
-        );
-        if (nextArr.length !== currentArr.length) {
-          await updateDoc(userRef, { fcmTokens: cleanFirestoreData(nextArr) });
-        }
+    // 1. Delete from users/{userId}/fcmTokens/{token}
+    if (savedToken) {
+      try {
+        await deleteDoc(doc(db, 'users', userId, 'fcmTokens', savedToken));
+      } catch {
+        // ignore
       }
-    } catch (err) {
-      console.warn('Could not clean FCM token from user array:', err);
     }
-
-    // 2. Delete from subcollection
-    if (savedTokenId) {
+    if (savedTokenId && savedTokenId !== savedToken) {
       try {
         await deleteDoc(doc(db, 'users', userId, 'fcmTokens', savedTokenId));
       } catch {
@@ -568,7 +565,7 @@ export async function removeCurrentDeviceFcmToken(userId?: string): Promise<void
       }
     }
 
-    // 3. Unregister from Express server cache
+    // 2. Unregister from Express server cache
     if (savedToken || savedTokenId) {
       try {
         const headers = await getAuthHeaders();
@@ -577,7 +574,7 @@ export async function removeCurrentDeviceFcmToken(userId?: string): Promise<void
           headers,
           body: JSON.stringify({
             userId,
-            tokenId: savedTokenId,
+            tokenId: savedToken || savedTokenId,
             token: savedToken
           })
         });
@@ -587,7 +584,7 @@ export async function removeCurrentDeviceFcmToken(userId?: string): Promise<void
     }
   }
 
-  // 4. Delete token from Firebase Messaging SDK
+  // 3. Delete token from Firebase Messaging SDK
   try {
     const supported = await isSupported().catch(() => false);
     if (supported) {
@@ -609,7 +606,10 @@ export async function syncExistingDeviceTokenState(
 ): Promise<void> {
   if (typeof window === 'undefined' || !userId) return;
 
-  await syncNotificationSettingsToServer(userId, settings || DEFAULT_NOTIFICATION_SETTINGS);
+  const effectiveSettings = await fetchUserNotificationSettings(userId, settings).catch(
+    () => settings || DEFAULT_NOTIFICATION_SETTINGS
+  );
+  await syncNotificationSettingsToServer(userId, effectiveSettings);
 
   if (!('Notification' in window)) return;
 

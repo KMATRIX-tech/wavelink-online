@@ -419,12 +419,58 @@
         "savedAt": { "type": "string" }
       },
       "required": ["id", "postId", "userId", "savedAt"]
+    },
+    "FcmTokenDocument": {
+      "title": "FcmTokenDocument",
+      "description": "Device FCM push notification token stored in users/{uid}/fcmTokens/{token}",
+      "type": "object",
+      "properties": {
+        "token": { "type": "string", "maxLength": 1024 },
+        "deviceName": { "type": "string", "maxLength": 120 },
+        "platform": { "type": "string", "maxLength": 80 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "lastUsedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["token", "deviceName", "platform", "createdAt", "lastUsedAt"]
+    },
+    "UserNotificationSettings": {
+      "title": "UserNotificationSettings",
+      "description": "User notification toggle preferences stored in users/{uid}/settings/notifications",
+      "type": "object",
+      "properties": {
+        "masterEnabled": { "type": "boolean" },
+        "messages": { "type": "boolean" },
+        "calls": { "type": "boolean" },
+        "followers": { "type": "boolean" },
+        "likesAndComments": { "type": "boolean" },
+        "reactions": { "type": "boolean" },
+        "replies": { "type": "boolean" },
+        "followedPosts": { "type": "boolean" },
+        "challenges": { "type": "boolean" },
+        "announcements": { "type": "boolean" },
+        "payments": { "type": "boolean" },
+        "soundAndVibration": { "type": "boolean" },
+        "showMessagePreviews": { "type": "boolean" },
+        "quietHoursEnabled": { "type": "boolean" },
+        "quietHoursStart": { "type": "string" },
+        "quietHoursEnd": { "type": "string" },
+        "timezoneOffsetMinutes": { "type": "number" },
+        "updatedAt": { "type": "string" }
+      }
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserProfile" },
       "description": "User profiles and account standing records"
+    },
+    "/users/{userId}/fcmTokens/{tokenId}": {
+      "schema": { "$ref": "#/entities/FcmTokenDocument" },
+      "description": "Device FCM tokens for push notifications"
+    },
+    "/users/{userId}/settings/{docId}": {
+      "schema": { "$ref": "#/entities/UserNotificationSettings" },
+      "description": "User settings documents including notification toggles"
     },
     "/posts/{postId}": {
       "schema": { "$ref": "#/entities/Post" },

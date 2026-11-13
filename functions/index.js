@@ -136,23 +136,34 @@ async function consumeHourlyPushQuota(db, recipientId) {
   });
 }
 
-async function collectUserTokens(db, recipientId, userData) {
-  const tokenMap = new Map(); // token -> { source: 'array' | 'sub', docId?: string }
-
-  if (userData && Array.isArray(userData.fcmTokens)) {
-    for (const entry of userData.fcmTokens) {
-      const tok = entry && typeof entry.token === 'string' ? entry.token.trim() : '';
-      if (tok && !tok.startsWith('fcm_web_') && tok.length <= 1024) {
-        tokenMap.set(tok, { source: 'array' });
-      }
+async function getUserNotificationSettings(db, recipientId, userData) {
+  let subData = {};
+  try {
+    const snap = await db.doc(`users/${recipientId}/settings/notifications`).get();
+    if (snap.exists) {
+      subData = snap.data() || {};
     }
+  } catch {
+    // ignore subcollection read errors
   }
+  return {
+    ...DEFAULT_SETTINGS,
+    ...(userData && userData.notificationSettings ? userData.notificationSettings : {}),
+    ...subData
+  };
+}
+
+async function collectUserTokens(db, recipientId) {
+  const tokenMap = new Map(); // token -> { source: 'sub', docId: string }
 
   try {
     const subSnap = await db.collection(`users/${recipientId}/fcmTokens`).get();
     subSnap.forEach((docSnap) => {
       const d = docSnap.data();
-      const tok = d && typeof d.token === 'string' ? d.token.trim() : '';
+      const tok =
+        d && typeof d.token === 'string' && d.token.trim()
+          ? d.token.trim()
+          : docSnap.id;
       if (tok && !tok.startsWith('fcm_web_') && tok.length <= 1024) {
         tokenMap.set(tok, { source: 'sub', docId: docSnap.id });
       }
@@ -164,29 +175,16 @@ async function collectUserTokens(db, recipientId, userData) {
   return tokenMap;
 }
 
-async function cleanupInvalidTokens(db, recipientId, userData, tokenMap, invalidTokens) {
+async function cleanupInvalidTokens(db, recipientId, _userData, tokenMap, invalidTokens) {
   if (!invalidTokens.length) return;
-  const invalidSet = new Set(invalidTokens);
 
-  // 1. Clean users/{uid}.fcmTokens array
-  if (userData && Array.isArray(userData.fcmTokens)) {
-    const remaining = userData.fcmTokens.filter(
-      (item) => item && typeof item.token === 'string' && !invalidSet.has(item.token.trim())
-    );
-    if (remaining.length !== userData.fcmTokens.length) {
-      await db
-        .doc(`users/${recipientId}`)
-        .update({ fcmTokens: remaining })
-        .catch(() => {});
-    }
-  }
-
-  // 2. Clean users/{uid}/fcmTokens subcollection docs
+  // Clean users/{uid}/fcmTokens subcollection docs
   const deletes = [];
   for (const badTok of invalidTokens) {
     const meta = tokenMap.get(badTok);
-    if (meta && meta.docId) {
-      deletes.push(db.doc(`users/${recipientId}/fcmTokens/${meta.docId}`).delete().catch(() => {}));
+    const docId = meta && meta.docId ? meta.docId : badTok;
+    if (docId) {
+      deletes.push(db.doc(`users/${recipientId}/fcmTokens/${docId}`).delete().catch(() => {}));
     }
   }
   if (deletes.length) {
@@ -216,7 +214,7 @@ async function sendPushToUser(db, params) {
     return { sent: false, reason: 'user_inactive' };
   }
 
-  const settings = { ...DEFAULT_SETTINGS, ...(userData.notificationSettings || {}) };
+  const settings = await getUserNotificationSettings(db, recipientId, userData);
 
   if (!bypassRateAndSettings) {
     if (!isCategoryEnabled(category, settings)) {
@@ -231,7 +229,7 @@ async function sendPushToUser(db, params) {
     }
   }
 
-  const tokenMap = await collectUserTokens(db, recipientId, userData);
+  const tokenMap = await collectUserTokens(db, recipientId);
   const tokens = Array.from(tokenMap.keys());
   if (!tokens.length) {
     return { sent: false, reason: 'no_tokens' };
@@ -384,7 +382,7 @@ async function handleChatMessageCreated(channelId, messageData, isGroup) {
         return;
       }
 
-      const settings = { ...DEFAULT_SETTINGS, ...(rData.notificationSettings || {}) };
+      const settings = await getUserNotificationSettings(db, recipientId, rData);
       const showPreview = settings.showMessagePreviews !== false;
 
       let bodyText = 'Sent you a new message';
@@ -829,7 +827,7 @@ exports.onPostCreatedNotifyFollowers = onDocumentCreated(
         }
 
         const fData = fDoc.data() || {};
-        const settings = { ...DEFAULT_SETTINGS, ...(fData.notificationSettings || {}) };
+        const settings = await getUserNotificationSettings(db, followerId, fData);
         if (settings.masterEnabled === false || settings.followedPosts === false) {
           return;
         }

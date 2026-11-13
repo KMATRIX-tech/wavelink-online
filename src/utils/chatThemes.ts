@@ -669,6 +669,12 @@ export function computeChatThemeVars(
       : '#0F172A'
     : resolvedMeta.textSecondary;
 
+  const btnBg = hasCustomPhoto
+    ? 'rgba(15, 23, 42, 0.08)'
+    : resolvedMeta.isDark
+    ? 'rgba(255, 255, 255, 0.12)'
+    : resolvedMeta.bgSubtle;
+
   const styleVars = {
     '--chat-bg-color': resolvedMeta.bgCanvas,
     '--chat-bg-image': bgImage,
@@ -679,6 +685,8 @@ export function computeChatThemeVars(
     '--chat-header-text': headerText,
     '--chat-header-subtext': headerSubtext,
     '--chat-header-border': hasCustomPhoto ? 'rgba(255,255,255,0.35)' : resolvedMeta.borderHairline,
+    '--chat-btn-bg': btnBg,
+    '--chat-menu-bg': hasCustomPhoto ? 'rgba(255, 255, 255, 0.96)' : resolvedMeta.bgSurface,
     '--chat-sent-bg': `linear-gradient(135deg, ${primaryAccent} 0%, ${secondaryAccent} 100%)`,
     '--chat-sent-text': sentTextColor,
     '--chat-received-bg': receivedBg,

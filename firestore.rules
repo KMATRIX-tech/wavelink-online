@@ -348,16 +348,14 @@ service cloud.firestore {
       allow update: if isValidId(userId) && (isAdmin() || isServerVerifiedOwnerRoleGrant(userId) || isSafeUserProfileUpdate(userId));
       allow delete: if isValidId(userId) && (isOwner(userId) || isSuperAdmin());
 
-      // Device FCM Push Notification Tokens — strictly private to the user & admin
+      // Device FCM Push Notification Tokens — strictly private to the user
       match /fcmTokens/{tokenId} {
-        allow read: if isOwner(userId) || isAdmin();
-        allow create, update: if (isOwner(userId) || isAdmin()) &&
-          request.resource.data.keys().hasAll(['token', 'userId']) &&
-          request.resource.data.userId == userId &&
-          request.resource.data.token is string &&
-          request.resource.data.token.size() > 0 &&
-          request.resource.data.token.size() <= 1024;
-        allow delete: if isOwner(userId) || isAdmin();
+        allow read, create, update, delete: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // User Settings (including notification toggles at users/{uid}/settings/notifications)
+      match /settings/{docId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
       }
 
       // Private Saved Posts subcollection — strictly private to the user & admin
@@ -379,6 +377,13 @@ service cloud.firestore {
       match /privatePushMeta/{docId} {
         allow read, write: if false;
       }
+    }
+
+    match /users/{userId}/fcmTokens/{tokenId} {
+      allow read, create, update, delete: if request.auth != null && request.auth.uid == userId;
+    }
+    match /users/{userId}/settings/{docId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
     // Phase 5: Top-level Private Creator Stats collection — strictly only the owner of the account can see their own stats

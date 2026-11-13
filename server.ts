@@ -5385,23 +5385,15 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         }
       }
 
-      let userData: Record<string, any> | null = null;
       if (adminDb) {
         try {
-          const userSnap = await adminDb.doc(`users/${userId}`).get();
-          userData = userSnap.exists ? (userSnap.data() as Record<string, any>) : null;
-          if (userData && Array.isArray(userData.fcmTokens)) {
-            for (const item of userData.fcmTokens) {
-              const tok = item && typeof item.token === 'string' ? item.token.trim() : '';
-              if (tok && !tok.startsWith('fcm_web_')) {
-                if (!tokenEntries.has(tok)) tokenEntries.set(tok, '');
-              }
-            }
-          }
           const tokSnap = await adminDb.collection(`users/${userId}/fcmTokens`).get();
           tokSnap.forEach((d) => {
             const dData = d.data();
-            const tok = dData && typeof dData.token === 'string' ? dData.token.trim() : '';
+            const tok =
+              dData && typeof dData.token === 'string' && dData.token.trim()
+                ? dData.token.trim()
+                : d.id;
             if (tok && !tok.startsWith('fcm_web_')) {
               tokenEntries.set(tok, d.id);
             }
@@ -5454,21 +5446,14 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       });
 
       if (invalidTokens.length > 0) {
-        const invalidSet = new Set(invalidTokens);
         for (const badTok of invalidTokens) {
-          const docId = tokenEntries.get(badTok);
+          const docId = tokenEntries.get(badTok) || badTok;
           if (docId) {
             userFcmTokensStore.get(userId)?.delete(docId);
             if (adminDb) {
               adminDb.doc(`users/${userId}/fcmTokens/${docId}`).delete().catch(() => {});
             }
           }
-        }
-        if (adminDb && userData && Array.isArray(userData.fcmTokens)) {
-          const remaining = userData.fcmTokens.filter(
-            (item: any) => item && typeof item.token === 'string' && !invalidSet.has(item.token.trim())
-          );
-          await adminDb.doc(`users/${userId}`).update({ fcmTokens: remaining }).catch(() => {});
         }
       }
 
@@ -5540,12 +5525,17 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
       if (adminDb) {
         try {
-          const userSnap = await adminDb.doc(`users/${recipientId}`).get();
+          const [userSnap, settingsSnap] = await Promise.all([
+            adminDb.doc(`users/${recipientId}`).get(),
+            adminDb.doc(`users/${recipientId}/settings/notifications`).get(),
+          ]);
           const userData = userSnap.data();
-          if (userData?.notificationSettings) {
+          const subSettings = settingsSnap.exists ? settingsSnap.data() : null;
+          if (userData?.notificationSettings || subSettings) {
             settings = {
               ...DEFAULT_SERVER_NOTIFICATION_SETTINGS,
-              ...userData.notificationSettings,
+              ...(userData?.notificationSettings || {}),
+              ...(subSettings || {}),
             };
             userNotificationSettingsStore.set(recipientId, settings);
           }

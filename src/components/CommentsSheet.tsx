@@ -127,12 +127,41 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
     setOptimisticComments([]);
   }, [isOpen, post?.id]);
 
-  // Body scroll lock & Escape / Focus trap while sheet is open
+  // Body scroll lock, bottom-nav hide signal, visualViewport keyboard tracking & Escape / Focus trap while sheet is open
   useEffect(() => {
     if (!isOpen || !post) return;
 
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
+    document.documentElement.setAttribute('data-bottom-sheet-open', 'true');
+    window.dispatchEvent(
+      new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: true } })
+    );
+
+    const updateSheetViewport = () => {
+      if (typeof window === 'undefined') return;
+      const vv = window.visualViewport;
+      const vvHeight = vv ? vv.height : window.innerHeight;
+      const vvOffsetTop = vv ? vv.offsetTop : 0;
+      const layoutHeight = document.documentElement.clientHeight || window.innerHeight;
+      const kbOffset = Math.max(0, Math.round(layoutHeight - vvHeight - vvOffsetTop));
+
+      document.documentElement.style.setProperty('--vv-height', `${Math.round(vvHeight)}px`);
+      document.documentElement.style.setProperty('--vv-offset-top', `${Math.round(vvOffsetTop)}px`);
+      document.documentElement.style.setProperty('--kb-offset', `${kbOffset}px`);
+      document.documentElement.style.setProperty('--comments-kb-offset', `${kbOffset}px`);
+
+      if (window.innerWidth < 768) {
+        const isKbOpen = kbOffset > 65 || (document.activeElement === inputRef.current && kbOffset > 20);
+        document.documentElement.setAttribute('data-keyboard-open', isKbOpen ? 'true' : 'false');
+      }
+    };
+
+    updateSheetViewport();
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', updateSheetViewport);
+    vv?.addEventListener('scroll', updateSheetViewport);
+    window.addEventListener('resize', updateSheetViewport);
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -165,6 +194,14 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
     window.addEventListener('keydown', handleKeyDown);
     return () => {
       document.body.style.overflow = prevOverflow;
+      document.documentElement.removeAttribute('data-bottom-sheet-open');
+      document.documentElement.style.removeProperty('--comments-kb-offset');
+      window.dispatchEvent(
+        new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: false } })
+      );
+      vv?.removeEventListener('resize', updateSheetViewport);
+      vv?.removeEventListener('scroll', updateSheetViewport);
+      window.removeEventListener('resize', updateSheetViewport);
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [isOpen, post, reportingComment, onClose]);
@@ -969,7 +1006,7 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
                   type="button"
                   onClick={() => setShowEmojiStrip((prev) => !prev)}
                   aria-label="Toggle emojis"
-                  className={`w-10 h-10 rounded-full flex items-center justify-center transition shrink-0 cursor-pointer border ${
+                  className={`w-11 h-11 min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center transition shrink-0 cursor-pointer border ${
                     showEmojiStrip
                       ? 'bg-[var(--accent-primary)]/15 text-[var(--accent-primary)] border-[var(--accent-primary)]/40'
                       : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-hairline)] hover:text-[var(--text-primary)]'
@@ -978,12 +1015,37 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
                   <Smile size={18} />
                 </button>
 
-                <div className="flex-1 min-w-0">
+                <div
+                  onClick={() => inputRef.current?.focus()}
+                  className="flex-1 min-w-0 cursor-text"
+                >
                   <textarea
                     ref={inputRef}
                     rows={1}
                     value={commentText}
                     onChange={(e) => setCommentText(e.target.value)}
+                    onFocus={() => {
+                      document.documentElement.setAttribute('data-input-focused', 'true');
+                      window.dispatchEvent(
+                        new CustomEvent('wavelink:chat-input-focus', {
+                          detail: { focused: true }
+                        })
+                      );
+                      window.setTimeout(() => {
+                        window.visualViewport?.dispatchEvent(new Event('resize'));
+                      }, 80);
+                    }}
+                    onBlur={() => {
+                      document.documentElement.removeAttribute('data-input-focused');
+                      window.dispatchEvent(
+                        new CustomEvent('wavelink:chat-input-focus', {
+                          detail: { focused: false }
+                        })
+                      );
+                      window.setTimeout(() => {
+                        window.visualViewport?.dispatchEvent(new Event('resize'));
+                      }, 80);
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
@@ -999,7 +1061,7 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
                         ? 'Andika maoni...'
                         : 'Add a comment...'
                     }
-                    className="w-full min-h-[40px] max-h-24 py-2.5 px-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs sm:text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent-primary)] resize-none leading-snug"
+                    className="wavelink-comments-textarea w-full min-h-[44px] max-h-24 py-2.5 px-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent-primary)] resize-none leading-snug block"
                   />
                 </div>
 
@@ -1016,13 +1078,13 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
                         }
                       : undefined
                   }
-                  className={`w-10 h-10 rounded-full flex items-center justify-center transition shrink-0 cursor-pointer ${
+                  className={`w-11 h-11 min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center transition shrink-0 cursor-pointer ${
                     commentText.trim()
                       ? 'text-white shadow-md active:scale-95'
                       : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] opacity-50 cursor-not-allowed border border-[var(--border-hairline)]'
                   }`}
                 >
-                  <Send size={16} />
+                  <Send size={17} />
                 </button>
               </div>
             </div>

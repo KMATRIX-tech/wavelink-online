@@ -243,8 +243,16 @@ export const ShareSheet: React.FC<ShareSheetProps> = ({
     };
 
     window.addEventListener('keydown', handleKeyDown);
+    document.documentElement.setAttribute('data-bottom-sheet-open', 'true');
+    window.dispatchEvent(
+      new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: true } })
+    );
     return () => {
       document.body.style.overflow = prevOverflow;
+      document.documentElement.removeAttribute('data-bottom-sheet-open');
+      window.dispatchEvent(
+        new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: false } })
+      );
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [isOpen, post, showReportModal, onClose]);

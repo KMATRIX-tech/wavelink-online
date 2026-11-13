@@ -112,6 +112,20 @@ export const ChatThemePickerModal: React.FC<ChatThemePickerModalProps> = ({
   }, [isOpen, conversationId, initialPreference]);
 
   useEffect(() => {
+    if (!isOpen) return;
+    document.documentElement.setAttribute('data-bottom-sheet-open', 'true');
+    window.dispatchEvent(
+      new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: true } })
+    );
+    return () => {
+      document.documentElement.removeAttribute('data-bottom-sheet-open');
+      window.dispatchEvent(
+        new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: false } })
+      );
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
     return () => {
       revokeLocalPreviewUrl();
     };

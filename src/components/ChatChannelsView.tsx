@@ -707,6 +707,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const micHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasMicHeldRef = useRef<boolean>(false);
 
+  // Mobile (< 768px) Chat Home collapsible header on scroll down / up
+  const [isMobileChatHeaderHidden, setIsMobileChatHeaderHidden] = useState<boolean>(false);
+  const chatHomeHeaderRef = useRef<HTMLDivElement | null>(null);
+  const chatHomeScrollRef = useRef<HTMLDivElement | null>(null);
+  const lastChatListScrollTopRef = useRef<number>(0);
+  const chatListScrollRafRef = useRef<number | null>(null);
+
   // Voice Note MediaRecorder & Speech-to-Text state & refs
   const [isRecordingVoice, setIsRecordingVoice] = useState<boolean>(false);
   const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
@@ -931,7 +938,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       }
 
       if (chatShellRef.current) {
-        if (isConvoScreenOpenOnMobile) {
+        if (window.innerWidth < 768) {
+          // On mobile (< 768px), use flex column + dvh + safe-area insets instead of fixed pixel heights
+          chatShellRef.current.style.removeProperty('--chat-visual-height');
+        } else if (isConvoScreenOpenOnMobile) {
           chatShellRef.current.style.setProperty('--chat-visual-height', `${Math.round(vvHeight)}px`);
         } else {
           const rect = chatShellRef.current.getBoundingClientRect();
@@ -977,6 +987,83 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       document.documentElement.style.removeProperty('--kb-offset');
     };
   }, [activeChannel, showMobileChannels]);
+
+  // Smoothly slide the mobile Chat/People/Groups header out on scroll down and back in on scroll up (< 768px only)
+  useEffect(() => {
+    setIsMobileChatHeaderHidden(false);
+  }, [convoFilter, searchQuery]);
+
+  useEffect(() => {
+    const scrollEl = chatHomeScrollRef.current;
+    if (!scrollEl) return;
+
+    const updateHeaderHeightVar = () => {
+      const headerEl = chatHomeHeaderRef.current;
+      const leftColEl = scrollEl.parentElement;
+      if (headerEl && leftColEl) {
+        const h = headerEl.offsetHeight;
+        if (h > 0) {
+          leftColEl.style.setProperty('--chat-home-header-h', `${h}px`);
+        }
+      }
+    };
+
+    updateHeaderHeightVar();
+    const ro =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => updateHeaderHeightVar())
+        : null;
+    if (ro && chatHomeHeaderRef.current) {
+      ro.observe(chatHomeHeaderRef.current);
+    }
+
+    const handleChatListScroll = () => {
+      if (chatListScrollRafRef.current !== null) return;
+      chatListScrollRafRef.current = window.requestAnimationFrame(() => {
+        chatListScrollRafRef.current = null;
+        if (window.innerWidth >= 768) {
+          setIsMobileChatHeaderHidden(false);
+          return;
+        }
+        const currentTop = Math.max(0, scrollEl.scrollTop);
+        const prevTop = lastChatListScrollTopRef.current;
+        const delta = currentTop - prevTop;
+
+        // At the very top of the list or while typing in the search box, always show the header
+        if (currentTop <= 12 || document.activeElement === searchInputRef.current) {
+          setIsMobileChatHeaderHidden(false);
+          lastChatListScrollTopRef.current = currentTop;
+          return;
+        }
+
+        // Ignore tiny scroll movements (< 8px threshold)
+        if (Math.abs(delta) < 8) {
+          return;
+        }
+
+        if (delta > 0 && currentTop > 20) {
+          setIsMobileChatHeaderHidden(true);
+        } else if (delta < 0) {
+          setIsMobileChatHeaderHidden(false);
+        }
+
+        lastChatListScrollTopRef.current = currentTop;
+      });
+    };
+
+    scrollEl.addEventListener('scroll', handleChatListScroll, { passive: true });
+    window.addEventListener('resize', updateHeaderHeightVar);
+
+    return () => {
+      scrollEl.removeEventListener('scroll', handleChatListScroll);
+      window.removeEventListener('resize', updateHeaderHeightVar);
+      if (ro) ro.disconnect();
+      if (chatListScrollRafRef.current !== null) {
+        window.cancelAnimationFrame(chatListScrollRafRef.current);
+        chatListScrollRafRef.current = null;
+      }
+    };
+  }, [showMobileChannels, activeChannel]);
 
   // 1. Load registered users / online members once with limit(convoFetchLimit) and in-memory caching
   useEffect(() => {
@@ -3450,8 +3537,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             isMobileListScreenVisible ? 'flex' : 'hidden lg:flex'
           }`}
         >
-          {/* Top Header & Search Bar */}
-          <div className="p-3.5 sm:p-4 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] space-y-3 shrink-0">
+          {/* Top Header & Search Bar — slides up on scroll down and back in on scroll up on mobile (< 768px) */}
+          <div
+            ref={chatHomeHeaderRef}
+            data-header-hidden={isMobileChatHeaderHidden ? 'true' : 'false'}
+            className="wavelink-chat-home-header p-3.5 sm:p-4 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] space-y-3 shrink-0"
+          >
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2.5 min-w-0">
                 <div
@@ -3577,7 +3668,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
           </div>
 
           {/* Scrollable Chat Home Body */}
-          <div className="flex-1 overflow-y-auto p-3.5 space-y-5 pb-24">
+          <div
+            ref={chatHomeScrollRef}
+            className="wavelink-chat-home-scroll flex-1 overflow-y-auto p-3.5 space-y-5 pb-28"
+          >
             {/* 1. Horizontal "Active now" row of round avatars with colored ring & realtime presence dot */}
             <div className="space-y-2">
               <div className="flex items-center justify-between px-1">
@@ -4092,7 +4186,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             onClick={() => {
               setConvoFilter((prev) => (prev === 'people' ? 'chats' : 'people'));
             }}
-            className="absolute bottom-4 right-4 z-20 min-h-[48px] px-4 py-2.5 rounded-full text-white font-extrabold text-xs flex items-center gap-2 shadow-lg transition hover:scale-105 active:scale-95 cursor-pointer"
+            className="wavelink-floating-new-chat-btn absolute bottom-4 right-4 z-20 min-h-[48px] px-4 py-2.5 rounded-full text-white font-extrabold text-xs flex items-center gap-2 shadow-lg transition-all duration-200 hover:scale-105 active:scale-95 cursor-pointer"
             style={{
               background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
             }}
@@ -4171,7 +4265,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             </div>
           ) : (
             <>
-          {/* Mobile (< 768px) Floating Rounded Header Card */}
+          {/* Dedicated fixed theme background layer on mobile (< 768px): sits behind everything (z-index: -1, pointer-events: none) */}
+          <div className="wavelink-mobile-chat-theme-bg md:hidden" aria-hidden="true" />
+
+          {/* Mobile (< 768px) Chat Header — always visible in flex column right below TopHeader */}
           <div className="flex md:hidden wavelink-mobile-convo-header items-center justify-between gap-1.5">
             <div className="flex items-center gap-1.5 min-w-0 flex-1">
               <button
@@ -4204,7 +4301,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                     />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <h2 className="font-extrabold text-sm text-[var(--text-primary)] truncate leading-tight">
+                    <h2 className="wavelink-convo-header-title font-extrabold text-sm text-[var(--text-primary)] truncate leading-tight">
                       {activeGroup.name}
                     </h2>
                     {activeChannelTypingUsers.length > 0 ? (
@@ -4217,7 +4314,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                         <span>typing...</span>
                       </p>
                     ) : (
-                      <p className="text-[11px] text-[var(--text-secondary)] font-semibold truncate flex items-center gap-1 mt-0.5 leading-tight">
+                      <p className="wavelink-convo-header-subtitle text-[11px] text-[var(--text-secondary)] font-semibold truncate flex items-center gap-1 mt-0.5 leading-tight">
                         <span className="w-2 h-2 rounded-full bg-[#22c55e] shrink-0" />
                         <span className="truncate">
                           {(() => {
@@ -4281,7 +4378,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                         className={`text-[11px] font-bold truncate flex items-center gap-1.5 mt-0.5 leading-tight ${
                           isChattingWithSupportBot || directRecipientPresence.status === 'online'
                             ? 'text-emerald-600 dark:text-emerald-400'
-                            : 'text-[var(--text-secondary)]'
+                            : 'wavelink-convo-header-subtitle text-[var(--text-secondary)]'
                         }`}
                       >
                         <span
@@ -4326,7 +4423,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                           photoURL: directRecipient.photoURL
                         })
                       }
-                      className="wavelink-mobile-convo-header-btn text-white shadow-xs cursor-pointer"
+                      className="wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-video text-white shadow-xs cursor-pointer"
                       style={{
                         background:
                           'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
@@ -4346,7 +4443,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                           photoURL: directRecipient.photoURL
                         })
                       }
-                      className="wavelink-mobile-convo-header-btn bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer"
+                      className="wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-voice bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer"
                       title="Start Voice Call"
                       aria-label="Start Voice Call"
                     >
@@ -4367,7 +4464,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </button>
 
               {showHeaderMenu && (
-                <div className="absolute right-0 top-12 w-56 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-40 space-y-1">
+                <div className="wavelink-mobile-convo-menu absolute right-0 top-12 w-56 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-50 space-y-1">
                   {activeChannel && (
                     <button
                       type="button"

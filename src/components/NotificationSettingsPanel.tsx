@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
-import { UserNotificationSettings } from '../types';
+import { UserNotificationSettings, FcmTokenEntry } from '../types';
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
   fetchDeviceTokenFromUserDoc,
+  fetchUserNotificationSettings,
   getBrowserNotificationPermission,
   getDeviceSavedTokenFromUserDoc,
   getMessagingServiceWorkerRegistration,
@@ -39,7 +40,7 @@ import {
 } from 'lucide-react';
 
 export const NotificationSettingsPanel: React.FC = () => {
-  const { currentUser, userProfile, updateUserProfile, showGlobalToast } = useAuth();
+  const { currentUser, userProfile, showGlobalToast } = useAuth();
   const { language, t } = useLanguage();
 
   const [settings, setSettings] = useState<UserNotificationSettings>(() => ({
@@ -53,6 +54,7 @@ export const NotificationSettingsPanel: React.FC = () => {
   const [docDeviceToken, setDocDeviceToken] = useState<string | null>(() =>
     getDeviceSavedTokenFromUserDoc(userProfile)
   );
+  const [registeredDevices, setRegisteredDevices] = useState<FcmTokenEntry[]>([]);
   const [isRechecking, setIsRechecking] = useState(false);
   const [isRequestingPermission, setIsRequestingPermission] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -62,20 +64,21 @@ export const NotificationSettingsPanel: React.FC = () => {
     text: string;
   } | null>(null);
 
+  // Load notification toggles from users/{uid}/settings/notifications
   useEffect(() => {
-    if (userProfile?.notificationSettings) {
-      setSettings({
-        ...DEFAULT_NOTIFICATION_SETTINGS,
-        ...userProfile.notificationSettings
+    if (!currentUser?.uid) return;
+    let cancelled = false;
+    fetchUserNotificationSettings(currentUser.uid, userProfile?.notificationSettings)
+      .then((loaded) => {
+        if (!cancelled) setSettings(loaded);
+      })
+      .catch((err) => {
+        console.warn('[WaveLink Push] Could not load users/{uid}/settings/notifications:', err);
       });
-    }
-  }, [userProfile?.notificationSettings]);
-
-  // Keep docDeviceToken synced with userProfile.fcmTokens & browser permission
-  useEffect(() => {
-    setPermissionState(getBrowserNotificationPermission());
-    setDocDeviceToken(getDeviceSavedTokenFromUserDoc(userProfile));
-  }, [userProfile]);
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.uid, userProfile?.notificationSettings]);
 
   const refreshStatusFromBrowserAndFirestore = useCallback(
     async (showMessage = false) => {
@@ -86,8 +89,9 @@ export const NotificationSettingsPanel: React.FC = () => {
       setIsRechecking(true);
       if (showMessage) setStatusFeedback(null);
       try {
-        const { tokenInDoc } = await fetchDeviceTokenFromUserDoc(currentUser.uid);
+        const { tokenInDoc, allTokens } = await fetchDeviceTokenFromUserDoc(currentUser.uid);
         setDocDeviceToken(tokenInDoc);
+        setRegisteredDevices(allTokens);
         if (showMessage) {
           if (nextPermission === 'denied') {
             setStatusFeedback({
@@ -97,7 +101,7 @@ export const NotificationSettingsPanel: React.FC = () => {
           } else if (nextPermission === 'granted' && tokenInDoc) {
             setStatusFeedback({
               type: 'success',
-              text: 'Notifications are On and this device token is saved in your user document.'
+              text: 'Notifications are On and this device token is saved in users/{uid}/fcmTokens.'
             });
           } else if (nextPermission === 'granted' && !tokenInDoc) {
             setStatusFeedback({
@@ -112,7 +116,7 @@ export const NotificationSettingsPanel: React.FC = () => {
           }
         }
       } catch (err: any) {
-        console.error('[WaveLink Push] Failed to check user document fcmTokens:', err);
+        console.error('[WaveLink Push] Failed to check users/{uid}/fcmTokens:', err);
         if (showMessage) {
           setStatusFeedback({
             type: 'error',
@@ -126,7 +130,7 @@ export const NotificationSettingsPanel: React.FC = () => {
     [currentUser?.uid]
   );
 
-  // Verify Firestore user document token state when panel mounts
+  // Verify Firestore subcollection token state when panel mounts
   useEffect(() => {
     refreshStatusFromBrowserAndFirestore(false);
   }, [refreshStatusFromBrowserAndFirestore]);
@@ -141,12 +145,13 @@ export const NotificationSettingsPanel: React.FC = () => {
       setPermissionState(result.permission);
       if (result.success && result.token) {
         setDocDeviceToken(result.token);
+        await refreshStatusFromBrowserAndFirestore(false);
         setStatusFeedback({
           type: 'success',
           text:
             language === 'sw'
               ? 'Arifa za simu zimewashwa kwenye kifaa hiki!'
-              : 'Notifications are now On! Device token saved to your user document.'
+              : 'Notifications are now On! Device token saved in users/{uid}/fcmTokens.'
         });
         showGlobalToast(
           language === 'sw'
@@ -179,12 +184,13 @@ export const NotificationSettingsPanel: React.FC = () => {
     try {
       await removeCurrentDeviceFcmToken(currentUser.uid);
       setDocDeviceToken(null);
+      await refreshStatusFromBrowserAndFirestore(false);
       setStatusFeedback({
         type: 'success',
         text:
           language === 'sw'
             ? 'Kifaa hiki kimeondolewa na hakitapokea tena arifa.'
-            : 'This device token has been removed from your user document.'
+            : 'This device token has been removed from users/{uid}/fcmTokens.'
       });
       showGlobalToast(
         language === 'sw'
@@ -220,7 +226,6 @@ export const NotificationSettingsPanel: React.FC = () => {
     setIsSaving(true);
     try {
       await saveUserNotificationSettings(currentUser.uid, nextSettings);
-      await updateUserProfile({ notificationSettings: nextSettings });
     } catch (err: any) {
       console.error('Failed to save notification settings:', err);
       setStatusFeedback({
@@ -336,7 +341,6 @@ export const NotificationSettingsPanel: React.FC = () => {
 
   const statusKind = getNotificationStatusKind(permissionState, docDeviceToken || getSavedDeviceToken());
   const isDeviceSubscribed = statusKind === 'on';
-  const registeredDevices = Array.isArray(userProfile?.fcmTokens) ? userProfile!.fcmTokens : [];
   const likesAndCommentsChecked =
     settings.likesAndComments !== undefined
       ? settings.likesAndComments !== false
@@ -568,12 +572,12 @@ export const NotificationSettingsPanel: React.FC = () => {
         {registeredDevices.length > 0 && (
           <div className="pt-2 border-t border-stone-100">
             <div className="text-[11px] font-bold text-stone-500 uppercase tracking-wider mb-1.5">
-              Registered devices ({registeredDevices.length}/5)
+              Registered devices ({registeredDevices.length})
             </div>
             <div className="flex flex-wrap gap-2">
               {registeredDevices.map((dev, idx) => (
                 <div
-                  key={`${dev.deviceId || idx}`}
+                  key={`${dev.token || dev.deviceId || idx}`}
                   className="px-2.5 py-1 rounded-lg bg-stone-50 border border-stone-200 text-[11px] text-stone-700 font-semibold"
                 >
                   {dev.deviceName || dev.platform || 'Device'}

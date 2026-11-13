@@ -519,8 +519,25 @@ html[data-theme-mode="dark"] .wavelink-app-shell select {
     min-height: var(--vv-height, 100dvh);
   }
 
-  html[data-keyboard-open="true"] .wavelink-mobile-bottom-nav {
-    display: none !important;
+  html[data-keyboard-open="true"] .wavelink-mobile-bottom-nav,
+  html[data-bottom-sheet-open="true"] .wavelink-mobile-bottom-nav,
+  html[data-input-focused="true"] .wavelink-mobile-bottom-nav {
+    transform: translate3d(0, 7rem, 0) !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease !important;
+  }
+
+  html[data-keyboard-open="true"] .wavelink-floating-ai-btn,
+  html[data-bottom-sheet-open="true"] .wavelink-floating-ai-btn,
+  html[data-input-focused="true"] .wavelink-floating-ai-btn,
+  html[data-keyboard-open="true"] .wavelink-floating-new-chat-btn,
+  html[data-bottom-sheet-open="true"] .wavelink-floating-new-chat-btn,
+  html[data-input-focused="true"] .wavelink-floating-new-chat-btn {
+    transform: translate3d(0, 4rem, 0) scale(0.85) !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease !important;
   }
 
   html[data-keyboard-open="true"] .wavelink-main-content {
@@ -702,20 +719,22 @@ div.wavelink-post-body:hover p.wavelink-post-body {
   transition: height 0.08s ease-out, max-height 0.08s ease-out;
 }
 
-/* Separate Full-Screen Conversation Screen on phones & compact screens (< 1024px) */
-html[data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen {
-  position: fixed;
-  inset: 0;
-  z-index: 48;
-  width: 100%;
-  max-width: 100%;
-  height: var(--vv-height, 100dvh);
-  max-height: var(--vv-height, 100dvh);
-  padding-top: env(safe-area-inset-top, 0px);
-  background-color: var(--bg-surface, #FFFFFF);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+/* Separate Full-Screen Conversation Screen on compact tablet screens (768px - 1023px) */
+@media (min-width: 768px) and (max-width: 1023px) {
+  html[data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen {
+    position: fixed;
+    inset: 0;
+    z-index: 48;
+    width: 100%;
+    max-width: 100%;
+    height: var(--vv-height, 100dvh);
+    max-height: var(--vv-height, 100dvh);
+    padding-top: env(safe-area-inset-top, 0px);
+    background-color: var(--bg-surface, #FFFFFF);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
 }
 
 html[data-mobile-chat-convo="open"] .wavelink-mobile-bottom-nav {
@@ -2488,7 +2507,7 @@ html[data-simple-mode="true"] textarea {
 .wavelink-share-overlay {
   position: fixed;
   inset: 0;
-  z-index: 70;
+  z-index: 95;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
@@ -2502,23 +2521,48 @@ html[data-simple-mode="true"] textarea {
   position: relative;
   width: 100%;
   max-width: 100%;
-  height: 70dvh;
-  max-height: 70dvh;
+  height: 75dvh;
+  max-height: 75dvh;
   display: flex;
   flex-direction: column;
   border-radius: 1.75rem 1.75rem 0 0;
   background-color: var(--bg-surface);
-  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+  background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
   backdrop-filter: blur(22px) saturate(165%);
   -webkit-backdrop-filter: blur(22px) saturate(165%);
   border-top: 1px solid var(--border-hairline);
   box-shadow: 0 -18px 48px rgba(12, 10, 9, 0.32);
   color: var(--text-primary);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-bottom: 0;
   animation: wavelink-sheet-up 280ms cubic-bezier(0.16, 1, 0.3, 1);
-  transition: transform 280ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 280ms cubic-bezier(0.16, 1, 0.3, 1), height 140ms ease-out, max-height 140ms ease-out;
   will-change: transform;
   overflow: hidden;
+}
+
+@media (max-width: 767px) {
+  .wavelink-comments-overlay {
+    top: var(--vv-offset-top, 0px);
+    left: 0;
+    right: 0;
+    bottom: auto;
+    height: var(--vv-height, 100dvh);
+    max-height: var(--vv-height, 100dvh);
+  }
+
+  .wavelink-comments-sheet {
+    height: min(75dvh, calc(var(--vv-height, 100dvh) - env(safe-area-inset-top, 0px) - 0.5rem));
+    max-height: min(75dvh, calc(var(--vv-height, 100dvh) - env(safe-area-inset-top, 0px) - 0.5rem));
+  }
+
+  html[data-keyboard-open="true"] .wavelink-comments-sheet {
+    height: calc(var(--vv-height, 100dvh) - env(safe-area-inset-top, 0px) - 0.25rem);
+    max-height: calc(var(--vv-height, 100dvh) - env(safe-area-inset-top, 0px) - 0.25rem);
+  }
+
+  .wavelink-comments-textarea {
+    font-size: 16px !important;
+  }
 }
 
 .wavelink-share-sheet {
@@ -2561,12 +2605,17 @@ html[data-simple-mode="true"] textarea {
 .wavelink-comments-input-footer {
   position: sticky;
   bottom: 0;
-  z-index: 10;
-  background-color: color-mix(in srgb, var(--bg-surface) 94%, transparent);
+  z-index: 20;
+  flex-shrink: 0;
+  background-color: color-mix(in srgb, var(--bg-surface) 96%, transparent);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border-top: 1px solid var(--border-hairline);
-  padding: 0.625rem 0.875rem calc(0.625rem + env(safe-area-inset-bottom, 0px));
+  padding: 0.625rem 0.875rem max(0.625rem, env(safe-area-inset-bottom, 0px));
+}
+
+html[data-keyboard-open="true"] .wavelink-comments-input-footer {
+  padding-bottom: max(0.45rem, env(safe-area-inset-bottom, 0px));
 }
 
 .wavelink-share-grid {
@@ -3406,22 +3455,143 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
    Profile pages, and Feed completely untouched.
    ============================================================================ */
 @media (max-width: 767px) {
-  /* 1. Full-screen visualViewport container & calm cloud-textured theme background */
-  html[data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen {
+  /* Ensure app shell creates an isolated stacking context so z-index: -1 theme backgrounds sit behind all UI */
+  .wavelink-app-shell {
+    isolation: isolate;
+  }
+
+  .wavelink-custom-bg-layer {
     position: fixed;
-    top: var(--vv-offset-top, 0px);
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+  }
+
+  /* Mobile Chat List Screen: Collapsible Top Section (Chat title + New Group, Search, Chats | People | Groups tabs)
+     Slides up out of view on scroll down and slides back in immediately on scroll up using transform only (no layout jumps) */
+  html[data-mobile-chat-convo="list"] .wavelink-chat-shell {
+    height: calc(var(--vv-height, 100dvh) - 3.5rem - env(safe-area-inset-top, 0px));
+    max-height: calc(var(--vv-height, 100dvh) - 3.5rem - env(safe-area-inset-top, 0px));
+  }
+
+  .wavelink-chat-left-col {
+    position: relative;
+    overflow: hidden;
+    height: 100%;
+  }
+
+  .wavelink-chat-home-header {
+    position: absolute;
+    top: 0;
     left: 0;
     right: 0;
-    bottom: auto;
-    z-index: 48;
-    width: 100%;
-    max-width: 100%;
+    z-index: 25;
+    transform: translate3d(0, 0, 0);
+    transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 220ms ease;
+    will-change: transform;
+    box-shadow: 0 8px 22px -12px rgba(15, 23, 42, 0.14);
+  }
+
+  .wavelink-chat-home-header[data-header-hidden="true"] {
+    transform: translate3d(0, -104%, 0);
+    box-shadow: none;
+    pointer-events: none;
+  }
+
+  .wavelink-chat-home-scroll {
+    padding-top: calc(var(--chat-home-header-h, 11.25rem) + 0.75rem) !important;
+    padding-bottom: calc(9.25rem + env(safe-area-inset-bottom, 0px)) !important;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .wavelink-floating-new-chat-btn {
+    bottom: calc(5.25rem + env(safe-area-inset-bottom, 0px)) !important;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wavelink-chat-home-header {
+      transition: none !important;
+    }
+  }
+
+  /* 1. Strict Flex Column on Mobile Conversation Screen:
+        Global Top Bar (fixed height) -> Chat Header (always visible, never overlapped) ->
+        Scrollable Message List (flex: 1, overflow-y: auto, min-height: 0) -> Input Bar */
+  html[data-mobile-chat-convo="open"] .wavelink-app-shell {
     height: var(--vv-height, 100dvh);
     max-height: var(--vv-height, 100dvh);
-    padding-top: 0;
+    min-height: var(--vv-height, 100dvh);
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    background: transparent !important;
+    animation: none !important;
+  }
+
+  html[data-mobile-chat-convo="open"] .wavelink-app-shell > header {
+    flex-shrink: 0;
+    position: relative;
+    top: 0;
+    z-index: 40;
+  }
+
+  html[data-mobile-chat-convo="open"] .wavelink-body-workspace,
+  html[data-mobile-chat-convo="open"] .wavelink-main-content,
+  html[data-mobile-chat-convo="open"] .wavelink-main-content--chat,
+  html[data-mobile-chat-convo="open"] .wavelink-chat-wrapper,
+  html[data-mobile-chat-convo="open"] .wavelink-chat-shell {
+    display: flex !important;
+    flex-direction: column !important;
+    flex: 1 1 0% !important;
+    min-height: 0 !important;
+    height: auto !important;
+    max-height: none !important;
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    margin: 0 !important;
+    border-top: none !important;
+    border-bottom: none !important;
+    background: transparent !important;
+    transform: none !important;
+    animation: none !important;
+    will-change: auto !important;
+  }
+
+  html[data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen,
+  .wavelink-mobile-conversation-screen {
+    position: relative !important;
+    inset: auto !important;
+    top: auto !important;
+    left: auto !important;
+    right: auto !important;
+    bottom: auto !important;
+    z-index: 1;
+    width: 100%;
+    max-width: 100%;
+    flex: 1 1 0% !important;
+    min-height: 0 !important;
+    height: auto !important;
+    max-height: none !important;
+    padding-top: 0 !important;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: transparent !important;
+    transform: none !important;
+    animation: none !important;
+  }
+
+  /* Theme backgrounds sit BEHIND everything (position: fixed, inset: 0, z-index: -1, pointer-events: none)
+     and never change layout size or push content */
+  .wavelink-mobile-conversation-screen .wavelink-mobile-chat-theme-bg {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
     background-color: var(--bg-canvas);
     background-image:
       radial-gradient(120% 75% at 14% 10%, color-mix(in srgb, var(--accent-primary) 16%, transparent) 0%, transparent 58%),
@@ -3431,10 +3601,10 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
       url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cpath d='M18 68c16-14 40-14 54 0 12-10 34-10 46 2 14-8 34-6 44 6' fill='none' stroke='%23ffffff' stroke-opacity='0.30' stroke-width='18' stroke-linecap='round'/%3E%3Cpath d='M-10 142c20-16 48-16 64 0 14-12 38-12 52 2 16-10 40-8 54 4' fill='none' stroke='%23ffffff' stroke-opacity='0.24' stroke-width='20' stroke-linecap='round'/%3E%3C/svg%3E"),
       linear-gradient(175deg, color-mix(in srgb, var(--bg-subtle) 65%, var(--bg-canvas)) 0%, var(--bg-canvas) 55%, color-mix(in srgb, var(--accent-primary) 8%, var(--bg-canvas)) 100%);
     background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%, 240px 240px, 100% 100%;
-    transition: height 120ms ease-out, max-height 120ms ease-out;
+    transition: background 250ms ease, background-color 250ms ease;
   }
 
-  html[data-theme-mode="dark"][data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen {
+  html[data-theme-mode="dark"] .wavelink-mobile-conversation-screen .wavelink-mobile-chat-theme-bg {
     background-color: var(--bg-canvas);
     background-image:
       radial-gradient(120% 75% at 14% 10%, color-mix(in srgb, var(--accent-primary) 22%, transparent) 0%, transparent 58%),
@@ -3446,35 +3616,38 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
     background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%, 240px 240px, 100% 100%;
   }
 
-  /* 2. Floating Rounded Header Card */
+  /* 2. Chat Header Card — always visible right below global top bar, never overlapped */
   .wavelink-mobile-conversation-screen .wavelink-mobile-convo-header {
-    margin: max(0.5rem, env(safe-area-inset-top, 0px)) 0.625rem 0.25rem;
-    padding: 0.4375rem 0.5rem;
-    min-height: 60px;
-    border-radius: 1.5rem;
-    background: color-mix(in srgb, var(--bg-surface) 94%, #ffffff);
+    margin: 0.375rem 0.625rem 0.25rem;
+    padding: 0.375rem 0.5rem;
+    min-height: 56px;
+    border-radius: 1.375rem;
+    background: color-mix(in srgb, var(--bg-surface) 95%, #ffffff);
     border: 1px solid var(--border-hairline);
+    color: var(--text-primary);
     box-shadow:
-      0 12px 28px -12px rgba(15, 23, 42, 0.16),
+      0 10px 24px -12px rgba(15, 23, 42, 0.16),
       0 2px 8px -2px rgba(15, 23, 42, 0.06);
     flex-shrink: 0;
     position: relative;
-    z-index: 30;
-    transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 200ms ease;
+    z-index: 35;
+    transition: background 200ms ease, border-color 200ms ease, color 200ms ease, box-shadow 200ms ease;
   }
 
   html[data-theme-mode="dark"] .wavelink-mobile-conversation-screen .wavelink-mobile-convo-header {
-    background: color-mix(in srgb, var(--bg-surface) 88%, #ffffff 12%);
+    background: color-mix(in srgb, var(--bg-surface) 92%, #ffffff 8%);
+    border-color: var(--border-hairline);
+    color: var(--text-primary);
     box-shadow:
-      0 14px 32px -12px rgba(2, 6, 23, 0.55),
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.12);
+      0 14px 32px -12px rgba(2, 6, 23, 0.65),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.14);
   }
 
   .wavelink-mobile-conversation-screen .wavelink-mobile-convo-header-btn {
-    width: 44px;
-    height: 44px;
-    min-width: 44px;
-    min-height: 44px;
+    width: 42px;
+    height: 42px;
+    min-width: 42px;
+    min-height: 42px;
     border-radius: 9999px;
     display: inline-flex;
     align-items: center;
@@ -3494,8 +3667,12 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
     flex-shrink: 0;
   }
 
-  /* 3. Messages Stream, Centered Date Pill, Bubbles & Compact Voice Notes */
+  /* 3. Scrollable Messages List (flex: 1, overflow-y: auto, min-height: 0) */
   .wavelink-mobile-conversation-screen .wavelink-mobile-convo-messages {
+    flex: 1 1 0% !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
     background: transparent !important;
     padding: 0.625rem 0.75rem 0.75rem;
     scroll-behavior: smooth;
@@ -3623,17 +3800,17 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
   /* 4. Two-State Rounded Bottom Bar (Default 3-Button Dock <-> Text Field + Circular Send) */
   .wavelink-mobile-conversation-screen .wavelink-mobile-convo-bottom-bar {
     position: relative;
-    z-index: 35;
+    z-index: 30;
     flex-shrink: 0;
     width: 100%;
     max-width: 100%;
-    padding: 0.375rem 0.75rem max(0.625rem, env(safe-area-inset-bottom, 0px));
+    padding: 0.375rem 0.75rem max(0.5rem, env(safe-area-inset-bottom, 0px));
     background: transparent !important;
     border-top: none !important;
   }
 
   html[data-keyboard-open="true"] .wavelink-mobile-conversation-screen .wavelink-mobile-convo-bottom-bar {
-    padding-bottom: max(0.45rem, env(safe-area-inset-bottom, 0px));
+    padding-bottom: max(0.375rem, env(safe-area-inset-bottom, 0px));
   }
 
   .wavelink-mobile-conversation-screen .wavelink-mobile-convo-dock {
@@ -3747,13 +3924,9 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
     opacity: 0.72;
   }
 
-  /* Mobile (< 768px) Per-Chat Theme Overrides & Bottom Sheet Picker */
-  html[data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen {
-    transition: height 120ms ease-out, max-height 120ms ease-out, background 250ms ease, background-color 250ms ease;
-  }
-
-  html[data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen[data-chat-themed="true"],
-  html[data-theme-mode="dark"][data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen[data-chat-themed="true"] {
+  /* Mobile (< 768px) Per-Chat Theme Overrides — Applied to fixed z-index -1 background layer */
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-chat-theme-bg,
+  html[data-theme-mode="dark"] .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-chat-theme-bg {
     background-color: var(--chat-bg-color, var(--bg-canvas)) !important;
     background-image: var(--chat-bg-image, none) !important;
     background-size: var(--chat-bg-size, 100% 100%) !important;
@@ -3772,12 +3945,30 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
   }
 
   .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header h2,
-  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-convo-header-title {
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-convo-header-title,
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-convo-header-title span {
     color: var(--chat-header-text, var(--text-primary)) !important;
   }
 
-  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-convo-header-subtitle {
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-convo-header-subtitle,
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-convo-header-subtitle span {
     color: var(--chat-header-subtext, var(--text-secondary)) !important;
+  }
+
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-mobile-convo-header-btn:not(.wavelink-mobile-convo-call-video) {
+    background: var(--chat-btn-bg, var(--bg-subtle)) !important;
+    border-color: var(--chat-header-border, var(--border-hairline)) !important;
+    color: var(--chat-header-text, var(--text-primary)) !important;
+  }
+
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-header .wavelink-mobile-convo-call-video {
+    background: var(--chat-sent-bg, linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))) !important;
+    color: var(--chat-sent-text, #FFFFFF) !important;
+  }
+
+  .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-menu {
+    background: var(--chat-menu-bg, var(--bg-surface)) !important;
+    border-color: var(--chat-header-border, var(--border-hairline)) !important;
   }
 
   .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-date-pill,
@@ -3816,6 +4007,7 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
   .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-convo-system-pill {
     background: var(--chat-system-bg, rgba(15, 23, 42, 0.08)) !important;
     color: var(--chat-system-text, var(--text-secondary)) !important;
+    border-color: var(--chat-header-border, var(--border-hairline)) !important;
   }
 
   .wavelink-mobile-conversation-screen[data-chat-themed="true"] .wavelink-mobile-convo-dock,
@@ -3952,7 +4144,8 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  html:not([data-battery-saver="true"]):not([data-lite-mode="true"]) [data-chat-themed="true"][data-chat-animated="true"] {
+  html:not([data-battery-saver="true"]):not([data-lite-mode="true"]) .wavelink-chat-center-col[data-chat-themed="true"][data-chat-animated="true"],
+  html:not([data-battery-saver="true"]):not([data-lite-mode="true"]) .wavelink-mobile-conversation-screen[data-chat-themed="true"][data-chat-animated="true"] .wavelink-mobile-chat-theme-bg {
     animation: wavelinkChatPatternDrift 28s ease-in-out infinite;
   }
 }
@@ -3961,6 +4154,7 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
   .wavelink-chat-theme-sheet,
   .wavelink-chat-center-col,
   .wavelink-mobile-conversation-screen,
+  .wavelink-mobile-chat-theme-bg,
   .wavelink-custom-bg-img,
   .wavelink-custom-bg-scrim {
     animation: none !important;
@@ -4100,7 +4294,7 @@ html[data-has-custom-bg="true"] .wavelink-chat-center-col:not([data-chat-themed=
 
 /* Mobile-only (< 768px) custom background integration */
 @media (max-width: 767px) {
-  html[data-has-custom-bg="true"][data-mobile-chat-convo="open"] .wavelink-mobile-conversation-screen:not([data-chat-themed="true"]) {
+  html[data-has-custom-bg="true"] .wavelink-mobile-conversation-screen:not([data-chat-themed="true"]) .wavelink-mobile-chat-theme-bg {
     background-color: transparent !important;
     background-image: none !important;
   }

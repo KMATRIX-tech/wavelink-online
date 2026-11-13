@@ -17,6 +17,7 @@ import {
   sendNotification
 } from '../services/notificationService';
 import {
+  fetchDeviceTokenFromUserDoc,
   getBrowserNotificationPermission,
   getDeviceSavedTokenFromUserDoc,
   getNotificationStatusKind,
@@ -70,7 +71,19 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
   useEffect(() => {
     setPermissionState(getBrowserNotificationPermission());
     setSavedTokenInDoc(getDeviceSavedTokenFromUserDoc(userProfile) || getSavedDeviceToken());
-  }, [userProfile, isOpen]);
+    if (!currentUser?.uid) return;
+    let cancelled = false;
+    fetchDeviceTokenFromUserDoc(currentUser.uid)
+      .then((res) => {
+        if (!cancelled && res.tokenInDoc) {
+          setSavedTokenInDoc(res.tokenInDoc);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.uid, userProfile, isOpen]);
 
   const statusKind = getNotificationStatusKind(permissionState, savedTokenInDoc);
   const isPushEnabled = statusKind === 'on';
