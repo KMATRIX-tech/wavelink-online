@@ -1,5 +1,5 @@
-import { db, cleanFirestoreData, handleFirestoreError, OperationType } from '../firebase';
-import { doc, setDoc, updateDoc, collection, serverTimestamp } from 'firebase/firestore';
+import { db, cleanFirestoreData, getAuthHeaders, handleFirestoreError, OperationType } from '../firebase';
+import { doc, setDoc, collection } from 'firebase/firestore';
 import {
   SubscriptionTier,
   MobileMoneyProvider,
@@ -194,11 +194,10 @@ export async function initiateAzamPayAirtelCheckout(
   let apiData: any = null;
 
   try {
+    const headers = await getAuthHeaders();
     const response = await fetch('/api/azampay/checkout', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers,
       body: JSON.stringify({
         phoneNumber: params.phoneNumber,
         amount: params.tier.priceTZS,
@@ -296,53 +295,32 @@ export async function completeSubscription(
   userId: string,
   planId: 'weekly' | 'monthly' | 'annual'
 ): Promise<void> {
-  const now = new Date();
-  const expiresAt = new Date();
-  if (planId === 'weekly') {
-    expiresAt.setDate(expiresAt.getDate() + 7);
-  } else if (planId === 'monthly') {
-    expiresAt.setDate(expiresAt.getDate() + 30);
-  } else {
-    expiresAt.setDate(expiresAt.getDate() + 365);
+  const headers = await getAuthHeaders();
+  const res = await fetch('/api/payments/complete-subscription', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      transactionId,
+      planId
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.success) {
+    throw new Error(
+      data?.error ||
+        'Subscription payment could not be verified automatically. Please submit for admin verification.'
+    );
   }
 
-  const completedAt = now.toISOString();
-  const expiresAtIso = expiresAt.toISOString();
-
-  try {
-    // 1. Update subscription transaction document
-    const txDocRef = doc(db, 'subscriptions', transactionId);
-    await updateDoc(txDocRef, {
-      status: 'completed',
-      completedAt,
-      mpesaReceiptNumber: `AZM-${Math.random().toString(36).substring(2, 10).toUpperCase()}`
-    });
-
-    // 2. Upgrade user profile in Firestore
-    const userDocRef = doc(db, 'users', userId);
-    await updateDoc(userDocRef, {
-      isPro: true,
-      hasBlueStar: true,
-      proPlan: planId,
-      proExpiresAt: expiresAtIso,
-      proBadge: planId === 'annual' ? 'founder' : 'verified',
-      proBorderEffect: planId === 'annual' ? 'aura-gold' : 'neon-pulse',
-      proAccentColor: 'purple',
-      updatedAt: completedAt
-    });
-
-    sendNotification({
-      recipientId: userId,
-      actorId: 'wavelink_billing',
-      actorName: 'WaveLink Billing',
-      type: 'payment_verified',
-      title: 'Payment Confirmed! 🎉',
-      body: `Your WaveLink Pro (${planId}) subscription is now active.`,
-      entityId: transactionId
-    }).catch(() => {});
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `users/${userId}`);
-  }
+  sendNotification({
+    recipientId: userId,
+    actorId: userId,
+    actorName: 'WaveLink Billing',
+    type: 'payment_verified',
+    title: 'Payment Confirmed! 🎉',
+    body: `Your WaveLink Pro (${planId}) subscription is now active.`,
+    entityId: transactionId
+  }).catch(() => {});
 }
 
 /**
@@ -366,9 +344,10 @@ export async function initiatePostBoost(params: {
   else if (params.provider === 'tigopesa') azamProvider = 'Tigo';
 
   try {
+    const headers = await getAuthHeaders();
     await fetch('/api/azampay/checkout', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         phoneNumber: params.phoneNumber,
         amount: amountTZS,
@@ -419,27 +398,15 @@ export async function completePostBoost(
   transactionId: string,
   postId: string
 ): Promise<void> {
-  const now = new Date();
-  const boostedUntil = new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString(); // 48h boost
-
-  try {
-    // Update post
-    const postRef = doc(db, 'posts', postId);
-    await updateDoc(postRef, {
-      isBoosted: true,
-      boostedUntil,
-      boostTier: 'priority_48h',
-      updatedAt: now.toISOString()
-    });
-
-    // Update transaction
-    const txRef = doc(db, 'subscriptions', transactionId);
-    await updateDoc(txRef, {
-      status: 'completed',
-      completedAt: now.toISOString()
-    });
-  } catch (err) {
-    console.error('Error completing post boost:', err);
+  const headers = await getAuthHeaders();
+  const res = await fetch('/api/payments/complete-boost', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ transactionId, postId })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.success) {
+    throw new Error(data?.error || 'Could not complete post boost verification.');
   }
 }
 
@@ -467,9 +434,10 @@ export async function initiateCreatorTip(params: {
   else if (params.provider === 'tigopesa') azamProvider = 'Tigo';
 
   try {
+    const headers = await getAuthHeaders();
     await fetch('/api/azampay/checkout', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         phoneNumber: params.phoneNumber,
         amount: params.grossAmountTZS,
@@ -525,30 +493,15 @@ export async function completeCreatorTip(
   postId: string,
   grossAmountTZS: number
 ): Promise<void> {
-  const now = new Date();
-  try {
-    const postRef = doc(db, 'posts', postId);
-    // increment tip stats
-    await updateDoc(postRef, {
-      tipsCount: (prev: any) => (prev || 0) + 1,
-      tipsTotalTZS: (prev: any) => (prev || 0) + grossAmountTZS,
-      updatedAt: now.toISOString()
-    }).catch(async () => {
-      // Direct set if field didn't exist
-      await updateDoc(postRef, {
-        tipsCount: 1,
-        tipsTotalTZS: grossAmountTZS,
-        updatedAt: now.toISOString()
-      });
-    });
-
-    const txRef = doc(db, 'subscriptions', transactionId);
-    await updateDoc(txRef, {
-      status: 'completed',
-      completedAt: now.toISOString()
-    });
-  } catch (err) {
-    console.error('Error completing creator tip:', err);
+  const headers = await getAuthHeaders();
+  const res = await fetch('/api/payments/complete-tip', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ transactionId, postId, grossAmountTZS })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.success) {
+    throw new Error(data?.error || 'Could not verify creator tip payment.');
   }
 }
 

@@ -34,7 +34,7 @@ export const VideoUploadProgressChip: React.FC<VideoUploadProgressChipProps> = (
 
   const wrapperClass =
     variant === 'floating'
-      ? 'fixed top-16 right-4 z-[90] w-[calc(100vw-2rem)] max-w-sm space-y-2 pointer-events-auto'
+      ? 'wavelink-floating-upload-chip fixed top-16 right-4 z-[90] w-[calc(100vw-2rem)] max-w-sm space-y-2 pointer-events-auto'
       : 'w-full mb-4 space-y-2.5';
 
   return (

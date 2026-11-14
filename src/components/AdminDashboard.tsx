@@ -16,6 +16,8 @@ import {
 } from '../firebase';
 import {
   fetchIceServersForCall,
+  hasRelayIceServer,
+  extractIceCandidateInfo,
   FetchIceServersResult
 } from '../utils/webrtcConfig';
 import {
@@ -352,6 +354,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     status: 'idle',
     summary: `Not tested yet — click Run Check to probe Cloudinary (${CLOUDINARY_CLOUD_NAME} / ${CLOUDINARY_UPLOAD_PRESET}).`
   });
+  const [callLoopbackHealth, setCallLoopbackHealth] = useState<SubHealthState>({
+    status: 'idle',
+    summary: 'Not tested yet — click Call Test to verify TURN relay, Firestore /calls accepted rules, and live WebRTC peer loopback.'
+  });
   const [isRunningAllHealthChecks, setIsRunningAllHealthChecks] = useState(false);
 
   const handleTestIceServersHealth = useCallback(async () => {
@@ -528,6 +534,163 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     }
   }, []);
 
+  const handleRunFullCallTest = useCallback(async () => {
+    const activeUser = auth.currentUser || currentUser;
+    const activeUid = activeUser?.uid;
+    if (!activeUid) {
+      setCallLoopbackHealth({
+        status: 'error',
+        summary: 'Failed — sign in required for Call Test',
+        detail: 'Sign in with your admin account to run the full WebRTC & Firestore call probe.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+      return;
+    }
+
+    setCallLoopbackHealth({
+      status: 'testing',
+      summary: 'Testing /api/ice-servers, /calls Firestore accepted flow, and live WebRTC loopback...'
+    });
+
+    const probeCallId = `sys_health_rtc_${activeUid}_${Date.now()}`;
+    const callDocRef = doc(db, 'calls', probeCallId);
+    const callerCandRef = doc(db, 'calls', probeCallId, 'callerCandidates', 'c1');
+    const calleeCandRef = doc(db, 'calls', probeCallId, 'calleeCandidates', 'c1');
+    let callerPc: RTCPeerConnection | null = null;
+    let calleePc: RTCPeerConnection | null = null;
+
+    try {
+      const idToken = await activeUser.getIdToken();
+      const iceResult = await fetchIceServersForCall(idToken);
+      const allUrls = iceResult.iceServers.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]));
+      const hasTcpOrTlsRelay = allUrls.some(
+        (u) => /443/i.test(u) && /turns?:/i.test(u)
+      );
+      if (!hasRelayIceServer(iceResult.iceServers) || iceResult.isFallback) {
+        throw new Error(iceResult.reason || 'relay unavailable (/api/ice-servers returned STUN fallback)');
+      }
+
+      callerPc = new RTCPeerConnection({ iceServers: iceResult.iceServers, iceCandidatePoolSize: 2 });
+      calleePc = new RTCPeerConnection({ iceServers: iceResult.iceServers, iceCandidatePoolSize: 2 });
+      callerPc.createDataChannel('wavelink-loopback');
+
+      const queuedForCallee: RTCIceCandidateInit[] = [];
+      const queuedForCaller: RTCIceCandidateInit[] = [];
+      const gatheredTypes = new Set<string>();
+      let calleeHasRemote = false;
+      let callerHasRemote = false;
+
+      callerPc.onicecandidate = (e) => {
+        if (!e.candidate) return;
+        gatheredTypes.add(extractIceCandidateInfo(e.candidate).type);
+        const init = e.candidate.toJSON();
+        if (calleeHasRemote && calleePc) {
+          calleePc.addIceCandidate(new RTCIceCandidate(init)).catch(() => {});
+        } else {
+          queuedForCallee.push(init);
+        }
+      };
+
+      calleePc.onicecandidate = (e) => {
+        if (!e.candidate) return;
+        gatheredTypes.add(extractIceCandidateInfo(e.candidate).type);
+        const init = e.candidate.toJSON();
+        if (callerHasRemote && callerPc) {
+          callerPc.addIceCandidate(new RTCIceCandidate(init)).catch(() => {});
+        } else {
+          queuedForCaller.push(init);
+        }
+      };
+
+      const offer = await callerPc.createOffer();
+      await callerPc.setLocalDescription(offer);
+
+      const nowIso = new Date().toISOString();
+      await setDoc(callDocRef, {
+        callerId: activeUid,
+        caller: activeUid,
+        calleeId: activeUid,
+        receiverId: activeUid,
+        type: 'video',
+        status: 'ringing',
+        offer: { type: offer.type, sdp: offer.sdp || '' },
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      await calleePc.setRemoteDescription(new RTCSessionDescription(offer));
+      calleeHasRemote = true;
+      for (const cand of queuedForCallee) {
+        await calleePc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+      }
+      const answer = await calleePc.createAnswer();
+      await calleePc.setLocalDescription(answer);
+
+      await updateDoc(callDocRef, {
+        status: 'accepted',
+        answer: { type: answer.type, sdp: answer.sdp || '' },
+        acceptedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      await setDoc(callerCandRef, { candidate: 'candidate:1 1 udp 1 127.0.0.1 9999 typ host', sdpMid: '0', sdpMLineIndex: 0 });
+      await setDoc(calleeCandRef, { candidate: 'candidate:2 1 udp 1 127.0.0.1 9998 typ host', sdpMid: '0', sdpMLineIndex: 0 });
+
+      await callerPc.setRemoteDescription(new RTCSessionDescription(answer));
+      callerHasRemote = true;
+      for (const cand of queuedForCaller) {
+        await callerPc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          reject(new Error(`WebRTC loopback timed out after 12s (callerICE=${callerPc?.iceConnectionState}, calleeICE=${calleePc?.iceConnectionState})`));
+        }, 12000);
+
+        const checkConnected = () => {
+          const cIce = callerPc?.iceConnectionState;
+          const rIce = calleePc?.iceConnectionState;
+          if (
+            (cIce === 'connected' || cIce === 'completed' || callerPc?.connectionState === 'connected') &&
+            (rIce === 'connected' || rIce === 'completed' || calleePc?.connectionState === 'connected')
+          ) {
+            window.clearTimeout(timer);
+            resolve();
+          } else if (cIce === 'failed' || rIce === 'failed') {
+            window.clearTimeout(timer);
+            reject(new Error(`ICE failed (caller=${cIce}, callee=${rIce})`));
+          }
+        };
+
+        callerPc!.oniceconnectionstatechange = checkConnected;
+        calleePc!.oniceconnectionstatechange = checkConnected;
+        callerPc!.onconnectionstatechange = checkConnected;
+        calleePc!.onconnectionstatechange = checkConnected;
+        checkConnected();
+      });
+
+      const typeList = Array.from(gatheredTypes);
+      setCallLoopbackHealth({
+        status: 'healthy',
+        summary: `Healthy — Live WebRTC connected & TURN + /calls accepted verified`,
+        detail: `ICE servers: ${iceResult.iceServers.length} (port 443 TCP/TLS: ${hasTcpOrTlsRelay ? 'yes' : 'no'}). Candidate types: [${typeList.join(', ') || 'host'}].`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      setCallLoopbackHealth({
+        status: 'error',
+        summary: `Failed — ${err?.message || 'Call loopback error'}`,
+        detail: `Check Metered TURN env vars or deployed Firestore rules for /calls.`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } finally {
+      try { callerPc?.close(); } catch {}
+      try { calleePc?.close(); } catch {}
+      await deleteDoc(callerCandRef).catch(() => {});
+      await deleteDoc(calleeCandRef).catch(() => {});
+      await deleteDoc(callDocRef).catch(() => {});
+    }
+  }, [currentUser]);
+
   const handleRunAllSystemChecks = useCallback(async () => {
     setIsRunningAllHealthChecks(true);
     try {
@@ -536,6 +699,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         handleTestCallSignalingHealth(),
         handleTestProfileSaveHealth(),
         handleTestCloudinaryHealth(),
+        handleRunFullCallTest(),
       ]);
     } finally {
       setIsRunningAllHealthChecks(false);
@@ -545,6 +709,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     handleTestCallSignalingHealth,
     handleTestProfileSaveHealth,
     handleTestCloudinaryHealth,
+    handleRunFullCallTest,
   ]);
 
   useEffect(() => {
@@ -557,7 +722,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     setIsTestingAzampay(true);
     setAzampayTestResult(null);
     try {
-      const res = await fetch('/api/azampay/token', { method: 'POST' });
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/azampay/token', { method: 'POST', headers });
       const data = await res.json();
       if (data.success) {
         setAzampayTestResult(`Gateway Connected (${data.payee || 'WaveLink'} - ${data.environment || 'sandbox'})`);
@@ -714,16 +880,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Fetch initial Support Bot config from server
   useEffect(() => {
-    if (!isAdmin) return;
-    fetch('/api/support-bot/config')
-      .then((r) => r.json())
+    if (!isAdmin || !currentUser) return;
+    getAuthHeaders()
+      .then((headers) => fetch('/api/support-bot/config', { headers }))
+      .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (d?.config) {
           setBotConfig((prev) => ({ ...prev, ...d.config }));
         }
       })
       .catch(() => {});
-  }, [isAdmin]);
+  }, [isAdmin, currentUser]);
 
   const [isLoadingDashboardData, setIsLoadingDashboardData] = useState(false);
   const [isRefreshingDashboard, setIsRefreshingDashboard] = useState(false);
@@ -2892,6 +3059,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               <div className="flex items-center gap-2 flex-wrap">
                 <button
                   type="button"
+                  onClick={handleRunFullCallTest}
+                  disabled={callLoopbackHealth.status === 'testing' || isRunningAllHealthChecks}
+                  className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold inline-flex items-center gap-2 transition disabled:opacity-60 cursor-pointer"
+                >
+                  {callLoopbackHealth.status === 'testing' ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <PhoneCall size={14} />
+                  )}
+                  <span>{callLoopbackHealth.status === 'testing' ? 'Testing Call...' : 'Call Test'}</span>
+                </button>
+                <button
+                  type="button"
                   onClick={handleRunAllSystemChecks}
                   disabled={isRunningAllHealthChecks}
                   className="min-h-[40px] px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-2 transition disabled:opacity-60 cursor-pointer"
@@ -2998,6 +3178,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                   state: cloudinaryHealth,
                   onRun: handleTestCloudinaryHealth,
                   btnLabel: 'Test Upload',
+                },
+                {
+                  id: 'loopback',
+                  title: '5. Live Call Loopback & Rules',
+                  state: callLoopbackHealth,
+                  onRun: handleRunFullCallTest,
+                  btnLabel: 'Call Test',
                 },
               ].map((item) => (
                 <div

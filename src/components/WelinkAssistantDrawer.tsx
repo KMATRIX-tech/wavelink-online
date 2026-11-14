@@ -46,6 +46,7 @@ import {
   detectUpgradeIdea,
   recordUpgradeFeedback,
 } from '../services/upgradeFeedbackService';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 export type WelinkMode = 'chat' | 'image' | 'voice';
 
@@ -852,7 +853,7 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     startBrowserSpeechRecognition();
 
     try {
-      const wsUrl = getWelinkLiveVoiceWsUrl(selectedVoice);
+      const wsUrl = await getWelinkLiveVoiceWsUrl(selectedVoice);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -1060,10 +1061,12 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   };
 
+  useBottomSheetLock(isOpen, 'welink-assistant');
+
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end">
+    <div className="fixed inset-0 z-[80] flex justify-end">
       {/* Backdrop */}
       <div
         className="fixed inset-0 bg-stone-900/30 backdrop-blur-xs transition-opacity"
@@ -1071,7 +1074,10 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
       />
 
       {/* Drawer Container */}
-      <aside className="relative z-10 w-full max-w-md sm:max-w-lg bg-[var(--bg-surface,#FFFFFF)] h-full shadow-2xl border-l border-[var(--border-hairline,#EFECE6)] flex flex-col overflow-hidden animate-slide-left">
+      <aside
+        className="relative z-10 w-full max-w-md sm:max-w-lg bg-[var(--bg-surface,#FFFFFF)] h-full shadow-2xl border-l border-[var(--border-hairline,#EFECE6)] flex flex-col overflow-hidden animate-slide-left"
+        style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
+      >
         {/* Calm Warm Header */}
         <div className="px-5 py-4 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3">

@@ -25,6 +25,7 @@ import {
 } from '../services/videoUploadQueue';
 import { savePostDocument } from '../services/postService';
 import { SongSelectorModal } from './SongSelectorModal';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import { OnlineSong, Post } from '../types';
 import {
   getHydratedRoyaltyFreeTracks,
@@ -68,6 +69,7 @@ import {
   MapPin,
   MessageSquare,
   Maximize2,
+  ArrowLeft,
   Crown,
   Layers,
   FlipHorizontal,
@@ -1855,8 +1857,13 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
     (c) => currentVideoTime >= c.startTime && currentVideoTime <= c.endTime
   );
 
+  useBottomSheetLock(Boolean(selectedFile || step >= 2), 'studio-editor');
+
   return (
-    <div className="max-w-2xl mx-auto pb-28">
+    <div
+      className="max-w-2xl mx-auto pb-28"
+      style={{ paddingBottom: 'max(7rem, calc(5rem + env(safe-area-inset-bottom, 0px)))' }}
+    >
       {/* Hidden File Inputs */}
       <input
         type="file"
@@ -1885,7 +1892,18 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       {/* TOP STUDIO NAVIGATION BAR (Light, Friendly, Big Tap Targets) */}
       <div className="bg-white rounded-3xl border border-[#EFECE6] shadow-xs p-3 mb-3 flex flex-wrap items-center justify-between gap-2">
         {/* 3-Step Indicator Pills */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {onNavigateToFeed && (
+            <button
+              type="button"
+              onClick={onNavigateToFeed}
+              aria-label="Back to feed"
+              className="lg:hidden min-w-[44px] min-h-[44px] px-2.5 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] flex items-center justify-center gap-1 text-xs font-extrabold transition cursor-pointer"
+            >
+              <ArrowLeft size={16} />
+              <span>Feed</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setStep(1)}
@@ -4009,34 +4027,36 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
           )}
 
           {/* Primary Export & Publish Button */}
-          <button
-            type="button"
-            disabled={isPublishing || (!selectedFile && !caption.trim())}
-            onClick={handlePublish}
-            className="w-full min-h-[54px] py-3.5 px-6 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-md disabled:opacity-50 active:scale-[0.99] transition cursor-pointer"
-          >
-            {isPublishing ? (
-              <>
-                <Loader2 size={18} className="animate-spin" />
-                <span>{uploadStatusText || `Uploading (${uploadProgress}%)...`}</span>
-              </>
-            ) : publishSuccess ? (
-              <>
-                <CheckCircle2 size={18} />
-                <span>Published to WaveLink!</span>
-              </>
-            ) : canRetryUpload ? (
-              <>
-                <RotateCcw size={18} />
-                <span>Retry Upload to Cloudinary</span>
-              </>
-            ) : (
-              <>
-                <Send size={18} />
-                <span>Export & Publish Wave</span>
-              </>
-            )}
-          </button>
+          <div style={{ paddingBottom: 'max(1.5rem, env(safe-area-inset-bottom, 0px))' }}>
+            <button
+              type="button"
+              disabled={isPublishing || (!selectedFile && !caption.trim())}
+              onClick={handlePublish}
+              className="w-full min-h-[54px] py-3.5 px-6 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-md disabled:opacity-50 active:scale-[0.99] transition cursor-pointer"
+            >
+              {isPublishing ? (
+                <>
+                  <Loader2 size={18} className="animate-spin" />
+                  <span>{uploadStatusText || `Uploading (${uploadProgress}%)...`}</span>
+                </>
+              ) : publishSuccess ? (
+                <>
+                  <CheckCircle2 size={18} />
+                  <span>Published to WaveLink!</span>
+                </>
+              ) : canRetryUpload ? (
+                <>
+                  <RotateCcw size={18} />
+                  <span>Retry Upload to Cloudinary</span>
+                </>
+              ) : (
+                <>
+                  <Send size={18} />
+                  <span>Export & Publish Wave</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       )}
 

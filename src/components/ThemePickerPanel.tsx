@@ -21,6 +21,7 @@ import {
 } from '../types';
 import { validateCustomBackgroundFile } from '../utils/mediaStorage';
 import { CustomBackgroundModal } from './CustomBackgroundModal';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   Check,
   Sparkles,
@@ -95,6 +96,8 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
   const [selectedCustomFile, setSelectedCustomFile] = useState<File | null>(null);
   const [isCustomBgModalOpen, setIsCustomBgModalOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useBottomSheetLock(Boolean(showProUpgradePrompt && !isProEffective), 'pro-upgrade-prompt');
 
   // Mix your own theme local draft state
   const defaultDraftMix = (): CustomThemeMix => {
@@ -1578,11 +1581,12 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
           role="dialog"
           aria-modal="true"
           aria-label="Custom backgrounds are a Pro feature"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/55 backdrop-blur-xs"
+          className="fixed inset-0 z-[80] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/55 backdrop-blur-xs"
           onClick={() => setShowProUpgradePrompt(false)}
         >
           <div
-            className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] shadow-2xl p-5 sm:p-6 space-y-4"
+            className="w-full max-w-sm rounded-t-3xl sm:rounded-3xl bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] shadow-2xl p-5 sm:p-6 space-y-4 max-h-[90dvh] overflow-y-auto overscroll-contain"
+            style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom, 0px))' }}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-3">

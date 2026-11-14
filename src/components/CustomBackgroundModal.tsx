@@ -26,6 +26,7 @@ import {
   computeEffectiveTextMode,
   uploadProfileImageToCloudinary
 } from '../utils/mediaStorage';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 interface CustomBackgroundModalProps {
   isOpen: boolean;
@@ -55,6 +56,8 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
 }) => {
   const { currentUser, showGlobalToast } = useAuth();
   const { saveCustomBackground } = useTheme();
+
+  useBottomSheetLock(isOpen, 'custom-background');
 
   const isUploadMode = Boolean(file);
   const [objectUrl, setObjectUrl] = useState<string>('');
@@ -350,7 +353,7 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-label="Edit custom app background"
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 overflow-hidden"
+      className="fixed inset-0 z-[85] flex items-end sm:items-center justify-center p-0 sm:p-4 overflow-hidden"
     >
       {/* REAL APP LIVE PREVIEW LAYER BEHIND THE MODAL SHEET */}
       <div className="fixed inset-0 z-0 pointer-events-none select-none overflow-hidden bg-slate-950">
@@ -476,7 +479,8 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
       </div>
 
       {/* FOREGROUND EDITOR CARD / BOTTOM SHEET */}
-      <div className="relative z-10 w-full max-w-xl bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] rounded-t-3xl sm:rounded-3xl shadow-2xl max-h-[84dvh] sm:max-h-[88dvh] flex flex-col overflow-hidden backdrop-blur-xl">
+      <div className="relative z-10 w-full max-w-xl bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] rounded-t-3xl sm:rounded-3xl shadow-2xl max-h-[86dvh] sm:max-h-[88dvh] flex flex-col overflow-hidden backdrop-blur-xl">
+        <div className="wavelink-sheet-drag-handle sm:hidden mt-2.5 mb-0.5 shrink-0" />
         {/* Modal Header */}
         <div className="px-4 sm:px-5 py-3.5 border-b border-[var(--border-hairline)] flex items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -507,7 +511,7 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
         </div>
 
         {/* Scrollable Editor Body */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 sm:p-5 space-y-4">
           {/* Frame Switcher (9:16 Phone vs 16:9 Desktop) + Interactive Crop Box */}
           <div className="space-y-2.5">
             <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -700,13 +704,16 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
           )}
         </div>
 
-        {/* Sticky Footer Buttons: Reset, Cancel, Save (All >= 44px) */}
-        <div className="px-4 sm:px-5 py-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] flex items-center justify-between gap-2 flex-wrap shrink-0">
+        {/* Sticky Footer Buttons: Reset, Cancel, Save (All >= 48px with safe-area padding) */}
+        <div
+          className="px-4 sm:px-5 pt-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] flex items-center justify-between gap-2 flex-wrap shrink-0"
+          style={{ paddingBottom: 'max(0.875rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           <button
             type="button"
             disabled={isSaving}
             onClick={handleReset}
-            className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold inline-flex items-center gap-1.5 hover:opacity-85 cursor-pointer disabled:opacity-50"
+            className="min-h-[48px] px-3.5 py-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold inline-flex items-center gap-1.5 hover:opacity-85 cursor-pointer disabled:opacity-50"
           >
             <RotateCcw size={14} />
             <span>{language === 'sw' ? 'Rudisha' : 'Reset'}</span>
@@ -717,7 +724,7 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
               type="button"
               disabled={isSaving}
               onClick={onClose}
-              className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold hover:opacity-85 cursor-pointer disabled:opacity-50"
+              className="min-h-[48px] px-4 py-2.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold hover:opacity-85 cursor-pointer disabled:opacity-50"
             >
               {language === 'sw' ? 'Ghairi' : 'Cancel'}
             </button>
@@ -725,7 +732,7 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
               type="button"
               disabled={isSaving}
               onClick={handleSave}
-              className="min-h-[44px] px-5 py-2 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50"
+              className="min-h-[48px] px-5 py-2.5 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50"
             >
               <Check size={15} strokeWidth={2.8} />
               <span>

@@ -505,6 +505,25 @@ html[data-theme-mode="dark"] .wavelink-app-shell select {
   user-select: none;
 }
 
+/* Hide floating action overlays globally across all viewports while any bottom sheet or full-screen editor is active */
+html[data-bottom-sheet-open="true"] .wavelink-floating-ai-btn,
+html[data-bottom-sheet-open="true"] .wavelink-floating-new-chat-btn,
+html[data-bottom-sheet-open="true"] .wavelink-floating-upload-chip {
+  transform: translate3d(0, 4rem, 0) scale(0.85) !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease !important;
+}
+
+@media (max-width: 1023px) {
+  html[data-bottom-sheet-open="true"] .wavelink-mobile-bottom-nav {
+    transform: translate3d(0, 7rem, 0) !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease !important;
+  }
+}
+
 /* When virtual keyboard is open on mobile (< 768px), hide bottom nav, adjust shell height to visualViewport, and prevent input clipping */
 @media (max-width: 767px) {
   input,
@@ -520,7 +539,6 @@ html[data-theme-mode="dark"] .wavelink-app-shell select {
   }
 
   html[data-keyboard-open="true"] .wavelink-mobile-bottom-nav,
-  html[data-bottom-sheet-open="true"] .wavelink-mobile-bottom-nav,
   html[data-input-focused="true"] .wavelink-mobile-bottom-nav {
     transform: translate3d(0, 7rem, 0) !important;
     opacity: 0 !important;
@@ -529,10 +547,8 @@ html[data-theme-mode="dark"] .wavelink-app-shell select {
   }
 
   html[data-keyboard-open="true"] .wavelink-floating-ai-btn,
-  html[data-bottom-sheet-open="true"] .wavelink-floating-ai-btn,
   html[data-input-focused="true"] .wavelink-floating-ai-btn,
   html[data-keyboard-open="true"] .wavelink-floating-new-chat-btn,
-  html[data-bottom-sheet-open="true"] .wavelink-floating-new-chat-btn,
   html[data-input-focused="true"] .wavelink-floating-new-chat-btn {
     transform: translate3d(0, 4rem, 0) scale(0.85) !important;
     opacity: 0 !important;
@@ -1081,8 +1097,12 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     left: 0;
     right: 0;
     z-index: 32;
-    padding: calc(max(0.75rem, env(safe-area-inset-top, 0px)) + 0.25rem) 1rem 1.25rem;
-    background: linear-gradient(to bottom, rgba(6, 10, 20, 0.84) 0%, rgba(6, 10, 20, 0.35) 62%, rgba(6, 10, 20, 0) 100%);
+    padding:
+      calc(max(0.625rem, env(safe-area-inset-top, 0px)) + 0.25rem)
+      max(0.75rem, env(safe-area-inset-right, 0px))
+      1rem
+      max(0.75rem, env(safe-area-inset-left, 0px));
+    background: linear-gradient(to bottom, rgba(6, 10, 20, 0.86) 0%, rgba(6, 10, 20, 0.36) 65%, rgba(6, 10, 20, 0) 100%);
     color: #ffffff;
     transition: opacity 240ms cubic-bezier(0.22, 1, 0.36, 1), transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
   }
@@ -1125,10 +1145,10 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
 
   .wavelink-call-local-pip {
     position: absolute;
-    top: calc(max(0.75rem, env(safe-area-inset-top, 0px)) + 4.25rem);
-    right: 0.875rem;
-    width: 102px;
-    height: 142px;
+    top: calc(max(0.625rem, env(safe-area-inset-top, 0px)) + 4.35rem);
+    right: max(0.75rem, env(safe-area-inset-right, 0px));
+    width: 96px;
+    height: 134px;
     border-radius: 1.125rem;
     overflow: hidden;
     border: 1.5px solid rgba(255, 255, 255, 0.55);
@@ -1152,15 +1172,15 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
 
   .wavelink-call-controls-bar {
     position: absolute;
-    bottom: calc(max(0.875rem, env(safe-area-inset-bottom, 0px)) + 0.375rem);
+    bottom: calc(max(0.625rem, env(safe-area-inset-bottom, 0px)) + 0.375rem);
     left: 50%;
     transform: translate3d(-50%, 0, 0);
     z-index: 34;
-    width: max-content;
-    max-width: calc(100vw - 1.5rem);
-    padding: 0.625rem 0.75rem;
-    border-radius: 9999px;
-    background: rgba(10, 15, 28, 0.76);
+    width: min(calc(100vw - 1rem), 25rem);
+    max-width: calc(100vw - max(1rem, env(safe-area-inset-left, 0px) + env(safe-area-inset-right, 0px)));
+    padding: 0.5rem 0.625rem;
+    border-radius: 1.75rem;
+    background: rgba(10, 15, 28, 0.8);
     backdrop-filter: blur(20px) saturate(150%);
     -webkit-backdrop-filter: blur(20px) saturate(150%);
     border: 1px solid rgba(255, 255, 255, 0.16);
@@ -1168,8 +1188,8 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     display: flex;
     flex-direction: row;
     align-items: center;
-    justify-content: center;
-    gap: 0.625rem;
+    justify-content: space-between;
+    gap: 0.375rem;
     transition: opacity 240ms cubic-bezier(0.22, 1, 0.36, 1), transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
@@ -1177,6 +1197,29 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     opacity: 0;
     transform: translate3d(-50%, 18px, 0);
     pointer-events: none;
+  }
+
+  .wavelink-call-ctrl-slot {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+  }
+
+  .wavelink-call-ctrl-label {
+    font-size: 0.625rem;
+    font-weight: 700;
+    line-height: 1;
+    color: rgba(255, 255, 255, 0.88);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    pointer-events: none;
+    user-select: none;
   }
 
   .wavelink-call-control-btn {
@@ -1192,6 +1235,13 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     flex-shrink: 0;
     transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms ease;
     cursor: pointer;
+  }
+
+  .wavelink-call-control-btn--end {
+    width: 52px;
+    height: 52px;
+    min-width: 52px;
+    min-height: 52px;
   }
 
   .wavelink-call-control-btn:active {
@@ -1215,6 +1265,74 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
 
   .wavelink-call-end-solo-btn:active {
     transform: scale(0.92);
+  }
+}
+
+@media (max-width: 379px) {
+  .wavelink-call-controls-bar {
+    width: calc(100vw - 0.75rem);
+    padding: 0.45rem 0.4rem;
+    gap: 0.25rem;
+  }
+
+  .wavelink-call-control-btn--end {
+    width: 48px;
+    height: 48px;
+    min-width: 48px;
+    min-height: 48px;
+  }
+}
+
+/* Mobile landscape phone call adaptation (fit 100dvh cleanly with zero clipping) */
+@media (max-width: 932px) and (max-height: 520px) and (orientation: landscape) {
+  .wavelink-call-header {
+    padding:
+      calc(max(0.375rem, env(safe-area-inset-top, 0px)) + 0.125rem)
+      max(0.75rem, env(safe-area-inset-right, 0px))
+      0.5rem
+      max(0.75rem, env(safe-area-inset-left, 0px));
+  }
+
+  .wavelink-call-avatar-frame,
+  .wavelink-call-avatar-img {
+    width: 68px !important;
+    height: 68px !important;
+    margin-bottom: 0.5rem !important;
+  }
+
+  .wavelink-call-local-pip {
+    top: calc(max(0.375rem, env(safe-area-inset-top, 0px)) + 3.4rem);
+    bottom: auto;
+    right: max(0.75rem, env(safe-area-inset-right, 0px));
+    width: 112px;
+    height: 68px;
+  }
+
+  .wavelink-call-controls-bar {
+    bottom: max(0.375rem, env(safe-area-inset-bottom, 0px));
+    padding: 0.375rem 0.625rem;
+    width: min(calc(100vw - 2rem), 22rem);
+  }
+
+  .wavelink-call-ctrl-label {
+    display: none;
+  }
+
+  .wavelink-incoming-call-card {
+    padding-top: max(0.5rem, env(safe-area-inset-top, 0px));
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+    gap: 0.5rem;
+  }
+
+  .wavelink-incoming-call-replies {
+    margin: 0.25rem 0;
+  }
+
+  .wavelink-incoming-call-btn {
+    width: 56px;
+    height: 56px;
+    min-width: 56px;
+    min-height: 56px;
   }
 }
 
@@ -1424,18 +1542,44 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
 
   .wavelink-call-controls-bar {
     position: absolute;
-    bottom: 1.25rem;
+    bottom: max(1.25rem, env(safe-area-inset-bottom, 0px));
     left: 50%;
     transform: translate3d(-50%, 0, 0);
     z-index: 34;
+    width: min(calc(100vw - 3rem), 26rem);
     padding: 0.625rem 0.875rem;
-    border-radius: 9999px;
+    border-radius: 1.75rem;
     background: rgba(10, 15, 28, 0.82);
     backdrop-filter: blur(20px);
     border: 1px solid rgba(255, 255, 255, 0.16);
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    justify-content: space-between;
+    gap: 0.625rem;
+  }
+
+  .wavelink-call-controls-bar--hidden {
+    opacity: 0;
+    transform: translate3d(-50%, 18px, 0);
+    pointer-events: none;
+  }
+
+  .wavelink-call-ctrl-slot {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+  }
+
+  .wavelink-call-ctrl-label {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    line-height: 1;
+    color: rgba(255, 255, 255, 0.88);
+    white-space: nowrap;
   }
 
   .wavelink-call-control-btn {
@@ -1448,6 +1592,13 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
     display: inline-flex;
     align-items: center;
     justify-content: center;
+  }
+
+  .wavelink-call-control-btn--end {
+    width: 52px;
+    height: 52px;
+    min-width: 52px;
+    min-height: 52px;
   }
 
   .wavelink-call-end-solo-btn {

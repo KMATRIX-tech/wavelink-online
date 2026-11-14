@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { flushSync } from 'react-dom';
 import { useAuth } from '../context/AuthContext';
 import {
+  auth,
   db,
   handleFirestoreError,
   OperationType,
@@ -106,7 +107,8 @@ import {
   FileText,
   Pencil,
   Paperclip,
-  Palette
+  Palette,
+  Clock
 } from 'lucide-react';
 import { ADMIN_EMAIL, isSuperAdminEmail, getAuthHeaders } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
@@ -1128,12 +1130,17 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     };
   }, [currentUser?.uid, initialTargetUserId, convoFetchLimit]);
 
-  // 2. Load user-created groups once with limit(20) and in-memory caching
+  // 2. Load user-created groups once with limit(20) scoped to memberIds and in-memory caching
   useEffect(() => {
+    if (!currentUser?.uid) return;
     let isMounted = true;
     const fetchGroups = async () => {
       try {
-        const groupsCol = query(collection(db, 'groups'), limit(20));
+        const groupsCol = query(
+          collection(db, 'groups'),
+          where('memberIds', 'array-contains', currentUser.uid),
+          limit(20)
+        );
         const snapshot = await getDocs(groupsCol);
         if (!isMounted) return;
         const list: ChatGroup[] = [];
@@ -1278,6 +1285,58 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       !isChattingWithSupportBot &&
       (userProfile?.blockedUserIds || []).includes(directRecipient.id)
   );
+  const isBlockedByRecipient = Boolean(
+    directRecipient &&
+      !isChattingWithSupportBot &&
+      currentUser?.uid &&
+      (directRecipient.blockedUserIds || []).includes(currentUser.uid)
+  );
+  const dmPrivacyBlockReason = (() => {
+    if (!isDirectMessage || !directRecipient || isChattingWithSupportBot) return null;
+    if (isRecipientBlocked) {
+      return 'You have blocked this user. Unblock them first to send a message.';
+    }
+    if (isBlockedByRecipient && !isAdmin) {
+      return 'You cannot message this user.';
+    }
+    if (!isAdmin) {
+      const dmPref = directRecipient.privacySettings?.allowDirectMessages || 'everyone';
+      if (dmPref === 'none') {
+        return `${directRecipient.displayName} has turned off incoming direct messages.`;
+      }
+      if (
+        dmPref === 'followers' &&
+        !(userProfile?.followingIds || []).includes(directRecipient.id) &&
+        !(directRecipient.followingIds || []).includes(currentUser?.uid || '')
+      ) {
+        return `Follow ${directRecipient.displayName} to send a direct message.`;
+      }
+    }
+    return null;
+  })();
+  const callPrivacyBlockReason = (() => {
+    if (!isDirectMessage || !directRecipient || isChattingWithSupportBot) return null;
+    if (isRecipientBlocked) {
+      return 'You have blocked this user. Unblock them first to place a call.';
+    }
+    if (isBlockedByRecipient && !isAdmin) {
+      return 'You cannot call this user.';
+    }
+    if (!isAdmin) {
+      const callPref = directRecipient.privacySettings?.allowCalls || 'everyone';
+      if (callPref === 'none') {
+        return `${directRecipient.displayName} has disabled incoming calls.`;
+      }
+      if (
+        callPref === 'followers' &&
+        !(userProfile?.followingIds || []).includes(directRecipient.id) &&
+        !(directRecipient.followingIds || []).includes(currentUser?.uid || '')
+      ) {
+        return `Only followers can call ${directRecipient.displayName}.`;
+      }
+    }
+    return null;
+  })();
   const directRecipientPresence = usePresence(
     directRecipient && !isChattingWithSupportBot ? directRecipient.id : undefined,
     directRecipient
@@ -1294,6 +1353,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       })
     : '';
 
+  const isCurrentUserGroupOwner = Boolean(
+    activeGroup && currentUser && activeGroup.creatorId === currentUser.uid
+  );
   const isCurrentUserGroupAdmin = activeGroup && currentUser
     ? (activeGroup.adminIds?.includes(currentUser.uid) || activeGroup.creatorId === currentUser.uid || isAdmin)
     : false;
@@ -1301,6 +1363,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const isCurrentUserMember = activeGroup && currentUser
     ? activeGroup.memberIds?.includes(currentUser.uid)
     : false;
+
+  const activeDisappearingHours = Number(
+    activeGroup?.disappearingHours ??
+      (activeChannel ? channelMetaMap[activeChannel]?.disappearingHours : 0) ??
+      0
+  );
 
   // 2b. Real-time listener for DM channels metadata (limited to convoFetchLimit, default 20)
   // NOTE: Real-time message subcollection listener is strictly scoped ONLY to the open `activeChannel`.
@@ -1485,11 +1553,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         })
         .catch(() => {});
 
-      fetch('/api/users/resolve-avatars', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uids: uidsNeedingServerLookup })
-      })
+      getAuthHeaders()
+        .then((headers) =>
+          fetch('/api/users/resolve-avatars', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ uids: uidsNeedingServerLookup })
+          })
+        )
         .then((r) => r.json())
         .then((data) => {
           if (data?.avatars && typeof data.avatars === 'object') {
@@ -1517,11 +1588,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     let isUnmounted = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const connectChatWs = () => {
+    const connectChatWs = async () => {
       if (isUnmounted) return;
       try {
+        const idToken = (await auth.currentUser?.getIdToken().catch(() => '')) || '';
+        if (isUnmounted || !idToken) return;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/api/chat/ws`;
+        const wsUrl = `${protocol}//${window.location.host}/api/chat/ws?token=${encodeURIComponent(idToken)}`;
         const ws = new WebSocket(wsUrl);
         chatWsRef.current = ws;
 
@@ -1886,6 +1959,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
     const publishMergedMessages = () => {
       const combined: ChannelMessage[] = [];
+      const nowMs = Date.now();
       mergedDocsMap.forEach((msgData) => {
         // Ensure Support Bot messages stay strictly inside the WaveLink Support DM channel
         if (
@@ -1895,6 +1969,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             isSupportBotUser(msgData.senderEmail))
         ) {
           return;
+        }
+        // Hide expired disappearing messages
+        if (msgData.expiresAt) {
+          const expMs = Date.parse(msgData.expiresAt);
+          if (Number.isFinite(expMs) && expMs <= nowMs) {
+            return;
+          }
         }
         combined.push(msgData);
       });
@@ -2608,8 +2689,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   // Send message (with XSS sanitization + deterministic conversationId + serverTimestamp + Support Bot response)
   const handleSendMessage = async (customGifUrl?: string) => {
     if ((!inputText.trim() && !customGifUrl && !chatMediaUrl) || !currentUser || !activeChannel) return;
-    if (isRecipientBlocked) {
-      setChatMediaNotice('You have blocked this user. Unblock them first to send a message.');
+    if (dmPrivacyBlockReason) {
+      setChatMediaNotice(dmPrivacyBlockReason);
       return;
     }
 
@@ -2669,7 +2750,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         isDeleted: false,
         readBy: [currentUser.uid],
         timestamp: serverTimestamp(),
-        createdAt: nowIso
+        createdAt: nowIso,
+        ...(activeDisappearingHours > 0
+          ? { expiresAt: new Date(Date.now() + activeDisappearingHours * 3600 * 1000).toISOString() }
+          : {})
       };
 
       if (chatMediaUrl) {
@@ -3247,9 +3331,69 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     }
   };
 
-  // Delete entire group (Admin only)
+  const handleUpdateDisappearingTimer = async (hours: number) => {
+    if (!currentUser?.uid || !activeChannel) return;
+    const validHours = [0, 24, 168, 720].includes(hours) ? hours : 0;
+    const nowIso = new Date().toISOString();
+    try {
+      if (activeGroup) {
+        if (!isCurrentUserGroupAdmin) return;
+        await updateDoc(doc(db, 'groups', activeChannel), {
+          disappearingHours: validHours,
+          updatedAt: nowIso
+        });
+        setGroups((prev) =>
+          prev.map((g) => (g.id === activeChannel ? { ...g, disappearingHours: validHours } : g))
+        );
+      } else if (isDirectMessage) {
+        const rawOtherId = directRecipient?.id || getOtherDmParticipantId(activeChannel, currentUser.uid);
+        const participants = Array.from(new Set([currentUser.uid, rawOtherId].filter(Boolean))).sort();
+        await setDoc(
+          doc(db, 'channels', activeChannel),
+          {
+            id: activeChannel,
+            conversationId: activeChannel,
+            participants,
+            disappearingHours: validHours,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+        setChannelMetaMap((prev) => ({
+          ...prev,
+          [activeChannel]: {
+            ...(prev[activeChannel] || { id: activeChannel, participants }),
+            disappearingHours: validHours
+          }
+        }));
+      }
+      const label =
+        validHours === 0
+          ? 'Off'
+          : validHours === 24
+          ? '24 hours'
+          : validHours === 168
+          ? '7 days'
+          : '30 days';
+      showGlobalToast(`⏱️ Disappearing messages set to ${label}`);
+      writeChatThemeSystemLine(
+        activeChannel,
+        validHours === 0
+          ? 'turned off disappearing messages.'
+          : `set disappearing messages to ${label}.`
+      ).catch(() => {});
+    } catch (err) {
+      handleFirestoreError(
+        err,
+        OperationType.UPDATE,
+        activeGroup ? `groups/${activeChannel}` : `channels/${activeChannel}`
+      );
+    }
+  };
+
+  // Delete entire group (Owner or Platform Admin only)
   const handleDeleteGroup = async () => {
-    if (!activeGroup || !isCurrentUserGroupAdmin) return;
+    if (!activeGroup || (!isCurrentUserGroupOwner && !isAdmin)) return;
     if (!confirm(`Are you sure you want to permanently delete "${activeGroup.name}"? All chat history will be deleted.`)) return;
     try {
       await deleteDoc(doc(db, 'groups', activeGroup.id));
@@ -3308,11 +3452,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   );
 
   // Subtle system line when theme changes
-  const writeChatThemeSystemLine = async (
+  async function writeChatThemeSystemLine(
     targetChannelId: string,
     text: string,
     visibleToUid?: string
-  ) => {
+  ) {
     if (!currentUser || !targetChannelId) return;
     try {
       const msgId = `sys_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -4602,19 +4746,25 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   <>
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        if (callPrivacyBlockReason) {
+                          setChatMediaNotice(callPrivacyBlockReason);
+                          return;
+                        }
                         onOpenCall('video', {
                           id: directRecipient.id,
                           name: directRecipient.displayName,
                           photoURL: directRecipient.photoURL
-                        })
-                      }
-                      className="wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-video text-white shadow-xs cursor-pointer"
+                        });
+                      }}
+                      className={`wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-video text-white shadow-xs cursor-pointer ${
+                        callPrivacyBlockReason ? 'opacity-45' : ''
+                      }`}
                       style={{
                         background:
                           'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
                       }}
-                      title="Start Video Call"
+                      title={callPrivacyBlockReason || 'Start Video Call'}
                       aria-label="Start Video Call"
                     >
                       <Video size={18} />
@@ -4622,15 +4772,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        if (callPrivacyBlockReason) {
+                          setChatMediaNotice(callPrivacyBlockReason);
+                          return;
+                        }
                         onOpenCall('voice', {
                           id: directRecipient.id,
                           name: directRecipient.displayName,
                           photoURL: directRecipient.photoURL
-                        })
-                      }
-                      className="wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-voice bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer"
-                      title="Start Voice Call"
+                        });
+                      }}
+                      className={`wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-voice bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer ${
+                        callPrivacyBlockReason ? 'opacity-45' : ''
+                      }`}
+                      title={callPrivacyBlockReason || 'Start Voice Call'}
                       aria-label="Start Voice Call"
                     >
                       <PhoneCall size={18} className="text-emerald-500" />
@@ -4685,6 +4841,36 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                       </span>
                     </button>
                   )}
+
+                  {activeChannel &&
+                    !isChattingWithSupportBot &&
+                    (isDirectMessage || isCurrentUserGroupAdmin) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const cycle = [0, 24, 168, 720];
+                          const idx = cycle.indexOf(activeDisappearingHours);
+                          const next = cycle[(idx + 1) % cycle.length];
+                          handleUpdateDisappearingTimer(next);
+                          setShowHeaderMenu(false);
+                        }}
+                        className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center justify-between gap-2 cursor-pointer"
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <Clock size={15} className="text-[var(--accent-primary)]" />
+                          <span>Disappearing msgs</span>
+                        </span>
+                        <span className="text-[11px] font-extrabold text-[var(--accent-primary)]">
+                          {activeDisappearingHours === 0
+                            ? 'Off'
+                            : activeDisappearingHours === 24
+                            ? '24h'
+                            : activeDisappearingHours === 168
+                            ? '7d'
+                            : '30d'}
+                        </span>
+                      </button>
+                    )}
 
                   {activeGroup && (
                     <>
@@ -4939,15 +5125,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   <>
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        if (callPrivacyBlockReason) {
+                          setChatMediaNotice(callPrivacyBlockReason);
+                          return;
+                        }
                         onOpenCall('voice', {
                           id: directRecipient.id,
                           name: directRecipient.displayName,
                           photoURL: directRecipient.photoURL
-                        })
-                      }
-                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer"
-                      title="Start Voice Call"
+                        });
+                      }}
+                      className={`min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center justify-center gap-1.5 transition shrink-0 cursor-pointer ${
+                        callPrivacyBlockReason ? 'opacity-45' : ''
+                      }`}
+                      title={callPrivacyBlockReason || 'Start Voice Call'}
                       aria-label="Start Voice Call"
                     >
                       <PhoneCall size={17} className="text-emerald-500" />
@@ -4956,19 +5148,25 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        if (callPrivacyBlockReason) {
+                          setChatMediaNotice(callPrivacyBlockReason);
+                          return;
+                        }
                         onOpenCall('video', {
                           id: directRecipient.id,
                           name: directRecipient.displayName,
                           photoURL: directRecipient.photoURL
-                        })
-                      }
-                      className="min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-xs transition shrink-0 cursor-pointer"
+                        });
+                      }}
+                      className={`min-w-[44px] min-h-[44px] px-2.5 sm:px-3 py-2 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-xs transition shrink-0 cursor-pointer ${
+                        callPrivacyBlockReason ? 'opacity-45' : ''
+                      }`}
                       style={{
                         background:
                           'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
                       }}
-                      title="Start Video Call"
+                      title={callPrivacyBlockReason || 'Start Video Call'}
                       aria-label="Start Video Call"
                     >
                       <Video size={17} />
@@ -5037,6 +5235,36 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                       </span>
                     </button>
                   )}
+
+                  {activeChannel &&
+                    !isChattingWithSupportBot &&
+                    (isDirectMessage || isCurrentUserGroupAdmin) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const cycle = [0, 24, 168, 720];
+                          const idx = cycle.indexOf(activeDisappearingHours);
+                          const next = cycle[(idx + 1) % cycle.length];
+                          handleUpdateDisappearingTimer(next);
+                          setShowHeaderMenu(false);
+                        }}
+                        className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] flex items-center justify-between gap-2 cursor-pointer"
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <Clock size={15} className="text-[var(--accent-primary)]" />
+                          <span>Disappearing msgs</span>
+                        </span>
+                        <span className="text-[11px] font-extrabold text-[var(--accent-primary)]">
+                          {activeDisappearingHours === 0
+                            ? 'Off'
+                            : activeDisappearingHours === 24
+                            ? '24h'
+                            : activeDisappearingHours === 168
+                            ? '7d'
+                            : '30d'}
+                        </span>
+                      </button>
+                    )}
 
                   <button
                     type="button"
@@ -5282,6 +5510,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   const visibleToUid = (msg as any).visibleTo as string | undefined;
                   if (visibleToUid && visibleToUid !== currentUser?.uid) {
                     return null;
+                  }
+                  if (msg.expiresAt) {
+                    const expMs = Date.parse(msg.expiresAt);
+                    if (Number.isFinite(expMs) && expMs <= Date.now()) {
+                      return null;
+                    }
                   }
 
                   const isOwn = msg.senderId === currentUser?.uid;
@@ -5711,6 +5945,24 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                               >
                                 <Reply size={13} />
                               </button>
+                              {!isOwn && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    reportContent({
+                                      targetType: 'message',
+                                      targetId: msg.id,
+                                      targetAuthorId: msg.senderId,
+                                      targetSummary: sanitizeUserText(msg.text || '[Attachment]', 160),
+                                      reason: 'Reported message from WaveLink Chat'
+                                    })
+                                  }
+                                  className="p-1 rounded-lg hover:bg-amber-500/15 hover:text-amber-500 cursor-pointer"
+                                  title="Report message"
+                                >
+                                  <Flag size={12} />
+                                </button>
+                              )}
                               {isOwn && (
                                 <>
                                   <button
@@ -6035,7 +6287,27 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </div>
             )}
 
-            {isBlockedFromAdminChat ? (
+            {dmPrivacyBlockReason ? (
+              <div className="p-3 bg-[var(--bg-surface)] rounded-3xl border border-[var(--border-hairline)] shadow-lg flex items-center justify-between gap-2.5">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-10 h-10 rounded-2xl bg-stone-500 text-white flex items-center justify-center shrink-0">
+                    <Lock size={16} />
+                  </div>
+                  <p className="text-xs font-bold text-[var(--text-secondary)] truncate">
+                    {dmPrivacyBlockReason}
+                  </p>
+                </div>
+                {isRecipientBlocked && directRecipient && (
+                  <button
+                    type="button"
+                    onClick={() => toggleBlockUser(directRecipient.id)}
+                    className="min-h-[40px] px-3 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] font-extrabold text-xs shrink-0 cursor-pointer"
+                  >
+                    Unblock
+                  </button>
+                )}
+              </div>
+            ) : isBlockedFromAdminChat ? (
               <div className="p-3 bg-[var(--bg-surface)] rounded-3xl border border-[var(--border-hairline)] shadow-lg flex items-center justify-between gap-2.5">
                 <div className="flex items-center gap-2.5 min-w-0">
                   <div className="w-10 h-10 rounded-2xl bg-amber-500 text-white flex items-center justify-center shrink-0">
@@ -6346,7 +6618,27 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </div>
             )}
 
-            {isBlockedFromAdminChat ? (
+            {dmPrivacyBlockReason ? (
+              <div className="p-3.5 bg-[var(--bg-subtle)] rounded-2xl border border-[var(--border-hairline)] flex items-center justify-between flex-wrap gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 rounded-2xl bg-stone-500 text-white shadow-2xs shrink-0">
+                    <Lock size={18} />
+                  </div>
+                  <p className="text-xs font-bold text-[var(--text-secondary)]">
+                    {dmPrivacyBlockReason}
+                  </p>
+                </div>
+                {isRecipientBlocked && directRecipient && (
+                  <button
+                    type="button"
+                    onClick={() => toggleBlockUser(directRecipient.id)}
+                    className="min-h-[40px] py-2 px-4 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] font-extrabold text-xs cursor-pointer"
+                  >
+                    Unblock User
+                  </button>
+                )}
+              </div>
+            ) : isBlockedFromAdminChat ? (
               <div className="p-3.5 bg-[var(--bg-subtle)] rounded-2xl border border-[var(--border-hairline)] flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-3">
                   <div className="p-2.5 rounded-2xl bg-amber-500 text-white shadow-2xs shrink-0">
@@ -7362,7 +7654,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                               {isGroupCreator ? (
                                 <span className="text-amber-600 font-bold flex items-center gap-0.5">
                                   <Crown size={10} />
-                                  <span>Admin</span>
+                                  <span>Owner</span>
                                 </span>
                               ) : isGroupAdmin ? (
                                 <span className="text-[#2563EB] font-bold flex items-center gap-0.5">
@@ -7403,6 +7695,29 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                 </div>
               </div>
 
+              {/* Disappearing Messages Timer */}
+              {isCurrentUserGroupAdmin && (
+                <div className="p-3 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] space-y-2">
+                  <div className="flex items-center justify-between text-xs font-bold text-[#1C1917]">
+                    <span className="flex items-center gap-1.5">
+                      <Clock size={14} className="text-[#2563EB]" />
+                      <span>Disappearing Messages</span>
+                    </span>
+                    <select
+                      aria-label="Disappearing messages timer"
+                      value={activeDisappearingHours}
+                      onChange={(e) => handleUpdateDisappearingTimer(Number(e.target.value))}
+                      className="px-2.5 py-1 rounded-xl bg-white border border-[#D6D3CD] text-xs font-bold text-[#1C1917]"
+                    >
+                      <option value={0}>Off</option>
+                      <option value={24}>24 Hours</option>
+                      <option value={168}>7 Days</option>
+                      <option value={720}>30 Days</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
               {/* Danger Zone: Exit Group or Delete Group */}
               <div className="pt-3 border-t border-[#EFECE6] space-y-2">
                 {isCurrentUserMember && (
@@ -7416,7 +7731,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   </button>
                 )}
 
-                {isCurrentUserGroupAdmin && (
+                {(isCurrentUserGroupOwner || isAdmin) && (
                   <button
                     type="button"
                     onClick={handleDeleteGroup}

@@ -601,6 +601,7 @@ export interface ChannelMessage {
   reportedBadReply?: boolean;
   readBy?: string[];
   lastSeenAt?: string;
+  expiresAt?: string;
   timestamp?: any;
   createdAt: string;
   updatedAt?: string;
@@ -627,6 +628,7 @@ export interface ChatChannelMeta {
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
   suggestedTheme?: SharedChatThemeSuggestion | null;
+  disappearingHours?: number;
   updatedAt?: string;
 }
 
@@ -655,6 +657,7 @@ export interface ChatGroup {
   lastSeen?: Record<string, string>;
   typing?: Record<string, TypingStatusEntry>;
   suggestedTheme?: SharedChatThemeSuggestion | null;
+  disappearingHours?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -903,7 +906,7 @@ export interface ContentReport {
   reporterId: string;
   reporterEmail: string;
   reporterName?: string;
-  targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video';
+  targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video' | 'message';
   targetId: string;
   targetAuthorId?: string;
   targetSummary?: string;

@@ -350,15 +350,14 @@ function safeConstantTimeEquals(inputA: string, inputB: string): boolean {
   return hashesMatch && lengthsMatch;
 }
 
-const SERVER_ADMIN_GRANT_KEY = 'wvlk_srv_grant_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
-
 // Deterministic server-only HMAC secret for signing Owner session tokens (survives server restarts, never exposed to client)
 function getOwnerHmacSecret(): string {
   const email = getOwnerEmail();
   const code = getOwnerAccessCode() || 'wavelink_default_owner_secret';
+  const project = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'formal-photon-n48x0';
   return crypto
     .createHash('sha256')
-    .update(`wavelink_owner_hmac_v2:${email}:${code}:${SERVER_ADMIN_GRANT_KEY}`)
+    .update(`wavelink_owner_hmac_v3:${email}:${code}:${project}`)
     .digest('hex');
 }
 
@@ -542,7 +541,7 @@ async function grantOwnerRoleViaFirestoreRest(
   };
 
   try {
-    // Step 1: Write /admins/{ownerUid} with _serverGrantKey so Firestore rules recognize the server grant immediately
+    // Step 1: Write /admins/{ownerUid} (Firestore rules permit verified owner email token + isSubAdmin==false)
     const adminDocUrl = `${dbPath}/admins/${encodeURIComponent(ownerUid)}`;
     const adminResp = await fetch(adminDocUrl, {
       method: 'PATCH',
@@ -551,7 +550,7 @@ async function grantOwnerRoleViaFirestoreRest(
         fields: {
           uid: { stringValue: ownerUid },
           role: { stringValue: 'admin' },
-          _serverGrantKey: { stringValue: SERVER_ADMIN_GRANT_KEY },
+          isSubAdmin: { booleanValue: false },
           grantedBy: { stringValue: 'server_owner_verification' },
           updatedAt: { stringValue: nowIso }
         }
@@ -568,12 +567,12 @@ async function grantOwnerRoleViaFirestoreRest(
       );
     }
 
-    // Step 2: Patch ONLY role & verification fields on /users/{ownerUid} (including _serverGrantKey) so existing points, followers, posts, username, bio stay untouched
+    // Step 2: Patch ONLY role & verification fields on /users/{ownerUid} so existing points, followers, posts, username, bio stay untouched
     const maskParams = [
       'id',
       'email',
       'role',
-      '_serverGrantKey',
+      'isOwner',
       'isSubAdmin',
       'isPro',
       'hasBlueStar',
@@ -594,7 +593,7 @@ async function grantOwnerRoleViaFirestoreRest(
           id: { stringValue: ownerUid },
           email: { stringValue: email },
           role: { stringValue: 'admin' },
-          _serverGrantKey: { stringValue: SERVER_ADMIN_GRANT_KEY },
+          isOwner: { booleanValue: true },
           isSubAdmin: { booleanValue: false },
           isPro: { booleanValue: true },
           hasBlueStar: { booleanValue: true },
@@ -822,129 +821,6 @@ interface VerifiedAuthUser {
   tokenExpired?: boolean;
 }
 
-function verifyFirebaseIdTokenHeader(req: express.Request): VerifiedAuthUser | null {
-  const authHeader = String(req.headers.authorization || '').trim();
-  const fallbackUid = sanitizeServerString(req.headers['x-wavelink-uid'], 128);
-  const fallbackEmail = sanitizeServerString(req.headers['x-wavelink-email'], 160).toLowerCase();
-  const rawOwnerToken = String(req.headers['x-wavelink-owner-token'] || '').trim();
-  const ownerTokenCheck = verifyOwnerSessionToken(rawOwnerToken);
-
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    const parts = token.split('.');
-    if (parts.length === 3) {
-      try {
-        const payloadJson = Buffer.from(parts[1], 'base64url').toString('utf-8');
-        const payload = JSON.parse(payloadJson);
-        const nowSec = Math.floor(Date.now() / 1000);
-        if (payload && typeof payload === 'object') {
-          const uid = String(payload.user_id || payload.sub || fallbackUid || '').trim();
-          const email = String(payload.email || fallbackEmail || '').trim().toLowerCase();
-          const emailVerified = Boolean(payload.email_verified ?? false);
-          const signInProvider = String(payload.firebase?.sign_in_provider || '').trim();
-          const tokenExpired = Boolean(payload.exp && Number(payload.exp) < nowSec - 60);
-          const customAdminClaim = Boolean(
-            !tokenExpired &&
-              (payload.admin === true ||
-                payload.role === 'super_admin' ||
-                payload.role === 'admin')
-          );
-          const tokenRole: 'admin' | 'sub_admin' | 'user' = customAdminClaim
-            ? 'admin'
-            : !tokenExpired && payload.role === 'sub_admin'
-            ? 'sub_admin'
-            : 'user';
-
-          if (tokenExpired) {
-            return {
-              uid,
-              email,
-              emailVerified,
-              signInProvider,
-              tokenRole: 'user',
-              customAdminClaim: false,
-              isVerifiedOwnerSession: false,
-              tokenExpired: true
-            };
-          }
-
-          if (uid) {
-            return {
-              uid,
-              email,
-              emailVerified,
-              signInProvider,
-              tokenRole,
-              customAdminClaim,
-              isVerifiedOwnerSession:
-                (ownerTokenCheck.valid && ownerTokenCheck.uid === uid) ||
-                serverOwnerUids.has(uid)
-            };
-          }
-        }
-      } catch {
-        // fall through to header fallback in preview
-      }
-    }
-  }
-
-  if (ownerTokenCheck.valid) {
-    return {
-      uid: ownerTokenCheck.uid,
-      email: fallbackEmail,
-      emailVerified: true,
-      tokenRole: 'admin',
-      customAdminClaim: true,
-      isVerifiedOwnerSession: true
-    };
-  }
-
-  if (fallbackUid || fallbackEmail) {
-    const uid = fallbackUid || 'authenticated_user';
-    const isOwnerSession = serverOwnerUids.has(uid);
-    return {
-      uid,
-      email: fallbackEmail,
-      emailVerified: false,
-      tokenRole: isOwnerSession ? 'admin' : 'user',
-      customAdminClaim: isOwnerSession,
-      isVerifiedOwnerSession: isOwnerSession
-    };
-  }
-  return null;
-}
-
-function isServerAdminUser(user: VerifiedAuthUser | null, bodyEmail?: string, bodySubAdmin?: boolean): {
-  authorized: boolean;
-  role: 'super_admin' | 'sub_admin' | 'user';
-} {
-  if (user?.tokenExpired) {
-    return { authorized: false, role: 'user' };
-  }
-  const candidateEmail = (user?.email || bodyEmail || '').trim().toLowerCase();
-  const candidateUid = (user?.uid || '').trim();
-
-  if (
-    isOwnerEmail(candidateEmail) ||
-    user?.tokenRole === 'admin' ||
-    Boolean(user?.customAdminClaim) ||
-    Boolean(user?.isVerifiedOwnerSession) ||
-    (candidateUid && serverOwnerUids.has(candidateUid))
-  ) {
-    return { authorized: true, role: 'super_admin' };
-  }
-
-  if (
-    user?.tokenRole === 'sub_admin' ||
-    (candidateEmail && serverSubAdminEmails.has(candidateEmail)) ||
-    (candidateUid && serverSubAdminUids.has(candidateUid)) ||
-    Boolean(bodySubAdmin && candidateEmail && candidateEmail !== 'support-bot@wavelink.system')
-  ) {
-    return { authorized: true, role: 'sub_admin' };
-  }
-
-  return { authorized: false, role: 'user' };
-}
 
 const WELINK_SYSTEM_INSTRUCTION = `You are WELINK, the warm, intelligent, and official AI Assistant & Community Guide built into the WaveLink social platform.
 STRICT SECURITY RULES:
@@ -1493,12 +1369,25 @@ interface RateBucket {
 }
 
 function getClientKey(req: express.Request): string {
-  const user = verifyFirebaseIdTokenHeader(req);
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    const parts = token.split('.');
+    if (parts.length === 3) {
+      try {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        const uid = String(payload?.user_id || payload?.sub || '').trim();
+        if (uid) return `uid:${uid}`;
+      } catch {
+        // fall through to IP key
+      }
+    }
+  }
   const ip =
     (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
     req.socket.remoteAddress ||
     'unknown';
-  return user?.uid ? `uid:${user.uid}` : `ip:${ip}`;
+  return `ip:${ip}`;
 }
 
 function createRateLimiter(options: {
@@ -1585,19 +1474,17 @@ async function getFirebaseSecureTokenCerts(): Promise<Record<string, string> | n
   }
 }
 
-async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
+async function verifyStrictFirebaseRawToken(token: string): Promise<{
   valid: boolean;
   uid: string;
   email: string;
+  emailVerified: boolean;
+  customRole?: 'admin' | 'sub_admin' | 'user';
+  customAdminClaim?: boolean;
   error?: string;
 }> {
-  const authHeader = String(req.headers.authorization || '').trim();
-  if (!authHeader.startsWith('Bearer ')) {
-    return { valid: false, uid: '', email: '', error: 'Sign-in required: missing Firebase ID token.' };
-  }
-  const token = authHeader.slice(7).trim();
   if (!token || token.split('.').length !== 3) {
-    return { valid: false, uid: '', email: '', error: 'Invalid Firebase ID token format.' };
+    return { valid: false, uid: '', email: '', emailVerified: false, error: 'Invalid Firebase ID token format.' };
   }
 
   // 1. Try Firebase Admin SDK when credentials are available
@@ -1605,10 +1492,21 @@ async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
     if (ensureFirebaseAdminInitialized() && getAdminApps().length > 0) {
       const decoded = await getAdminAuth(getAdminApp()).verifyIdToken(token, true);
       if (decoded?.uid) {
+        const customAdminClaim = Boolean(
+          decoded.admin === true || decoded.role === 'super_admin' || decoded.role === 'admin'
+        );
+        const customRole: 'admin' | 'sub_admin' | 'user' = customAdminClaim
+          ? 'admin'
+          : decoded.role === 'sub_admin'
+          ? 'sub_admin'
+          : 'user';
         return {
           valid: true,
           uid: decoded.uid,
           email: String(decoded.email || '').trim().toLowerCase(),
+          emailVerified: Boolean(decoded.email_verified),
+          customRole,
+          customAdminClaim,
         };
       }
     }
@@ -1621,12 +1519,12 @@ async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
       code === 'auth/argument-error' ||
       code === 'auth/user-disabled'
     ) {
-      return { valid: false, uid: '', email: '', error: 'Firebase ID token is invalid or expired.' };
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Firebase ID token is invalid or expired.' };
     }
     // Otherwise ADC/service-account may be absent in preview/Render -> continue to Google public cert verification
   }
 
-  // 2. Cryptographic JWT RS256 verification against Google's Firebase Auth X.509 certificates
+  // 2. Cryptographic JWT RS256 verification against Google's Firebase Auth X.509 certificates (FAIL-CLOSED)
   try {
     const [headerB64, payloadB64, sigB64] = token.split('.');
     const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as {
@@ -1639,6 +1537,9 @@ async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
       sub?: string;
       user_id?: string;
       email?: string;
+      email_verified?: boolean;
+      role?: string;
+      admin?: boolean;
       exp?: number;
       iat?: number;
       auth_time?: number;
@@ -1649,47 +1550,232 @@ async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
     const uid = String(payload?.sub || payload?.user_id || '').trim();
 
     if (!uid || !payload || typeof payload.exp !== 'number') {
-      return { valid: false, uid: '', email: '', error: 'Malformed Firebase ID token claims.' };
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Malformed Firebase ID token claims.' };
     }
     if (payload.exp <= nowSec - 30) {
-      return { valid: false, uid: '', email: '', error: 'Firebase ID token has expired.' };
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Firebase ID token has expired.' };
     }
     if (typeof payload.iat === 'number' && payload.iat > nowSec + 300) {
-      return { valid: false, uid: '', email: '', error: 'Firebase ID token issued-at timestamp is invalid.' };
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Firebase ID token issued-at timestamp is invalid.' };
     }
     if (projectId) {
       if (payload.aud !== projectId || payload.iss !== `https://securetoken.google.com/${projectId}`) {
-        return { valid: false, uid: '', email: '', error: 'Firebase ID token project mismatch.' };
+        return { valid: false, uid: '', email: '', emailVerified: false, error: 'Firebase ID token project mismatch.' };
       }
     }
 
     if (header?.alg !== 'RS256' || !header?.kid) {
-      return { valid: false, uid: '', email: '', error: 'Unsupported Firebase ID token signature algorithm.' };
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Unsupported Firebase ID token signature algorithm.' };
     }
 
     const certs = await getFirebaseSecureTokenCerts();
-    if (certs) {
-      const certPem = certs[header.kid];
-      if (!certPem) {
-        return { valid: false, uid: '', email: '', error: 'Unrecognized Firebase ID token signing key.' };
-      }
-      const verifier = crypto.createVerify('RSA-SHA256');
-      verifier.update(`${headerB64}.${payloadB64}`);
-      verifier.end();
-      const signatureValid = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
-      if (!signatureValid) {
-        return { valid: false, uid: '', email: '', error: 'Invalid Firebase ID token signature.' };
-      }
+    if (!certs) {
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Unable to verify Firebase signing certificates.' };
     }
+
+    const certPem = certs[header.kid];
+    if (!certPem) {
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Unrecognized Firebase ID token signing key.' };
+    }
+    const verifier = crypto.createVerify('RSA-SHA256');
+    verifier.update(`${headerB64}.${payloadB64}`);
+    verifier.end();
+    const signatureValid = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
+    if (!signatureValid) {
+      return { valid: false, uid: '', email: '', emailVerified: false, error: 'Invalid Firebase ID token signature.' };
+    }
+
+    const customAdminClaim = Boolean(
+      payload.admin === true || payload.role === 'super_admin' || payload.role === 'admin'
+    );
+    const customRole: 'admin' | 'sub_admin' | 'user' = customAdminClaim
+      ? 'admin'
+      : payload.role === 'sub_admin'
+      ? 'sub_admin'
+      : 'user';
 
     return {
       valid: true,
       uid,
       email: String(payload.email || '').trim().toLowerCase(),
+      emailVerified: Boolean(payload.email_verified),
+      customRole,
+      customAdminClaim,
     };
   } catch {
-    return { valid: false, uid: '', email: '', error: 'Failed to validate Firebase ID token.' };
+    return { valid: false, uid: '', email: '', emailVerified: false, error: 'Failed to validate Firebase ID token.' };
   }
+}
+
+async function verifyStrictFirebaseIdToken(req: express.Request): Promise<{
+  valid: boolean;
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  customRole?: 'admin' | 'sub_admin' | 'user';
+  customAdminClaim?: boolean;
+  rawIdToken: string;
+  error?: string;
+}> {
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (!authHeader.startsWith('Bearer ')) {
+    return {
+      valid: false,
+      uid: '',
+      email: '',
+      emailVerified: false,
+      rawIdToken: '',
+      error: 'Sign-in required: missing Firebase ID token.',
+    };
+  }
+  const token = authHeader.slice(7).trim();
+  const result = await verifyStrictFirebaseRawToken(token);
+  return { ...result, rawIdToken: token };
+}
+
+async function resolveServerUserPrivileges(req: express.Request): Promise<{
+  valid: boolean;
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  role: 'super_admin' | 'sub_admin' | 'user';
+  isAdmin: boolean;
+  isSuperAdmin: boolean;
+  isPro: boolean;
+  rawIdToken: string;
+  error?: string;
+}> {
+  const verified = await verifyStrictFirebaseIdToken(req);
+  if (!verified.valid || !verified.uid) {
+    return {
+      valid: false,
+      uid: '',
+      email: '',
+      emailVerified: false,
+      role: 'user',
+      isAdmin: false,
+      isSuperAdmin: false,
+      isPro: false,
+      rawIdToken: '',
+      error: verified.error || 'Authentication required.',
+    };
+  }
+
+  const uid = verified.uid;
+  const email = verified.email;
+  const rawOwnerToken = String(req.headers['x-wavelink-owner-token'] || '').trim();
+  const ownerTokenCheck = verifyOwnerSessionToken(rawOwnerToken, uid);
+
+  let role: 'super_admin' | 'sub_admin' | 'user' = 'user';
+  let isPro = false;
+
+  if (
+    (isOwnerEmail(email) && verified.emailVerified) ||
+    verified.customAdminClaim ||
+    verified.customRole === 'admin' ||
+    ownerTokenCheck.valid ||
+    serverOwnerUids.has(uid)
+  ) {
+    role = 'super_admin';
+    isPro = true;
+  } else if (
+    verified.customRole === 'sub_admin' ||
+    serverSubAdminUids.has(uid) ||
+    (email && serverSubAdminEmails.has(email))
+  ) {
+    role = 'sub_admin';
+    isPro = true;
+  }
+
+  // Check Firestore /users/{uid} and /admins/{uid} for authoritative role & isPro
+  try {
+    const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
+    let userData: Record<string, any> | null = null;
+    let isAdminDoc = false;
+
+    if (ensureFirebaseAdminInitialized() && getAdminApps().length > 0) {
+      try {
+        const adminDb =
+          firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+            ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+            : getAdminFirestore(getAdminApp());
+        const [uSnap, aSnap] = await Promise.all([
+          adminDb.collection('users').doc(uid).get(),
+          adminDb.collection('admins').doc(uid).get(),
+        ]);
+        if (uSnap.exists) userData = uSnap.data() || null;
+        if (aSnap.exists) {
+          const aRole = String(aSnap.data()?.role || '');
+          if (aRole === 'admin' || aRole === 'super_admin') isAdminDoc = true;
+        }
+      } catch {
+        // fall through to REST
+      }
+    }
+
+    if (!userData && projectId && verified.rawIdToken) {
+      const dbPath = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+        projectId
+      )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents`;
+      const headers = { Authorization: `Bearer ${verified.rawIdToken}` };
+      const uResp = await fetch(`${dbPath}/users/${encodeURIComponent(uid)}`, { headers }).catch(() => null);
+      if (uResp && uResp.ok) {
+        const docJson = await uResp.json().catch(() => null);
+        const f = docJson?.fields || {};
+        userData = {
+          role: f.role?.stringValue || 'user',
+          isOwner: Boolean(f.isOwner?.booleanValue),
+          isSubAdmin: Boolean(f.isSubAdmin?.booleanValue),
+          isBot: Boolean(f.isBot?.booleanValue),
+          isPro: Boolean(f.isPro?.booleanValue),
+          hasBlueStar: Boolean(f.hasBlueStar?.booleanValue),
+          isVerifiedByAdmin: Boolean(f.isVerifiedByAdmin?.booleanValue),
+        };
+      }
+      if (!isAdminDoc && role === 'user') {
+        const aResp = await fetch(`${dbPath}/admins/${encodeURIComponent(uid)}`, { headers }).catch(() => null);
+        if (aResp && aResp.ok) {
+          const aJson = await aResp.json().catch(() => null);
+          const aRole = String(aJson?.fields?.role?.stringValue || '');
+          if (aRole === 'admin' || aRole === 'super_admin') isAdminDoc = true;
+        }
+      }
+    }
+
+    if (isAdminDoc || userData?.role === 'admin' || userData?.role === 'super_admin' || userData?.isOwner === true) {
+      role = 'super_admin';
+      isPro = true;
+      persistOwnerUidOnServer(uid);
+    } else if (
+      role === 'user' &&
+      !userData?.isBot &&
+      (userData?.role === 'sub_admin' || userData?.isSubAdmin === true)
+    ) {
+      role = 'sub_admin';
+      serverSubAdminUids.add(uid);
+      isPro = true;
+    } else if (
+      userData?.isPro === true ||
+      userData?.hasBlueStar === true ||
+      userData?.isVerifiedByAdmin === true
+    ) {
+      isPro = true;
+    }
+  } catch {
+    // non-fatal lookup fallback
+  }
+
+  return {
+    valid: true,
+    uid,
+    email,
+    emailVerified: verified.emailVerified,
+    role,
+    isAdmin: role === 'super_admin' || role === 'sub_admin',
+    isSuperAdmin: role === 'super_admin',
+    isPro,
+    rawIdToken: verified.rawIdToken,
+  };
 }
 
 const iceServerUserBuckets = new Map<string, RateBucket>();
@@ -2035,6 +2121,14 @@ async function startServer() {
    * Multi-turn conversational AI assistant with Zod validation, per-user daily limits & output scrubbing
    */
   app.post('/api/welink/chat', rateLimitAi, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({
+        success: false,
+        error: caller.error || 'Authentication required to chat with WELINK AI.',
+      });
+    }
+
     const parsed = WelinkChatSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({
@@ -2043,9 +2137,8 @@ async function startServer() {
       });
     }
 
-    const { messages, model, isPro } = parsed.data;
-    const clientKey = getClientKey(req);
-    const quota = checkAndIncrementUserAiQuota(clientKey, 'chat', Boolean(isPro));
+    const { messages, model } = parsed.data;
+    const quota = checkAndIncrementUserAiQuota(`uid:${caller.uid}`, 'chat', caller.isPro);
     if (!quota.allowed) {
       return res.status(429).json({
         success: false,
@@ -2102,6 +2195,14 @@ async function startServer() {
    * Server-Sent Events (SSE) streaming conversational AI assistant
    */
   app.post('/api/welink/chat-stream', rateLimitAi, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({
+        success: false,
+        error: caller.error || 'Authentication required to chat with WELINK AI.',
+      });
+    }
+
     const parsed = WelinkChatSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({
@@ -2110,9 +2211,8 @@ async function startServer() {
       });
     }
 
-    const { messages, model, isPro } = parsed.data;
-    const clientKey = getClientKey(req);
-    const quota = checkAndIncrementUserAiQuota(clientKey, 'chat', Boolean(isPro));
+    const { messages, model } = parsed.data;
+    const quota = checkAndIncrementUserAiQuota(`uid:${caller.uid}`, 'chat', caller.isPro);
     if (!quota.allowed) {
       return res.status(429).json({
         success: false,
@@ -2189,6 +2289,14 @@ async function startServer() {
    * Create & Edit Images with per-user daily limits (Free: 1/day, Pro: 25/day)
    */
   app.post('/api/welink/image', rateLimitAi, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({
+        success: false,
+        error: caller.error || 'Authentication required to create AI images.',
+      });
+    }
+
     const parsed = WelinkImageSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({
@@ -2197,12 +2305,11 @@ async function startServer() {
       });
     }
 
-    const { prompt, imageBase64, imageMimeType, aspectRatio, isPro } = parsed.data;
+    const { prompt, imageBase64, imageMimeType, aspectRatio } = parsed.data;
     const cleanPrompt = sanitizeServerString(prompt, 800);
     const safeRatio = aspectRatio || '1:1';
 
-    const clientKey = getClientKey(req);
-    const quota = checkAndIncrementUserAiQuota(clientKey, 'image', Boolean(isPro));
+    const quota = checkAndIncrementUserAiQuota(`uid:${caller.uid}`, 'image', caller.isPro);
     if (!quota.allowed) {
       return res.status(429).json({
         success: false,
@@ -2306,6 +2413,14 @@ async function startServer() {
    * Keeps GEMINI_API_KEY strictly on the server and enforces per-user rate limits.
    */
   app.post('/api/ai/post-assist', rateLimitPostAi, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({
+        success: false,
+        error: caller.error || 'Authentication required to use AI Writing Assistant.',
+      });
+    }
+
     const parsed = AiPostAssistSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({
@@ -2314,10 +2429,9 @@ async function startServer() {
       });
     }
 
-    const { mode, text, mediaType, tone, isPro } = parsed.data;
+    const { mode, text, mediaType, tone } = parsed.data;
     const cleanDraft = sanitizeServerString(text || '', 2000);
-    const clientKey = getClientKey(req);
-    const quota = checkAndIncrementUserAiQuota(clientKey, 'chat', Boolean(isPro));
+    const quota = checkAndIncrementUserAiQuota(`uid:${caller.uid}`, 'chat', caller.isPro);
     if (!quota.allowed) {
       return res.status(429).json({
         success: false,
@@ -2463,6 +2577,13 @@ Return ONLY the improved post text without surrounding quotes or markdown explan
    * Combines fast deterministic scam/abuse rules with Gemini safety classification.
    */
   app.post('/api/ai/moderate', rateLimitPostAi, async (req, res) => {
+    const authUser = await verifyStrictFirebaseIdToken(req);
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({
+        success: false,
+        error: authUser.error || 'Authentication required.',
+      });
+    }
     const parsed = AiModerationSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({
@@ -2715,7 +2836,42 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
         sanitizedMeteredServers.push(cleanEntry);
       }
 
-      const hasRelay = sanitizedMeteredServers.some((srv) => {
+      const existingUrlSet = new Set<string>(
+        sanitizedMeteredServers.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]))
+      );
+      const ensuredTcpEntries: Array<{ urls: string; username: string; credential: string }> = [];
+
+      for (const srv of sanitizedMeteredServers) {
+        if (!srv.username || !srv.credential) continue;
+        const list = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
+        for (const u of list) {
+          const match = /^turns?:([^/:?]+)(?::\d+)?/i.exec(u);
+          if (!match) continue;
+          const host = match[1];
+          const tcpTurnUrl = `turn:${host}:443?transport=tcp`;
+          const tlsTurnsUrl = `turns:${host}:443?transport=tcp`;
+          if (!existingUrlSet.has(tcpTurnUrl)) {
+            existingUrlSet.add(tcpTurnUrl);
+            ensuredTcpEntries.push({
+              urls: tcpTurnUrl,
+              username: srv.username,
+              credential: srv.credential,
+            });
+          }
+          if (!existingUrlSet.has(tlsTurnsUrl)) {
+            existingUrlSet.add(tlsTurnsUrl);
+            ensuredTcpEntries.push({
+              urls: tlsTurnsUrl,
+              username: srv.username,
+              credential: srv.credential,
+            });
+          }
+        }
+      }
+
+      const enrichedMeteredServers = [...sanitizedMeteredServers, ...ensuredTcpEntries];
+
+      const hasRelay = enrichedMeteredServers.some((srv) => {
         const list = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
         return list.some((u) => /^turns?:/i.test(u));
       });
@@ -2733,10 +2889,10 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
       }
 
       const seenStun = new Set(
-        sanitizedMeteredServers.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]))
+        enrichedMeteredServers.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]))
       );
       const extraStuns = PUBLIC_STUN_FALLBACK_SERVERS.filter((s) => !seenStun.has(s.urls));
-      const finalIceServers = [...sanitizedMeteredServers, ...extraStuns];
+      const finalIceServers = [...enrichedMeteredServers, ...extraStuns];
 
       cachedMeteredIce = {
         iceServers: finalIceServers,
@@ -2775,7 +2931,14 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
    * GET /api/support-bot/config
    * Returns current Support Bot status & daily Gemini usage
    */
-  app.get('/api/support-bot/config', (_req, res) => {
+  app.get('/api/support-bot/config', async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Administrator privileges required to view Support Bot configuration.',
+      });
+    }
     const today = getTodayDateString();
     if (supportBotState.usageDate !== today) {
       supportBotState.usageDate = today;
@@ -2791,10 +2954,9 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
    * POST /api/support-bot/config
    * Admin-only endpoint to turn Support Bot ON/OFF or adjust limits
    */
-  app.post('/api/support-bot/config', rateLimitAuth, (req, res) => {
-    const authUser = verifyFirebaseIdTokenHeader(req);
-    const adminCheck = isServerAdminUser(authUser, req.body?.adminEmail, req.body?.isSubAdmin);
-    if (!adminCheck.authorized) {
+  app.post('/api/support-bot/config', rateLimitAuth, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.isAdmin) {
       return res.status(403).json({
         success: false,
         error: 'Administrator privileges required to modify Support Bot settings.',
@@ -2835,6 +2997,13 @@ Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" |
    * Escalates refunds, bans, complaints, and payment problems to a human Admin Ticket.
    */
   app.post('/api/support-bot/message', async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({
+        success: false,
+        error: caller.error || 'Sign-in required to message WaveLink Support.',
+      });
+    }
     const today = getTodayDateString();
     if (supportBotState.usageDate !== today) {
       supportBotState.usageDate = today;
@@ -3306,7 +3475,7 @@ Escalation Required: ${
             {
               uid: ownerUid,
               role: 'admin',
-              _serverGrantKey: SERVER_ADMIN_GRANT_KEY,
+              isSubAdmin: false,
               grantedBy: 'server_owner_verification',
               updatedAt: nowIso
             },
@@ -3320,7 +3489,7 @@ Escalation Required: ${
               id: ownerUid,
               email: normalizedTokenEmail,
               role: 'admin',
-              _serverGrantKey: SERVER_ADMIN_GRANT_KEY,
+              isOwner: true,
               isSubAdmin: false,
               isPro: true,
               hasBlueStar: true,
@@ -3865,6 +4034,27 @@ Escalation Required: ${
     if (cached) {
       return res.json({ success: true, authEmail: cached.authEmail, channel: 'email' });
     }
+    try {
+      if (ensureFirebaseAdminInitialized() && getAdminApps().length > 0) {
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        const adminDb =
+          firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+            ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+            : getAdminFirestore(getAdminApp());
+        for (const cand of [`@${rawUsername}`, rawUsername]) {
+          const snap = await adminDb.collection('users').where('username', '==', cand).limit(1).get();
+          if (!snap.empty) {
+            const docEmail = String(snap.docs[0].data()?.email || '').trim().toLowerCase();
+            if (docEmail) {
+              usernameToAuthIdentifierMap.set(rawUsername, { authEmail: docEmail, channel: 'email' });
+              return res.json({ success: true, authEmail: docEmail, channel: 'email' });
+            }
+          }
+        }
+      }
+    } catch {
+      // non-fatal
+    }
     return res.json({ success: true, authEmail: null });
   });
 
@@ -3874,6 +4064,11 @@ Escalation Required: ${
    * for a list of user UIDs and backfills /users/{uid}.photoURL in Firestore if it was missing or a DiceBear placeholder.
    */
   app.post('/api/users/resolve-avatars', rateLimitGlobal, async (req, res) => {
+    const authCheck = await verifyStrictFirebaseIdToken(req);
+    if (!authCheck.valid || !authCheck.uid) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
     const rawUids = Array.isArray(req.body?.uids) ? req.body.uids : [];
     const cleanUids: string[] = rawUids
       .map((u: unknown) => sanitizeServerString(u, 128))
@@ -3958,125 +4153,42 @@ Escalation Required: ${
   });
 
   app.post('/api/admin/verify', rateLimitGlobal, async (req, res) => {
-    const authUser = verifyFirebaseIdTokenHeader(req);
-    const { email, isSubAdmin } = req.body || {};
-    const authHeader = String(req.headers.authorization || '').trim();
-    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const caller = await resolveServerUserPrivileges(req);
+    const rawIdToken = caller.rawIdToken;
     const rawOwnerToken = String(req.headers['x-wavelink-owner-token'] || '').trim();
-    const ownerTokenCheck = verifyOwnerSessionToken(rawOwnerToken, authUser?.uid);
+    const ownerTokenCheck = verifyOwnerSessionToken(rawOwnerToken, caller.uid);
 
-    let check = isServerAdminUser(authUser, email, isSubAdmin);
-    let firestoreRole: 'admin' | 'sub_admin' | 'user' | null = null;
-    let serverCustomClaimAdmin = false;
-
-    // Check Firebase Admin SDK customClaims on the UID if available
-    if (authUser?.uid && !authUser.tokenExpired) {
-      try {
-        if (ensureFirebaseAdminInitialized()) {
-          const userRecord = await getAdminAuth(getAdminApp()).getUser(authUser.uid);
-          const claims = userRecord.customClaims || {};
-          if (claims.role === 'admin' || claims.role === 'super_admin' || claims.admin === true) {
-            serverCustomClaimAdmin = true;
-            persistOwnerUidOnServer(authUser.uid);
-            check = { authorized: true, role: 'super_admin' };
-          } else if (claims.role === 'sub_admin') {
-            serverSubAdminUids.add(authUser.uid);
-            check = { authorized: true, role: 'sub_admin' };
-          }
-        }
-      } catch {
-        // Admin SDK getUser optional in preview container
-      }
-    }
-
-    // Check canonical role in Firestore (/users/{uid}.role and /admins/{uid}) via REST API
-    if (!check.authorized && authUser?.uid && !authUser.tokenExpired) {
-      firestoreRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
-      if (firestoreRole === 'admin') {
-        persistOwnerUidOnServer(authUser.uid);
-        check = { authorized: true, role: 'super_admin' };
-      } else if (firestoreRole === 'sub_admin') {
-        serverSubAdminUids.add(authUser.uid);
-        check = { authorized: true, role: 'sub_admin' };
-      }
-    }
-
-    // Also check Firestore via Admin SDK if available
-    if (!check.authorized && authUser?.uid && !authUser.tokenExpired) {
-      try {
-        if (ensureFirebaseAdminInitialized()) {
-          const { firestoreDatabaseId } = getServerFirebaseConfig();
-          const adminDb =
-            firestoreDatabaseId && firestoreDatabaseId !== '(default)'
-              ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
-              : getAdminFirestore(getAdminApp());
-          const userSnap = await adminDb.collection('users').doc(authUser.uid).get();
-          const userData = userSnap.data();
-          if (userData?.role === 'admin' || userData?.role === 'super_admin') {
-            firestoreRole = 'admin';
-            persistOwnerUidOnServer(authUser.uid);
-            check = { authorized: true, role: 'super_admin' };
-          } else if (userData?.isSubAdmin === true || userData?.role === 'sub_admin') {
-            firestoreRole = 'sub_admin';
-            serverSubAdminUids.add(authUser.uid);
-            check = { authorized: true, role: 'sub_admin' };
-          }
-        }
-      } catch {
-        // ignore if local preview lacks service account credentials
-      }
-    }
-
-    const candidateUid = (authUser?.uid || '').trim();
-    const candidateEmail = (authUser?.email || email || '').trim().toLowerCase();
+    const candidateUid = caller.uid;
+    const candidateEmail = caller.email;
     const ownerEmailEnv = getOwnerEmail().trim().toLowerCase();
     const emailMatchesOwner =
-      isOwnerEmail(candidateEmail) ||
-      (Boolean(candidateEmail && ownerEmailEnv) &&
-        safeConstantTimeEquals(candidateEmail, ownerEmailEnv));
+      Boolean(caller.valid && caller.emailVerified) && (
+        isOwnerEmail(candidateEmail) ||
+        (Boolean(candidateEmail && ownerEmailEnv) &&
+          safeConstantTimeEquals(candidateEmail, ownerEmailEnv))
+      );
 
-    if (!check.authorized) {
-      // Determine which check failed (without revealing any secret)
+    if (!caller.valid || !caller.isAdmin) {
       let failedCheck:
         | 'owner sign-in not used'
         | 'email does not match'
         | 'role missing'
         | 'session needs refresh' = 'role missing';
 
-      if (!rawIdToken || authUser?.tokenExpired || !candidateUid) {
+      if (!rawIdToken || !caller.valid || !candidateUid) {
         failedCheck = 'session needs refresh';
       } else if (!emailMatchesOwner) {
         failedCheck = 'email does not match';
       } else if (ownerTokenCheck.expired) {
         failedCheck = 'session needs refresh';
-      } else if (
-        !rawOwnerToken &&
-        !serverOwnerUids.has(candidateUid) &&
-        !authUser?.customAdminClaim &&
-        firestoreRole !== 'admin'
-      ) {
-        failedCheck = 'owner sign-in not used';
-      } else if (!authUser?.customAdminClaim && (serverCustomClaimAdmin || firestoreRole === 'admin')) {
-        failedCheck = 'session needs refresh';
       } else {
-        failedCheck = 'role missing';
+        failedCheck = 'owner sign-in not used';
       }
 
       const isPassiveCheck = Boolean(req.body?.passiveCheck);
       if (!isPassiveCheck) {
-        // Log detailed check diagnostics strictly on the server stdout (never stderr)
         console.log(
-          `[WaveLink Server Auth Info] Admin Desk check for UID="${candidateUid || 'none'}": failedCheck="${failedCheck}" | tokenExpired=${Boolean(
-            authUser?.tokenExpired
-          )} | emailMatchesOwner=${emailMatchesOwner} | tokenAdminClaim=${Boolean(
-            authUser?.customAdminClaim
-          )} | serverCustomClaimAdmin=${serverCustomClaimAdmin} | ownerTokenProvided=${Boolean(
-            rawOwnerToken
-          )} | ownerTokenValid=${ownerTokenCheck.valid} | ownerTokenExpired=${Boolean(
-            ownerTokenCheck.expired
-          )} | inServerOwnerUids=${Boolean(
-            candidateUid && serverOwnerUids.has(candidateUid)
-          )} | firestoreRole="${firestoreRole || 'none'}"`
+          `[WaveLink Server Auth Info] Admin Desk check for UID="${candidateUid || 'none'}": failedCheck="${failedCheck}" | emailMatchesOwner=${emailMatchesOwner}`
         );
       }
 
@@ -4089,18 +4201,15 @@ Escalation Required: ${
       });
     }
 
-    // Ensure custom claims and Firestore role are synchronized for verified owner admin
-    const canonicalRole = check.role === 'super_admin' ? 'admin' : check.role;
+    const canonicalRole = caller.role === 'super_admin' ? 'admin' : caller.role;
     let needsTokenRefresh = false;
     if (canonicalRole === 'admin' && candidateUid) {
       persistOwnerUidOnServer(candidateUid);
-      if (!authUser?.customAdminClaim) {
-        const claimsUpdated = await setServerAdminCustomClaims(candidateUid);
-        if (claimsUpdated) {
-          needsTokenRefresh = true;
-        }
+      const claimsUpdated = await setServerAdminCustomClaims(candidateUid);
+      if (claimsUpdated) {
+        needsTokenRefresh = true;
       }
-      if (rawIdToken && firestoreRole !== 'admin') {
+      if (rawIdToken) {
         await grantOwnerRoleViaFirestoreRest(
           candidateUid,
           candidateEmail || ownerEmailEnv,
@@ -4110,9 +4219,7 @@ Escalation Required: ${
     }
 
     console.log(
-      `[WaveLink Server Auth Log] Admin Desk verified for UID="${candidateUid}" with role="${canonicalRole}" (tokenClaim=${Boolean(
-        authUser?.customAdminClaim
-      )}, needsTokenRefresh=${needsTokenRefresh}).`
+      `[WaveLink Server Auth Log] Admin Desk verified for UID="${candidateUid}" with role="${canonicalRole}" (needsTokenRefresh=${needsTokenRefresh}).`
     );
 
     return res.json({
@@ -4129,21 +4236,10 @@ Escalation Required: ${
   });
 
   app.post('/api/admin/role', rateLimitAuth, async (req, res) => {
-    const authUser = verifyFirebaseIdTokenHeader(req);
-    const authHeader = String(req.headers.authorization || '').trim();
-    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const callerEmail = sanitizeServerString(req.body?.callerEmail, 160).toLowerCase();
+    const caller = await resolveServerUserPrivileges(req);
+    const rawIdToken = caller.rawIdToken;
 
-    let check = isServerAdminUser(authUser, callerEmail, false);
-    if (!check.authorized && authUser?.uid) {
-      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
-      if (restRole === 'admin') {
-        check = { authorized: true, role: 'super_admin' };
-      }
-    }
-    const isSuper = check.authorized && check.role === 'super_admin';
-
-    if (!isSuper) {
+    if (!caller.valid || !caller.isSuperAdmin) {
       return res.status(403).json({
         success: false,
         error: 'Only the Platform Super Admin can assign or revoke administrator roles.',
@@ -4240,23 +4336,10 @@ Escalation Required: ${
    * Persists changes via Firebase Admin SDK and Firestore REST API so it always succeeds.
    */
   app.post('/api/admin/grant-pro', rateLimitAuth, async (req, res) => {
-    const authUser = verifyFirebaseIdTokenHeader(req);
-    const authHeader = String(req.headers.authorization || '').trim();
-    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const callerEmail = sanitizeServerString(req.body?.callerEmail, 160).toLowerCase();
-    const callerIsSubAdmin = Boolean(req.body?.isSubAdmin);
+    const caller = await resolveServerUserPrivileges(req);
+    const rawIdToken = caller.rawIdToken;
 
-    let check = isServerAdminUser(authUser, callerEmail, callerIsSubAdmin);
-    if (!check.authorized && authUser?.uid) {
-      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
-      if (restRole === 'admin') {
-        check = { authorized: true, role: 'super_admin' };
-      } else if (restRole === 'sub_admin') {
-        check = { authorized: true, role: 'sub_admin' };
-      }
-    }
-
-    if (!check.authorized) {
+    if (!caller.valid || !caller.isAdmin) {
       return res.status(403).json({
         success: false,
         error: 'Only administrators can verify members or grant Pro status.'
@@ -4403,19 +4486,10 @@ Escalation Required: ${
    * For the owner email, @keylan is always treated as the main owner profile.
    */
   app.post('/api/admin/merge-duplicates', rateLimitAuth, async (req, res) => {
-    const authUser = verifyFirebaseIdTokenHeader(req);
-    const authHeader = String(req.headers.authorization || '').trim();
-    const rawIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const caller = await resolveServerUserPrivileges(req);
+    const authUser = { uid: caller.uid, email: caller.email };
 
-    let check = isServerAdminUser(authUser, undefined, false);
-    if (!check.authorized && authUser?.uid) {
-      const restRole = await fetchUserRoleViaFirestoreRest(authUser.uid, rawIdToken);
-      if (restRole === 'admin') {
-        check = { authorized: true, role: 'super_admin' };
-      }
-    }
-
-    if (!check.authorized) {
+    if (!caller.valid || !caller.isAdmin) {
       return res.status(403).json({
         success: false,
         error: 'Admin authorization required to merge accounts.'
@@ -4562,9 +4636,16 @@ Escalation Required: ${
 
   /**
    * POST /api/azampay/token
-   * Verify AzamPay connectivity without exposing any secrets or tokens
+   * Admin-only check of AzamPay connectivity without exposing any secrets or tokens
    */
-  app.post('/api/azampay/token', rateLimitPayment, async (_req, res) => {
+  app.post('/api/azampay/token', rateLimitPayment, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Administrator privileges required to test gateway connectivity.',
+      });
+    }
     try {
       await getAzamPayToken();
       res.json({
@@ -4583,11 +4664,16 @@ Escalation Required: ${
 
   /**
    * POST /api/azampay/checkout
-   * Frontend sends ONLY { phoneNumber, amount, plan, provider }.
-   * Server validates inputs with Zod and attaches owner receiving details internally.
-   * Never sends OWNER_PHONE to frontend, logs, or API responses.
+   * Requires signed-in user. Server validates inputs with Zod and attaches owner receiving details internally.
    */
   app.post('/api/azampay/checkout', rateLimitPayment, async (req, res) => {
+    const caller = await verifyStrictFirebaseIdToken(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({
+        success: false,
+        error: caller.error || 'Authentication required to initiate Mobile Money checkout.',
+      });
+    }
     try {
       const parsed = CheckoutSchema.safeParse(req.body || {});
       if (!parsed.success) {
@@ -4699,11 +4785,284 @@ Escalation Required: ${
     }
   });
 
+  /**
+   * POST /api/pro/redeem-coupon
+   * Server-verified coupon / Harvest Pass redemption (writes isPro via Admin SDK only).
+   */
+  app.post('/api/pro/redeem-coupon', rateLimitPayment, async (req, res) => {
+    const caller = await verifyStrictFirebaseIdToken(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({ success: false, error: caller.error || 'Authentication required.' });
+    }
+    const cleanCode = sanitizeServerString(req.body?.code || '', 64).toUpperCase();
+    if (!cleanCode) {
+      return res.status(400).json({ success: false, error: 'Coupon code is required.' });
+    }
+
+    const adminDb = (() => {
+      try {
+        if (!ensureFirebaseAdminInitialized() || !getAdminApps().length) return null;
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        return firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+      } catch {
+        return null;
+      }
+    })();
+
+    let isValidCode = cleanCode === 'HARVEST2026';
+    if (!isValidCode && adminDb) {
+      try {
+        const [couponSnap, promoSnap] = await Promise.all([
+          adminDb.collection('coupons').doc(cleanCode).get(),
+          adminDb.collection('promo_codes').doc(cleanCode).get(),
+        ]);
+        if ((couponSnap.exists && couponSnap.data()?.active !== false) ||
+            (promoSnap.exists && promoSnap.data()?.active !== false)) {
+          isValidCode = true;
+        }
+      } catch {
+        // ignore lookup failure
+      }
+    }
+
+    if (!isValidCode) {
+      return res.status(400).json({ success: false, error: 'Invalid or expired coupon code.' });
+    }
+
+    if (!adminDb) {
+      return res.status(503).json({
+        success: false,
+        error: 'Server Pro provisioning requires Firebase Admin credentials or manual Admin verification.'
+      });
+    }
+
+    try {
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
+      const proFields = {
+        isPro: true,
+        hasBlueStar: true,
+        isVerifiedByAdmin: true,
+        proPlan: 'annual',
+        proExpiresAt: expiresAt,
+        proBadge: 'verified',
+        proBorderEffect: 'neon-pulse',
+        proAccentColor: 'emerald',
+        redeemedCoupon: cleanCode,
+        updatedAt: now.toISOString(),
+      };
+      await adminDb.collection('users').doc(caller.uid).set(proFields, { merge: true });
+      return res.json({ success: true, proFields });
+    } catch (err: any) {
+      return res.status(503).json({
+        success: false,
+        error: err?.message || 'Could not activate Pro on server. Please request Admin verification.'
+      });
+    }
+  });
+
+  app.post('/api/payments/complete-subscription', rateLimitPayment, async (req, res) => {
+    const caller = await verifyStrictFirebaseIdToken(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({ success: false, error: caller.error || 'Authentication required.' });
+    }
+    const transactionId = sanitizeServerString(req.body?.transactionId, 160);
+    const planId = req.body?.planId === 'weekly' || req.body?.planId === 'annual' ? req.body.planId : 'monthly';
+    if (!transactionId) {
+      return res.status(400).json({ success: false, error: 'transactionId is required.' });
+    }
+
+    const adminDb = (() => {
+      try {
+        if (!ensureFirebaseAdminInitialized() || !getAdminApps().length) return null;
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        return firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+      } catch {
+        return null;
+      }
+    })();
+
+    if (!adminDb) {
+      return res.status(503).json({
+        success: false,
+        pendingVerification: true,
+        error: 'Payment verification queue unavailable without Admin credentials; submit manual verification in Pro Hub.'
+      });
+    }
+
+    try {
+      const txRef = adminDb.collection('subscriptions').doc(transactionId);
+      const txSnap = await txRef.get();
+      if (!txSnap.exists || txSnap.data()?.userId !== caller.uid) {
+        return res.status(403).json({ success: false, error: 'Subscription transaction not found for your account.' });
+      }
+      const now = new Date();
+      const days = planId === 'weekly' ? 7 : planId === 'annual' ? 365 : 30;
+      const expiresAtIso = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+      const completedAt = now.toISOString();
+
+      await txRef.update({
+        status: 'completed',
+        completedAt,
+        mpesaReceiptNumber: `AZM-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
+      });
+      await adminDb.collection('users').doc(caller.uid).set(
+        {
+          isPro: true,
+          hasBlueStar: true,
+          proPlan: planId,
+          proExpiresAt: expiresAtIso,
+          proBadge: planId === 'annual' ? 'founder' : 'verified',
+          proBorderEffect: planId === 'annual' ? 'aura-gold' : 'neon-pulse',
+          proAccentColor: 'purple',
+          updatedAt: completedAt,
+        },
+        { merge: true }
+      );
+      return res.json({ success: true, proPlan: planId, proExpiresAt: expiresAtIso });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to complete subscription.' });
+    }
+  });
+
+  app.post('/api/payments/complete-boost', rateLimitPayment, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({ success: false, error: caller.error || 'Authentication required.' });
+    }
+    const transactionId = sanitizeServerString(req.body?.transactionId, 160);
+    const postId = sanitizeServerString(req.body?.postId, 160);
+    if (!transactionId || !postId) {
+      return res.status(400).json({ success: false, error: 'transactionId and postId are required.' });
+    }
+    const adminDb = (() => {
+      try {
+        if (!ensureFirebaseAdminInitialized() || !getAdminApps().length) return null;
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        return firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+      } catch {
+        return null;
+      }
+    })();
+    if (!adminDb) {
+      return res.status(503).json({ success: false, error: 'Server verification unavailable.' });
+    }
+    try {
+      const postRef = adminDb.collection('posts').doc(postId);
+      const postSnap = await postRef.get();
+      if (!postSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Post not found.' });
+      }
+      const postAuthorId = postSnap.data()?.authorId;
+      const txRef = adminDb.collection('subscriptions').doc(transactionId);
+      const txSnap = await txRef.get();
+      const isExemptOwnerFreeBoost =
+        transactionId.startsWith('free_boost_') &&
+        (caller.isPro || caller.isAdmin) &&
+        (postAuthorId === caller.uid || caller.isAdmin);
+      let isValidPointsBoost = false;
+      if (transactionId.startsWith('pts_boost_') && (postAuthorId === caller.uid || caller.isAdmin)) {
+        const callerSnap = await adminDb.collection('users').doc(caller.uid).get();
+        const txs = Array.isArray(callerSnap.data()?.pointTransactions) ? callerSnap.data()?.pointTransactions : [];
+        const fiveMinsAgo = Date.now() - 5 * 60 * 1000;
+        isValidPointsBoost = txs.some(
+          (tx: any) =>
+            tx?.category === 'post_boost' &&
+            tx?.type === 'spent' &&
+            Number(new Date(tx?.createdAt || 0).getTime()) >= fiveMinsAgo
+        );
+      }
+      const isValidPaidTx =
+        txSnap.exists && txSnap.data()?.userId === caller.uid && txSnap.data()?.postId === postId;
+      if (!isExemptOwnerFreeBoost && !isValidPointsBoost && !isValidPaidTx) {
+        return res.status(403).json({ success: false, error: 'Boost transaction mismatch.' });
+      }
+      const now = new Date();
+      const boostedUntil = new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString();
+      await postRef.set(
+        {
+          isBoosted: true,
+          boostedUntil,
+          boostTier: 'priority_48h',
+          updatedAt: now.toISOString(),
+        },
+        { merge: true }
+      );
+      if (txSnap.exists) {
+        await txRef.update({ status: 'completed', completedAt: now.toISOString() });
+      }
+      return res.json({ success: true, boostedUntil });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to boost post.' });
+    }
+  });
+
+  app.post('/api/payments/complete-tip', rateLimitPayment, async (req, res) => {
+    const caller = await verifyStrictFirebaseIdToken(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({ success: false, error: caller.error || 'Authentication required.' });
+    }
+    const transactionId = sanitizeServerString(req.body?.transactionId, 160);
+    const postId = sanitizeServerString(req.body?.postId, 160);
+    const grossAmountTZS = Number(req.body?.grossAmountTZS || 0);
+    if (!transactionId || !postId || !Number.isFinite(grossAmountTZS) || grossAmountTZS <= 0) {
+      return res.status(400).json({ success: false, error: 'Valid transactionId, postId, and grossAmountTZS are required.' });
+    }
+    const adminDb = (() => {
+      try {
+        if (!ensureFirebaseAdminInitialized() || !getAdminApps().length) return null;
+        const { firestoreDatabaseId } = getServerFirebaseConfig();
+        return firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+      } catch {
+        return null;
+      }
+    })();
+    if (!adminDb) {
+      return res.status(503).json({ success: false, error: 'Server verification unavailable.' });
+    }
+    try {
+      const txRef = adminDb.collection('subscriptions').doc(transactionId);
+      const txSnap = await txRef.get();
+      if (!txSnap.exists || txSnap.data()?.userId !== caller.uid || txSnap.data()?.postId !== postId) {
+        return res.status(403).json({ success: false, error: 'Tip transaction mismatch.' });
+      }
+      const postRef = adminDb.collection('posts').doc(postId);
+      const postSnap = await postRef.get();
+      const prevCount = Number(postSnap.data()?.tipsCount || 0);
+      const prevTotal = Number(postSnap.data()?.tipsTotalTZS || 0);
+      const nowIso = new Date().toISOString();
+      await postRef.set(
+        {
+          tipsCount: prevCount + 1,
+          tipsTotalTZS: prevTotal + grossAmountTZS,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      await txRef.update({ status: 'completed', completedAt: nowIso });
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to record tip.' });
+    }
+  });
+
   // ============================================================================
   // 4. WELINK LIVE VOICE (REST TURN FALLBACK + WEBSOCKET REAL-TIME BRIDGE)
   // ============================================================================
 
   app.post('/api/welink/voice-turn', rateLimitAi, async (req, res) => {
+    const caller = await verifyStrictFirebaseIdToken(req);
+    if (!caller.valid || !caller.uid) {
+      return res.status(401).json({ success: false, error: caller.error || 'Authentication required.' });
+    }
     const { transcript, history } = req.body || {};
     const cleanTranscript = sanitizeServerString(transcript, 1000);
     if (!cleanTranscript) {
@@ -4793,8 +5152,22 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     }
   });
 
-  chatWss.on('connection', (clientWs: WebSocket) => {
-    let connectedUserId = '';
+  chatWss.on('connection', async (clientWs: WebSocket, request) => {
+    let verifiedWsUid = '';
+    try {
+      const urlObj = new URL(request.url || '/api/chat/ws', 'http://localhost');
+      const tokenParam = urlObj.searchParams.get('token') || '';
+      if (tokenParam) {
+        const verified = await verifyStrictFirebaseRawToken(tokenParam);
+        if (verified.valid && verified.uid) {
+          verifiedWsUid = verified.uid;
+        }
+      }
+    } catch {
+      // check message token fallback if not in query string
+    }
+
+    let connectedUserId = verifiedWsUid;
     let connectedUserName = '';
     let connectedPhotoURL = '';
     const joinedChannels = new Set<string>();
@@ -4816,12 +5189,23 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       });
     };
 
-    clientWs.on('message', (raw) => {
+    clientWs.on('message', async (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
+        if (!verifiedWsUid && typeof msg.token === 'string' && msg.token.trim()) {
+          const verified = await verifyStrictFirebaseRawToken(msg.token.trim());
+          if (verified.valid && verified.uid) {
+            verifiedWsUid = verified.uid;
+            connectedUserId = verified.uid;
+          }
+        }
         if (msg.type === 'chat:join') {
           const channelId = sanitizeServerString(msg.channelId, 160);
-          if (msg.userId) connectedUserId = sanitizeServerString(msg.userId, 128);
+          if (verifiedWsUid) {
+            connectedUserId = verifiedWsUid;
+          } else if (!verifiedWsUid) {
+            return;
+          }
           if (msg.name) connectedUserName = sanitizeServerString(msg.name, 80);
           if (msg.photoURL) connectedPhotoURL = sanitizeServerString(msg.photoURL, 500);
           if (channelId) {
@@ -4848,8 +5232,9 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
             );
           }
         } else if (msg.type === 'chat:typing') {
+          if (!verifiedWsUid) return;
           const channelId = sanitizeServerString(msg.channelId, 160);
-          const userId = sanitizeServerString(msg.userId || connectedUserId, 128);
+          const userId = verifiedWsUid;
           if (!channelId || !userId) return;
 
           connectedUserId = userId;
@@ -4881,8 +5266,9 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
           broadcastTypingEvent(entry);
         } else if (msg.type === 'chat:seen') {
+          if (!verifiedWsUid) return;
           const channelId = sanitizeServerString(msg.channelId, 160);
-          const userId = sanitizeServerString(msg.userId || connectedUserId, 128);
+          const userId = verifiedWsUid;
           if (!channelId || !userId) return;
           const seenAt = new Date().toISOString();
           const seenPayload = JSON.stringify({
@@ -4897,10 +5283,11 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
             }
           });
         } else if (msg.type === 'call:signal') {
-          // WebRTC real-time P2P signaling relay (offer, answer, ice-candidate, end)
+          // WebRTC real-time P2P signaling relay — verified caller UID only
+          if (!verifiedWsUid) return;
           const targetUserId = sanitizeServerString(msg.targetUserId, 128);
-          const fromUserId = sanitizeServerString(msg.fromUserId || connectedUserId, 128);
-          if (!targetUserId || !fromUserId) return;
+          const fromUserId = verifiedWsUid;
+          if (!targetUserId || !fromUserId || targetUserId === fromUserId) return;
 
           const signalPayload = JSON.stringify({
             type: 'call:signal',
@@ -4910,7 +5297,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
             fromName: sanitizeServerString(msg.fromName || connectedUserName || 'A Waver', 80),
             fromPhotoURL: sanitizeServerString(msg.fromPhotoURL || connectedPhotoURL || '', 500),
             callType: msg.callType === 'voice' ? 'voice' : 'video',
-            signalType: sanitizeServerString(msg.signalType, 40), // 'offer' | 'answer' | 'candidate' | 'end' | 'ringing' | 'accepted' | 'declined'
+            signalType: sanitizeServerString(msg.signalType, 40),
             signalData: msg.signalData,
             timestamp: new Date().toISOString(),
           });
@@ -4950,14 +5337,22 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
   wss.on('connection', async (clientWs: WebSocket, request) => {
     const validVoices = ['Zephyr', 'Puck', 'Kore', 'Fenrir', 'Charon', 'Aoede'];
     let requestedVoice = 'Zephyr';
+    let tokenParam = '';
     try {
       const urlObj = new URL(request.url || '/api/welink/live', 'http://localhost');
       const v = urlObj.searchParams.get('voice') || 'Zephyr';
+      tokenParam = urlObj.searchParams.get('token') || '';
       if (validVoices.includes(v)) {
         requestedVoice = v;
       }
     } catch {
       // use default Zephyr
+    }
+
+    const wsAuth = await verifyStrictFirebaseRawToken(tokenParam);
+    if (!wsAuth.valid || !wsAuth.uid) {
+      clientWs.close(1008, 'Authentication required');
+      return;
     }
 
     const apiKey = getServerGeminiKey();
@@ -5215,10 +5610,19 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
    * Server-side enforcement of Spark media MIME type, 80 MB size cap, and 60s Free / 90s Pro duration limit.
    * Spark videos themselves are uploaded directly from the browser to Firebase Storage (never through Express).
    */
-  app.post('/api/sparks/validate', rateLimitUpload, (req, res) => {
+  const videoOwnerMap = new Map<string, string>();
+
+  app.post('/api/sparks/validate', rateLimitUpload, async (req, res) => {
     try {
-      const authUser = verifyFirebaseIdTokenHeader(req);
-      const { mimeType, fileSize, durationSeconds, isPro } = req.body || {};
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({
+          success: false,
+          code: 'AUTH_REQUIRED',
+          error: caller.error || 'Authentication required to upload Sparks.',
+        });
+      }
+      const { mimeType, fileSize, durationSeconds } = req.body || {};
 
       const normalizedMime = String(mimeType || '').split(';')[0].trim().toLowerCase();
       const isVideo = ALLOWED_VIDEO_MIMES.has(normalizedMime) || normalizedMime.startsWith('video/');
@@ -5250,8 +5654,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         });
       }
 
-      const isAdminCaller = isServerAdminUser(authUser, authUser?.email, false).authorized;
-      const effectivePro = Boolean(isPro || isAdminCaller);
+      const effectivePro = Boolean(caller.isPro || caller.isAdmin);
 
       if (isVideo) {
         const dur = Number(durationSeconds || 0);
@@ -5302,10 +5705,26 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   app.post('/api/media/video-chunk', rateLimitUpload, async (req, res) => {
     try {
-      const { videoId, chunkIndex, totalChunks, dataBase64, mimeType, isPro, totalFileSize } = req.body || {};
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({
+          success: false,
+          error: caller.error || 'Authentication required to upload media chunks.',
+        });
+      }
+
+      const { videoId, chunkIndex, totalChunks, dataBase64, mimeType, totalFileSize } = req.body || {};
       const safeId = String(videoId || '').replace(/[^a-zA-Z0-9_-]/g, '');
       if (!safeId || typeof chunkIndex !== 'number' || typeof totalChunks !== 'number' || !dataBase64) {
         return res.status(400).json({ success: false, error: 'Invalid video chunk payload.' });
+      }
+
+      const existingOwner = videoOwnerMap.get(safeId);
+      if (existingOwner && existingOwner !== caller.uid && !caller.isAdmin) {
+        return res.status(403).json({ success: false, error: 'Cannot overwrite another user media upload.' });
+      }
+      if (!existingOwner) {
+        videoOwnerMap.set(safeId, caller.uid);
       }
 
       const rawMime = String(mimeType || 'video/mp4').split(';')[0].trim().toLowerCase();
@@ -5316,11 +5735,12 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
           ? rawMime
           : 'video/mp4';
 
-      const maxAllowedBytes = isPro ? MAX_PRO_VIDEO_BYTES : MAX_FREE_VIDEO_BYTES;
+      const effectivePro = Boolean(caller.isPro || caller.isAdmin);
+      const maxAllowedBytes = effectivePro ? MAX_PRO_VIDEO_BYTES : MAX_FREE_VIDEO_BYTES;
       if (typeof totalFileSize === 'number' && totalFileSize > maxAllowedBytes) {
         return res.status(413).json({
           success: false,
-          error: isPro
+          error: effectivePro
             ? 'Video exceeds the WaveLink Pro 100 MB maximum limit.'
             : 'Free tier supports videos up to 50 MB. Upgrade to WaveLink Pro to upload videos up to 100 MB.',
         });
@@ -5343,9 +5763,9 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         if (stat && stat.size + chunkBuffer.length > maxAllowedBytes + 512 * 1024) {
           return res.status(413).json({
             success: false,
-            error: isPro
+            error: effectivePro
               ? 'Video exceeds the 100 MB maximum size limit.'
-              : 'Free tier supports videos from 0 KB to 4 MB.',
+              : 'Free tier supports videos up to 50 MB. Upgrade to WaveLink Pro for up to 100 MB.',
           });
         }
         await fs.promises.appendFile(filePath, chunkBuffer);
@@ -5606,17 +6026,21 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   // Register device FCM token on server
   app.post('/api/notifications/register-token', async (req, res) => {
-    const authUser = await verifyFirebaseIdTokenHeader(req);
-    const userId = String(req.body?.userId || authUser?.uid || '').trim();
+    const authUser = await verifyStrictFirebaseIdToken(req);
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({ error: authUser.error || 'Authentication required.' });
+    }
+    const userId = authUser.uid;
+    const requestedUid = String(req.body?.userId || userId).trim();
+    if (requestedUid !== userId) {
+      return res.status(403).json({ error: 'Cannot register token for another user' });
+    }
     const token = String(req.body?.token || '').trim();
     const tokenId = String(req.body?.tokenId || '').trim() || `tok_${token.slice(0, 16)}`;
     const platform = String(req.body?.platform || 'web').trim();
 
-    if (!userId || !token) {
-      return res.status(400).json({ error: 'userId and token are required' });
-    }
-    if (authUser?.uid && authUser.uid !== userId) {
-      return res.status(403).json({ error: 'Cannot register token for another user' });
+    if (!token) {
+      return res.status(400).json({ error: 'token is required' });
     }
 
     if (!userFcmTokensStore.has(userId)) {
@@ -5634,11 +6058,19 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   // Unregister / delete device FCM token on logout or invalidation
   app.post('/api/notifications/unregister-token', async (req, res) => {
-    const userId = String(req.body?.userId || '').trim();
+    const authUser = await verifyStrictFirebaseIdToken(req);
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({ error: authUser.error || 'Authentication required.' });
+    }
+    const userId = authUser.uid;
+    const requestedUid = String(req.body?.userId || userId).trim();
+    if (requestedUid !== userId) {
+      return res.status(403).json({ error: 'Cannot unregister token for another user' });
+    }
     const tokenId = String(req.body?.tokenId || '').trim();
     const token = String(req.body?.token || '').trim();
 
-    if (userId && userFcmTokensStore.has(userId)) {
+    if (userFcmTokensStore.has(userId)) {
       const userMap = userFcmTokensStore.get(userId)!;
       if (tokenId) userMap.delete(tokenId);
       if (token) {
@@ -5648,7 +6080,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       }
     }
 
-    if (userId && tokenId) {
+    if (tokenId) {
       const adminDb = getServerFirestore();
       if (adminDb) {
         await adminDb
@@ -5663,13 +6095,14 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   // Sync user notification settings to server so server respects them before sending push
   app.post('/api/notifications/sync-settings', async (req, res) => {
-    const authUser = await verifyFirebaseIdTokenHeader(req);
-    const userId = String(req.body?.userId || authUser?.uid || '').trim();
-    const raw = req.body?.settings || {};
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
+    const authUser = await verifyStrictFirebaseIdToken(req);
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({ error: authUser.error || 'Authentication required.' });
     }
-    if (authUser?.uid && authUser.uid !== userId) {
+    const userId = authUser.uid;
+    const requestedUid = String(req.body?.userId || userId).trim();
+    const raw = req.body?.settings || {};
+    if (requestedUid !== userId) {
       return res.status(403).json({ error: 'Cannot modify another user settings' });
     }
 
@@ -5699,8 +6132,8 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
   // Test push notification for the signed-in user's own registered devices
   app.post('/api/notifications/send-test', async (req, res) => {
     try {
-      const authUser = await verifyFirebaseIdTokenHeader(req);
-      if (!authUser?.uid) {
+      const authUser = await verifyStrictFirebaseIdToken(req);
+      if (!authUser.valid || !authUser.uid) {
         return res.status(401).json({ sent: false, error: 'Sign in required to send a test notification.' });
       }
       const userId = authUser.uid;
@@ -5803,8 +6236,8 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
   // Server-only push notification dispatch using Firebase Admin SDK
   app.post('/api/notifications/send-push', async (req, res) => {
     try {
-      const authUser = await verifyFirebaseIdTokenHeader(req);
-      if (!authUser?.uid) {
+      const authUser = await verifyStrictFirebaseIdToken(req);
+      if (!authUser.valid || !authUser.uid) {
         return res.status(401).json({ error: 'Authentication required to trigger push notifications' });
       }
 
@@ -6038,39 +6471,66 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   /**
    * POST /api/posts/create
-   * High-speed server-side post creation with Firebase Admin SDK.
-   * Guarantees post persistence even if client-side IndexedDB tab locks or network acks stall.
+   * High-speed server-side post creation with strict auth, field whitelist, and Admin SDK persistence.
    */
   app.post('/api/posts/create', async (req, res) => {
     try {
-      const authUser = await verifyFirebaseIdTokenHeader(req);
-      const postData = req.body || {};
-      const authorId = String(postData.authorId || authUser?.uid || '').trim();
-
-      if (!authorId) {
-        return res.status(401).json({ error: 'Authentication required to create a post.' });
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ error: caller.error || 'Authentication required to create a post.' });
       }
 
-      // If user token is provided, verify authorId matches (unless system admin)
-      if (authUser?.uid && authUser.uid !== authorId && !authUser.email?.endsWith('@wavelink.app')) {
+      const postData = req.body || {};
+      const requestedAuthorId = sanitizeServerString(postData.authorId || caller.uid, 128);
+      const isBotPost = requestedAuthorId === 'wavelink_support_bot' && caller.isAdmin;
+
+      if (requestedAuthorId !== caller.uid && !isBotPost) {
         return res.status(403).json({ error: 'Cannot create post on behalf of another user.' });
       }
 
-      const postId = String(
-        postData.id || `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
-      ).trim();
+      const rawAudience = String(postData.audience || 'public');
+      const safeAudience =
+        rawAudience === 'followers' || rawAudience === 'close_friends' ? rawAudience : 'public';
+
+      const postId = sanitizeServerString(
+        postData.id || `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+        160
+      );
 
       const adminDb = getServerFirestore();
       if (!adminDb) {
         return res.status(500).json({ error: 'Server database unavailable' });
       }
 
-      const payload = {
-        ...postData,
+      const nowIso = new Date().toISOString();
+      const payload: Record<string, any> = {
         id: postId,
-        authorId,
-        createdAt: postData.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        authorId: isBotPost ? 'wavelink_support_bot' : caller.uid,
+        authorName: sanitizeServerString(postData.authorName || 'WaveLink Member', 100),
+        authorUsername: sanitizeServerString(postData.authorUsername || '', 60),
+        ...(postData.authorPhotoURL ? { authorPhotoURL: sanitizeServerString(postData.authorPhotoURL, 150000) } : {}),
+        content: sanitizeServerString(postData.content || '', 4000),
+        mediaType: ['text', 'image', 'video'].includes(String(postData.mediaType)) ? postData.mediaType : 'text',
+        ...(postData.mediaUrl ? { mediaUrl: sanitizeServerString(postData.mediaUrl, 4096) } : {}),
+        ...(postData.imageUrl ? { imageUrl: sanitizeServerString(postData.imageUrl, 4096) } : {}),
+        ...(postData.videoUrl && !String(postData.videoUrl).startsWith('data:video/')
+          ? { videoUrl: sanitizeServerString(postData.videoUrl, 4096) }
+          : {}),
+        ...(typeof postData.duration === 'number' ? { duration: Math.max(0, Math.min(caller.isPro ? 90.5 : 60.5, postData.duration)) } : {}),
+        ...(typeof postData.videoDurationSeconds === 'number'
+          ? { videoDurationSeconds: Math.max(0, Math.min(caller.isPro ? 90.5 : 60.5, postData.videoDurationSeconds)) }
+          : {}),
+        ...(postData.soundtrack ? { soundtrack: postData.soundtrack } : {}),
+        ...(Array.isArray(postData.tags) ? { tags: postData.tags.slice(0, 15) } : {}),
+        audience: safeAudience,
+        likes: [],
+        likesCount: 0,
+        commentsCount: 0,
+        isBoosted: false,
+        tipsTotalTZS: 0,
+        tipsCount: 0,
+        createdAt: postData.createdAt || nowIso,
+        updatedAt: nowIso
       };
 
       await adminDb.collection('posts').doc(postId).set(payload, { merge: true });
@@ -6083,9 +6543,9 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   // Phase 4: Server-enforced Anti-Spam Share Verification for Weekly Creator Challenges
   app.post('/api/challenges/record-share', async (req, res) => {
-    const authUser = await verifyFirebaseIdTokenHeader(req);
-    if (!authUser?.uid) {
-      return res.status(401).json({ error: 'Authentication required' });
+    const authUser = await verifyStrictFirebaseIdToken(req);
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({ error: authUser.error || 'Authentication required' });
     }
     const postId = String(req.body?.postId || '').trim();
     const authorId = String(req.body?.authorId || '').trim();
@@ -6105,10 +6565,10 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   // Phase 5: Server-enforced Private Creator Stats access check (strictly account owner only)
   app.get('/api/creator-stats/:userId', async (req, res) => {
-    const authUser = await verifyFirebaseIdTokenHeader(req);
+    const authUser = await verifyStrictFirebaseIdToken(req);
     const targetUserId = String(req.params.userId || '').trim();
-    if (!authUser?.uid) {
-      return res.status(401).json({ error: 'Authentication required' });
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({ error: authUser.error || 'Authentication required' });
     }
     if (authUser.uid !== targetUserId) {
       return res.status(403).json({

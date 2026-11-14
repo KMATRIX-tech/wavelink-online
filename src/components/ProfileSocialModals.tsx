@@ -33,6 +33,7 @@ import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
 import { Avatar } from './Avatar';
 import { uploadImageToCloudinary } from '../utils/mediaStorage';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 export interface ProfileBadgeInfo {
   id: 'streak' | 'pro' | 'verified' | 'early_member' | 'top_supporter';
@@ -258,15 +259,17 @@ export const FollowersListModal: React.FC<FollowersListModalProps> = ({
     };
   }, [isOpen, tab, followerIds, followingIds]);
 
+  useBottomSheetLock(isOpen, 'followers-modal');
+
   if (!isOpen) return null;
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
+      className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
       onClick={onClose}
     >
       <div
-        className="w-full sm:max-w-md bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[82dvh] flex flex-col"
+        className="w-full sm:max-w-md bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[85dvh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -320,7 +323,10 @@ export const FollowersListModal: React.FC<FollowersListModalProps> = ({
         </div>
 
         {/* List */}
-        <div className="p-4 overflow-y-auto flex-1 space-y-2.5">
+        <div
+          className="p-4 overflow-y-auto overscroll-contain flex-1 min-h-0 space-y-2.5"
+          style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           {loading ? (
             <div className="space-y-2.5">
               {[1, 2, 3, 4].map((n) => (
@@ -482,6 +488,8 @@ export const ProfilePostViewerModal: React.FC<ProfilePostViewerModalProps> = ({
     return () => clearTimeout(timer);
   }, [isOpen, initialPostId]);
 
+  useBottomSheetLock(isOpen, 'profile-post-viewer');
+
   if (!isOpen) return null;
 
   const handleToggleLike = async (post: Post) => {
@@ -517,7 +525,7 @@ export const ProfilePostViewerModal: React.FC<ProfilePostViewerModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex flex-col"
+      className="fixed inset-0 z-[80] bg-black/75 backdrop-blur-md flex flex-col"
       onClick={onClose}
     >
       {/* Top Bar */}
@@ -758,6 +766,8 @@ export const StoryHighlightsBar: React.FC<StoryHighlightsBarProps> = ({
   const [uploadingCover, setUploadingCover] = useState<boolean>(false);
   const [customCoverUrl, setCustomCoverUrl] = useState<string>('');
 
+  useBottomSheetLock(Boolean(viewingHighlight || isAddModalOpen), 'profile-highlight-modal');
+
   const savedHighlights = Array.isArray(profile?.storyHighlights)
     ? profile!.storyHighlights!
     : [];
@@ -873,7 +883,7 @@ export const StoryHighlightsBar: React.FC<StoryHighlightsBarProps> = ({
       {/* Highlight Viewer Modal */}
       {viewingHighlight && (
         <div
-          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
+          className="fixed inset-0 z-[80] bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
           onClick={() => setViewingHighlight(null)}
         >
           <div
@@ -918,12 +928,13 @@ export const StoryHighlightsBar: React.FC<StoryHighlightsBarProps> = ({
       {/* Add Highlight Modal */}
       {isAddModalOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4"
+          className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
           onClick={() => setIsAddModalOpen(false)}
         >
           <form
             onSubmit={handleCreateHighlight}
-            className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-5 shadow-2xl space-y-4"
+            className="w-full max-w-sm rounded-t-3xl sm:rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-5 shadow-2xl space-y-4 max-h-[90dvh] overflow-y-auto overscroll-contain"
+            style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom, 0px))' }}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">

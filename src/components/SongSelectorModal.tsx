@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { OnlineSong } from '../types';
 import { getHydratedRoyaltyFreeTracks, RoyaltyFreeTrack } from '../utils/creatorStudioAudio';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   Search,
   Music,
@@ -54,6 +55,8 @@ export const SongSelectorModal: React.FC<SongSelectorModalProps> = ({
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  useBottomSheetLock(isOpen, 'song-selector');
 
   useEffect(() => {
     if (isOpen) {
@@ -218,7 +221,7 @@ export const SongSelectorModal: React.FC<SongSelectorModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
+    <div className="fixed inset-0 z-[90] flex items-end sm:items-center justify-center p-0 sm:p-4">
       <div
         className="fixed inset-0 bg-stone-900/50 backdrop-blur-xs"
         onClick={() => {
@@ -228,8 +231,13 @@ export const SongSelectorModal: React.FC<SongSelectorModalProps> = ({
       />
 
       <div className="relative w-full max-w-xl bg-white rounded-t-3xl sm:rounded-3xl border border-[#EFECE6] shadow-2xl overflow-hidden flex flex-col max-h-[90dvh] z-10">
+        {/* Drag handle on phone sheet */}
+        <div className="sm:hidden pt-2 pb-1 flex justify-center bg-[#FAF7F2] shrink-0">
+          <span className="w-10 h-1 rounded-full bg-stone-300" />
+        </div>
+
         {/* Compact Header */}
-        <div className="px-4 py-3.5 border-b border-[#EFECE6] flex items-center justify-between bg-[#FAF7F2]">
+        <div className="px-4 py-3.5 border-b border-[#EFECE6] flex items-center justify-between bg-[#FAF7F2] shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center">
               <Music size={17} />
@@ -382,7 +390,10 @@ export const SongSelectorModal: React.FC<SongSelectorModalProps> = ({
         )}
 
         {/* Royalty-Free Track List */}
-        <div className="flex-1 overflow-y-auto p-3.5 space-y-2 bg-white">
+        <div
+          className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-3.5 space-y-2 bg-white"
+          style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           {filteredTracks.map((song) => {
             const isPlaying = playingTrackId === song.trackId;
             const isSelected =

@@ -128,10 +128,7 @@ export const AuthPage: React.FC = () => {
   const [ownerLockedOut, setOwnerLockedOut] = useState(false);
   const [isOwnerSubmitting, setIsOwnerSubmitting] = useState(false);
 
-  // Automatically record current domain in Firebase on mount for tracking
-  useEffect(() => {
-    recordSystemDomain().catch(() => {});
-  }, []);
+  // System domains are recorded by signed-in admins inside App.tsx
 
   // Load existing Firestore profile details for a verified existing UID so username & displayName are pre-filled
   const loadExistingAccountProfileIntoForm = useCallback(async (uid: string, fallbackEmail: string, fallbackName?: string | null) => {

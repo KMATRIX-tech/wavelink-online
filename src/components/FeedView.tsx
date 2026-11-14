@@ -33,7 +33,8 @@ import {
   notifyQuotaExceeded,
   isFirestoreQuotaError,
   resolveUserAvatarUrl,
-  getBestAuthUserPhotoUrl
+  getBestAuthUserPhotoUrl,
+  getCachedUserProfile
 } from '../firebase';
 import {
   collection,
@@ -67,6 +68,7 @@ import { AdsterraAdBanner } from './AdsterraAdBanner';
 import { shouldShowAds } from './AdsterraManager';
 import { RichEventCard } from './RichEventCard';
 import { ImageLightboxModal, LightboxState } from './ImageLightboxModal';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import { AddToHomeScreenHintCard } from './PWAInstallButton';
 import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
@@ -118,6 +120,8 @@ import {
   RotateCcw,
   Trophy,
   Globe,
+  Users,
+  Lock,
   RefreshCw,
   Smile,
   MoreHorizontal
@@ -418,6 +422,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const videoInputRef = useRef<HTMLInputElement>(null);
   const [isFeelingPickerOpen, setIsFeelingPickerOpen] = useState(false);
   const [selectedFeeling, setSelectedFeeling] = useState<{ labelEn: string; labelSw: string; emoji: string } | null>(null);
+  const [postAudience, setPostAudience] = useState<'public' | 'followers' | 'close_friends'>('public');
 
   const FEELING_OPTIONS = [
     { labelEn: 'Blessed', labelSw: 'Mwenye Baraka', emoji: '🙏' },
@@ -459,6 +464,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [toastNotice, setToastNotice] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const toastTimeoutRef = useRef<any>(null);
+
+  useBottomSheetLock(Boolean(focusedPost || activeAiInfoPost), 'feed-detail-sheet');
 
   // Open AI Info glass sheet & load WELINK AI summary ONLY on tap (zero Firestore reads)
   const handleOpenAiInfo = async (post: Post) => {
@@ -1250,6 +1257,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
         authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
         authorUsername: userProfile?.username || `@${emailPrefix}`,
         authorPhotoURL: safeAuthorPhotoURL,
+        audience: postAudience,
         content: sanitizeUserText(inlineContent, 2000),
         trimStart: inlineVideoTrimStart,
         trimEnd: inlineVideoTrimEnd,
@@ -1259,6 +1267,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       setInlineMediaFile(null);
       setInlineMediaPreview(null);
       setInlineVideoNeedsTrim(false);
+      setPostAudience('public');
       setPostNotice(null);
       return;
     }
@@ -1316,6 +1325,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
         videoHeight: finalHeight,
         countryCode: activeCountryCode,
         locationTag: `${activeCountryMeta.flag} ${activeCountryMeta.nameEn}`,
+        audience: postAudience,
         likes: [],
         likesCount: 0,
         reactions: { like: [], heart: [], fire: [] },
@@ -1339,6 +1349,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       setInlineMediaFile(null);
       setInlineMediaPreview(null);
       setSelectedFeeling(null);
+      setPostAudience('public');
       setPostNotice({
         type: 'success',
         text:
@@ -1572,7 +1583,28 @@ export const FeedView: React.FC<FeedViewProps> = ({
   // - If feedMode === 'local', show posts from the user's selected country first!
   // - Boosted posts first, then Phase 3 interest-matched posts for recent waves, with plain chronological fallback
   const sortedPosts = [...posts]
-    .filter((p) => !blockedIds.includes(p.authorId))
+    .filter((p) => {
+      if (blockedIds.includes(p.authorId)) return false;
+      const authorCached = p.authorId ? getCachedUserProfile(p.authorId) : null;
+      if (currentUser?.uid && (authorCached?.blockedUserIds || []).includes(currentUser.uid)) {
+        return false;
+      }
+      if (p.authorId !== currentUser?.uid && !isAdmin) {
+        const audience = p.audience || 'public';
+        if (audience === 'followers') {
+          const viewerFollowsAuthor =
+            followedIds.includes(p.authorId) ||
+            (userProfile?.followingIds || []).includes(p.authorId);
+          if (!viewerFollowsAuthor) return false;
+        } else if (audience === 'close_friends') {
+          const isCloseFriend =
+            Boolean(currentUser?.uid) &&
+            (authorCached?.closeFriendIds || []).includes(currentUser!.uid);
+          if (!isCloseFriend) return false;
+        }
+      }
+      return true;
+    })
     .filter((p) => {
       if (feedMode === 'following') {
         return followedIds.includes(p.authorId) || p.authorId === currentUser?.uid;
@@ -2228,6 +2260,29 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       <Smile size={18} className="text-[#D97706]" />
                       <span>{language === 'sw' ? 'Hisia' : 'Feeling'}</span>
                     </button>
+
+                    {/* Audience Selector */}
+                    <div className="min-h-[46px] px-3 py-1.5 rounded-2xl bg-stone-50/90 border border-stone-200/90 text-[#44403C] text-xs font-extrabold flex items-center gap-1.5 shadow-2xs">
+                      {postAudience === 'public' ? (
+                        <Globe size={15} className="text-[#2563EB] shrink-0" />
+                      ) : postAudience === 'followers' ? (
+                        <Users size={15} className="text-[#0D9488] shrink-0" />
+                      ) : (
+                        <Lock size={15} className="text-amber-600 shrink-0" />
+                      )}
+                      <select
+                        aria-label="Post audience"
+                        value={postAudience}
+                        onChange={(e) =>
+                          setPostAudience(e.target.value as 'public' | 'followers' | 'close_friends')
+                        }
+                        className="bg-transparent text-xs font-extrabold text-[#1C1917] focus:outline-none cursor-pointer pr-1"
+                      >
+                        <option value="public">{language === 'sw' ? 'Kila mtu' : 'Public'}</option>
+                        <option value="followers">{language === 'sw' ? 'Wafuasi tu' : 'Followers'}</option>
+                        <option value="close_friends">{language === 'sw' ? 'Marafiki wa karibu' : 'Close Friends'}</option>
+                      </select>
+                    </div>
                   </div>
 
                   {/* ONE MAIN BUTTON ON SCREEN */}
@@ -2817,6 +2872,15 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-xs">
                               <Rocket size={10} className="fill-white" />
                               <span>Boosted</span>
+                            </span>
+                          )}
+                          {post.audience && post.audience !== 'public' && (
+                            <span
+                              className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-stone-900/10 dark:bg-white/10 text-[var(--text-secondary)]"
+                              title={post.audience === 'close_friends' ? 'Visible to Close Friends' : 'Visible to Followers'}
+                            >
+                              {post.audience === 'close_friends' ? <Lock size={10} /> : <Users size={10} />}
+                              <span>{post.audience === 'close_friends' ? 'Close Friends' : 'Followers'}</span>
                             </span>
                           )}
                         </div>
@@ -3565,7 +3629,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       {/* Post Detail Reader Modal with Top Visual Reading Progress Bar */}
       {focusedPost && (
         <div
-          className="fixed inset-0 z-50 bg-stone-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
+          className="fixed inset-0 z-[80] bg-stone-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
           onClick={() => setFocusedPost(null)}
         >
           <div
@@ -3824,11 +3888,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
           aria-modal="true"
           aria-label="WELINK AI Wave Summary"
           onClick={() => setActiveAiInfoPost(null)}
-          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/45 backdrop-blur-xs animate-in fade-in"
+          className="fixed inset-0 z-[80] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/45 backdrop-blur-xs animate-in fade-in"
         >
           <div
             onClick={(e) => e.stopPropagation()}
             className="wavelink-share-sheet w-full sm:max-w-md rounded-t-[28px] sm:rounded-[28px] p-5 space-y-4 border border-white/25 shadow-2xl"
+            style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom, 0px))' }}
           >
             <div className="wavelink-sheet-drag-handle sm:hidden" />
 

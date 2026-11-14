@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth, DAILY_REWARD_SCHEDULE, getLocalDateKey } from '../context/AuthContext';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   Flame,
   Sparkles,
@@ -21,6 +22,8 @@ export const DailyRewardModal: React.FC<DailyRewardModalProps> = ({ isOpen, onCl
   const { userProfile, claimDailyReward } = useAuth();
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
+
+  useBottomSheetLock(isOpen, 'daily-reward');
 
   if (!isOpen) return null;
 
@@ -52,10 +55,10 @@ export const DailyRewardModal: React.FC<DailyRewardModalProps> = ({ isOpen, onCl
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs animate-fade-in">
-      <div className="relative w-full max-w-lg rounded-3xl bg-white border border-slate-200/90 shadow-2xl overflow-hidden text-[#0F172A]">
+    <div className="fixed inset-0 z-[80] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/45 backdrop-blur-xs animate-fade-in">
+      <div className="relative w-full max-w-lg rounded-t-3xl sm:rounded-3xl bg-white border border-slate-200/90 shadow-2xl overflow-hidden text-[#0F172A] max-h-[90dvh] flex flex-col">
         {/* Top Gradient Header */}
-        <div className="relative p-6 bg-gradient-to-r from-[#3B82F6] via-sky-500 to-[#10B981] text-white">
+        <div className="relative p-5 sm:p-6 bg-gradient-to-r from-[#3B82F6] via-sky-500 to-[#10B981] text-white shrink-0">
           <button
             type="button"
             onClick={onClose}
@@ -112,7 +115,10 @@ export const DailyRewardModal: React.FC<DailyRewardModalProps> = ({ isOpen, onCl
         </div>
 
         {/* 7-Day Habitual Reward Track */}
-        <div className="p-6 space-y-5 bg-[#FFFFFF]">
+        <div
+          className="p-5 sm:p-6 space-y-5 bg-[#FFFFFF] flex-1 min-h-0 overflow-y-auto overscroll-contain"
+          style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           <div className="flex items-center justify-between">
             <div>
               <h4 className="font-extrabold text-sm text-[#0F172A] flex items-center gap-1.5">

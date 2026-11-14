@@ -21,6 +21,7 @@ import {
   uploadProfileImageToCloudinary,
   validateProfileImageFile
 } from '../utils/mediaStorage';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 export interface BuiltInCoverPreset {
   id: ProfileCoverPresetId;
@@ -452,6 +453,8 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
     };
   }, [loadedImage, panYPercent, zoomLevel]);
 
+  useBottomSheetLock(isOpen, 'profile-cover');
+
   if (!isOpen) return null;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -576,15 +579,20 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
+      className="fixed inset-0 z-[80] bg-black/65 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
       onClick={onClose}
     >
       <div
         className="w-full sm:max-w-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden max-h-[90dvh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Drag handle on phones */}
+        <div className="sm:hidden pt-2 pb-1 flex justify-center shrink-0">
+          <span className="w-10 h-1 rounded-full bg-[var(--border-hairline)]" />
+        </div>
+
         {/* Header */}
-        <div className="px-5 py-4 border-b border-[var(--border-hairline)] flex items-center justify-between gap-3">
+        <div className="px-5 py-4 border-b border-[var(--border-hairline)] flex items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 border border-amber-500/30 flex items-center justify-center">
               <Crown size={18} />
@@ -653,7 +661,7 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="p-5 overflow-y-auto space-y-4 flex-1">
+        <div className="p-5 overflow-y-auto overscroll-contain space-y-4 flex-1 min-h-0">
           {errorMsg && (
             <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-rose-700 dark:text-rose-200 space-y-2">
               <div className="flex items-start gap-2 text-xs font-bold">
@@ -888,11 +896,14 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-4 border-t border-[var(--border-hairline)] flex items-center justify-between gap-3">
+        <div
+          className="px-5 py-3.5 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] flex items-center justify-between gap-3 shrink-0"
+          style={{ paddingBottom: 'max(0.875rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           <button
             type="button"
             onClick={onClose}
-            className="min-h-[44px] px-4 py-2 rounded-xl bg-[var(--bg-subtle)] text-[var(--text-secondary)] text-xs font-extrabold cursor-pointer"
+            className="min-h-[48px] px-4 py-2 rounded-xl bg-[var(--bg-subtle)] text-[var(--text-secondary)] text-xs font-extrabold cursor-pointer"
           >
             {language === 'sw' ? 'Ghairi' : 'Cancel'}
           </button>
@@ -901,7 +912,7 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
             type="button"
             disabled={isSaving}
             onClick={handleSave}
-            className="min-h-[44px] px-6 py-2.5 rounded-xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-xs sm:text-sm font-extrabold flex items-center gap-2 shadow-md transition disabled:opacity-50 cursor-pointer"
+            className="min-h-[48px] px-6 py-2.5 rounded-xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-xs sm:text-sm font-extrabold flex items-center gap-2 shadow-md transition disabled:opacity-50 cursor-pointer"
           >
             <Check size={16} />
             <span>

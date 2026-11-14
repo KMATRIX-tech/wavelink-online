@@ -487,7 +487,7 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
 
     await sendNotification({
       recipientId: currentUser.uid,
-      actorId: 'wavelink_challenges',
+      actorId: currentUser.uid,
       actorName: 'WaveLink Challenges 🏆',
       type: 'challenge_reminder',
       title:

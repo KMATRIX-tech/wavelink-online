@@ -6,7 +6,7 @@
       "$uid": {
         ".read": "auth != null",
         ".write": "auth != null && auth.uid === $uid",
-        ".validate": "newData.hasChildren(['state', 'lastChanged']) && (newData.child('state').val() === 'online' || newData.child('state').val() === 'offline') && newData.child('lastChanged').isNumber() && !newData.hasChild('location') && !newData.hasChild('ip') && !newData.hasChild('device')",
+        ".validate": "newData.hasChildren(['state', 'lastChanged']) && (newData.child('state').val() === 'online' || newData.child('state').val() === 'offline') && newData.child('lastChanged').isNumber() && newData.child('lastChanged').val() <= now + 60000 && !newData.hasChild('location') && !newData.hasChild('ip') && !newData.hasChild('device')",
         "$other": {
           ".validate": false
         }
@@ -17,16 +17,16 @@
         ".read": "auth != null && auth.uid === $uid",
         ".write": "auth != null && auth.uid === $uid",
         "$connectionId": {
-          ".validate": "!newData.exists() || newData.isBoolean()"
+          ".validate": "$connectionId.length <= 128 && (!newData.exists() || newData.isBoolean())"
         }
       }
     },
     "typing": {
       "$conversationId": {
-        ".read": "auth != null && (($conversationId.beginsWith('dm_') && $conversationId.contains(auth.uid)) || !$conversationId.beginsWith('dm_'))",
+        ".read": "auth != null && $conversationId.length <= 160 && (($conversationId.beginsWith('dm_') && $conversationId.contains(auth.uid)) || $conversationId.beginsWith('grp_') || $conversationId.beginsWith('group_') || $conversationId === 'official_updates')",
         "$uid": {
-          ".write": "auth != null && auth.uid === $uid && (($conversationId.beginsWith('dm_') && $conversationId.contains(auth.uid)) || !$conversationId.beginsWith('dm_'))",
-          ".validate": "!newData.exists() || (newData.hasChildren(['isTyping', 'lastChanged']) && newData.child('isTyping').isBoolean() && newData.child('lastChanged').isNumber())",
+          ".write": "auth != null && auth.uid === $uid && $conversationId.length <= 160 && (($conversationId.beginsWith('dm_') && $conversationId.contains(auth.uid)) || $conversationId.beginsWith('grp_') || $conversationId.beginsWith('group_') || $conversationId === 'official_updates')",
+          ".validate": "!newData.exists() || (newData.hasChildren(['isTyping', 'lastChanged']) && newData.child('isTyping').isBoolean() && newData.child('lastChanged').isNumber() && newData.child('lastChanged').val() <= now + 60000)",
           "$other": {
             ".validate": false
           }

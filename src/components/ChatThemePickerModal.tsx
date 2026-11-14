@@ -22,6 +22,7 @@ import {
   Users,
   X
 } from 'lucide-react';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 interface ChatThemePickerModalProps {
   isOpen: boolean;
@@ -111,19 +112,7 @@ export const ChatThemePickerModal: React.FC<ChatThemePickerModalProps> = ({
     setErrorText(null);
   }, [isOpen, conversationId, initialPreference]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    document.documentElement.setAttribute('data-bottom-sheet-open', 'true');
-    window.dispatchEvent(
-      new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: true } })
-    );
-    return () => {
-      document.documentElement.removeAttribute('data-bottom-sheet-open');
-      window.dispatchEvent(
-        new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: false } })
-      );
-    };
-  }, [isOpen]);
+  useBottomSheetLock(isOpen, 'chat-theme-picker');
 
   useEffect(() => {
     return () => {
@@ -566,7 +555,10 @@ export const ChatThemePickerModal: React.FC<ChatThemePickerModalProps> = ({
         </div>
 
         {/* Footer Actions: Reset to default, Cancel, Save */}
-        <div className="px-4 py-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div
+          className="px-4 py-3 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] flex flex-wrap items-center justify-between gap-2 shrink-0"
+          style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           <button
             type="button"
             onClick={handleResetClick}

@@ -9,6 +9,7 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 import { LanguageProvider, useLanguage } from './context/LanguageContext';
 import { PresenceProvider } from './context/PresenceContext';
 import {
+  auth,
   db,
   cleanFirestoreData,
   testConnection,
@@ -147,7 +148,7 @@ function CustomAppBackgroundLayer({ hidden }: { hidden: boolean }) {
 }
 
 function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
-  const { userProfile } = useAuth();
+  const { userProfile, isAdmin } = useAuth();
   const { appearanceTheme, setAppearanceTheme } = useTheme();
   const { setLanguage, language, t } = useLanguage();
 
@@ -388,10 +389,14 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     const unsub = onSnapshot(
       q,
       (snap) => {
+        const blockedIds = userProfile?.blockedUserIds || [];
+        const mutedIds = userProfile?.mutedChannelIds || [];
         const unread: string[] = [];
         snap.forEach((d) => {
           const data = d.data();
           if (data && data.read === false) {
+            if (data.actorId && blockedIds.includes(data.actorId)) return;
+            if (data.type === 'message' && data.entityId && mutedIds.includes(data.entityId)) return;
             unread.push(d.id);
           }
         });
@@ -400,7 +405,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       () => {}
     );
     return () => unsub();
-  }, [currentUser?.uid]);
+  }, [currentUser?.uid, userProfile?.blockedUserIds, userProfile?.mutedChannelIds]);
 
   // Listen to the user's active DM conversations (already bounded) to compute unread message badge count
   useEffect(() => {
@@ -416,8 +421,10 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     const unsub = onSnapshot(
       q,
       (snap) => {
+        const mutedIds = userProfile?.mutedChannelIds || [];
         let total = 0;
         snap.forEach((docSnap) => {
+          if (mutedIds.includes(docSnap.id)) return;
           const data = docSnap.data();
           const unreadMap = data?.unread || data?.unreadCounts || {};
           const rawCount = Number(unreadMap[currentUser.uid] ?? 0);
@@ -610,7 +617,6 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
   useEffect(() => {
     testConnection().catch(() => {});
-    recordSystemDomain().catch(() => {});
 
     const handleGlobalHashtag = (e: Event) => {
       const detail = (e as CustomEvent<string | { hashtag?: string; tag?: string }>).detail;
@@ -907,10 +913,25 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           !handledCallIdsRef.current.has(callId) &&
           (data.callerId || data.caller) !== currentUser.uid
         ) {
+          const resolvedCallerId = String(data.callerId || data.caller || '');
+          const myBlocked = userProfile?.blockedUserIds || [];
+          const cachedCaller = resolvedCallerId ? getCachedUserProfile(resolvedCallerId) : null;
+          if (resolvedCallerId && (myBlocked.includes(resolvedCallerId) || cachedCaller?.blockedUserIds?.includes(currentUser.uid))) {
+            return;
+          }
+          const allowCallsPref = userProfile?.privacySettings?.allowCalls || 'everyone';
+          if (allowCallsPref === 'none' && cachedCaller?.role !== 'admin') {
+            return;
+          }
+          if (
+            allowCallsPref === 'followers' &&
+            cachedCaller?.role !== 'admin' &&
+            !(userProfile?.followingIds || []).includes(resolvedCallerId)
+          ) {
+            return;
+          }
           if (createdAtMs >= newestTime) {
             newestTime = createdAtMs;
-            const resolvedCallerId = String(data.callerId || data.caller || '');
-            const cachedCaller = resolvedCallerId ? getCachedUserProfile(resolvedCallerId) : null;
             newestRinging = {
               callId,
               callerId: resolvedCallerId,
@@ -1022,68 +1043,128 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       unsub1();
       unsub2();
     };
-  }, [currentUser?.uid, stopIncomingRingtone]);
+  }, [
+    currentUser?.uid,
+    stopIncomingRingtone,
+    userProfile?.blockedUserIds,
+    userProfile?.privacySettings?.allowCalls,
+    userProfile?.followingIds
+  ]);
+
+  useEffect(() => {
+    if (isAdmin) {
+      recordSystemDomain().catch(() => {});
+    }
+  }, [isAdmin]);
 
   // Real-time listener for incoming call signals via WebSocket (instant low-latency supplement)
   useEffect(() => {
     if (!currentUser?.uid) return;
     let isCleanedUp = false;
+    let activeWs: WebSocket | null = null;
 
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/chat/ws`;
-      const ws = new WebSocket(wsUrl);
+    const connectCallWs = async () => {
+      try {
+        const idToken = (await auth.currentUser?.getIdToken().catch(() => '')) || '';
+        if (isCleanedUp || !idToken) return;
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/chat/ws?token=${encodeURIComponent(idToken)}`;
+        const ws = new WebSocket(wsUrl);
+        activeWs = ws;
 
-      ws.onopen = () => {
-        if (isCleanedUp) return;
-        ws.send(
-          JSON.stringify({
-            type: 'chat:join',
-            channelId: `user_${currentUser.uid}`,
-            userId: currentUser.uid,
-            name: userProfile?.displayName || currentUser.displayName || 'Waver'
-          })
-        );
-      };
+        ws.onopen = () => {
+          if (isCleanedUp) return;
+          ws.send(
+            JSON.stringify({
+              type: 'chat:join',
+              channelId: `user_${currentUser.uid}`,
+              userId: currentUser.uid,
+              name: userProfile?.displayName || currentUser.displayName || 'Waver'
+            })
+          );
+        };
 
-      ws.onmessage = (event) => {
-        if (isCleanedUp) return;
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
-            const callerId = data.fromUserId || data.senderId;
-            if (data.signalType === 'offer' && callerId && !handledCallIdsRef.current.has(data.callId)) {
-              const cachedCaller = getCachedUserProfile(callerId);
-              setIncomingCall((prev) => ({
-                callId: data.callId,
-                callerId,
-                callerName: cachedCaller?.displayName || data.fromName || data.senderName || prev?.callerName || 'WaveLink Member',
-                callerPhotoURL: sanitizeShortHttpsUrl(cachedCaller?.photoURL) || prev?.callerPhotoURL,
-                callType: data.callType || prev?.callType || 'video',
-                offer: data.signalData || data.sdp || prev?.offer
-              }));
-            } else if (data.signalType === 'end' || data.signalType === 'declined') {
-              stopIncomingRingtone();
-              setIncomingCall((prev) => (prev?.callId === data.callId ? null : prev));
+        ws.onmessage = (event) => {
+          if (isCleanedUp) return;
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'call:signal' && data.targetUserId === currentUser.uid) {
+              const callerId = data.fromUserId || data.senderId;
+              if (data.signalType === 'offer' && callerId && !handledCallIdsRef.current.has(data.callId)) {
+                const cachedCaller = getCachedUserProfile(callerId);
+                const myBlocked = userProfile?.blockedUserIds || [];
+                if (myBlocked.includes(callerId) || cachedCaller?.blockedUserIds?.includes(currentUser.uid)) {
+                  return;
+                }
+                const allowCallsPref = userProfile?.privacySettings?.allowCalls || 'everyone';
+                if (allowCallsPref === 'none' && cachedCaller?.role !== 'admin') return;
+                if (
+                  allowCallsPref === 'followers' &&
+                  cachedCaller?.role !== 'admin' &&
+                  !(userProfile?.followingIds || []).includes(callerId)
+                ) {
+                  return;
+                }
+                setIncomingCall((prev) => ({
+                  callId: data.callId,
+                  callerId,
+                  callerName: cachedCaller?.displayName || data.fromName || data.senderName || prev?.callerName || 'WaveLink Member',
+                  callerPhotoURL: sanitizeShortHttpsUrl(cachedCaller?.photoURL) || prev?.callerPhotoURL,
+                  callType: data.callType || prev?.callType || 'video',
+                  offer: data.signalData || data.sdp || prev?.offer
+                }));
+              } else if (data.signalType === 'end' || data.signalType === 'declined') {
+                stopIncomingRingtone();
+                setIncomingCall((prev) => (prev?.callId === data.callId ? null : prev));
+              }
             }
+          } catch (err) {
+            console.warn('Incoming call signal parse notice:', err);
           }
-        } catch (err) {
-          console.warn('Incoming call signal parse notice:', err);
-        }
-      };
+        };
+      } catch {
+        // Non-blocking WebSocket setup
+      }
+    };
 
-      return () => {
-        isCleanedUp = true;
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close();
-        }
-      };
-    } catch {
-      // Non-blocking WebSocket setup
-    }
-  }, [currentUser?.uid, stopIncomingRingtone, userProfile?.displayName, currentUser?.displayName]);
+    connectCallWs();
+    return () => {
+      isCleanedUp = true;
+      if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        activeWs.close();
+      }
+    };
+  }, [
+    currentUser?.uid,
+    stopIncomingRingtone,
+    userProfile?.displayName,
+    currentUser?.displayName,
+    userProfile?.blockedUserIds,
+    userProfile?.privacySettings?.allowCalls,
+    userProfile?.followingIds
+  ]);
 
   const handleOpenCall = (type: 'video' | 'voice', recipient?: CallRecipient) => {
+    if (recipient?.id) {
+      const targetCached = getCachedUserProfile(recipient.id);
+      if (
+        (userProfile?.blockedUserIds || []).includes(recipient.id) ||
+        (currentUser?.uid && targetCached?.blockedUserIds?.includes(currentUser.uid))
+      ) {
+        return;
+      }
+      if (!isAdmin && targetCached?.privacySettings?.allowCalls) {
+        const allowCalls = targetCached.privacySettings.allowCalls;
+        if (allowCalls === 'none') return;
+        if (
+          allowCalls === 'followers' &&
+          !(userProfile?.followingIds || []).includes(recipient.id) &&
+          !(targetCached.followingIds || []).includes(currentUser?.uid || '')
+        ) {
+          return;
+        }
+      }
+    }
     triggerHaptic('medium');
     setIsWelinkOpen(false);
     setActiveCall({
@@ -1131,25 +1212,27 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       updatedAt: new Date().toISOString()
     }).catch(() => {});
 
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
-      ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            type: 'call:signal',
-            callId,
-            senderId: currentUser.uid,
-            senderName: userProfile?.displayName || currentUser.displayName || 'Waver',
-            targetUserId: callerId,
-            signalType: 'declined'
-          })
-        );
-        setTimeout(() => ws.close(), 300);
-      };
-    } catch {
-      // ws send error
-    }
+    auth.currentUser
+      ?.getIdToken()
+      .then((idToken) => {
+        if (!idToken) return;
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws?token=${encodeURIComponent(idToken)}`);
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({
+              type: 'call:signal',
+              callId,
+              senderId: currentUser?.uid,
+              senderName: userProfile?.displayName || currentUser?.displayName || 'Waver',
+              targetUserId: callerId,
+              signalType: 'declined'
+            })
+          );
+          setTimeout(() => ws.close(), 300);
+        };
+      })
+      .catch(() => {});
   };
 
   const handleQuickReplyDecline = async (rawMessage: string) => {
@@ -1546,7 +1629,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       )}
 
       {/* Non-blocking Background Spark & Video Upload Queue Progress Trackers */}
-      <SparkUploadQueueBanner variant="floating" />
+      {activeTab !== 'studio' && <SparkUploadQueueBanner variant="floating" />}
       {activeTab !== 'feed' && activeTab !== 'studio' && activeTab !== 'videos' && (
         <VideoUploadProgressChip variant="floating" />
       )}
@@ -1560,8 +1643,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         hasNewPosts={hasNewPosts}
       />
 
-      {/* Single Floating Assistant Button (hidden on Chat and when any bottom sheet or keyboard is open on phones) */}
-      {!isWelinkOpen && !activeCall && activeTab !== 'chat' && (
+      {/* Single Floating Assistant Button (hidden on Chat, Studio Editor, and when any bottom sheet or keyboard is open) */}
+      {!isWelinkOpen && !activeCall && activeTab !== 'chat' && activeTab !== 'studio' && (
         <button
           type="button"
           onClick={() => handleOpenWelink('chat')}

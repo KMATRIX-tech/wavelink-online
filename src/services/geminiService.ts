@@ -1,3 +1,5 @@
+import { auth, getAuthHeaders } from '../firebase';
+
 export const WELINK_SYSTEM_INSTRUCTION = `You are WELINK, the warm, intelligent, and official AI Assistant & Community Guide built into the WaveLink social platform.
 HOW TO RESPOND:
 1. Language Matching: Always reply in the exact same language the user writes in (e.g., English, Kiswahili, French, Arabic, etc.).
@@ -145,9 +147,10 @@ export async function sendWelinkChatMessage(params: {
 }): Promise<{ reply: string; model: string }> {
   const normalizedMessages = normalizeTurnsForRequest(params.messages);
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       signal: params.signal,
       body: JSON.stringify({
         model: params.model || 'gemini-3.8-flash',
@@ -189,9 +192,10 @@ export async function sendWelinkChatMessageStream(params: {
 }): Promise<{ fullText: string; model: string }> {
   const normalizedMessages = normalizeTurnsForRequest(params.messages);
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/chat-stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       signal: params.signal,
       body: JSON.stringify({
         model: params.model || 'gemini-3.8-flash',
@@ -383,9 +387,10 @@ export async function generateWelinkImage(params: {
   imageSize?: '1K' | '2K';
 }): Promise<{ imageUrl: string; caption: string; model: string }> {
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/image', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         prompt: params.prompt,
         imageBase64: params.imageBase64 || null,
@@ -431,9 +436,18 @@ export async function generateWelinkImage(params: {
 /**
  * Helper to construct the WebSocket URL for the server-side Gemini Live Voice proxy (/api/welink/live)
  */
-export function getWelinkLiveVoiceWsUrl(voiceName: string = 'Zephyr'): string {
+export async function getWelinkLiveVoiceWsUrl(voiceName: string = 'Zephyr'): Promise<string> {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/api/welink/live?voice=${encodeURIComponent(voiceName)}`;
+  let tokenParam = '';
+  try {
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+    if (idToken) {
+      tokenParam = `&token=${encodeURIComponent(idToken)}`;
+    }
+  } catch {
+    // ignore token fetch failure
+  }
+  return `${protocol}//${window.location.host}/api/welink/live?voice=${encodeURIComponent(voiceName)}${tokenParam}`;
 }
 
 /**
@@ -446,9 +460,10 @@ export async function sendWelinkVoiceTurn(params: {
   const cleanTranscript = String(params.transcript || '').trim();
   const history = Array.isArray(params.history) ? params.history : [];
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/welink/voice-turn', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         transcript: cleanTranscript,
         history,
@@ -487,9 +502,10 @@ export async function moderatePostContent(text: string): Promise<ModerationResul
   }
 
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/ai/moderate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ text: cleanText }),
     });
     const data = await res.json().catch(() => ({}));
@@ -522,9 +538,10 @@ export async function generatePostCaptions(params: {
   isPro?: boolean;
 }): Promise<string[]> {
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/ai/post-assist', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         mode: 'captions',
         text: params.text || '',
@@ -556,9 +573,10 @@ export async function improvePostContent(params: {
   isPro?: boolean;
 }): Promise<string> {
   try {
+    const headers = await getAuthHeaders();
     const res = await fetch('/api/ai/post-assist', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         mode: 'improve',
         text: params.text || '',

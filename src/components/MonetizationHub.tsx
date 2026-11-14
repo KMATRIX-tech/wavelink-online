@@ -117,6 +117,8 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
       } else {
         setHubPromoError('Invalid or expired coupon code. Please verify your code and try again.');
       }
+    } catch (err: any) {
+      setHubPromoError(err?.message || 'Could not redeem coupon right now. Please try again or request Admin verification.');
     } finally {
       setIsRedeemingHubPromo(false);
     }
@@ -413,6 +415,8 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
       }
       showTimedPointFeedback('success', 'Spent 20 WavePoints! Your wave post is now boosted for 48 hours.');
       showGlobalToast('🚀 Post Boosted with 20 WavePoints!');
+    } catch (err: any) {
+      showTimedPointFeedback('error', err?.message || 'Failed to boost post on server.');
     } finally {
       setIsProcessingPointAction(false);
     }

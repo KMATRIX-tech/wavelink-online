@@ -34,6 +34,7 @@ import { useLanguage } from '../context/LanguageContext';
 import { COMMUNITY_REPORT_CATEGORIES } from '../utils/africanCultureConfig';
 import { sendNotification } from '../services/notificationService';
 import { Avatar } from './Avatar';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   getPostShareUrl,
   sharePostToPlatform,
@@ -208,6 +209,8 @@ export const ShareSheet: React.FC<ShareSheetProps> = ({
     }
   }, [isOpen, post?.id]);
 
+  useBottomSheetLock(Boolean(isOpen && post), 'share-sheet');
+
   // Lock body scroll and trap Tab focus + Escape key
   useEffect(() => {
     if (!isOpen || !post) return;
@@ -243,16 +246,8 @@ export const ShareSheet: React.FC<ShareSheetProps> = ({
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    document.documentElement.setAttribute('data-bottom-sheet-open', 'true');
-    window.dispatchEvent(
-      new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: true } })
-    );
     return () => {
       document.body.style.overflow = prevOverflow;
-      document.documentElement.removeAttribute('data-bottom-sheet-open');
-      window.dispatchEvent(
-        new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: false } })
-      );
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [isOpen, post, showReportModal, onClose]);

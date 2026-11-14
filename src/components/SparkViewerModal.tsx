@@ -3,6 +3,7 @@ import { useAuth } from '../context/AuthContext';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import {
   doc,
+  setDoc,
   updateDoc,
   collection,
   query,
@@ -540,13 +541,29 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
       if (currentSpark.authorId !== currentUser.uid) {
         const sortedUids = [currentUser.uid, currentSpark.authorId].sort();
         const dmChannelId = `dm_${sortedUids[0]}_${sortedUids[1]}`;
-        await addDoc(collection(db, 'messages'), {
+        const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const replyMsgText = `🌊 Replied to your Spark: "${cleanText}"`;
+        await setDoc(
+          doc(db, 'channels', dmChannelId),
+          {
+            id: dmChannelId,
+            conversationId: dmChannelId,
+            participants: sortedUids,
+            lastMessageText: replyMsgText,
+            lastMessageSenderId: currentUser.uid,
+            lastMessageAt: nowIso,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        ).catch(() => {});
+        await setDoc(doc(db, 'channels', dmChannelId, 'messages', msgId), {
+          id: msgId,
           channelId: dmChannelId,
           senderId: currentUser.uid,
           senderName,
           senderPhotoURL: senderAvatar,
           recipientId: currentSpark.authorId,
-          text: `🌊 Replied to your Spark: "${cleanText}"`,
+          text: replyMsgText,
           createdAt: nowIso
         }).catch(() => {});
 

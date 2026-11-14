@@ -64,6 +64,7 @@ import {
   hasRelayIceServer,
   extractIceCandidateInfo,
 } from '../utils/webrtcConfig';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 interface LegacyChatContact {
   id: string;
@@ -184,7 +185,7 @@ function classifySignalingFailure(err: unknown): { reasonCode: string; detail: s
   };
 }
 
-function sendCallSignalOverWs(payload: {
+async function sendCallSignalOverWs(payload: {
   callId: string;
   targetUserId: string;
   fromUserId: string;
@@ -192,11 +193,13 @@ function sendCallSignalOverWs(payload: {
   callType: 'video' | 'voice';
   signalType: 'offer' | 'answer' | 'end' | 'declined';
   signalData?: RTCSessionDescriptionInit;
-}): void {
+}): Promise<void> {
   if (typeof window === 'undefined' || !payload.targetUserId || payload.targetUserId === payload.fromUserId) return;
   try {
+    const idToken = await auth.currentUser?.getIdToken().catch(() => '') || '';
+    if (!idToken) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
+    const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws?token=${encodeURIComponent(idToken)}`);
     const timer = window.setTimeout(() => {
       try {
         ws.close();
@@ -329,6 +332,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const [isRemoteVideoPaused, setIsRemoteVideoPaused] = useState(false);
   const [remoteAvatarError, setRemoteAvatarError] = useState(false);
   const [showMobileControls, setShowMobileControls] = useState(true);
+  const [showMobileMoreSheet, setShowMobileMoreSheet] = useState(false);
   const [activePopover, setActivePopover] = useState<'mic' | 'cam' | 'emoji' | 'more' | null>(null);
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
   const [videoInputs, setVideoInputs] = useState<MediaDeviceInfo[]>([]);
@@ -341,6 +345,15 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   const [floatingReactions, setFloatingReactions] = useState<Array<{ id: string; emoji: string; leftPct: number }>>([]);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const [pipOffset, setPipOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // Live Call Diagnostics state (updated on every ICE/connection/signaling event)
+  const [diagIceState, setDiagIceState] = useState<RTCIceConnectionState>('new');
+  const [diagConnState, setDiagConnState] = useState<RTCPeerConnectionState>('new');
+  const [diagSigState, setDiagSigState] = useState<RTCSignalingState>('stable');
+  const [diagCandidateTypes, setDiagCandidateTypes] = useState<string[]>([]);
+  const [diagRelayStatus, setDiagRelayStatus] = useState<string>('Checking ICE servers...');
+
+  useBottomSheetLock(true, 'calling-modal');
 
   // Live Captions & Meeting Notes
   const [isCaptionsActive, setIsCaptionsActive] = useState(false);
@@ -540,6 +553,10 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     isRestartingIceRef.current = false;
     setHasRemoteVideoTrack(false);
     setIsRemoteVideoPaused(false);
+    setDiagIceState('new');
+    setDiagConnState('new');
+    setDiagSigState('stable');
+    setDiagCandidateTypes([]);
     if (remoteMuteTimerRef.current) {
       window.clearTimeout(remoteMuteTimerRef.current);
       remoteMuteTimerRef.current = null;
@@ -717,7 +734,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     }
   }, [refreshMediaDevices]);
 
-  // Subscribe to DM messages ONLY when desktop in-call chat drawer is opened (zero idle reads)
+  // Subscribe to DM messages ONLY when in-call chat drawer/sheet is opened (zero idle reads)
+  const activeAuthUid = currentUser?.uid || '';
   useEffect(() => {
     if (!showInCallChat) return;
     const myUid = (auth.currentUser || currentUser)?.uid || resolvedUserId;
@@ -741,7 +759,38 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       () => {}
     );
     return () => unsub();
-  }, [showInCallChat, currentUser, resolvedUserId, resolvedRecipientId]);
+  }, [showInCallChat, activeAuthUid, resolvedUserId, resolvedRecipientId]);
+
+  // Re-clamp draggable PiP corner offset on orientation change or resize
+  useEffect(() => {
+    const clampPipOnResize = () => {
+      const pipEl = pipRef.current;
+      const stageEl = stageRef.current;
+      if (!pipEl || !stageEl) return;
+      const pipRect = pipEl.getBoundingClientRect();
+      const stageRect = stageEl.getBoundingClientRect();
+      if (pipRect.width === 0 || stageRect.width === 0) return;
+      const pad = 10;
+      setPipOffset((prev) => {
+        const baseLeft = pipRect.left - prev.x;
+        const baseTop = pipRect.top - prev.y;
+        const minX = stageRect.left + pad - baseLeft;
+        const maxX = stageRect.right - pad - (baseLeft + pipRect.width);
+        const minY = stageRect.top + pad - baseTop;
+        const maxY = stageRect.bottom - pad - (baseTop + pipRect.height);
+        const nextX = maxX >= minX ? Math.max(minX, Math.min(maxX, prev.x)) : 0;
+        const nextY = maxY >= minY ? Math.max(minY, Math.min(maxY, prev.y)) : 0;
+        if (nextX === prev.x && nextY === prev.y) return prev;
+        return { x: nextX, y: nextY };
+      });
+    };
+    window.addEventListener('resize', clampPipOnResize);
+    window.addEventListener('orientationchange', clampPipOnResize);
+    return () => {
+      window.removeEventListener('resize', clampPipOnResize);
+      window.removeEventListener('orientationchange', clampPipOnResize);
+    };
+  }, []);
 
   // Main WebRTC signaling and connection lifecycle
   useEffect(() => {
@@ -783,6 +832,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       pendingIceCandidatesRef.current = [];
       console.log(`[CALL] Draining ${queued.length} queued remote ICE candidate(s)`);
       for (const candidate of queued) {
+        if (isCancelled || pcRef.current !== pc) return;
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
           console.log('[CALL] Queued remote ICE candidate added');
@@ -803,11 +853,12 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       setIsOfferPosted(false);
       setIsRemoteVideoPaused(false);
       setShowMobileControls(true);
+      setDiagRelayStatus('Fetching ICE / TURN config...');
 
       const activeAuthUser = auth.currentUser || currentUser;
       if (!activeAuthUser?.uid) {
         throw new CallInitError(
-          'signalling permission denied',
+          'permission denied',
           'You must be signed in before starting or answering a call.'
         );
       }
@@ -818,19 +869,27 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         }, mode=${normalizedMode}, callId=${activeCallId}, attempt=${retryAttempt + 1})`
       );
 
-      // 1. Fetch ICE servers from authenticated GET /api/ice-servers before every call
+      // 1. Fetch ICE servers from authenticated GET /api/ice-servers BEFORE creating RTCPeerConnection
       let idToken = '';
       try {
         idToken = await activeAuthUser.getIdToken();
       } catch {
         // handled by fetchIceServersForCall fallback
       }
+      if (isCancelled) return;
 
       const iceConfigResult = await fetchIceServersForCall(idToken);
+      if (isCancelled) return;
+
       const iceServers = iceConfigResult.iceServers;
       const relayAvailable = hasRelayIceServer(iceServers) && !iceConfigResult.isFallback;
       relayAvailableRef.current = relayAvailable;
       setIsStunFallback(!relayAvailable);
+      setDiagRelayStatus(
+        relayAvailable
+          ? `Metered TURN active (${iceServers.length} servers)`
+          : `STUN-only fallback (${iceConfigResult.reason || 'relay unavailable'})`
+      );
 
       console.log('[CALL] RTCPeerConnection ICE servers configured:', {
         relayAvailable,
@@ -1190,33 +1249,41 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         }
       };
 
-      // 15-second connection timeout with friendly message and Try again button
+      // 20-second connection timeout with clear reason and Try again button
       startConnectionTimer = (label: string, resetExisting = false) => {
         if (connectionTimeoutRef.current) {
           if (!resetExisting) return;
           window.clearTimeout(connectionTimeoutRef.current);
         }
-        console.log(`[CALL] Starting 15s connection timeout (${label})`);
+        console.log(`[CALL] Starting 20s connection timeout (${label})`);
         connectionTimeoutRef.current = window.setTimeout(() => {
           connectionTimeoutRef.current = null;
           if (isCancelled || !pcRef.current) return;
           if (callStateRef.current !== 'connected') {
             const currIce = pcRef.current.iceConnectionState;
             const currConn = pcRef.current.connectionState;
-            logFinalFailure(`15s connection timeout (${label}, ice=${currIce}, conn=${currConn})`);
-            const isIceProblem = !gatheredRelayCandidateRef.current || currIce === 'checking' || currIce === 'failed' || currIce === 'new';
-            setFailureReasonLabel(isIceProblem ? 'ICE route failed' : 'peer connection failed');
+            const currSig = pcRef.current.signalingState;
+            logFinalFailure(`20s connection timeout (${label}, ice=${currIce}, conn=${currConn}, sig=${currSig})`);
+            const missingRelay = !relayAvailableRef.current || !gatheredRelayCandidateRef.current;
+            const reasonLabel = !relayAvailableRef.current
+              ? 'relay unavailable'
+              : currIce === 'failed' || currIce === 'checking' || currIce === 'new' || missingRelay
+              ? 'ICE failed'
+              : 'ICE failed';
+            setFailureReasonLabel(reasonLabel);
             setFailureNotice(
-              !gatheredRelayCandidateRef.current
-                ? 'ICE route failed within 15s (no TURN relay candidates gathered). Mobile networks may block direct peer connections.'
-                : 'ICE route timed out after 15 seconds. Check both internet connections and tap Try again.'
+              !relayAvailableRef.current
+                ? 'TURN relay unavailable — mobile networks often block direct peer-to-peer calls without relay servers.'
+                : !gatheredRelayCandidateRef.current
+                ? 'ICE failed within 20s (no relay candidates gathered). Check mobile network or tap Try again.'
+                : `Connection timed out after 20 seconds (ICE: ${currIce}). Tap Try again.`
             );
             updateLifecycleState('failed', 'Connection timed out');
           }
-        }, 15000);
+        }, 20000);
       };
 
-      // 6. Monitor ICE gathering, iceConnectionState, connectionState, and browser network changes
+      // 6. Monitor ICE gathering, iceConnectionState, connectionState, signalingState, and network changes
       pc.onicegatheringstatechange = () => {
         if (!pcRef.current || isCancelled) return;
         const gathering = pcRef.current.iceGatheringState;
@@ -1224,19 +1291,32 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         if (gathering === 'complete' && !gatheredRelayCandidateRef.current) {
           if (relayAvailableRef.current) {
             console.warn('[CALL] TURN server not reachable — ICE gathering completed without any relay candidate.');
+            setDiagRelayStatus('TURN configured but no relay candidate gathered');
           } else {
             console.log('[CALL] ICE gathering completed (STUN-only mode, no TURN relay configured).');
           }
         }
       };
 
+      pc.onsignalingstatechange = () => {
+        if (!pcRef.current || isCancelled) return;
+        const sigState = pcRef.current.signalingState;
+        setDiagSigState(sigState);
+        console.log(`[CALL] signalingState changed -> ${sigState}`);
+      };
+
       const handlePeerStateUpdate = () => {
         if (!pcRef.current || isCancelled) return;
         const connState = pcRef.current.connectionState;
         const iceState = pcRef.current.iceConnectionState;
+        const sigState = pcRef.current.signalingState;
+
+        setDiagConnState(connState);
+        setDiagIceState(iceState);
+        setDiagSigState(sigState);
 
         console.log(
-          `[CALL] State change -> iceConnectionState=${iceState}, connectionState=${connState}`
+          `[CALL] State change -> iceConnectionState=${iceState}, connectionState=${connState}, signalingState=${sigState}`
         );
 
         if (
@@ -1272,6 +1352,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               ).join(', ')}]`
             );
             setFailureNotice(null);
+            setFailureReasonLabel(null);
             setConnectionQuality('good');
             updateLifecycleState('connected', 'Connected');
             startQualityMonitor();
@@ -1285,25 +1366,29 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             updateLifecycleState('connecting', 'Connecting');
           }
         } else if (iceState === 'disconnected' || connState === 'disconnected') {
-          if (callStateRef.current === 'connected') {
-            updateLifecycleState('reconnecting', 'Reconnecting');
-          }
-          if (disconnectedTimerRef.current) {
-            window.clearTimeout(disconnectedTimerRef.current);
-          }
-          disconnectedTimerRef.current = window.setTimeout(() => {
-            if (!pcRef.current || isCancelled) return;
-            const currentIce = pcRef.current.iceConnectionState;
-            const currentConn = pcRef.current.connectionState;
-            if (
-              currentIce === 'disconnected' ||
-              currentIce === 'failed' ||
-              currentConn === 'disconnected' ||
-              currentConn === 'failed'
-            ) {
-              triggerAutomaticIceRestart('ice-disconnected');
+          // Only treat `disconnected` as needing ICE restart once the call was already connected/reconnecting,
+          // and give WebRTC 4.5s to self-recover before tearing down the SDP exchange.
+          if (callStateRef.current === 'connected' || callStateRef.current === 'reconnecting') {
+            if (callStateRef.current === 'connected') {
+              updateLifecycleState('reconnecting', 'Reconnecting');
             }
-          }, 1200);
+            if (disconnectedTimerRef.current) {
+              window.clearTimeout(disconnectedTimerRef.current);
+            }
+            disconnectedTimerRef.current = window.setTimeout(() => {
+              if (!pcRef.current || isCancelled) return;
+              const currentIce = pcRef.current.iceConnectionState;
+              const currentConn = pcRef.current.connectionState;
+              if (
+                currentIce === 'disconnected' ||
+                currentIce === 'failed' ||
+                currentConn === 'disconnected' ||
+                currentConn === 'failed'
+              ) {
+                triggerAutomaticIceRestart('ice-disconnected');
+              }
+            }, 4500);
+          }
         } else if (iceState === 'failed' || connState === 'failed') {
           if (disconnectedTimerRef.current) {
             window.clearTimeout(disconnectedTimerRef.current);
@@ -1323,7 +1408,6 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         if (isCancelled || isCleaningUpRef.current || !pcRef.current) return;
         if (
           callStateRef.current === 'connected' ||
-          callStateRef.current === 'connecting' ||
           callStateRef.current === 'reconnecting'
         ) {
           console.log('[CALL] Network drop/change detected -> running automatic ICE restart');
@@ -1361,8 +1445,10 @@ export const CallingModal: React.FC<CallingModalProps> = ({
 
         const candInfo = extractIceCandidateInfo(event.candidate);
         gatheredCandidateTypesRef.current.add(candInfo.type);
+        setDiagCandidateTypes(Array.from(gatheredCandidateTypesRef.current));
         if (candInfo.type === 'relay') {
           gatheredRelayCandidateRef.current = true;
+          setDiagRelayStatus('TURN relay candidate gathered ✓');
         }
 
         console.log(
@@ -1531,12 +1617,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         await flushPendingLocalCandidates();
         startRemoteCandidatesListener();
 
-        // 30-second ringing timeout if receiver never answers
+        // 20-second ringing timeout if receiver never answers
         ringingTimeoutRef.current = window.setTimeout(async () => {
           if (isCancelled) return;
           if (callStateRef.current === 'ringing') {
-            console.log('[CALL] 30s ringing timeout -> No answer');
-            setFailureNotice('No answer right now. Tap Try again to call back.');
+            console.log('[CALL] 20s ringing timeout -> no answer received');
+            setFailureReasonLabel('no answer received');
+            setFailureNotice('No answer received within 20 seconds. Tap Try again to call back.');
             updateLifecycleState('no-answer', 'No answer');
             try {
               await updateDoc(callDocRef, {
@@ -1547,7 +1634,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               // ignore
             }
           }
-        }, 30000);
+        }, 20000);
 
         callDocUnsubRef.current = onSnapshot(
           callDocRef,
@@ -1564,8 +1651,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             }
             if (data.status === 'missed' || data.status === 'no_answer') {
               clearTimers();
-              setFailureReasonLabel('no answer');
-              setFailureNotice('No answer right now. Tap Try again to call back.');
+              setFailureReasonLabel('no answer received');
+              setFailureNotice('No answer received right now. Tap Try again to call back.');
               updateLifecycleState('no-answer', 'No answer');
               return;
             }
@@ -1600,6 +1687,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               data.answer.sdp &&
               data.answer.sdp !== lastAppliedAnswerSdpRef.current
             ) {
+              if (pcRef.current.signalingState !== 'have-local-offer') {
+                console.warn(
+                  '[CALL] Skipping answer because signalingState is not have-local-offer:',
+                  pcRef.current.signalingState
+                );
+                return;
+              }
               lastAppliedAnswerSdpRef.current = data.answer.sdp;
               console.log(`[CALL] Answer received (sdpLength=${data.answer.sdp.length})`);
 
@@ -1617,6 +1711,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                 await pcRef.current.setRemoteDescription(
                   new RTCSessionDescription(data.answer as RTCSessionDescriptionInit)
                 );
+                if (isCancelled || !pcRef.current) return;
                 hasRemoteDescriptionRef.current = true;
                 console.log('[CALL] Caller setRemoteDescription(answer) complete');
                 await drainQueuedIceCandidates(pcRef.current);
@@ -1659,13 +1754,17 @@ export const CallingModal: React.FC<CallingModalProps> = ({
           try {
             console.log(`[CALL] Offer received by callee (sdpLength=${offerSdp.sdp.length})`);
             await pcRef.current.setRemoteDescription(new RTCSessionDescription(offerSdp));
+            if (isCancelled || !pcRef.current) return;
             hasRemoteDescriptionRef.current = true;
             console.log('[CALL] Callee setRemoteDescription(offer) complete');
             await drainQueuedIceCandidates(pcRef.current);
+            if (isCancelled || !pcRef.current) return;
 
             const answer = await pcRef.current.createAnswer();
+            if (isCancelled || !pcRef.current) return;
             console.log(`[CALL] Answer created (sdpLength=${answer.sdp?.length || 0})`);
             await pcRef.current.setLocalDescription(answer);
+            if (isCancelled || !pcRef.current) return;
             console.log('[CALL] Callee local description set (answer)');
 
             const nowIso = new Date().toISOString();
@@ -1689,6 +1788,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               updateLifecycleState('failed', 'Connection failed');
               return;
             }
+            if (isCancelled) return;
             console.log('[CALL] Callee wrote answer to call document');
             await flushPendingLocalCandidates();
           } catch (err) {
@@ -1809,7 +1909,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
     activeCallId,
     cleanupWebRTC,
     clearTimers,
-    currentUser,
+    activeAuthUid,
     effectiveIsIncoming,
     normalizedMode,
     retryAttempt,
@@ -1891,6 +1991,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
   };
 
   const handleFlipCamera = async () => {
+    if (
+      normalizedMode === 'voice' &&
+      !isScreenSharing &&
+      (!localStreamRef.current || localStreamRef.current.getVideoTracks().length === 0)
+    ) {
+      return;
+    }
     const nextFacing = facingMode === 'user' ? 'environment' : 'user';
     setFacingMode(nextFacing);
 
@@ -2389,10 +2496,10 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               : ''
           }`}
         >
-          <div className="flex items-center justify-between gap-3 w-full">
-            <div className="flex items-center gap-2.5 min-w-0">
-              {/* Mobile avatar + name + timer */}
-              <div className="flex lg:hidden items-center gap-2.5 min-w-0">
+          <div className="flex items-center justify-between gap-2.5 w-full">
+            <div className="flex items-center gap-2.5 min-w-0 flex-1">
+              {/* Mobile & Tablet (<1024px): avatar + caller name + status + top timer */}
+              <div className="flex lg:hidden items-center gap-2.5 min-w-0 flex-1">
                 <Avatar
                   uid={resolvedRecipientId}
                   src={resolvedRecipientAvatar}
@@ -2403,11 +2510,11 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                   onlyWhenVisible={false}
                   ringClassName="border border-white/40"
                 />
-                <div className="min-w-0">
-                  <h2 className="font-bold text-base truncate leading-tight text-white">
+                <div className="min-w-0 flex-1">
+                  <h2 className="font-bold text-sm sm:text-base truncate leading-tight text-white">
                     {resolvedRecipientName}
                   </h2>
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-white/85">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-white/90 min-w-0">
                     <span
                       className={`w-2 h-2 rounded-full shrink-0 ${
                         callState === 'connected' && connectionQuality === 'good'
@@ -2421,7 +2528,13 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                           : 'bg-cyan-300 animate-pulse'
                       }`}
                     />
-                    <span className="truncate font-mono tabular-nums">{liveStatusLabel}</span>
+                    <span className="truncate font-mono tabular-nums">
+                      {callState === 'connected'
+                        ? connectionQuality === 'weak'
+                          ? `Weak • ${formatDuration(callDuration)}`
+                          : formatDuration(callDuration)
+                        : liveStatusLabel}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -2460,6 +2573,21 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                   </div>
                 </div>
               </div>
+            </div>
+
+            {/* Mobile & Tablet (<1024px) More (...) Menu Trigger (48x48 touch target) */}
+            <div className="flex lg:hidden items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowMobileMoreSheet(true);
+                }}
+                aria-label="More call options"
+                className="w-12 h-12 min-w-[48px] min-h-[48px] rounded-full bg-black/45 hover:bg-black/60 border border-white/20 text-white flex items-center justify-center backdrop-blur-md transition active:scale-95 cursor-pointer"
+              >
+                <MoreHorizontal className="w-5 h-5" />
+              </button>
             </div>
 
             {/* Desktop subtle encryption shield indicator only (no participant count or clutter) */}
@@ -2511,8 +2639,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                   }}
                 />
 
-                <div className="relative z-10 flex flex-col items-center">
-                  <div className="relative mb-5 w-[120px] h-[120px] flex items-center justify-center">
+                <div className="relative z-10 flex flex-col items-center wavelink-call-avatar-stack">
+                  <div className="relative mb-4 wavelink-call-avatar-frame w-[120px] h-[120px] flex items-center justify-center">
                     {!isFailureTerminalState && callState !== 'connected' && (
                       <>
                         <div
@@ -2534,7 +2662,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                     <img
                       src={resolvedRecipientAvatar}
                       alt={resolvedRecipientName}
-                      className="w-[120px] h-[120px] rounded-full object-cover relative bg-slate-900"
+                      className="wavelink-call-avatar-img w-[120px] h-[120px] rounded-full object-cover relative bg-slate-900"
                       style={{
                         boxShadow:
                           '0 0 0 3px color-mix(in srgb, var(--accent-primary) 75%, #ffffff), 0 20px 44px rgba(0, 0, 0, 0.55)',
@@ -2792,91 +2920,94 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         )}
 
         {/* BOTTOM CONTROLS:
-            - Outgoing Ringing on Mobile/Tablet (<1024px): Single big red round End button
-            - Active/Connecting on Mobile/Tablet (<1024px): Floating rounded bar (Mute, Cam, Flip, Speaker, End) that hides on stage tap
+            - Mobile/Tablet (<1024px): One slim 5-button single row above safe-area bottom bar: Mute, Camera, centered Red End, Flip, Speaker (no timer inside bottom bar)
             - Desktop (>=1024px): Clean floating dark toolbar with Mic+picker, Cam+picker, Chat, Emoji, ScreenShare, More(...), Recording-style Timer, End */}
         {!isFailureTerminalState && (
           <>
-            {/* Mobile & Tablet Outgoing Ringing Solo End Button */}
-            {isOutgoingRingingOnly && (
-              <div className="lg:hidden absolute bottom-[calc(max(1.5rem,env(safe-area-inset-bottom,0px))+0.5rem)] left-1/2 -translate-x-1/2 z-35 flex flex-col items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleEndCall}
-                  aria-label="End call"
-                  className="wavelink-call-end-solo-btn"
-                >
-                  <PhoneOff className="w-7 h-7" />
-                </button>
-                <span className="text-xs font-bold text-white/90">End</span>
-              </div>
-            )}
-
-            {/* Mobile & Tablet Active/Connecting Control Bar */}
-            {!isOutgoingRingingOnly && (
-              <footer
-                className={`lg:hidden wavelink-call-controls-bar ${
-                  !showMobileControls ? 'wavelink-call-controls-bar--hidden' : ''
-                }`}
-              >
+            {/* Mobile & Tablet (< 1024px) Single-Row 5-Button Control Bar (Center Red End Button) */}
+            <footer
+              className={`lg:hidden wavelink-call-controls-bar ${
+                !showMobileControls && !isOutgoingRingingOnly ? 'wavelink-call-controls-bar--hidden' : ''
+              }`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* 1. Mute */}
+              <div className="wavelink-call-ctrl-slot">
                 <button
                   type="button"
                   onClick={toggleMute}
                   aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
                   className={`wavelink-call-control-btn ${
                     isMuted
-                      ? 'bg-rose-500/30 border-rose-400/70 text-rose-200'
-                      : 'bg-white/14 border-white/20 text-white'
+                      ? 'bg-rose-500/35 border-rose-400/75 text-rose-100'
+                      : 'bg-white/14 border-white/22 text-white'
                   }`}
                 >
                   {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                 </button>
+                <span className="wavelink-call-ctrl-label">{isMuted ? 'Unmute' : 'Mute'}</span>
+              </div>
 
+              {/* 2. Camera */}
+              <div className="wavelink-call-ctrl-slot">
                 <button
                   type="button"
                   onClick={toggleCamera}
                   aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
                   className={`wavelink-call-control-btn ${
                     isVideoOff
-                      ? 'bg-rose-500/30 border-rose-400/70 text-rose-200'
-                      : 'bg-white/14 border-white/20 text-white'
+                      ? 'bg-rose-500/35 border-rose-400/75 text-rose-100'
+                      : 'bg-white/14 border-white/22 text-white'
                   }`}
                 >
                   {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
                 </button>
+                <span className="wavelink-call-ctrl-label">Camera</span>
+              </div>
 
+              {/* 3. Red End Button in the CENTRE */}
+              <div className="wavelink-call-ctrl-slot">
+                <button
+                  type="button"
+                  onClick={handleEndCall}
+                  aria-label="End call"
+                  className="wavelink-call-control-btn wavelink-call-control-btn--end bg-rose-600 hover:bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-600/45"
+                >
+                  <PhoneOff className="w-5 h-5" />
+                </button>
+                <span className="wavelink-call-ctrl-label text-rose-200">End</span>
+              </div>
+
+              {/* 4. Flip Camera */}
+              <div className="wavelink-call-ctrl-slot">
                 <button
                   type="button"
                   onClick={handleFlipCamera}
                   aria-label="Flip camera"
-                  className="wavelink-call-control-btn bg-white/14 border-white/20 text-white"
+                  className="wavelink-call-control-btn bg-white/14 border-white/22 text-white"
                 >
                   <SwitchCamera className="w-5 h-5" />
                 </button>
+                <span className="wavelink-call-ctrl-label">Flip</span>
+              </div>
 
+              {/* 5. Speaker */}
+              <div className="wavelink-call-ctrl-slot">
                 <button
                   type="button"
                   onClick={toggleSpeaker}
                   aria-label={isSpeakerOn ? 'Mute speaker' : 'Unmute speaker'}
                   className={`wavelink-call-control-btn ${
                     !isSpeakerOn
-                      ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
-                      : 'bg-white/14 border-white/20 text-white'
+                      ? 'bg-amber-500/30 border-amber-400/65 text-amber-100'
+                      : 'bg-white/14 border-white/22 text-white'
                   }`}
                 >
                   {isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
                 </button>
-
-                <button
-                  type="button"
-                  onClick={handleEndCall}
-                  aria-label="End call"
-                  className="wavelink-call-control-btn bg-rose-600 hover:bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-600/35"
-                >
-                  <PhoneOff className="w-5 h-5" />
-                </button>
-              </footer>
-            )}
+                <span className="wavelink-call-ctrl-label">Speaker</span>
+              </div>
+            </footer>
 
             {/* Desktop (>= 1024px) Floating Dark Toolbar */}
             <footer className="hidden lg:flex wavelink-call-controls-bar">
@@ -3181,6 +3312,258 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               </div>
             </footer>
           </>
+        )}
+
+        {/* MOBILE & TABLET (< 1024px) IN-CALL CHAT BOTTOM SHEET */}
+        {showInCallChat && (
+          <div
+            className="lg:hidden fixed inset-0 z-50 bg-black/55 backdrop-blur-xs flex items-end justify-center"
+            onClick={() => setShowInCallChat(false)}
+          >
+            <div
+              className="w-full max-w-lg rounded-t-3xl bg-slate-950/95 border-t border-white/20 text-white shadow-2xl flex flex-col max-h-[75dvh] overflow-hidden"
+              style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom, 0px))' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="w-10 h-1 rounded-full bg-white/30 mx-auto mt-2.5 mb-1 shrink-0" />
+              <div className="flex items-center justify-between px-4 py-3 border-b border-white/12 shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <MessageSquare size={16} className="text-cyan-300 shrink-0" />
+                  <span className="text-sm font-bold truncate">
+                    Chat with {resolvedRecipientName}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowInCallChat(false)}
+                  aria-label="Close chat"
+                  className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center bg-white/10 text-white cursor-pointer"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-2 text-xs">
+                {inCallMessages.length === 0 ? (
+                  <p className="text-center text-white/55 py-8">
+                    Send a message to {resolvedRecipientName} without leaving the call.
+                  </p>
+                ) : (
+                  inCallMessages.map((m) => {
+                    const isMine =
+                      m.senderId === ((auth.currentUser || currentUser)?.uid || resolvedUserId);
+                    return (
+                      <div key={m.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+                        <div
+                          className={`max-w-[82%] px-3 py-2 rounded-2xl leading-snug ${
+                            isMine ? 'text-white rounded-br-sm' : 'bg-white/15 text-white rounded-bl-sm'
+                          }`}
+                          style={
+                            isMine
+                              ? {
+                                  background:
+                                    'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                                }
+                              : undefined
+                          }
+                        >
+                          {m.text || (m.mediaType && m.mediaType !== 'none' ? `[${m.mediaType}]` : '')}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <form
+                onSubmit={handleSendInCallMessage}
+                className="flex items-center gap-2 p-3 border-t border-white/12 bg-black/30 shrink-0"
+              >
+                <input
+                  type="text"
+                  value={inCallChatText}
+                  onChange={(e) => setInCallChatText(e.target.value)}
+                  placeholder="Type a message..."
+                  maxLength={500}
+                  className="flex-1 min-w-0 min-h-[44px] bg-white/10 border border-white/18 rounded-full px-4 py-2 text-xs text-white placeholder-white/55 focus:outline-none focus:border-white/45"
+                />
+                <button
+                  type="submit"
+                  disabled={!inCallChatText.trim()}
+                  aria-label="Send message"
+                  className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-white disabled:opacity-40 cursor-pointer shrink-0"
+                  style={{
+                    background:
+                      'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))',
+                  }}
+                >
+                  <Send size={16} />
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* MOBILE & TABLET (< 1024px) MORE MENU BOTTOM SHEET (Chat, Reactions, Share Screen on tablet only, Captions, AI Notes, Diagnostics) */}
+        {showMobileMoreSheet && (
+          <div
+            className="lg:hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end justify-center"
+            onClick={() => setShowMobileMoreSheet(false)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Call options"
+              className="w-full max-w-lg rounded-t-3xl bg-slate-950/96 border-t border-white/20 text-white shadow-2xl flex flex-col max-h-[82dvh] overflow-hidden"
+              style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 0px))' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="w-10 h-1 rounded-full bg-white/30 mx-auto mt-2.5 mb-1 shrink-0" />
+              <div className="flex items-center justify-between px-5 py-3 border-b border-white/12 shrink-0">
+                <h3 className="text-sm font-extrabold text-white">Call Options &amp; Diagnostics</h3>
+                <button
+                  type="button"
+                  onClick={() => setShowMobileMoreSheet(false)}
+                  aria-label="Close options"
+                  className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full bg-white/10 text-white flex items-center justify-center cursor-pointer"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
+                {/* Reactions Row */}
+                <div>
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-white/60 mb-2">
+                    Reactions
+                  </p>
+                  <div className="grid grid-cols-6 gap-2">
+                    {['👍', '❤️', '😂', '👏', '🔥', '🎉'].map((emo) => (
+                      <button
+                        key={emo}
+                        type="button"
+                        onClick={() => {
+                          handleTriggerEmojiReaction(emo);
+                          setShowMobileMoreSheet(false);
+                        }}
+                        className="min-h-[48px] rounded-2xl bg-white/10 hover:bg-white/20 text-2xl flex items-center justify-center active:scale-95 transition cursor-pointer"
+                      >
+                        {emo}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Actions Grid */}
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMobileMoreSheet(false);
+                      setShowInCallChat(true);
+                    }}
+                    className="min-h-[52px] px-3.5 py-2.5 rounded-2xl bg-white/10 hover:bg-white/16 border border-white/12 flex items-center gap-2.5 text-xs font-bold text-white cursor-pointer"
+                  >
+                    <MessageSquare size={17} className="text-cyan-300 shrink-0" />
+                    <span>In-Call Chat</span>
+                  </button>
+
+                  {/* Share Screen: hidden on phones (<768px), visible on tablet (>=768px) */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMobileMoreSheet(false);
+                      handleToggleScreenShare();
+                    }}
+                    className="hidden md:flex min-h-[52px] px-3.5 py-2.5 rounded-2xl bg-white/10 hover:bg-white/16 border border-white/12 items-center gap-2.5 text-xs font-bold text-white cursor-pointer"
+                  >
+                    {isScreenSharing ? (
+                      <MonitorOff size={17} className="text-emerald-300 shrink-0" />
+                    ) : (
+                      <Monitor size={17} className="text-cyan-300 shrink-0" />
+                    )}
+                    <span>{isScreenSharing ? 'Stop Share' : 'Share Screen'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsCaptionsActive((prev) => !prev);
+                      setShowMobileMoreSheet(false);
+                    }}
+                    className="min-h-[52px] px-3.5 py-2.5 rounded-2xl bg-white/10 hover:bg-white/16 border border-white/12 flex items-center justify-between gap-2 text-xs font-bold text-white cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2.5 min-w-0">
+                      <Captions size={17} className="text-cyan-300 shrink-0" />
+                      <span className="truncate">Live Captions</span>
+                    </span>
+                    {isCaptionsActive && <Check size={15} className="text-emerald-400 shrink-0" />}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMobileMoreSheet(false);
+                      handleGenerateMinutes();
+                    }}
+                    className="min-h-[52px] px-3.5 py-2.5 rounded-2xl bg-white/10 hover:bg-white/16 border border-white/12 flex items-center gap-2.5 text-xs font-bold text-white cursor-pointer"
+                  >
+                    <FileText size={17} className="text-cyan-300 shrink-0" />
+                    <span>AI Call Notes</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMobileMoreSheet(false);
+                      toggleFullscreen();
+                    }}
+                    className="min-h-[52px] px-3.5 py-2.5 rounded-2xl bg-white/10 hover:bg-white/16 border border-white/12 flex items-center gap-2.5 text-xs font-bold text-white cursor-pointer"
+                  >
+                    {isFullscreen ? (
+                      <Minimize2 size={17} className="text-cyan-300 shrink-0" />
+                    ) : (
+                      <Maximize2 size={17} className="text-cyan-300 shrink-0" />
+                    )}
+                    <span>{isFullscreen ? 'Exit Full' : 'Fullscreen'}</span>
+                  </button>
+                </div>
+
+                {/* Live WebRTC Call Diagnostics */}
+                <div className="rounded-2xl bg-white/8 border border-white/14 p-3.5 space-y-1.5 text-[11px] font-mono">
+                  <div className="flex items-center justify-between text-xs font-sans font-extrabold text-cyan-300 mb-1">
+                    <span className="flex items-center gap-1.5">
+                      <Radio size={14} />
+                      <span>Call Diagnostics</span>
+                    </span>
+                    <span className="text-[10px] uppercase tracking-wider text-white/75">
+                      {callState}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-2 text-white/85">
+                    <span className="text-white/55">ICE State:</span>
+                    <span className="font-bold">{diagIceState}</span>
+                  </div>
+                  <div className="flex justify-between gap-2 text-white/85">
+                    <span className="text-white/55">Peer Connection:</span>
+                    <span className="font-bold">{diagConnState}</span>
+                  </div>
+                  <div className="flex justify-between gap-2 text-white/85">
+                    <span className="text-white/55">Signaling:</span>
+                    <span className="font-bold">{diagSigState}</span>
+                  </div>
+                  <div className="flex justify-between gap-2 text-white/85">
+                    <span className="text-white/55">Candidates:</span>
+                    <span className="font-bold truncate">
+                      {diagCandidateTypes.length > 0 ? diagCandidateTypes.join(', ') : 'gathering...'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-2 text-white/85">
+                    <span className="text-white/55">TURN Relay:</span>
+                    <span className="font-bold truncate">{diagRelayStatus}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         )}
       </div>
 

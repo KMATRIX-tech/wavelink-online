@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { getAuthHeaders } from '../firebase';
 import { MobileMoneyProvider, EastAfricanCurrency } from '../types';
 import {
   initiateMobileMoneyPayment,
@@ -11,6 +12,7 @@ import {
 } from '../services/paymentService';
 import { submitPaymentRequest } from '../services/verificationService';
 import { formatLocalPrice, useAfricanRegion } from '../utils/africanCultureConfig';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   X,
   CheckCircle2,
@@ -73,6 +75,8 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
   const [error, setError] = useState<string | null>(null);
   const [receiptRef, setReceiptRef] = useState<string>('');
 
+  useBottomSheetLock(true, 'mobile-money-payment');
+
   const currentPlan = PLAN_DETAILS[selectedPlan];
 
   const handlePhoneInput = (val: string) => {
@@ -108,9 +112,10 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
       const formattedPhone = formatPhoneNumber(phoneNumber.trim());
 
       // 1. Trigger AzamPay checkout on server sending ONLY payer's phoneNumber, amount, plan, and provider
+      const authHeaders = await getAuthHeaders();
       const checkoutRes = await fetch('/api/azampay/checkout', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           phoneNumber: formattedPhone,
           amount: currentPlan.priceTZS,
@@ -175,10 +180,10 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/35 backdrop-blur-xs animate-fade-in">
-      <div className="relative w-full max-w-md rounded-3xl bg-[var(--bg-surface,#FFFFFF)] border border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] shadow-xl overflow-hidden flex flex-col">
+    <div className="fixed inset-0 z-[85] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-stone-900/35 backdrop-blur-xs animate-fade-in">
+      <div className="relative w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-[var(--bg-surface,#FFFFFF)] border border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] shadow-xl overflow-hidden flex flex-col max-h-[90dvh]">
         {/* Top Header */}
-        <div className="px-6 py-5 border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between bg-[var(--bg-surface,#FFFFFF)]">
+        <div className="px-6 py-4 sm:py-5 border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between bg-[var(--bg-surface,#FFFFFF)] shrink-0">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white flex items-center justify-center shadow-xs">
               <Crown size={20} />
@@ -196,7 +201,7 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
           <button
             type="button"
             onClick={onClose}
-            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition"
+            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition cursor-pointer"
             aria-label="Close payment window"
           >
             <X size={20} />
@@ -205,7 +210,7 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
 
         {/* Simple 3-Step Indicator */}
         {step < 4 && (
-          <div className="px-6 py-3 bg-[var(--bg-canvas,#FAF7F2)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between text-xs font-bold">
+          <div className="px-6 py-3 bg-[var(--bg-canvas,#FAF7F2)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between text-xs font-bold shrink-0">
             <div className={`flex items-center gap-1.5 ${step >= 1 ? 'text-[var(--accent-primary,#2563EB)]' : 'text-stone-400'}`}>
               <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[11px] ${step >= 1 ? 'bg-[var(--accent-primary,#2563EB)] text-white' : 'bg-stone-200 text-stone-600'}`}>
                 1
@@ -230,7 +235,10 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
         )}
 
         {/* Modal Body */}
-        <div className="p-6 space-y-5">
+        <div
+          className="p-6 space-y-5 flex-1 min-h-0 overflow-y-auto overscroll-contain"
+          style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           {/* STEP 1: ENTER YOUR PHONE NUMBER */}
           {step === 1 && (
             <form onSubmit={handleStep1Continue} className="space-y-5">

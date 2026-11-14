@@ -39,6 +39,7 @@ import { sanitizeUserText } from '../utils/security';
 import { sendNotification } from '../services/notificationService';
 import { CrystalBadge } from './CrystalBadge';
 import { Avatar } from './Avatar';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import type { Post, PostComment, CommentReactionType, UserProfile } from '../types';
 
 interface CommentsSheetProps {
@@ -127,16 +128,14 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
     setOptimisticComments([]);
   }, [isOpen, post?.id]);
 
-  // Body scroll lock, bottom-nav hide signal, visualViewport keyboard tracking & Escape / Focus trap while sheet is open
+  useBottomSheetLock(Boolean(isOpen && post), 'comments-sheet');
+
+  // Body scroll lock, visualViewport keyboard tracking & Escape / Focus trap while sheet is open
   useEffect(() => {
     if (!isOpen || !post) return;
 
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    document.documentElement.setAttribute('data-bottom-sheet-open', 'true');
-    window.dispatchEvent(
-      new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: true } })
-    );
 
     const updateSheetViewport = () => {
       if (typeof window === 'undefined') return;
@@ -194,11 +193,7 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
     window.addEventListener('keydown', handleKeyDown);
     return () => {
       document.body.style.overflow = prevOverflow;
-      document.documentElement.removeAttribute('data-bottom-sheet-open');
       document.documentElement.style.removeProperty('--comments-kb-offset');
-      window.dispatchEvent(
-        new CustomEvent('wavelink:bottom-sheet-state', { detail: { open: false } })
-      );
       vv?.removeEventListener('resize', updateSheetViewport);
       vv?.removeEventListener('scroll', updateSheetViewport);
       window.removeEventListener('resize', updateSheetViewport);

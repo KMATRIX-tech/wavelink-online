@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
+import { useBottomSheetLock } from '../utils/sheetLock';
 
 interface PostBoostModalProps {
   post: Post;
@@ -62,6 +63,8 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
   const [isAuthorizingPin, setIsAuthorizingPin] = useState(false);
   const [activeTx, setActiveTx] = useState<PaymentTransaction | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useBottomSheetLock(isOpen, 'post-boost');
 
   if (!isOpen) return null;
 
@@ -165,10 +168,10 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-stone-900/40 backdrop-blur-md animate-fade-in">
-      <div className="relative w-full max-w-md bg-white border border-[var(--border-subtle)] rounded-3xl shadow-2xl overflow-hidden flex flex-col">
+    <div className="fixed inset-0 z-[80] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-stone-900/40 backdrop-blur-md animate-fade-in">
+      <div className="relative w-full max-w-md bg-white border border-[var(--border-subtle)] rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90dvh]">
         {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-[var(--border-subtle)] bg-[#FAF7F2]">
+        <div className="flex items-center justify-between p-5 border-b border-[var(--border-subtle)] bg-[#FAF7F2] shrink-0">
           <div className="flex items-center gap-3">
             <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white shadow-xs">
               <Rocket size={20} />
@@ -189,14 +192,17 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 text-[#57534E] hover:text-[#1C1917] rounded-xl"
+            className="min-w-[44px] min-h-[44px] flex items-center justify-center text-[#57534E] hover:text-[#1C1917] rounded-xl cursor-pointer"
           >
             <X size={18} />
           </button>
         </div>
 
         {/* Body */}
-        <div className="p-5 sm:p-6 space-y-4">
+        <div
+          className="p-5 sm:p-6 space-y-4 flex-1 min-h-0 overflow-y-auto overscroll-contain"
+          style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom, 0px))' }}
+        >
           {step === 'intro' && (
             <form onSubmit={handleInitiateBoost} className="space-y-4">
               {/* Post Preview Snippet */}

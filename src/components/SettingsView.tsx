@@ -4282,7 +4282,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
 
               {/* ONE MAIN BUTTON */}
-              <div className="pt-2">
+              <div className="pt-2 pb-4 sm:pb-2">
                 <button
                   type="submit"
                   disabled={isSaving}
@@ -4326,7 +4326,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       )}
 
       {/* Footer: Empowering African Creators */}
-      <div className="pt-4 pb-2 text-center text-xs font-bold text-[#57534E]">
+      <div
+        className="pt-4 pb-24 lg:pb-6 text-center text-xs font-bold text-[#57534E]"
+        style={{ paddingBottom: 'max(6rem, calc(4.5rem + env(safe-area-inset-bottom, 0px)))' }}
+      >
         WaveLink • {t('footer.tagline')}
       </div>
     </div>

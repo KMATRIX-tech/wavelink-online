@@ -360,7 +360,7 @@ interface AuthContextType {
   toggleSavePost: (postId: string) => Promise<boolean>;
   toggleBlockUser: (targetUserId: string) => Promise<boolean>;
   reportContent: (params: {
-    targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video';
+    targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video' | 'message';
     targetId: string;
     targetAuthorId?: string;
     targetSummary?: string;
@@ -392,14 +392,13 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-function hasLocalProPass(uid?: string | null): boolean {
+function clearLegacyLocalProPass(uid?: string | null): void {
   try {
-    if (typeof window === 'undefined') return false;
-    if (localStorage.getItem('wavelink_pro_pass') === 'true') return true;
-    if (uid && localStorage.getItem(`wavelink_pro_pass_${uid}`) === 'true') return true;
-    return false;
+    if (typeof window === 'undefined') return;
+    localStorage.removeItem('wavelink_pro_pass');
+    if (uid) localStorage.removeItem(`wavelink_pro_pass_${uid}`);
   } catch {
-    return false;
+    // ignore storage errors
   }
 }
 
@@ -646,7 +645,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     verifiedRoleOverride?: 'admin' | 'sub_admin' | 'user'
   ) => {
     const userDocRef = doc(db, 'users', user.uid);
-    const localPro = hasLocalProPass(user.uid);
+    clearLegacyLocalProPass(user.uid);
     const nowIso = new Date().toISOString();
 
     try {
@@ -723,12 +722,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           savedPostIds: [],
           role: initialRole,
           isSubAdmin: initialRole === 'sub_admin',
-          hasBlueStar: Boolean(localPro || isInitialAdmin),
-          isVerifiedByAdmin: Boolean(localPro || isInitialAdmin),
-          isPro: Boolean(localPro || isInitialAdmin),
-          proBadge: isInitialAdmin ? 'founder' : localPro ? 'verified' : undefined,
-          proBorderEffect: isInitialAdmin ? 'aura-gold' : localPro ? 'neon-pulse' : undefined,
-          proAccentColor: isInitialAdmin ? 'gold' : localPro ? 'emerald' : undefined,
+          hasBlueStar: Boolean(isInitialAdmin),
+          isVerifiedByAdmin: Boolean(isInitialAdmin),
+          isPro: Boolean(isInitialAdmin),
+          proBadge: isInitialAdmin ? 'founder' : undefined,
+          proBorderEffect: isInitialAdmin ? 'aura-gold' : undefined,
+          proAccentColor: isInitialAdmin ? 'gold' : undefined,
           isOnline: true,
           lastSeenAt: nowIso,
           ...rewardFields,
@@ -777,10 +776,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           photoURL: bestPhotoUrl,
           role: effectiveRole,
           isSubAdmin: effectiveRole === 'sub_admin',
-          isPro: Boolean(data.isPro || localPro || isEffectiveAdmin),
-          hasBlueStar: Boolean(data.hasBlueStar || data.isPro || localPro || isEffectiveAdmin),
-          isVerifiedByAdmin: Boolean(data.isVerifiedByAdmin || localPro || isEffectiveAdmin),
-          proBadge: isEffectiveAdmin ? 'founder' : data.proBadge || (localPro ? 'verified' : undefined),
+          isPro: Boolean(data.isPro || data.isVerifiedByAdmin || isEffectiveAdmin),
+          hasBlueStar: Boolean(data.hasBlueStar || data.isPro || data.isVerifiedByAdmin || isEffectiveAdmin),
+          isVerifiedByAdmin: Boolean(data.isVerifiedByAdmin || isEffectiveAdmin),
+          proBadge: isEffectiveAdmin ? 'founder' : data.proBadge || undefined,
           isOnline: true,
           lastSeenAt: nowIso,
           ...rewardFields
@@ -1234,7 +1233,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           (docSnap) => {
             if (docSnap.exists()) {
               const snapData = docSnap.data() as UserProfile;
-              const currentLocalPro = hasLocalProPass(user.uid);
               const localReward = getLocalDailyRewardCache(user.uid);
               const canonicalRole = resolveCanonicalAdminRole(snapData.role, snapData.isSubAdmin);
               const isSnapAdmin = canonicalRole === 'admin';
@@ -1263,12 +1261,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               setUserProfile({
                 ...snapData,
                 photoURL: bestSnapPhoto,
-                isPro: Boolean(snapData.isPro || snapData.isVerifiedByAdmin || currentLocalPro || isSnapAdmin),
+                isPro: Boolean(snapData.isPro || snapData.isVerifiedByAdmin || isSnapAdmin),
                 hasBlueStar: Boolean(
-                  snapData.hasBlueStar || snapData.isVerifiedByAdmin || snapData.isPro || currentLocalPro || isSnapAdmin
+                  snapData.hasBlueStar || snapData.isVerifiedByAdmin || snapData.isPro || isSnapAdmin
                 ),
-                isVerifiedByAdmin: Boolean(snapData.isVerifiedByAdmin || currentLocalPro || isSnapAdmin),
-                proBadge: snapData.proBadge || (isSnapAdmin ? 'founder' : currentLocalPro ? 'verified' : undefined),
+                isVerifiedByAdmin: Boolean(snapData.isVerifiedByAdmin || isSnapAdmin),
+                proBadge: snapData.proBadge || (isSnapAdmin ? 'founder' : undefined),
                 points: resolvedPoints,
                 wavePoints: resolvedPoints,
                 loginStreak: Math.max(snapData.loginStreak ?? 0, localReward?.loginStreak ?? 1),
@@ -1934,7 +1932,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const reportContent = async (params: {
-    targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video';
+    targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video' | 'message';
     targetId: string;
     targetAuthorId?: string;
     targetSummary?: string;
@@ -2351,100 +2349,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     );
   };
 
-  // Instant Harvest Pass ("HARVEST2026") activation:
-  // Updates local state + localStorage immediately, purges Adsterra ads, adds Blue Star badge,
-  // and syncs to Firestore with a 1.5s timeout so network checks never block or hang.
-  const activateHarvestPass = async () => {
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
-
-    try {
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('wavelink_pro_pass', 'true');
-        if (currentUser?.uid) {
-          localStorage.setItem(`wavelink_pro_pass_${currentUser.uid}`, 'true');
-        }
-      }
-    } catch (_) {}
-
-    const proFields = {
-      isPro: true,
-      hasBlueStar: true,
-      isVerifiedByAdmin: true,
-      proPlan: 'annual' as const,
-      proExpiresAt: expiresAt,
-      proBadge: 'verified' as const,
-      proBorderEffect: 'neon-pulse' as const,
-      proAccentColor: 'emerald' as const,
-      updatedAt: now.toISOString()
-    };
-
-    // 1. Immediately update local state so UI, Blue Star badge, and Adsterra removal react instantaneously
-    setUserProfile((prev) =>
-      prev
-        ? { ...prev, ...proFields }
-        : currentUser
-        ? {
-            id: currentUser.uid,
-            email: currentUser.email || '',
-            displayName: currentUser.displayName || currentUser.email?.split('@')[0] || 'Waver',
-            username: `@${(currentUser.email?.split('@')[0] || 'waver').toLowerCase()}`,
-            status: 'active',
-            isBanned: false,
-            createdAt: now.toISOString(),
-            ...proFields
-          }
-        : null
-    );
-
-    // 2. Show global toast notification ("Harvest Pass Activated!")
-    showGlobalToast('Harvest Pass Activated!');
-
-    // 3. Sync to Firestore with a strict 1.2s timeout fallback so it never hangs on network errors
-    if (currentUser?.uid) {
-      const userRef = doc(db, 'users', currentUser.uid);
-      const writePromise = setDoc(userRef, cleanFirestoreData(proFields), { merge: true }).catch((err) => {
-        console.warn('Firestore Harvest Pass sync fallback:', err);
-      });
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1200));
-      await Promise.race([writePromise, timeoutPromise]);
-    }
-  };
-
-  // Verify official coupon code (supports built-in official code or any valid code stored in Firestore)
+  // Server-verified coupon / Harvest Pass redemption (writes isPro via Admin SDK only)
   const verifyAndRedeemCoupon = async (rawCode: string): Promise<boolean> => {
     const clean = rawCode.trim().toUpperCase();
-    if (!clean) return false;
+    if (!clean || !currentUser?.uid) return false;
 
-    if (clean === 'HARVEST2026') {
-      await activateHarvestPass();
-      return true;
+    clearLegacyLocalProPass(currentUser.uid);
+
+    const headers = await getAuthHeaders();
+    const resp = await fetch('/api/pro/redeem-coupon', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ code: clean }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data?.success) {
+      throw new Error(data?.error || 'Invalid or expired coupon code.');
     }
 
-    try {
-      const checkFirestoreCoupon = async (): Promise<boolean> => {
-        const couponSnap = await getDoc(doc(db, 'coupons', clean));
-        if (couponSnap.exists() && couponSnap.data()?.active !== false) {
-          return true;
-        }
-        const promoSnap = await getDoc(doc(db, 'promo_codes', clean));
-        if (promoSnap.exists() && promoSnap.data()?.active !== false) {
-          return true;
-        }
-        return false;
-      };
-
-      const timeoutPromise = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000));
-      const isValidInDb = await Promise.race([checkFirestoreCoupon(), timeoutPromise]);
-      if (isValidInDb) {
-        await activateHarvestPass();
-        return true;
-      }
-    } catch {
-      // Fallback gracefully if offline
+    if (data?.proFields) {
+      setUserProfile((prev) => (prev ? { ...prev, ...data.proFields } : prev));
     }
+    showGlobalToast('🎉 WaveLink Pro Activated!');
+    return true;
+  };
 
-    return false;
+  const activateHarvestPass = async () => {
+    await verifyAndRedeemCoupon('HARVEST2026');
   };
 
   return (

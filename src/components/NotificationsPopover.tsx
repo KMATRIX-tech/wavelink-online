@@ -110,8 +110,14 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     const unsub = onSnapshot(
       q,
       (snap) => {
+        const blockedIds = userProfile?.blockedUserIds || [];
         const list: AppNotification[] = [];
-        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as AppNotification));
+        snap.forEach((d) => {
+          const data = d.data() as AppNotification;
+          if (!blockedIds.includes(data.actorId)) {
+            list.push({ ...data, id: d.id });
+          }
+        });
         setNotifications(list);
         setIsLoading(false);
       },
@@ -122,7 +128,7 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     );
 
     return () => unsub();
-  }, [currentUser]);
+  }, [currentUser, userProfile?.blockedUserIds]);
 
   // Click outside to close
   useEffect(() => {
@@ -218,7 +224,7 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
     const pick = sampleTypes[Math.floor(Math.random() * sampleTypes.length)];
     await sendNotification({
       recipientId: currentUser.uid,
-      actorId: 'sample_bot_1',
+      actorId: currentUser.uid,
       actorName: 'Amani Creative',
       actorUsername: '@amani_tz',
       actorPhotoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',

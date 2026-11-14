@@ -13,6 +13,7 @@ import {
 } from '../utils/mediaStorage';
 import { enqueueSparkUploadJob } from '../services/sparkUploadQueue';
 import { SongSelectorModal } from './SongSelectorModal';
+import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   Flame,
   Zap,
@@ -74,6 +75,8 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
+
+  useBottomSheetLock(isOpen, 'spark-composer');
 
   if (!isOpen) return null;
 
@@ -170,14 +173,14 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+    <div className="fixed inset-0 z-[80] flex items-end sm:items-center justify-center p-0 sm:p-4 overflow-hidden">
       {/* Backdrop */}
       <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm transition-opacity" onClick={isUploading ? undefined : onClose} />
 
       {/* Modal Dialog */}
-      <div className="relative w-full max-w-xl bg-white rounded-3xl border border-slate-200/80 shadow-[0_12px_40px_-8px_rgba(15,23,42,0.14)] overflow-hidden z-10 animate-fade-in my-auto">
+      <div className="relative w-full max-w-xl bg-white rounded-t-3xl sm:rounded-3xl border border-slate-200/80 shadow-[0_12px_40px_-8px_rgba(15,23,42,0.14)] overflow-hidden z-10 animate-fade-in max-h-[92dvh] flex flex-col">
         {/* Top Banner */}
-        <div className="p-5 sm:p-6 bg-[#F8FAFC] border-b border-slate-100 text-[#0F172A] relative overflow-hidden">
+        <div className="p-4 sm:p-6 bg-[#F8FAFC] border-b border-slate-100 text-[#0F172A] relative overflow-hidden shrink-0">
           <div className="relative z-10 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="p-2.5 rounded-2xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] shadow-sm text-white">
@@ -214,7 +217,8 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
           </p>
         </div>
 
-        <form onSubmit={handleCreateSpark} className="p-5 sm:p-6 space-y-4">
+        <form onSubmit={handleCreateSpark} className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-5 sm:p-6 space-y-4">
           {feedbackNotice && (
             <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-slate-900 text-xs font-bold space-y-1.5">
               <div className="flex items-center justify-between gap-2">
@@ -442,13 +446,18 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
             </div>
           )}
 
+          </div>
+
           {/* Modal Actions */}
-          <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-100">
+          <div
+            className="shrink-0 flex items-center justify-end gap-2.5 px-5 sm:px-6 pt-3 border-t border-slate-100 bg-white"
+            style={{ paddingBottom: 'max(0.875rem, env(safe-area-inset-bottom, 0px))' }}
+          >
             <button
               type="button"
               onClick={onClose}
               disabled={isUploading}
-              className="px-4 py-2 rounded-2xl text-xs font-semibold text-slate-600 hover:bg-[#F8FAFC] border border-slate-200 transition"
+              className="min-h-[48px] px-4 py-2 rounded-2xl text-xs font-semibold text-slate-600 hover:bg-[#F8FAFC] border border-slate-200 transition cursor-pointer"
             >
               Cancel
             </button>
@@ -456,7 +465,7 @@ export const SparkComposerModal: React.FC<SparkComposerModalProps> = ({
             <button
               type="submit"
               disabled={isUploading || !mediaDataUrl}
-              className="px-6 py-2.5 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition disabled:opacity-40"
+              className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm shadow-blue-500/20 active:scale-95 transition disabled:opacity-40 cursor-pointer"
             >
               <Flame size={16} />
               <span>{isUploading ? 'Uploading Spark...' : 'Publish 24h Spark 🔥'}</span>

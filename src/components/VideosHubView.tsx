@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { db, handleFirestoreError, OperationType, getCachedUserProfile } from '../firebase';
 import {
   collection,
   query,
@@ -720,6 +720,24 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
   }, []);
 
   const filteredPosts = videoPosts.filter((post) => {
+    const blockedIds = userProfile?.blockedUserIds || [];
+    if (blockedIds.includes(post.authorId)) return false;
+    const authorCached = post.authorId ? getCachedUserProfile(post.authorId) : null;
+    if (currentUser?.uid && (authorCached?.blockedUserIds || []).includes(currentUser.uid)) {
+      return false;
+    }
+    if (post.authorId !== currentUser?.uid && !isAdmin) {
+      const audience = post.audience || 'public';
+      if (audience === 'followers' && !(userProfile?.followingIds || []).includes(post.authorId)) {
+        return false;
+      }
+      if (
+        audience === 'close_friends' &&
+        (!currentUser?.uid || !(authorCached?.closeFriendIds || []).includes(currentUser.uid))
+      ) {
+        return false;
+      }
+    }
     if (filter === 'saved') {
       return (userProfile?.savedPostIds || []).includes(post.id);
     }

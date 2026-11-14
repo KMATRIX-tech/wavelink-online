@@ -151,7 +151,7 @@ export const SupportDeskView: React.FC = () => {
 
       // If this ticket came from a WaveLink Support Bot DM conversation, also post the human follow-up into their DM thread
       if (ticket.botConversationId) {
-        await addDoc(collection(db, 'directMessages', ticket.botConversationId, 'messages'), {
+        await addDoc(collection(db, 'channels', ticket.botConversationId, 'messages'), {
           channelId: ticket.botConversationId,
           senderId: currentUser?.uid || 'admin',
           senderEmail: currentUser?.email || '',

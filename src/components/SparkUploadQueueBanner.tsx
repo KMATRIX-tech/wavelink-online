@@ -120,7 +120,7 @@ export const SparkUploadQueueBanner: React.FC<SparkUploadQueueBannerProps> = ({
 
   return (
     <div
-      className="fixed bottom-20 right-3 sm:right-6 z-40 w-[calc(100vw-1.5rem)] max-w-sm space-y-2 pointer-events-none"
+      className="wavelink-floating-upload-chip fixed bottom-20 right-3 sm:right-6 z-40 w-[calc(100vw-1.5rem)] max-w-sm space-y-2 pointer-events-none"
       aria-live="polite"
     >
       {jobs.map((job) => {
