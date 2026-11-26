@@ -1,96 +1,81 @@
-import React, { useState } from 'react';
-import { useLanguage } from '../context/LanguageContext';
-import { triggerHaptic } from '../utils/haptics';
+import React from 'react';
 import {
   HelpCircle,
   X,
-  Sparkles,
-  Mic,
-  ChevronDown,
-  ChevronUp,
-  Compass,
+  Camera,
   MessageCircle,
-  CheckCircle2
+  Zap,
+  Palette,
+  ShieldCheck,
+  Sparkles,
+  Bot
 } from 'lucide-react';
+import { useLanguage } from '../context/LanguageContext';
 
 interface HelpModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onOpenWelink?: (mode?: 'chat' | 'image' | 'voice') => void;
+  onStartTour?: () => void;
   onOpenTour?: () => void;
+  onOpenAssistant?: () => void;
+  onOpenWelink?: (mode?: 'chat' | 'image' | 'voice') => void;
 }
 
 export const HelpModal: React.FC<HelpModalProps> = ({
   isOpen,
   onClose,
-  onOpenWelink,
-  onOpenTour
+  onStartTour,
+  onOpenTour,
+  onOpenAssistant,
+  onOpenWelink
 }) => {
   const { language } = useLanguage();
-  const [openIndex, setOpenIndex] = useState<number | null>(0);
 
   if (!isOpen) return null;
 
-  const faqs = [
+  const handleTourClick = onStartTour || onOpenTour;
+  const handleAssistantClick = onOpenAssistant || (onOpenWelink ? () => onOpenWelink('chat') : undefined);
+
+  const shortAnswers = [
     {
-      q:
+      icon: <Camera size={18} className="text-[#2563EB]" />,
+      title: language === 'sw' ? '1. Shiriki picha au video' : '1. Share a post',
+      answer:
         language === 'sw'
-          ? 'Ninawezaje kuweka picha au video?'
-          : 'How do I share a photo or video?',
-      a:
-        language === 'sw'
-          ? 'Kwenye ukurasa wa Mwanzo (Home), gusa kisanduku kikubwa kilicho juu kinachosema "Shiriki kitu na marafiki zako", chagua kitufe cha Picha au Video, kisha gusa "Chapisha".'
-          : 'At the top of Home, tap the big box that says "Share something with your friends", tap Photo or Video, select your file, and tap "Post Wave".'
+          ? 'Bonyeza + kuchapisha picha, video, au Spark ya saa 24.'
+          : 'Tap + to post a photo, video, or 24-hour Spark.'
     },
     {
-      q:
+      icon: <MessageCircle size={18} className="text-[#0D9488]" />,
+      title: language === 'sw' ? '2. Soga na piga simu' : '2. Chat & call',
+      answer:
         language === 'sw'
-          ? 'Je, kutuma ujumbe kwenye Chat ni bure?'
-          : 'Is sending messages free on WaveLink?',
-      a:
-        language === 'sw'
-          ? 'Ndio! Kutuma ujumbe na kupiga soga na rafiki yeyote kwenye WaveLink ni bure kabisa.'
-          : 'Yes! Sending messages, chatting, and connecting with friends on WaveLink is 100% free.'
+          ? 'Fungua Soga kutuma ujumbe au kupiga simu bure.'
+          : 'Open Chat to message or call friends for free.'
     },
     {
-      q:
+      icon: <Zap size={18} className="text-[#D97706]" />,
+      title: language === 'sw' ? '3. Pata WavePoints' : '3. Earn WavePoints',
+      answer:
         language === 'sw'
-          ? 'Sparks ni nini?'
-          : 'What are Sparks?',
-      a:
-        language === 'sw'
-          ? 'Sparks ni picha au video fupi za matukio ya siku yako zinazodumu kwa saa 24 kisha hupotea, sawa na Status kwenye WhatsApp.'
-          : 'Sparks are fun 24-hour moments that disappear after a day, just like WhatsApp Status or Instagram Stories.'
+          ? 'Ingia kila siku na uchapishe kupata WavePoints.'
+          : 'Check in daily and share posts to earn WavePoints.'
     },
     {
-      q:
+      icon: <Palette size={18} className="text-pink-600" />,
+      title: language === 'sw' ? '4. Badilisha mandhari' : '4. Change themes',
+      answer:
         language === 'sw'
-          ? 'Hali Rahisi (Simple Mode) inasaidia nini?'
-          : 'What is Simple Mode?',
-      a:
-        language === 'sw'
-          ? 'Hali Rahisi hufanya maandishi na vitufe kuwa vikubwa zaidi na huficha menyu ngumu, ikikupa ukurasa mwepesi na rahisi kutumia.'
-          : 'Simple Mode makes all text and buttons larger and hides advanced menus, creating a calm, high-contrast experience perfect for parents and easy everyday browsing.'
+          ? 'Fungua Wasifu > Mandhari kuchagua rangi au picha.'
+          : 'Open Profile > Themes to pick colors or a photo background.'
     },
     {
-      q:
+      icon: <ShieldCheck size={18} className="text-emerald-600" />,
+      title: language === 'sw' ? '5. Usalama na faragha' : '5. Stay safe',
+      answer:
         language === 'sw'
-          ? 'Nabadilishaje kati ya Kiswahili na Kiingereza?'
-          : 'How do I change language between English and Kiswahili?',
-      a:
-        language === 'sw'
-          ? 'Gusa bendera ya nchi na herufi za lugha (kama 🇹🇿 SW) zilizo juu kulia mwa ukurasa ili kuchagua Kiswahili au Kiingereza papo hapo.'
-          : 'Tap the country flag and language icon (like 🇹🇿 SW or 🇰🇪 EN) at the top right of the header to switch languages instantly.'
-    },
-    {
-      q:
-        language === 'sw'
-          ? 'Arifa za simu (Push Notifications) hufanyaje kazi kwenye simu?'
-          : 'How do push notifications & calls work when WaveLink is closed?',
-      a:
-        language === 'sw'
-          ? 'Washa arifa katika Mipangilio > Arifa. Kwenye iPhone, gusa Share kisha "Add to Home Screen" kwanza. Pia, programu ya wavuti haiwezi kuchukua skrini nzima simu ikiwa imefungwa—simu zinazoingia zitaonekana kama arifa yenye vitufe vya Answer na Decline.'
-          : 'Enable notifications in Settings > Alerts. On iPhone, tap Safari Share → Add to Home Screen first (iOS 16.4+) and open WaveLink from your Home Screen. Because WaveLink is a web app, incoming calls when your phone is locked appear as high-priority notifications with Answer and Decline buttons rather than taking over the full lock screen.'
+          ? 'Fungua Wasifu > Usalama kuwasha uthibitisho wa hatua 2.'
+          : 'Open Profile > Security to turn on 2-step login or block anyone.'
     }
   ];
 
@@ -98,103 +83,90 @@ export const HelpModal: React.FC<HelpModalProps> = ({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Help and Answers"
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-stone-900/60 backdrop-blur-sm animate-fade-in"
+      aria-label={language === 'sw' ? 'Msaada' : 'Help'}
+      className="fixed inset-0 z-[115] flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-200"
     >
-      <div className="w-full max-w-lg bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-3xl p-6 shadow-2xl relative text-stone-900 dark:text-stone-100 max-h-[90dvh] flex flex-col">
+      <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200/90 dark:border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
         {/* Header */}
-        <div className="flex items-start justify-between pb-4 border-b border-stone-100 dark:border-stone-800 shrink-0">
+        <div className="px-5 py-4 bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <div className="w-10 h-10 rounded-2xl bg-teal-50 dark:bg-teal-950/50 text-[#0D9488] flex items-center justify-center shrink-0">
+            <div className="w-10 h-10 rounded-2xl bg-white/20 flex items-center justify-center">
               <HelpCircle size={22} />
             </div>
-            <div>
-              <h2 className="text-lg font-black text-[#1C1917] dark:text-stone-100">
-                {language === 'sw' ? 'Msaada na Maswali' : 'Help & Friendly Answers'}
-              </h2>
-              <p className="text-xs text-stone-500 dark:text-stone-400">
-                {language === 'sw' ? 'Majibu mafupi na msaidizi wa WELINK' : 'Simple answers and friendly guidance'}
-              </p>
-            </div>
+            <h2 className="font-extrabold text-lg">
+              {language === 'sw' ? 'Msaada' : 'Help'}
+            </h2>
           </div>
+
           <button
             type="button"
             onClick={onClose}
-            className="p-1.5 rounded-xl text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition cursor-pointer"
+            aria-label={language === 'sw' ? 'Funga' : 'Close'}
+            className="min-w-[44px] min-h-[44px] rounded-2xl bg-white/15 hover:bg-white/25 flex items-center justify-center transition cursor-pointer"
           >
             <X size={18} />
           </button>
         </div>
 
-        {/* Scrollable FAQ Accordion */}
-        <div className="flex-1 overflow-y-auto py-4 space-y-2.5 pr-1">
-          {faqs.map((faq, idx) => {
-            const isOpen = openIndex === idx;
-            return (
-              <div
-                key={idx}
-                className="rounded-2xl border border-stone-200 dark:border-stone-800 overflow-hidden bg-stone-50/60 dark:bg-stone-800/40 transition"
-              >
-                <button
-                  type="button"
-                  onClick={() => setOpenIndex(isOpen ? null : idx)}
-                  className="w-full p-3.5 text-left flex items-center justify-between gap-2 font-bold text-xs sm:text-sm text-stone-800 dark:text-stone-200 hover:text-[#2563EB] transition cursor-pointer"
-                >
-                  <span>{faq.q}</span>
-                  {isOpen ? <ChevronUp size={16} className="shrink-0 text-stone-400" /> : <ChevronDown size={16} className="shrink-0 text-stone-400" />}
-                </button>
-                {isOpen && (
-                  <div className="px-3.5 pb-3.5 pt-0 text-xs sm:text-sm text-stone-600 dark:text-stone-300 leading-relaxed border-t border-stone-100 dark:border-stone-700/50 pt-2.5">
-                    {faq.a}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Bottom Actions: Ask WELINK + Show Me Around */}
-        <div className="pt-4 border-t border-stone-100 dark:border-stone-800 space-y-2 shrink-0">
-          {onOpenWelink && (
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  onClose();
-                  onOpenWelink('chat');
-                }}
-                className="min-h-[44px] px-3 py-2 rounded-xl bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 text-[#2563EB] font-extrabold text-xs flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
-              >
-                <Sparkles size={14} />
-                <span>{language === 'sw' ? 'Muulize WELINK' : 'Ask WELINK'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  onClose();
-                  onOpenWelink('voice');
-                }}
-                className="min-h-[44px] px-3 py-2 rounded-xl bg-teal-50 dark:bg-teal-950/40 hover:bg-teal-100 text-[#0D9488] font-extrabold text-xs flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
-              >
-                <Mic size={14} />
-                <span>{language === 'sw' ? 'Ongea na WELINK' : 'Voice with WELINK'}</span>
-              </button>
-            </div>
-          )}
-
-          {onOpenTour && (
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-                onOpenTour();
-              }}
-              className="w-full min-h-[44px] py-2 px-3 rounded-xl bg-stone-100 hover:bg-stone-200 dark:bg-stone-800 text-stone-700 dark:text-stone-200 font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+        {/* 5 Short Answers */}
+        <div className="p-4 sm:p-5 space-y-2.5 max-h-[75vh] overflow-y-auto">
+          {shortAnswers.map((item) => (
+            <div
+              key={item.title}
+              className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/75 border border-slate-200/80 dark:border-slate-700/80 flex items-start gap-3"
             >
-              <Compass size={15} />
-              <span>{language === 'sw' ? 'Nionyeshe Jinsi ya Kutumia (Show me around)' : 'Show me around (Quick Tour)'}</span>
-            </button>
-          )}
+              <div className="w-9 h-9 rounded-xl bg-white dark:bg-slate-900 border border-slate-200/70 dark:border-slate-700 flex items-center justify-center shrink-0">
+                {item.icon}
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-extrabold text-slate-900 dark:text-white">
+                  {item.title}
+                </h3>
+                <p className="text-sm text-slate-600 dark:text-slate-300 mt-0.5 leading-snug">
+                  {item.answer}
+                </p>
+              </div>
+            </div>
+          ))}
+
+          {/* Action Buttons */}
+          <div className="grid grid-cols-2 gap-2.5 pt-2">
+            {handleTourClick && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  handleTourClick();
+                }}
+                className="min-h-[48px] px-4 py-2.5 rounded-2xl bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/50 text-[#2563EB] dark:text-blue-300 border border-blue-200/80 dark:border-blue-800/70 text-sm font-extrabold flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+              >
+                <Sparkles size={16} />
+                <span>{language === 'sw' ? 'Mafunzo' : 'Welcome Tour'}</span>
+              </button>
+            )}
+
+            {handleAssistantClick && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  handleAssistantClick();
+                }}
+                className="min-h-[48px] px-4 py-2.5 rounded-2xl bg-teal-50 hover:bg-teal-100 dark:bg-teal-950/50 text-[#0D9488] dark:text-teal-300 border border-teal-200/80 dark:border-teal-800/70 text-sm font-extrabold flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+              >
+                <Bot size={16} />
+                <span>{language === 'sw' ? 'Uliza WELINK' : 'Ask WELINK'}</span>
+              </button>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full min-h-[48px] mt-1 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-extrabold text-sm transition active:scale-95 cursor-pointer"
+          >
+            {language === 'sw' ? 'Sawa' : 'Done'}
+          </button>
         </div>
       </div>
     </div>

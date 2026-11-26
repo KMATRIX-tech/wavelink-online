@@ -18,6 +18,7 @@ import {
   Globe,
   HelpCircle,
   Compass,
+  LogOut,
   X
 } from 'lucide-react';
 import { inviteFriends } from '../utils/share.js';
@@ -44,7 +45,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   hasUnreadNotifications = false,
   unreadNotificationCount = 0
 }) => {
-  const { currentUser, userProfile, updateUserProfile } = useAuth();
+  const { currentUser, userProfile, updateUserProfile, signOut } = useAuth();
   const { language, setLanguage, t } = useLanguage();
   const { enabled: isDataSaverOn, setEnabled: toggleDataSaver, formattedSaved } = useDataSaver();
   const { countryMeta, setCountryCode, patternFrame } = useAfricanRegion(userProfile);
@@ -175,7 +176,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 if (onNavigateTab) onNavigateTab('settings');
               }}
               title={`${pointsCount} WavePoints`}
-              className="min-h-[36px] sm:min-h-[38px] px-1.5 sm:px-2.5 py-1 rounded-xl bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border border-amber-200/80 dark:border-amber-800/60 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+              className="min-h-[2.75rem] px-2.5 sm:px-3 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border border-amber-200/80 dark:border-amber-800/60 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
             >
               <Sparkles size={13} className="text-amber-600 shrink-0" />
               <span className="tabular-nums">{pointsCount}</span>
@@ -191,7 +192,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   setIsLangCountryOpen((prev) => !prev);
                   setIsMoreMenuOpen(false);
                 }}
-                className="min-h-[36px] sm:min-h-[38px] px-1.5 sm:px-2.5 py-1 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-extrabold flex items-center gap-1 transition active:scale-95 cursor-pointer"
+                className="min-h-[2.75rem] min-w-[2.75rem] px-2.5 py-1.5 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-extrabold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
                 title={`${countryMeta.flag} ${countryMeta.nameEn} · ${language === 'sw' ? 'Kiswahili' : 'English'}`}
                 aria-label="Country and Language"
                 aria-expanded={isLangCountryOpen}
@@ -215,7 +216,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                           updateUserProfile({ language: 'en' }).catch(() => {});
                           setIsLangCountryOpen(false);
                         }}
-                        className={`py-1.5 px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition cursor-pointer ${
+                        className={`min-h-[2.75rem] py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition cursor-pointer ${
                           language === 'en'
                             ? 'bg-[#2563EB] text-white shadow-2xs'
                             : 'bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-300 hover:bg-stone-200'
@@ -231,7 +232,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                           updateUserProfile({ language: 'sw' }).catch(() => {});
                           setIsLangCountryOpen(false);
                         }}
-                        className={`py-1.5 px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition cursor-pointer ${
+                        className={`min-h-[2.75rem] py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition cursor-pointer ${
                           language === 'sw'
                             ? 'bg-[#0D9488] text-white shadow-2xs'
                             : 'bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-300 hover:bg-stone-200'
@@ -246,7 +247,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   {/* Country & Region Picker */}
                   <div className="pt-2 border-t border-stone-100 dark:border-stone-800">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-stone-400 block mb-1.5">
-                      Select Country & Currency
+                      Country
                     </span>
                     <div className="max-h-48 overflow-y-auto space-y-1 pr-1">
                       {AFRICAN_COUNTRIES.map((c) => {
@@ -263,7 +264,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                               }).catch(() => {});
                               setIsLangCountryOpen(false);
                             }}
-                            className={`w-full py-1.5 px-2 rounded-xl text-xs flex items-center justify-between transition cursor-pointer ${
+                            className={`w-full min-h-[2.75rem] py-2 px-2.5 rounded-xl text-xs flex items-center justify-between transition cursor-pointer ${
                               isSelected
                                 ? 'bg-teal-50 dark:bg-teal-950/40 text-[#0D9488] font-bold'
                                 : 'hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-700 dark:text-stone-300'
@@ -294,7 +295,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   setIsMoreMenuOpen((prev) => !prev);
                   setIsLangCountryOpen(false);
                 }}
-                className="min-h-[38px] min-w-[38px] p-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-bold flex items-center justify-center transition active:scale-95 cursor-pointer"
+                className="min-h-[2.75rem] min-w-[2.75rem] p-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-bold flex items-center justify-center transition active:scale-95 cursor-pointer"
                 title={t('header.more')}
                 aria-label={t('header.more')}
                 aria-expanded={isMoreMenuOpen}
@@ -303,7 +304,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               </button>
 
               {isMoreMenuOpen && (
-                <div className="absolute right-0 top-full mt-2 w-60 rounded-2xl bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 shadow-xl p-2 z-50 animate-in fade-in space-y-1">
+                <div className="absolute right-0 top-full mt-2 w-52 rounded-2xl bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 shadow-xl p-2 z-50 animate-in fade-in space-y-1">
                   {onOpenWelink && (
                     <>
                       <button
@@ -312,15 +313,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                           setIsMoreMenuOpen(false);
                           onOpenWelink('voice');
                         }}
-                        className="w-full px-3 py-2 rounded-xl hover:bg-teal-50 dark:hover:bg-teal-950/40 text-left text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
+                        className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl hover:bg-teal-50 dark:hover:bg-teal-950/40 text-left text-xs font-extrabold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
                       >
                         <div className="w-7 h-7 rounded-lg bg-teal-100 dark:bg-teal-900/40 text-[#0D9488] flex items-center justify-center shrink-0">
                           <Mic size={14} />
                         </div>
-                        <div>
-                          <div className="font-bold">{t('header.liveTalk')}</div>
-                          <div className="text-[10px] text-stone-400">Voice talk with WELINK</div>
-                        </div>
+                        <span>{t('header.liveTalk')}</span>
                       </button>
 
                       <button
@@ -329,15 +327,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                           setIsMoreMenuOpen(false);
                           onOpenWelink('chat');
                         }}
-                        className="w-full px-3 py-2 rounded-xl hover:bg-blue-50 dark:hover:bg-blue-950/40 text-left text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
+                        className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl hover:bg-blue-50 dark:hover:bg-blue-950/40 text-left text-xs font-extrabold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
                       >
                         <div className="w-7 h-7 rounded-lg bg-blue-100 dark:bg-blue-900/40 text-[#2563EB] flex items-center justify-center shrink-0">
                           <Sparkles size={14} />
                         </div>
-                        <div>
-                          <div className="font-bold">{t('header.welinkAi')}</div>
-                          <div className="text-[10px] text-stone-400">AI Creator assistant</div>
-                        </div>
+                        <span>{t('header.welinkAi')}</span>
                       </button>
                     </>
                   )}
@@ -348,15 +343,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                       setIsMoreMenuOpen(false);
                       inviteFriends();
                     }}
-                    className="w-full px-3 py-2 rounded-xl hover:bg-emerald-50 dark:hover:bg-emerald-950/40 text-left text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
+                    className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl hover:bg-emerald-50 dark:hover:bg-emerald-950/40 text-left text-xs font-extrabold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
                   >
                     <div className="w-7 h-7 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 flex items-center justify-center shrink-0">
                       <UserPlus size={14} />
                     </div>
-                    <div>
-                      <div className="font-bold">{t('nav.inviteFriends')}</div>
-                      <div className="text-[10px] text-stone-400">Share via WhatsApp</div>
-                    </div>
+                    <span>{t('nav.inviteFriends')}</span>
                   </button>
 
                   <div className="pt-1 mt-1 border-t border-stone-100 dark:border-stone-800 space-y-1">
@@ -366,15 +358,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                         setIsMoreMenuOpen(false);
                         window.dispatchEvent(new CustomEvent('wavelink:open-help'));
                       }}
-                      className="w-full px-3 py-2 rounded-xl hover:bg-teal-50 dark:hover:bg-teal-950/40 text-left text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
+                      className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl hover:bg-teal-50 dark:hover:bg-teal-950/40 text-left text-xs font-extrabold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
                     >
                       <div className="w-7 h-7 rounded-lg bg-teal-100 dark:bg-teal-900/40 text-[#0D9488] flex items-center justify-center shrink-0">
                         <HelpCircle size={14} />
                       </div>
-                      <div>
-                        <div className="font-bold">{language === 'sw' ? 'Msaada na Maswali' : 'Help & Answers'}</div>
-                        <div className="text-[10px] text-stone-400">Quick guides & assistance</div>
-                      </div>
+                      <span>{language === 'sw' ? 'Msaada' : 'Help'}</span>
                     </button>
 
                     <button
@@ -383,25 +372,22 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                         setIsMoreMenuOpen(false);
                         window.dispatchEvent(new CustomEvent('wavelink:open-tour'));
                       }}
-                      className="w-full px-3 py-2 rounded-xl hover:bg-blue-50 dark:hover:bg-blue-950/40 text-left text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
+                      className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl hover:bg-blue-50 dark:hover:bg-blue-950/40 text-left text-xs font-extrabold text-stone-800 dark:text-stone-200 flex items-center gap-2.5 transition cursor-pointer"
                     >
                       <div className="w-7 h-7 rounded-lg bg-blue-100 dark:bg-blue-900/40 text-[#2563EB] flex items-center justify-center shrink-0">
                         <Compass size={14} />
                       </div>
-                      <div>
-                        <div className="font-bold">{language === 'sw' ? 'Nionyeshe Jinsi ya Kutumia' : 'Show me around'}</div>
-                        <div className="text-[10px] text-stone-400">3-step friendly tour</div>
-                      </div>
+                      <span>{language === 'sw' ? 'Ziara' : 'Tour'}</span>
                     </button>
                   </div>
 
-                  <div className="pt-1 mt-1 border-t border-stone-100 dark:border-stone-800">
+                  <div className="pt-1 mt-1 border-t border-stone-100 dark:border-stone-800 space-y-1">
                     <button
                       type="button"
                       onClick={() => {
                         toggleDataSaver();
                       }}
-                      className="w-full px-3 py-2 rounded-xl hover:bg-stone-100 dark:hover:bg-stone-800 text-left text-xs flex items-center justify-between transition cursor-pointer"
+                      className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl hover:bg-stone-100 dark:hover:bg-stone-800 text-left text-xs flex items-center justify-between transition cursor-pointer"
                     >
                       <div className="flex items-center gap-2.5">
                         <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
@@ -409,19 +395,48 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                         }`}>
                           <Zap size={14} />
                         </div>
-                        <div>
-                          <div className="font-bold text-stone-800 dark:text-stone-200">
-                            {isDataSaverOn ? t('datasaver.on') : t('datasaver.off')}
-                          </div>
-                          <div className="text-[10px] text-stone-400">{formattedSaved}</div>
-                        </div>
+                        <span className="font-extrabold text-stone-800 dark:text-stone-200">
+                          {language === 'sw' ? 'Okoa Data' : 'Data Saver'}
+                        </span>
                       </div>
                       <span className={`w-2 h-2 rounded-full ${isDataSaverOn ? 'bg-[#0D9488]' : 'bg-stone-300'}`} />
                     </button>
+
+                    {currentUser && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic('light');
+                          setIsMoreMenuOpen(false);
+                          void signOut();
+                        }}
+                        className="w-full min-h-[2.75rem] px-3 py-2 rounded-xl bg-rose-50/80 hover:bg-rose-100 dark:bg-rose-950/30 dark:hover:bg-rose-950/60 text-left text-xs font-extrabold text-rose-700 dark:text-rose-300 flex items-center gap-2.5 transition cursor-pointer"
+                      >
+                        <div className="w-7 h-7 rounded-lg bg-rose-600 text-white flex items-center justify-center shrink-0">
+                          <LogOut size={14} />
+                        </div>
+                        <span>{language === 'sw' ? 'Toka (Log Out)' : 'Log Out'}</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
             </div>
+
+            {/* Direct 1-Tap Help Button */}
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                window.dispatchEvent(new CustomEvent('wavelink:open-help'));
+              }}
+              className="min-h-[2.75rem] min-w-[2.75rem] px-2.5 py-2 rounded-xl bg-stone-100 hover:bg-stone-200/80 dark:bg-stone-800 dark:hover:bg-stone-700 text-stone-700 dark:text-stone-200 border border-stone-200/80 dark:border-stone-700 text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+              title={language === 'sw' ? 'Msaada' : 'Help'}
+              aria-label={language === 'sw' ? 'Msaada' : 'Help'}
+            >
+              <HelpCircle size={16} className="text-[#2563EB]" />
+              <span className="hidden sm:inline">{language === 'sw' ? 'Msaada' : 'Help'}</span>
+            </button>
 
             {/* Item 4: Notifications Bell Menu */}
             <NotificationsPopover
@@ -439,7 +454,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   triggerHaptic('tab');
                   if (onNavigateTab) onNavigateTab('settings');
                 }}
-                className={`relative w-9 h-9 min-w-[36px] min-h-[36px] rounded-full focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0 flex items-center justify-center cursor-pointer ${activeFrameClass}`}
+                className={`relative min-w-[2.75rem] min-h-[2.75rem] rounded-full focus:outline-none ring-2 ring-transparent hover:ring-[#2563EB]/20 transition shrink-0 flex items-center justify-center cursor-pointer ${activeFrameClass}`}
                 title="Profile"
                 aria-label="Profile"
               >
@@ -458,6 +473,23 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   targetProfile={userProfile}
                   ringClassName="border border-stone-200 dark:border-stone-700"
                 />
+              </button>
+            )}
+
+            {/* Item 6: Direct 1-Tap Log Out Button */}
+            {currentUser && (
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic('light');
+                  void signOut();
+                }}
+                className="min-h-[2.75rem] min-w-[2.75rem] px-2.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 text-rose-600 dark:text-rose-300 border border-rose-200/80 dark:border-rose-800/70 text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+                title={language === 'sw' ? 'Toka' : 'Log Out'}
+                aria-label={language === 'sw' ? 'Toka' : 'Log Out'}
+              >
+                <LogOut size={16} />
+                <span className="hidden md:inline">{language === 'sw' ? 'Toka' : 'Log Out'}</span>
               </button>
             )}
           </div>

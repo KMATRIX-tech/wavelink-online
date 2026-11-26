@@ -32,7 +32,11 @@ import { Post, Spark, StoryHighlightItem, UserProfile } from '../types';
 import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
 import { Avatar } from './Avatar';
-import { uploadImageToCloudinary } from '../utils/mediaStorage';
+import {
+  compressImageForUpload,
+  optimizeCloudinaryThumbnailUrl,
+  uploadImageToCloudinary
+} from '../utils/mediaStorage';
 import { useBottomSheetLock } from '../utils/sheetLock';
 
 export interface ProfileBadgeInfo {
@@ -794,8 +798,18 @@ export const StoryHighlightsBar: React.FC<StoryHighlightsBarProps> = ({
     if (!file) return;
     setUploadingCover(true);
     try {
-      const res = await uploadImageToCloudinary(file);
-      setCustomCoverUrl(res.secureUrl);
+      const compressed = await compressImageForUpload(file, {
+        maxWidth: 400,
+        maxHeight: 400,
+        targetMaxBytes: 120 * 1024
+      });
+      const res = await uploadImageToCloudinary(compressed.blob, undefined, {
+        maxWidth: 400,
+        maxHeight: 400,
+        targetMaxBytes: 120 * 1024,
+        thumbnailWidth: 400
+      });
+      setCustomCoverUrl(optimizeCloudinaryThumbnailUrl(res.thumbnailUrl || res.secureUrl, { width: 400 }));
     } catch {
       // ignore
     } finally {

@@ -24,6 +24,7 @@ import { VideoUploadProgressChip } from './VideoUploadProgressChip';
 import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
 import { Avatar } from './Avatar';
+import { formatCompactNumber } from '../utils/safetyFilters';
 import {
   cloneVideoFileToMemory,
   inspectAndValidateVideoFile,
@@ -52,7 +53,8 @@ import {
   RefreshCw,
   Scissors,
   Music,
-  Trash2
+  Trash2,
+  Flag
 } from 'lucide-react';
 
 interface VideosHubViewProps {
@@ -102,6 +104,7 @@ interface ReelSlideItemProps {
   onShare: (post: Post) => void;
   onToggleSave: (postId: string) => void;
   onOpenTip: (post: Post) => void;
+  onReport: (post: Post) => void;
 }
 
 const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
@@ -118,7 +121,8 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
   onOpenComments,
   onShare,
   onToggleSave,
-  onOpenTip
+  onOpenTip,
+  onReport
 }) => {
   const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(() => {
     if (post.videoWidth && post.videoHeight && post.videoWidth > 0 && post.videoHeight > 0) {
@@ -488,7 +492,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
               <Heart size={20} className={isLiked ? 'fill-white' : ''} />
             </span>
             <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-              {post.likesCount || 0}
+              {formatCompactNumber(post.likesCount || 0)}
             </span>
           </button>
 
@@ -503,7 +507,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
               <MessageCircle size={20} />
             </span>
             <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-              {post.commentsCount || 0}
+              {formatCompactNumber(post.commentsCount || 0)}
             </span>
           </button>
 
@@ -524,7 +528,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
               {isCopied ? <Check size={19} /> : <Share2 size={19} />}
             </span>
             <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-              {isCopied ? 'Shared' : post.sharesCount ? post.sharesCount : 'Share'}
+              {isCopied ? 'Shared' : post.sharesCount ? formatCompactNumber(post.sharesCount) : 'Share'}
             </span>
           </button>
 
@@ -545,7 +549,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
               <Bookmark size={19} className={isSaved ? 'fill-white' : ''} />
             </span>
             <span className="text-[11px] font-mono font-bold text-white tabular-nums drop-shadow-xs">
-              {post.savesCount || 0}
+              {formatCompactNumber(post.savesCount || 0)}
             </span>
           </button>
 
@@ -561,6 +565,19 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
             </span>
             <span className="text-[10px] font-extrabold text-white drop-shadow-xs">Tip</span>
           </button>
+
+          {/* 6. Report Reel */}
+          <button
+            type="button"
+            onClick={() => onReport(post)}
+            aria-label="Report reel"
+            className="flex flex-col items-center gap-1 group cursor-pointer min-w-[44px]"
+          >
+            <span className="w-10 h-10 rounded-2xl bg-black/45 hover:bg-rose-600/80 backdrop-blur-md border border-white/25 text-white/85 hover:text-white flex items-center justify-center transition active:scale-90 shadow-md">
+              <Flag size={16} />
+            </span>
+            <span className="text-[10px] font-bold text-white/85 drop-shadow-xs">Report</span>
+          </button>
         </div>
       </div>
     </div>
@@ -568,7 +585,7 @@ const ReelSlideItem: React.FC<ReelSlideItemProps> = ({
 };
 
 export const VideosHubView: React.FC<VideosHubViewProps> = () => {
-  const { currentUser, userProfile, isAdmin, isProEffective, toggleSavePost } = useAuth();
+  const { currentUser, userProfile, isAdmin, isProEffective, toggleSavePost, reportContent } = useAuth();
   const isProTier = Boolean(isProEffective || isAdmin);
   const maxVideoSeconds = getMaxVideoDurationSeconds(isProTier);
   const { jobs: videoUploadJobs } = useVideoUploadQueue();
@@ -720,6 +737,7 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
   }, []);
 
   const filteredPosts = videoPosts.filter((post) => {
+    if (post.isHidden && post.authorId !== currentUser?.uid && !isAdmin) return false;
     const blockedIds = userProfile?.blockedUserIds || [];
     if (blockedIds.includes(post.authorId)) return false;
     const authorCached = post.authorId ? getCachedUserProfile(post.authorId) : null;
@@ -1121,6 +1139,16 @@ export const VideosHubView: React.FC<VideosHubViewProps> = () => {
                   onShare={handleShare}
                   onToggleSave={handleToggleSave}
                   onOpenTip={(targetPost) => setTippingPost(targetPost)}
+                  onReport={async (targetPost) => {
+                    await reportContent({
+                      targetType: 'video',
+                      targetId: targetPost.id,
+                      targetSummary: `${targetPost.authorName}: ${(targetPost.content || 'Video Reel').slice(0, 80)}`,
+                      reason: 'Reported from Reels Hub for safety review',
+                    });
+                    setUploadNotice('Reel reported to WaveLink Safety Team for review.');
+                    setTimeout(() => setUploadNotice(null), 3500);
+                  }}
                 />
               </section>
             );

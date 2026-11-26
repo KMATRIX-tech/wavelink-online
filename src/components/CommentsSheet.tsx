@@ -36,6 +36,7 @@ import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
 import { COMMUNITY_REPORT_CATEGORIES } from '../utils/africanCultureConfig';
 import { sanitizeUserText } from '../utils/security';
+import { checkClientSpam, checkWordFilter, checkActionRateLimit } from '../utils/safetyFilters';
 import { sendNotification } from '../services/notificationService';
 import { CrystalBadge } from './CrystalBadge';
 import { Avatar } from './Avatar';
@@ -71,7 +72,7 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
   onClose,
   onCommentCountChange
 }) => {
-  const { currentUser, userProfile, isAdmin, reportContent } = useAuth();
+  const { currentUser, userProfile, isAdmin, reportContent, toggleBlockUser } = useAuth();
   const { language } = useLanguage();
 
   const [serverComments, setServerComments] = useState<PostComment[]>([]);
@@ -277,14 +278,17 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
   // Combine server comments and pending/failed optimistic comments
   const allComments = useMemo(() => {
     const map = new Map<string, PostComment>();
-    serverComments.forEach((c) => map.set(c.id, c));
+    serverComments.forEach((c) => {
+      if (c.isHidden && c.authorId !== currentUser?.uid && !isAdmin) return;
+      map.set(c.id, c);
+    });
     optimisticComments.forEach((opt) => {
       if (!map.has(opt.id)) {
         map.set(opt.id, opt);
       }
     });
     return Array.from(map.values());
-  }, [serverComments, optimisticComments]);
+  }, [serverComments, optimisticComments, currentUser?.uid, isAdmin]);
 
   // Separate top-level comments (newest first) and replies grouped by parentId (oldest first)
   const { rootComments, repliesByParentId } = useMemo(() => {
@@ -426,6 +430,25 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
 
   const handleSendComment = async () => {
     if (!commentText.trim() || !currentUser || !post) return;
+    const rateRes = checkActionRateLimit(currentUser.uid, 'comment');
+    if (!rateRes.allowed) {
+      triggerSheetToast(rateRes.message || 'You are commenting too fast. Please wait a moment.');
+      return;
+    }
+    const spamRes = checkClientSpam('comment', commentText.trim());
+    if (spamRes.isSpam) {
+      triggerSheetToast(spamRes.reason || 'Please slow down before commenting again.');
+      return;
+    }
+    const wordRes = checkWordFilter(commentText.trim());
+    if (wordRes.flagged) {
+      triggerSheetToast(
+        language === 'sw'
+          ? 'Maoni yako yana maneno yaliyozuiwa na kichujio cha usalama.'
+          : 'Your comment contains words blocked by the WaveLink safety filter.'
+      );
+      return;
+    }
     const textToSend = commentText;
     const parentToUse = replyingTo;
     setCommentText('');
@@ -758,20 +781,36 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
                 <span>{language === 'sw' ? 'Jibu' : 'Reply'}</span>
               </button>
 
-              {/* Report comment button (Google Play UGC requirement) */}
+              {/* Report & Block comment author buttons (Google Play UGC requirement) */}
               {currentUser && comment.authorId !== currentUser.uid && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setReportingComment(comment);
-                    setReportNote('');
-                  }}
-                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[11px] text-[var(--text-secondary)] hover:text-amber-500 transition cursor-pointer ml-auto"
-                  title={language === 'sw' ? 'Ripoti maoni' : 'Report comment'}
-                  aria-label="Report comment"
-                >
-                  <Flag size={11} />
-                </button>
+                <div className="inline-flex items-center gap-1 ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReportingComment(comment);
+                      setReportNote('');
+                    }}
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[11px] text-[var(--text-secondary)] hover:text-amber-500 transition cursor-pointer"
+                    title={language === 'sw' ? 'Ripoti maoni' : 'Report comment'}
+                    aria-label="Report comment"
+                  >
+                    <Flag size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      toggleBlockUser(comment.authorId);
+                      triggerSheetToast(
+                        language === 'sw' ? 'Mtumiaji amezuiwa' : 'User blocked'
+                      );
+                    }}
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold text-[var(--text-secondary)] hover:text-rose-500 transition cursor-pointer"
+                    title={language === 'sw' ? 'Zuia mtumiaji' : 'Block user'}
+                    aria-label="Block user"
+                  >
+                    {language === 'sw' ? 'Zuia' : 'Block'}
+                  </button>
+                </div>
               )}
 
               {/* Delete comment button for author or admin */}

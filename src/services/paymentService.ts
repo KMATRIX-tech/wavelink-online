@@ -288,28 +288,64 @@ export async function initiateMobileMoneyPayment(params: {
 }
 
 /**
- * Complete and activate subscription upon USSD PIN confirmation
+ * Complete and activate subscription upon USSD PIN confirmation (strictly verified on server)
  */
 export async function completeSubscription(
   transactionId: string,
   userId: string,
-  planId: 'weekly' | 'monthly' | 'annual'
+  planId: 'weekly' | 'monthly' | 'annual',
+  provider: MobileMoneyProvider = 'mpesa',
+  phoneNumber = ''
 ): Promise<void> {
-  const headers = await getAuthHeaders();
-  const res = await fetch('/api/payments/complete-subscription', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
+  let verifiedOnServer = false;
+
+  // 1. Try Firebase Cloud Function verifyMobileMoneyProPayment first
+  try {
+    const { getFunctions, httpsCallable } = await import('firebase/functions');
+    const { getApp } = await import('firebase/app');
+    const functionsInstance = getFunctions(getApp(), 'europe-west2');
+    const verifyFn = httpsCallable<
+      {
+        transactionId: string;
+        planId: string;
+        provider: string;
+        phoneNumber: string;
+      },
+      { success: boolean }
+    >(functionsInstance, 'verifyMobileMoneyProPayment');
+    const fnRes = await verifyFn({
       transactionId,
-      planId
-    })
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data?.success) {
-    throw new Error(
-      data?.error ||
-        'Subscription payment could not be verified automatically. Please submit for admin verification.'
-    );
+      planId,
+      provider,
+      phoneNumber
+    });
+    if (fnRes?.data?.success) {
+      verifiedOnServer = true;
+    }
+  } catch {
+    // Fallback to Express backend server verification below
+  }
+
+  // 2. Fallback to Express backend server verification (/api/payments/complete-subscription)
+  if (!verifiedOnServer) {
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/payments/complete-subscription', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        transactionId,
+        planId,
+        provider,
+        phoneNumber
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.success) {
+      throw new Error(
+        data?.error ||
+          'Subscription payment could not be verified automatically. Please submit for admin verification.'
+      );
+    }
   }
 
   sendNotification({

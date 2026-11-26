@@ -55,8 +55,6 @@ type SharePlatformId =
   | 'facebook'
   | 'x'
   | 'messenger'
-  | 'instagram'
-  | 'reddit'
   | 'sms'
   | 'more';
 
@@ -117,32 +115,6 @@ const SHARE_PLATFORMS: SharePlatformOption[] = [
       <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 2C6.48 2 2 6.14 2 11.25c0 2.88 1.44 5.45 3.69 7.14V22l3.48-1.91c.91.25 1.86.39 2.83.39 5.52 0 10-4.14 10-9.25S17.52 2 12 2z" />
         <polyline points="7.5 13.5 11 10 13.5 12.5 17 9" />
-      </svg>
-    )
-  },
-  {
-    id: 'instagram',
-    label: 'Instagram',
-    bgStyle: 'linear-gradient(135deg, #F58529 0%, #DD2A7B 55%, #8134AF 100%)',
-    renderIcon: () => (
-      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <rect x="2" y="2" width="20" height="20" rx="5" ry="5" />
-        <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z" />
-        <line x1="17.5" y1="6.5" x2="17.51" y2="6.5" />
-      </svg>
-    )
-  },
-  {
-    id: 'reddit',
-    label: 'Reddit',
-    bgStyle: '#FF4500',
-    renderIcon: () => (
-      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="13" r="7" />
-        <circle cx="9.5" cy="12" r="1" fill="currentColor" />
-        <circle cx="14.5" cy="12" r="1" fill="currentColor" />
-        <path d="M9.5 15.5c1.2 1 3.8 1 5 0" />
-        <path d="M12 6l2-3 3 1" />
       </svg>
     )
   },

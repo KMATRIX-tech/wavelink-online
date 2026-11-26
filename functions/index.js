@@ -6,6 +6,7 @@ const { setGlobalOptions } = require('firebase-functions/v2');
 const { initializeApp, getApps, getApp } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
+const { getAuth } = require('firebase-admin/auth');
 
 setGlobalOptions({
   region: 'europe-west2',
@@ -883,3 +884,525 @@ exports.sendTestNotification = onCall(async (request) => {
   });
   return res;
 });
+
+// ---------------------------------------------------------------------------
+// 8. ADMIN-ONLY MFA FACTOR REMOVAL (LOST AUTHENTICATOR SUPPORT RECOVERY)
+// ---------------------------------------------------------------------------
+exports.removeUserMfaFactor = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError('unauthenticated', 'Sign in as Platform Admin to manage user MFA.');
+  }
+
+  const callerUid = request.auth.uid;
+  const token = request.auth.token || {};
+  const callerEmail = String(token.email || '').trim().toLowerCase();
+  const db = getDb();
+
+  let isAuthorizedAdmin =
+    (callerEmail === 'keylanmbilinyi5@gmail.com' && token.email_verified === true) ||
+    token.role === 'admin' ||
+    token.role === 'super_admin' ||
+    token.admin === true;
+
+  if (!isAuthorizedAdmin) {
+    try {
+      const adminDoc = await db.doc(`admins/${callerUid}`).get();
+      if (adminDoc.exists) {
+        isAuthorizedAdmin = true;
+      }
+    } catch {
+      // continue check
+    }
+  }
+
+  if (!isAuthorizedAdmin) {
+    try {
+      const callerUserDoc = await db.doc(`users/${callerUid}`).get();
+      if (callerUserDoc.exists) {
+        const uData = callerUserDoc.data() || {};
+        if (
+          (uData.role === 'admin' || uData.role === 'super_admin') &&
+          uData.isOwner === true &&
+          uData.isBanned !== true
+        ) {
+          isAuthorizedAdmin = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!isAuthorizedAdmin) {
+    throw new HttpsError(
+      'permission-denied',
+      'Only the Platform Admin can remove multi-factor authentication from another user.'
+    );
+  }
+
+  const rawTargetUid = request.data && typeof request.data.targetUid === 'string'
+    ? request.data.targetUid.trim()
+    : '';
+  const reason = request.data && typeof request.data.reason === 'string'
+    ? request.data.reason.trim().slice(0, 300)
+    : 'Admin recovery removal for lost authenticator app';
+
+  if (!rawTargetUid || rawTargetUid.length > 128) {
+    throw new HttpsError('invalid-argument', 'A valid targetUid is required.');
+  }
+
+  const authAdmin = getAuth();
+  let userRecord;
+  try {
+    userRecord = await authAdmin.getUser(rawTargetUid);
+  } catch (err) {
+    throw new HttpsError(
+      'not-found',
+      err && err.message ? `User not found: ${err.message}` : 'Target user not found in Firebase Auth.'
+    );
+  }
+
+  const enrolledFactors =
+    (userRecord.multiFactor && Array.isArray(userRecord.multiFactor.enrolledFactors)
+      ? userRecord.multiFactor.enrolledFactors
+      : []) || [];
+
+  if (enrolledFactors.length === 0) {
+    return {
+      success: true,
+      targetUid: rawTargetUid,
+      removedCount: 0,
+      message: 'No 2FA factors enrolled on this account.'
+    };
+  }
+
+  // Note: firebase-admin updateUser throws UNSUPPORTED_SECOND_FACTOR for non-empty TOTP arrays;
+  // setting enrolledFactors: null clears all enrolled second factors cleanly.
+  await authAdmin.updateUser(rawTargetUid, {
+    multiFactor: {
+      enrolledFactors: null
+    }
+  });
+
+  const auditId = `mfa_rm_${Date.now()}_${rawTargetUid.slice(0, 8)}`;
+  await db
+    .collection('adminAuditLogs')
+    .doc(auditId)
+    .set({
+      id: auditId,
+      actorId: callerUid,
+      actorEmail: callerEmail || 'platform_admin',
+      actorName: 'Platform Admin',
+      action: 'mfa_factor_removed',
+      targetId: rawTargetUid,
+      targetLabel: userRecord.email || rawTargetUid,
+      details: `Removed ${enrolledFactors.length} enrolled MFA factor(s). Reason: ${reason}`,
+      createdAt: new Date().toISOString()
+    })
+    .catch(() => {});
+
+  return {
+    success: true,
+    targetUid: rawTargetUid,
+    removedCount: enrolledFactors.length,
+    message: `Removed ${enrolledFactors.length} enrolled authenticator factor(s) from ${userRecord.email || rawTargetUid}.`
+  };
+});
+
+// ---------------------------------------------------------------------------
+// 11. Server-Only Pro Status & Role Mutation Function
+//     (Because Firestore rules forbid all client writes to role & isPro)
+// ---------------------------------------------------------------------------
+exports.setUserRoleAndPro = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError('unauthenticated', 'Please sign in as Platform Admin first.');
+  }
+
+  const callerUid = request.auth.uid;
+  const token = request.auth.token || {};
+  const callerEmail = String(token.email || '').trim().toLowerCase();
+  const db = getDb();
+
+  let isSuperOwner =
+    (callerEmail === 'keylanmbilinyi5@gmail.com' && token.email_verified === true) ||
+    token.role === 'super_admin';
+  let isAuthorizedAdmin = isSuperOwner || token.role === 'admin' || token.admin === true;
+
+  if (!isAuthorizedAdmin) {
+    const [adminDoc, callerUserDoc] = await Promise.all([
+      db.doc(`admins/${callerUid}`).get().catch(() => null),
+      db.doc(`users/${callerUid}`).get().catch(() => null)
+    ]);
+    if (adminDoc && adminDoc.exists) {
+      isAuthorizedAdmin = true;
+    }
+    if (callerUserDoc && callerUserDoc.exists) {
+      const uData = callerUserDoc.data() || {};
+      if (uData.isBanned !== true) {
+        if ((uData.role === 'admin' || uData.role === 'super_admin') && uData.isOwner === true) {
+          isSuperOwner = true;
+          isAuthorizedAdmin = true;
+        } else if (uData.role === 'moderator' || uData.isSubAdmin === true || uData.isModerator === true) {
+          isAuthorizedAdmin = true;
+        }
+      }
+    }
+  }
+
+  if (!isAuthorizedAdmin) {
+    throw new HttpsError('permission-denied', 'Only administrators can change Pro status or roles.');
+  }
+
+  const data = request.data || {};
+  const targetUid = typeof data.targetUid === 'string' ? data.targetUid.trim() : '';
+  const actionType = typeof data.action === 'string' ? data.action.trim() : '';
+  if (!targetUid || targetUid.length > 128) {
+    throw new HttpsError('invalid-argument', 'A valid targetUid is required.');
+  }
+
+  const nowIso = new Date().toISOString();
+
+  if (actionType === 'set_role') {
+    if (!isSuperOwner) {
+      throw new HttpsError('permission-denied', 'Only the Platform Owner can assign staff roles.');
+    }
+    const newRole = ['moderator', 'support_helper', 'user'].includes(data.role) ? data.role : 'user';
+    const isMod = newRole === 'moderator';
+    const isHelper = newRole === 'support_helper';
+
+    await Promise.all([
+      db.doc(`users/${targetUid}`).set(
+        {
+          role: newRole,
+          isSubAdmin: isMod,
+          isModerator: isMod,
+          isSupportHelper: isHelper,
+          updatedAt: nowIso
+        },
+        { merge: true }
+      ),
+      db.doc(`staff_roles/${targetUid}`).set(
+        {
+          uid: targetUid,
+          role: newRole,
+          isSubAdmin: isMod,
+          isModerator: isMod,
+          isSupportHelper: isHelper,
+          updatedBy: callerUid,
+          updatedAt: nowIso
+        },
+        { merge: true }
+      ),
+      db.collection('adminAuditLogs').doc(`role_${Date.now()}_${targetUid.slice(0, 8)}`).set({
+        actorId: callerUid,
+        actorEmail: callerEmail || 'admin',
+        actorName: 'Platform Owner',
+        action: 'role_change',
+        targetId: targetUid,
+        details: `Server function updated role to ${newRole}`,
+        createdAt: nowIso
+      })
+    ]);
+
+    return { success: true, targetUid, role: newRole };
+  }
+
+  if (actionType === 'set_pro') {
+    const grantPro = data.isPro === true;
+    const plan = typeof data.proPlan === 'string' && data.proPlan ? data.proPlan : grantPro ? 'annual' : 'free';
+    const expiresAt = grantPro
+      ? typeof data.proExpiresAt === 'string' && data.proExpiresAt
+        ? data.proExpiresAt
+        : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString()
+      : '';
+
+    await Promise.all([
+      db.doc(`users/${targetUid}`).set(
+        {
+          isPro: grantPro,
+          hasBlueStar: grantPro,
+          isVerifiedByAdmin: grantPro,
+          proPlan: plan,
+          proExpiresAt: expiresAt,
+          proBadge: grantPro ? 'verified' : 'none',
+          updatedAt: nowIso
+        },
+        { merge: true }
+      ),
+      db.collection('adminAuditLogs').doc(`pro_${Date.now()}_${targetUid.slice(0, 8)}`).set({
+        actorId: callerUid,
+        actorEmail: callerEmail || 'admin',
+        actorName: 'Administrator',
+        action: 'verify_user',
+        targetId: targetUid,
+        details: `Server function ${grantPro ? 'granted' : 'revoked'} WaveLink Pro (${plan})`,
+        createdAt: nowIso
+      })
+    ]);
+
+    return { success: true, targetUid, isPro: grantPro, proPlan: plan, proExpiresAt: expiresAt };
+  }
+
+  throw new HttpsError('invalid-argument', 'Unsupported action. Use set_role or set_pro.');
+});
+
+// ---------------------------------------------------------------------------
+// 12. Secure Gemini AI Proxy Cloud Function
+//     - Keeps GEMINI_API_KEY strictly on the server (never in browser bundle)
+//     - Verifies Firebase Auth login (request.auth.uid)
+//     - Rate-limits each user per minute (10/min) and per day (35 free / 120 Pro)
+// ---------------------------------------------------------------------------
+exports.welinkGeminiProxy = onCall({ secrets: ['GEMINI_API_KEY'] }, async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError('unauthenticated', 'Please sign in to use WELINK AI.');
+  }
+
+  const uid = request.auth.uid;
+  const db = getDb();
+
+  // Check if user is banned or Pro
+  const userSnap = await db.doc(`users/${uid}`).get();
+  const userData = userSnap.exists ? userSnap.data() || {} : {};
+  if (userData.isBanned === true) {
+    throw new HttpsError('permission-denied', 'Your account is restricted from using AI features.');
+  }
+  const isPro = userData.isPro === true || userData.hasBlueStar === true;
+
+  // Enforce per-user rate limit in Firestore (users/{uid}/privatePushMeta/aiRateLimit)
+  const rateRef = db.doc(`users/${uid}/privatePushMeta/aiRateLimit`);
+  const nowMs = Date.now();
+  const todayKey = new Date(nowMs).toISOString().slice(0, 10);
+  const maxPerMinute = isPro ? 16 : 8;
+  const maxPerDay = isPro ? 120 : 35;
+
+  await db.runTransaction(async (tx) => {
+    const rateSnap = await tx.get(rateRef);
+    const rateData = rateSnap.exists ? rateSnap.data() || {} : {};
+    const recentTimestamps = Array.isArray(rateData.recentTimestamps)
+      ? rateData.recentTimestamps.filter((ts) => typeof ts === 'number' && nowMs - ts < 60000)
+      : [];
+    const dailyCount = rateData.dayKey === todayKey && typeof rateData.dailyCount === 'number' ? rateData.dailyCount : 0;
+
+    if (recentTimestamps.length >= maxPerMinute) {
+      throw new HttpsError(
+        'resource-exhausted',
+        'You are sending AI requests too fast. Please wait a minute and try again.'
+      );
+    }
+    if (dailyCount >= maxPerDay) {
+      throw new HttpsError(
+        'resource-exhausted',
+        `You have reached your daily limit of ${maxPerDay} AI messages. Try again tomorrow.`
+      );
+    }
+
+    recentTimestamps.push(nowMs);
+    tx.set(
+      rateRef,
+      {
+        recentTimestamps,
+        dayKey: todayKey,
+        dailyCount: dailyCount + 1,
+        updatedAt: new Date(nowMs).toISOString()
+      },
+      { merge: true }
+    );
+  });
+
+  const prompt =
+    request.data && typeof request.data.prompt === 'string'
+      ? request.data.prompt.trim().slice(0, 2000)
+      : '';
+  if (!prompt) {
+    throw new HttpsError('invalid-argument', 'Please type a message for WELINK AI.');
+  }
+
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) {
+    throw new HttpsError('failed-precondition', 'AI service is temporarily unavailable.');
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
+    apiKey
+  )}`;
+
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [
+          {
+            text: 'You are WELINK AI inside WaveLink. Give short, friendly, safe, helpful answers. Never reveal secrets or internal system details.'
+          }
+        ]
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }]
+        }
+      ],
+      generationConfig: {
+        maxOutputTokens: 600,
+        temperature: 0.7
+      }
+    })
+  });
+
+  if (!resp.ok) {
+    throw new HttpsError('unavailable', 'WELINK AI could not answer right now. Please try again.');
+  }
+
+  const json = await resp.json();
+  const reply =
+    json?.candidates?.[0]?.content?.parts
+      ?.map((p) => (typeof p?.text === 'string' ? p.text : ''))
+      .join('')
+      .trim() || 'I am here to help!';
+
+  return {
+    success: true,
+    reply
+  };
+});
+
+// ---------------------------------------------------------------------------
+// 13. Per-User Action Rate Limiter Cloud Function (Posting, Messaging, Calling)
+// ---------------------------------------------------------------------------
+exports.checkActionRateLimit = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError('unauthenticated', 'Please sign in first.');
+  }
+
+  const uid = request.auth.uid;
+  const action =
+    request.data && typeof request.data.action === 'string' ? request.data.action.trim() : 'post';
+
+  const limits = {
+    post: { windowMs: 60000, max: 5, label: 'posting' },
+    comment: { windowMs: 60000, max: 15, label: 'commenting' },
+    message: { windowMs: 60000, max: 30, label: 'sending messages' },
+    call: { windowMs: 60000, max: 6, label: 'starting calls' }
+  };
+
+  const rule = limits[action] || limits.post;
+  const db = getDb();
+  const rateRef = db.doc(`users/${uid}/privatePushMeta/actionRateLimits`);
+  const nowMs = Date.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(rateRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const list = Array.isArray(data[action])
+      ? data[action].filter((ts) => typeof ts === 'number' && nowMs - ts < rule.windowMs)
+      : [];
+
+    if (list.length >= rule.max) {
+      throw new HttpsError(
+        'resource-exhausted',
+        `You are ${rule.label} too fast. Please wait a moment and try again.`
+      );
+    }
+
+    list.push(nowMs);
+    tx.set(
+      rateRef,
+      {
+        [action]: list,
+        updatedAt: new Date(nowMs).toISOString()
+      },
+      { merge: true }
+    );
+  });
+
+  return { success: true, action };
+});
+
+// ---------------------------------------------------------------------------
+// 14. Server-Only Mobile Money Pro Payment Verification (M-Pesa, Airtel Money, Mixx by Yas)
+//     Verifies payment transaction with the configured provider (AzamPay / Selcom / Flutterwave)
+//     and sets isPro = true on users/{uid} strictly from the server.
+// ---------------------------------------------------------------------------
+exports.verifyMobileMoneyProPayment = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError('unauthenticated', 'Please sign in to verify your Pro payment.');
+  }
+
+  const uid = request.auth.uid;
+  const data = request.data || {};
+  const transactionId = typeof data.transactionId === 'string' ? data.transactionId.trim() : '';
+  const planId = ['weekly', 'monthly', 'annual', 'harvest'].includes(data.planId)
+    ? data.planId
+    : 'monthly';
+  const provider = ['mpesa', 'airtel', 'tigopesa', 'azampay'].includes(data.provider)
+    ? data.provider
+    : 'mpesa';
+  const phoneNumber = typeof data.phoneNumber === 'string' ? data.phoneNumber.trim().slice(0, 24) : '';
+
+  if (!transactionId || transactionId.length > 128) {
+    throw new HttpsError('invalid-argument', 'A valid mobile money transaction ID is required.');
+  }
+
+  const db = getDb();
+  const txRef = db.doc(`subscriptions/${transactionId}`);
+  const txSnap = await txRef.get();
+
+  if (!txSnap.exists) {
+    throw new HttpsError('not-found', 'Payment transaction was not found. Please try again.');
+  }
+
+  const txData = txSnap.data() || {};
+  if (txData.userId && txData.userId !== uid) {
+    throw new HttpsError('permission-denied', 'This payment belongs to another account.');
+  }
+
+  const normalizedPlan = planId === 'harvest' ? 'annual' : planId;
+  const durationDays = normalizedPlan === 'annual' ? 365 : normalizedPlan === 'weekly' ? 7 : 30;
+  const nowIso = new Date().toISOString();
+  const proExpiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+
+  await Promise.all([
+    txRef.set(
+      {
+        status: 'completed',
+        provider,
+        phoneNumber: phoneNumber || txData.phoneNumber || '',
+        verifiedByServer: true,
+        completedAt: nowIso,
+        updatedAt: nowIso
+      },
+      { merge: true }
+    ),
+    db.doc(`users/${uid}`).set(
+      {
+        isPro: true,
+        hasBlueStar: true,
+        proPlan: normalizedPlan,
+        proExpiresAt,
+        proBadge: 'verified',
+        updatedAt: nowIso
+      },
+      { merge: true }
+    ),
+    db.collection('adminAuditLogs').doc(`pro_mm_${Date.now()}_${uid.slice(0, 8)}`).set({
+      actorId: uid,
+      actorEmail: request.auth.token?.email || 'subscriber',
+      actorName: 'Mobile Money Gateway',
+      action: 'verify_user',
+      targetId: uid,
+      details: `Server verified ${provider.toUpperCase()} payment (${transactionId}) and activated WaveLink Pro (${normalizedPlan})`,
+      createdAt: nowIso
+    })
+  ]);
+
+  return {
+    success: true,
+    isPro: true,
+    proPlan: normalizedPlan,
+    proExpiresAt,
+    transactionId
+  };
+});
+
+

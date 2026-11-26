@@ -140,6 +140,51 @@ export interface StoryHighlightItem {
   createdAt: string;
 }
 
+export type StaffRole = 'user' | 'support_helper' | 'moderator' | 'sub_admin' | 'admin' | 'super_admin' | 'bot';
+
+export interface ActiveSessionDoc {
+  id: string;
+  userId?: string;
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  browser: string;
+  ipHint?: string;
+  createdAt: string;
+  lastUsedAt: string;
+  isCurrent?: boolean;
+}
+
+export interface ContentAppeal {
+  id: string;
+  userId: string;
+  userName: string;
+  userEmail?: string;
+  appealType?: string;
+  targetType: 'account_ban' | 'ban' | 'post' | 'comment' | 'reel' | 'video' | 'spark' | 'chat';
+  targetId: string;
+  targetSummary?: string;
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  resolutionNote?: string;
+  reviewNote?: string;
+  reviewNotes?: string;
+  reviewedBy?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface SystemStatusBannerConfig {
+  id?: string;
+  enabled: boolean;
+  severity?: 'info' | 'warning' | 'outage';
+  level?: 'info' | 'warning' | 'outage';
+  messageEn: string;
+  messageSw: string;
+  updatedAt: string;
+  updatedBy?: string;
+}
+
 export interface UserPrivacySettings {
   profileVisibility: 'public' | 'followers' | 'private';
   showOnlineStatus: boolean;
@@ -147,10 +192,11 @@ export interface UserPrivacySettings {
   onlineStatusAudience?: 'everyone' | 'close_friends' | 'nobody';
   allowDirectMessages: 'everyone' | 'followers' | 'none';
   allowCalls: 'everyone' | 'followers' | 'none';
+  whoCanFollow?: 'everyone' | 'followers' | 'none';
   sparkVisibility: 'everyone' | 'followers';
   showReadReceipts: boolean;
   allowSearchByEmail: boolean;
-  dataSharingConsent: boolean;
+  dataSharingConsent?: boolean;
   updatedAt?: string;
 }
 
@@ -261,15 +307,21 @@ export interface UserProfile {
   isCreatorSpotlight?: boolean;
   spotlightNote?: string;
   // Administrative and Security Roles
-  role?: 'admin' | 'super_admin' | 'sub_admin' | 'user' | 'bot';
+  role?: StaffRole;
   isBot?: boolean;
   isSubAdmin?: boolean;
+  isModerator?: boolean;
+  isSupportHelper?: boolean;
   hasBlueStar?: boolean;
   isVerifiedByAdmin?: boolean;
   isOfficialPartner?: boolean;
   partnerType?: string;
   partnerBadgeTitle?: string;
   isCommunityLeader?: boolean;
+  // Security Center Session & Password Reset Fields
+  sessionsRevokedAfter?: string;
+  forcePasswordReset?: boolean;
+  lastPasswordChangedAt?: string;
   // Pro Subscription Fields
   isPro?: boolean;
   proPlan?: 'weekly' | 'monthly' | 'annual';
@@ -404,6 +456,12 @@ export interface Post {
   affiliateProductUrl?: string;
   affiliateButtonText?: string;
   affiliateRating?: number;
+  // Safety Automation & Auto-Hide Moderation
+  isHidden?: boolean;
+  moderationStatus?: 'active' | 'auto_hidden' | 'hidden_by_staff' | 'restored';
+  moderationReason?: string;
+  reportCount?: number;
+  reportedBy?: string[];
   createdAt: string;
   updatedAt?: string;
 }
@@ -467,6 +525,8 @@ export interface Spark {
   viewers?: string[];
   viewersCount?: number;
   viewerUsers?: SparkViewerEntry[];
+  isHidden?: boolean;
+  reportCount?: number;
   createdAt: string;
   expiresAt: string;
 }
@@ -507,6 +567,8 @@ export interface PostComment {
   updatedAt?: string;
   parentId?: string | null;
   replyToName?: string | null;
+  isHidden?: boolean;
+  reportCount?: number;
   reactions?: {
     heart?: string[];
     laugh?: string[];
@@ -565,6 +627,10 @@ export interface SupportTicket {
   botConversationId?: string;
   status: TicketStatus;
   adminReply?: string;
+  repliedByRole?: string;
+  repliedByName?: string;
+  confirmationSent?: boolean;
+  confirmationReference?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -906,13 +972,17 @@ export interface ContentReport {
   reporterId: string;
   reporterEmail: string;
   reporterName?: string;
-  targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video' | 'message';
+  targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video' | 'reel' | 'spark' | 'message';
   targetId: string;
   targetAuthorId?: string;
   targetSummary?: string;
   reason: string;
-  status: 'open' | 'reviewed' | 'dismissed';
+  status: 'open' | 'reviewed' | 'dismissed' | 'auto_hidden' | 'restored';
+  independentReporters?: string[];
+  reportCount?: number;
+  autoHidden?: boolean;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export type AuditActionType =
@@ -922,19 +992,29 @@ export type AuditActionType =
   | 'role_change'
   | 'verify_user'
   | 'delete_post'
+  | 'hide_content'
+  | 'restore_content'
+  | 'auto_hide_content'
+  | 'appeal_submitted'
+  | 'appeal_reviewed'
+  | 'ticket_replied'
+  | 'status_banner_changed'
+  | 'session_revoked'
   | 'delete_ticket'
   | 'delete_account'
   | 'bot_toggle'
   | 'approve_draft'
   | 'report_submitted'
   | 'upgrade_status_change'
-  | 'merge_duplicate_accounts';
+  | 'merge_duplicate_accounts'
+  | 'mfa_factor_removed';
 
 export interface AdminAuditLog {
   id: string;
   actorId: string;
   actorEmail: string;
   actorName: string;
+  actorRole?: string;
   action: AuditActionType;
   targetId: string;
   targetLabel?: string;

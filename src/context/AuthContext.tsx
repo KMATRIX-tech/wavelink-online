@@ -13,7 +13,9 @@ import {
   sendEmailVerification as fbSendEmailVerification,
   deleteUser as fbDeleteUser,
   EmailAuthProvider,
-  reauthenticateWithCredential
+  reauthenticateWithCredential,
+  reauthenticateWithPopup,
+  linkWithCredential
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
 import {
@@ -21,6 +23,8 @@ import {
   db,
   OWNER_SESSION_STORAGE_KEY,
   resolveCanonicalAdminRole,
+  resolveCanonicalStaffRole,
+  detectClientDeviceMetadata,
   handleFirestoreError,
   OperationType,
   cleanFirestoreData,
@@ -290,6 +294,9 @@ interface AuthContextType {
   userProfile: UserProfile | null;
   isSuperAdmin: boolean;
   isSubAdmin: boolean;
+  isModerator: boolean;
+  isSupportHelper: boolean;
+  isStaff: boolean;
   isAdmin: boolean;
   isProEffective: boolean;
   isExemptFromPayments: boolean;
@@ -376,6 +383,11 @@ interface AuthContextType {
   }) => Promise<void>;
   dismissWarning: () => Promise<void>;
   toggleSubAdmin: (targetUserId: string, makeSubAdmin: boolean, targetEmail?: string) => Promise<void>;
+  assignStaffRole: (
+    targetUserId: string,
+    role: 'moderator' | 'support_helper' | 'user',
+    targetEmail?: string
+  ) => Promise<void>;
   toggleVerifyUser: (targetUserId: string, verify: boolean, targetEmail?: string) => Promise<void>;
   activateHarvestPass: () => Promise<void>;
   verifyAndRedeemCoupon: (rawCode: string) => Promise<boolean>;
@@ -463,7 +475,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     const cleanActiveEmail = (activeUser.email || '').trim().toLowerCase();
-    if (cleanActiveEmail === 'keylanmbilinyi5@gmail.com') {
+    const isVerifiedOwnerEmail =
+      cleanActiveEmail === 'keylanmbilinyi5@gmail.com' && Boolean(activeUser.emailVerified);
+    if (isVerifiedOwnerEmail) {
       setServerVerifiedRole('admin');
       setAdminCheckFailedReason(null);
     }
@@ -490,7 +504,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (typeof data.ownerSessionToken === 'string' && data.ownerSessionToken.trim()) {
           try {
             sessionStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
-            localStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
+            localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
           } catch {
             // ignore storage errors
           }
@@ -505,24 +519,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           await syncUserProfileDoc(activeUser, undefined, undefined, resolvedRole);
           return true;
         }
-      } else if (cleanActiveEmail !== 'keylanmbilinyi5@gmail.com') {
+      } else {
         const reason =
           typeof data?.failedCheck === 'string' && data.failedCheck.trim()
             ? data.failedCheck.trim()
             : claimRole === 'admin'
             ? 'session needs refresh'
             : 'owner sign-in not used';
-        setAdminCheckFailedReason(reason);
+        if (!isVerifiedOwnerEmail) {
+          setAdminCheckFailedReason(reason);
+        }
       }
     } catch {
-      if (claimRole === 'admin' || cleanActiveEmail === 'keylanmbilinyi5@gmail.com') {
+      if (claimRole === 'admin' || isVerifiedOwnerEmail) {
         setServerVerifiedRole('admin');
         setAdminCheckFailedReason(null);
         return true;
       }
       setAdminCheckFailedReason('session needs refresh');
     }
-    if (cleanActiveEmail === 'keylanmbilinyi5@gmail.com') {
+    if (isVerifiedOwnerEmail) {
       return true;
     }
     setServerVerifiedRole('user');
@@ -587,7 +603,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (typeof data.ownerSessionToken === 'string' && data.ownerSessionToken.trim()) {
         try {
           sessionStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
-          localStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken.trim());
+          localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
         } catch {
           // ignore storage errors
         }
@@ -650,7 +666,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const cleanUserEmail = (user.email || '').trim().toLowerCase();
-      const isOwnerEmail = cleanUserEmail === 'keylanmbilinyi5@gmail.com';
+      const isOwnerEmail =
+        cleanUserEmail === 'keylanmbilinyi5@gmail.com' && Boolean(user.emailVerified);
       const claimRole = await readTokenClaimRole(user, false);
 
       if (isOwnerEmail) {
@@ -828,6 +845,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         // Passively sync existing notification settings & token state (never prompts on load)
         syncExistingDeviceTokenState(user.uid, data.notificationSettings).catch(() => {});
+      }
+
+      // Register active device session for Security Center & New-Device Login Alerts
+      try {
+        const deviceMeta = detectClientDeviceMetadata();
+        const sessionHeaders = await getAuthHeaders();
+        fetch('/api/security/sessions/register', {
+          method: 'POST',
+          headers: sessionHeaders,
+          body: JSON.stringify({
+            ...deviceMeta,
+            username: customUsername || userProfile?.username || ''
+          })
+        }).catch(() => {});
+      } catch {
+        // non-blocking session registration
       }
     } catch (err) {
       console.warn('Profile sync notice:', err);
@@ -1044,11 +1077,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     try {
       const { points: _pts, wavePoints: _wpts, ...safeRewardFields } = rewardFields;
-      const rewardWritePayload = isAdmin ? rewardFields : safeRewardFields;
       await setDoc(
         doc(db, 'users', currentUser.uid),
         cleanFirestoreData({
-          ...rewardWritePayload,
+          ...safeRewardFields,
           updatedAt: new Date().toISOString()
         }),
         { merge: true }
@@ -1147,10 +1179,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         pointTransactions: updatedTxs,
         updatedAt: nowIso
       };
-      if (isAdmin) {
-        txPayload.points = newBalance;
-        txPayload.wavePoints = newBalance;
-      }
       await setDoc(
         doc(db, 'users', uid),
         cleanFirestoreData(txPayload),
@@ -1170,6 +1198,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let unsubscribeDoc: (() => void) | null = null;
     let presenceInterval: ReturnType<typeof setInterval> | null = null;
+    let revocationSignOutTriggered = false;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
       // If Hidden Owner Sign-In, Existing Account Setup, or Sign-Up Email Verification is pending, keep user on AuthPage
@@ -1182,15 +1211,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setIsLoading(false);
             return;
           }
-          const isOwnerTokenPresent = Boolean(
-            sessionStorage.getItem(OWNER_SESSION_STORAGE_KEY) ||
-              localStorage.getItem(OWNER_SESSION_STORAGE_KEY)
-          );
           const hasGoogleProvider = user.providerData.some((p) => p.providerId === 'google.com');
           if (
-            !isOwnerTokenPresent &&
-            (sessionStorage.getItem('wavelink_signup_verification_pending') === 'true' ||
-              (!user.emailVerified && !hasGoogleProvider))
+            sessionStorage.getItem('wavelink_signup_verification_pending') === 'true' ||
+            (!user.emailVerified && !hasGoogleProvider)
           ) {
             setCurrentUser(null);
             setIsLoading(false);
@@ -1205,12 +1229,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (user) {
         const cleanEmail = (user.email || '').trim().toLowerCase();
+        const isVerifiedOwnerEmail =
+          cleanEmail === 'keylanmbilinyi5@gmail.com' && Boolean(user.emailVerified);
         const hasOwnerSessionToken = Boolean(
           typeof window !== 'undefined' &&
-            (sessionStorage.getItem(OWNER_SESSION_STORAGE_KEY) ||
-              localStorage.getItem(OWNER_SESSION_STORAGE_KEY))
+            sessionStorage.getItem(OWNER_SESSION_STORAGE_KEY)
         );
-        if (cleanEmail === 'keylanmbilinyi5@gmail.com') {
+        try {
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+          }
+        } catch {
+          // ignore
+        }
+        if (isVerifiedOwnerEmail) {
           setServerVerifiedRole('admin');
           setAdminCheckFailedReason(null);
         }
@@ -1221,18 +1253,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           console.warn('Profile sync notice:', err);
         });
 
-        // Only verify server-side admin session on mount if owner email or owner token is present
-        if (cleanEmail === 'keylanmbilinyi5@gmail.com' || hasOwnerSessionToken) {
+        // Only verify server-side admin session on mount if verified owner email or owner token is present
+        if (isVerifiedOwnerEmail || hasOwnerSessionToken) {
           refreshAdminVerification(true).catch(() => {});
         }
 
-        // Listen for live status changes on /users/{uid} (single canonical source for role & profile)
+        // Listen for live status changes on /users/{uid} (single canonical source for role, revocation & profile)
         const userDocRef = doc(db, 'users', user.uid);
         unsubscribeDoc = onSnapshot(
           userDocRef,
           (docSnap) => {
             if (docSnap.exists()) {
-              const snapData = docSnap.data() as UserProfile;
+              const snapData = docSnap.data() as UserProfile & { sessionsRevokedKeepDeviceId?: string };
+
+              // Enforce real-time cross-device session revocation ("Log out of all devices" & "This wasn't me")
+              if (snapData.sessionsRevokedAfter && !revocationSignOutTriggered) {
+                const revokedMs = Date.parse(snapData.sessionsRevokedAfter);
+                const keepDevId = String(snapData.sessionsRevokedKeepDeviceId || '');
+                const myDevId = getClientDeviceId();
+                if (!Number.isNaN(revokedMs) && (!keepDevId || keepDevId !== myDevId)) {
+                  user
+                    .getIdTokenResult(false)
+                    .then((tokenRes) => {
+                      const authMs = tokenRes?.authTime ? Date.parse(tokenRes.authTime) : 0;
+                      if (authMs > 0 && authMs + 10000 < revokedMs && !revocationSignOutTriggered) {
+                        revocationSignOutTriggered = true;
+                        showGlobalToast('Your session was signed out for security. Please sign in again.');
+                        fbSignOut(auth).catch(() => {});
+                      }
+                    })
+                    .catch(() => {});
+                }
+              }
               const localReward = getLocalDailyRewardCache(user.uid);
               const canonicalRole = resolveCanonicalAdminRole(snapData.role, snapData.isSubAdmin);
               const isSnapAdmin = canonicalRole === 'admin';
@@ -1340,21 +1392,77 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const signInWithEmail = async (email: string, pass: string) => {
+    const cleanEmail = email.trim();
     const lockout = checkClientLoginLockout();
     if (lockout.locked) {
       throw new Error(
         `Too many failed login attempts. Please wait ${lockout.remainingSeconds} seconds before trying again.`
       );
     }
+
+    // Check server-side temporary lockout (15-min lockout after 5 failed attempts)
     try {
-      const cleanEmail = email.trim();
+      const serverLockResp = await fetch('/api/auth/check-lockout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail })
+      });
+      const serverLockData = await serverLockResp.json().catch(() => ({}));
+      if (serverLockData?.locked) {
+        throw new Error(
+          serverLockData.message ||
+            `Account temporarily locked for ${serverLockData.remainingSeconds || 900}s after repeated failed logins. Use 'Unlock Account via Email Code' below.`
+        );
+      }
+    } catch (lockErr: any) {
+      if (lockErr?.message && lockErr.message.includes('temporarily locked')) {
+        throw lockErr;
+      }
+    }
+
+    try {
       const res = await withAuthNetworkRetry(() =>
         signInWithEmailAndPassword(auth, cleanEmail, pass)
       );
       clearClientFailedLogins();
+      res.user
+        .getIdToken()
+        .then((token) =>
+          fetch('/api/auth/clear-failed-login', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+              'X-WaveLink-Device-Id': getClientDeviceId()
+            },
+            body: JSON.stringify({ email: cleanEmail })
+          })
+        )
+        .catch(() => {});
       await syncUserProfileDoc(res.user);
     } catch (err: unknown) {
+      if ((err as { code?: string })?.code === 'auth/multi-factor-auth-required') {
+        throw err;
+      }
       const attempt = recordClientFailedLogin();
+      try {
+        const recResp = await fetch('/api/auth/record-failed-login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: cleanEmail })
+        });
+        const recData = await recResp.json().catch(() => ({}));
+        if (recData?.locked) {
+          throw new Error(
+            recData.message ||
+              `Account locked for ${Math.ceil((recData.remainingSeconds || 900) / 60)} minutes after repeated failed logins. Unlock immediately with an email verification code below.`
+          );
+        }
+      } catch (srvLockErr: any) {
+        if (srvLockErr?.message && srvLockErr.message.includes('Account locked')) {
+          throw srvLockErr;
+        }
+      }
       console.warn('Email Sign-In Notice:', err);
       if (attempt.locked) {
         throw new Error(
@@ -1490,27 +1598,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // ignore
       }
       const uid = currentUser?.uid;
-      if (uid) {
-        // Mark offline in Firebase Realtime Database & detach presence listeners BEFORE signing out
-        try {
-          const { goOfflineAndCleanupPresence } = await import('./PresenceContext');
-          await goOfflineAndCleanupPresence(uid);
-        } catch {
-          // ignore
-        }
-        // Delete this device's FCM token from Firestore & server on logout
-        await removeCurrentDeviceFcmToken(uid).catch(() => {});
-        await setDoc(
-          doc(db, 'users', uid),
-          { isOnline: false, lastSeenAt: new Date().toISOString() },
-          { merge: true }
-        ).catch(() => {});
-      }
-      await fbSignOut(auth);
+
+      // Immediately transition UI to signed-out state when the user presses Log Out
+      setCurrentUser(null);
       setUserProfile(null);
       setServerVerifiedRole('user');
+
+      if (uid) {
+        // Attempt best-effort presence & FCM cleanup with a fast 250ms cap so logout never hangs
+        const cleanupPromise = Promise.allSettled([
+          import('./PresenceContext')
+            .then(({ goOfflineAndCleanupPresence }) => goOfflineAndCleanupPresence(uid))
+            .catch(() => {}),
+          removeCurrentDeviceFcmToken(uid).catch(() => {}),
+          setDoc(
+            doc(db, 'users', uid),
+            { isOnline: false, lastSeenAt: new Date().toISOString() },
+            { merge: true }
+          ).catch(() => {})
+        ]);
+        await Promise.race([
+          cleanupPromise,
+          new Promise((resolve) => setTimeout(resolve, 250))
+        ]);
+      }
+
+      await fbSignOut(auth);
     } catch (err) {
       console.error('Sign Out Error:', err);
+      setCurrentUser(null);
+      setUserProfile(null);
+      setServerVerifiedRole('user');
     }
   };
 
@@ -1518,12 +1636,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!currentUser) {
       throw new Error('You must be signed in to change your password.');
     }
+    const hasPasswordProvider = currentUser.providerData.some((p) => p.providerId === 'password');
+    const hasGoogleProvider = currentUser.providerData.some((p) => p.providerId === 'google.com');
+
+    if (hasPasswordProvider && !currentPassword.trim()) {
+      throw new Error('Please enter your current password first.');
+    }
+
     const cleanNew = newPassword.trim();
     const pwCheck = validateStrongPassword(cleanNew);
     if (!pwCheck.valid) {
       throw new Error(
         pwCheck.message ||
-          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
       );
     }
 
@@ -1535,41 +1660,81 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const serverPwData = await serverPwResp.json().catch(() => ({}));
     if (!serverPwResp.ok || !serverPwData.valid) {
       throw new Error(
-        serverPwData.error ||
-          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+        'Please choose a password with eight to twenty-four characters, including a letter and a number.'
       );
     }
 
-    // Re-authenticate first if currentPassword is provided and user has an email
-    if (currentPassword.trim() && currentUser.email) {
+    // Re-authenticate first when user has a password credential
+    if (currentUser.email && hasPasswordProvider) {
       try {
         const credential = EmailAuthProvider.credential(currentUser.email, currentPassword.trim());
         await reauthenticateWithCredential(currentUser, credential);
       } catch (reauthErr: any) {
         const code = reauthErr?.code || '';
         if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
-          throw new Error('Your current password is incorrect. Please check and try again.');
+          throw new Error('Your current password is not right. Please check it and try again.');
         }
+        throw new Error(getFriendlyAuthErrorMessage(reauthErr) || 'We could not check your current password. Please try again.');
       }
     }
 
-    try {
-      await fbUpdatePassword(currentUser, cleanNew);
+    const persistPasswordCleared = async () => {
+      const nowIso = new Date().toISOString();
       await setDoc(
         doc(db, 'users', currentUser.uid),
-        { passwordUpdatedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        { passwordUpdatedAt: nowIso, forcePasswordReset: false, updatedAt: nowIso },
         { merge: true }
       ).catch(() => {});
+      try {
+        const headers = await getAuthHeaders();
+        await fetch('/api/security/password-updated', { method: 'POST', headers });
+      } catch {
+        // non-blocking
+      }
+    };
+
+    try {
+      if (!hasPasswordProvider && currentUser.email) {
+        // Google-only user setting a WaveLink password for the first time
+        try {
+          const emailCred = EmailAuthProvider.credential(currentUser.email, cleanNew);
+          await linkWithCredential(currentUser, emailCred);
+        } catch (linkErr: any) {
+          if (linkErr?.code === 'auth/provider-already-linked') {
+            await fbUpdatePassword(currentUser, cleanNew);
+          } else if (linkErr?.code === 'auth/requires-recent-login' && hasGoogleProvider) {
+            const googleProvider = new GoogleAuthProvider();
+            googleProvider.setCustomParameters({ prompt: 'select_account' });
+            await reauthenticateWithPopup(currentUser, googleProvider);
+            const emailCred = EmailAuthProvider.credential(currentUser.email, cleanNew);
+            await linkWithCredential(currentUser, emailCred);
+          } else {
+            throw linkErr;
+          }
+        }
+      } else {
+        await fbUpdatePassword(currentUser, cleanNew);
+      }
+      await persistPasswordCleared();
     } catch (err: any) {
       const code = err?.code || '';
       if (code === 'auth/requires-recent-login') {
-        if (currentPassword.trim() && currentUser.email) {
+        if (currentPassword.trim() && currentUser.email && hasPasswordProvider) {
           const credential = EmailAuthProvider.credential(currentUser.email, currentPassword.trim());
           await reauthenticateWithCredential(currentUser, credential);
           await fbUpdatePassword(currentUser, cleanNew);
+          await persistPasswordCleared();
           return;
         }
-        throw new Error('For security, please enter your Current Password above to confirm changing your password.');
+        if (hasGoogleProvider) {
+          const googleProvider = new GoogleAuthProvider();
+          googleProvider.setCustomParameters({ prompt: 'select_account' });
+          await reauthenticateWithPopup(currentUser, googleProvider);
+          await fbUpdatePassword(currentUser, cleanNew);
+          await persistPasswordCleared();
+          return;
+        }
+        throw new Error('Please type your current password first to change your password.');
       }
       throw new Error(getFriendlyAuthErrorMessage(err));
     }
@@ -1653,7 +1818,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       if (data.proBorderEffect !== undefined) updatePayload.proBorderEffect = data.proBorderEffect;
       if (data.proAccentColor !== undefined) updatePayload.proAccentColor = data.proAccentColor;
-      if (data.proBadge !== undefined) updatePayload.proBadge = data.proBadge;
+      if (data.proBadge !== undefined) {
+        const canEditProBadge =
+          isSuperAdmin ||
+          isSubAdmin ||
+          Boolean(userProfile?.isVerifiedByAdmin) ||
+          Boolean(userProfile?.isPro) ||
+          Boolean(userProfile?.hasBlueStar);
+        if (canEditProBadge && (data.proBadge !== 'founder' || isSuperAdmin)) {
+          updatePayload.proBadge = data.proBadge;
+        }
+      }
       if (data.appearanceTheme !== undefined) updatePayload.appearanceTheme = data.appearanceTheme;
       if (data.followingIds !== undefined) updatePayload.followingIds = data.followingIds;
       if (data.closeFriendIds !== undefined) updatePayload.closeFriendIds = data.closeFriendIds;
@@ -1944,6 +2119,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const cleanReason = sanitizeUserText(params.reason || 'Reported for safety review', 500);
     const cleanSummary = sanitizeUserText(params.targetSummary || '', 400);
 
+    let autoHiddenByServer = false;
+    try {
+      const headers = await getAuthHeaders();
+      const srvResp = await fetch('/api/safety/report', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          targetType: params.targetType,
+          targetId: params.targetId,
+          targetAuthorId: params.targetAuthorId,
+          targetSummary: cleanSummary,
+          reason: cleanReason
+        })
+      });
+      const srvData = await srvResp.json().catch(() => ({}));
+      if (srvResp.ok && srvData?.success) {
+        autoHiddenByServer = Boolean(srvData.autoHidden);
+      }
+    } catch {
+      // Fallback to direct Firestore report write below
+    }
+
     await setDoc(
       doc(db, 'contentReports', reportId),
       cleanFirestoreData({
@@ -1956,11 +2153,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         targetAuthorId: params.targetAuthorId,
         targetSummary: cleanSummary,
         reason: cleanReason,
-        status: 'open',
+        status: autoHiddenByServer ? 'auto_hidden' : 'open',
+        autoHidden: autoHiddenByServer,
         createdAt: nowIso
       })
+    ).catch(() => {});
+
+    showGlobalToast(
+      autoHiddenByServer
+        ? 'Thank you. Multiple independent reports received — content has been automatically hidden pending moderator review.'
+        : 'Thank you. Your report has been sent to the WaveLink safety team.'
     );
-    showGlobalToast('Thank you. Your report has been sent to the WaveLink safety team.');
   };
 
   const sendVerificationEmail = async () => {
@@ -2022,10 +2225,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     const uid = currentUser.uid;
     const email = currentUser.email || '';
+    const hasPasswordProvider = currentUser.providerData.some((p) => p.providerId === 'password');
+    const hasGoogleProvider = currentUser.providerData.some((p) => p.providerId === 'google.com');
 
-    if (currentPassword && currentPassword.trim() && email) {
-      const credential = EmailAuthProvider.credential(email, currentPassword.trim());
-      await reauthenticateWithCredential(currentUser, credential);
+    // Re-authenticate BEFORE deleting any Firestore data so failed/stale auth never leaves an orphaned account
+    if (currentPassword && currentPassword.trim() && email && hasPasswordProvider) {
+      try {
+        const credential = EmailAuthProvider.credential(email, currentPassword.trim());
+        await reauthenticateWithCredential(currentUser, credential);
+      } catch (err: any) {
+        const code = err?.code || '';
+        if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+          throw new Error('Your current password is incorrect. Account deletion was cancelled.');
+        }
+        throw new Error(getFriendlyAuthErrorMessage(err) || 'Could not confirm your password.');
+      }
+    } else {
+      const tokenRes = await currentUser.getIdTokenResult(false).catch(() => null);
+      const authTimeMs = tokenRes?.authTime ? Date.parse(tokenRes.authTime) : 0;
+      const isRecent = authTimeMs > 0 && Date.now() - authTimeMs < 4 * 60 * 1000;
+      if (!isRecent) {
+        if (hasGoogleProvider && !hasPasswordProvider) {
+          const googleProvider = new GoogleAuthProvider();
+          googleProvider.setCustomParameters({ prompt: 'select_account' });
+          await reauthenticateWithPopup(currentUser, googleProvider);
+        } else if (hasPasswordProvider) {
+          throw new Error('For your security, please enter your current password to confirm account deletion.');
+        }
+      }
     }
 
     // 1. Record deletion in audit log
@@ -2050,8 +2277,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // continue cleanup
     }
 
-    // 3. Delete device FCM token and user profile document
+    // 3. Delete device FCM token, invoke server account deletion cleanup, and delete user profile document
     await removeCurrentDeviceFcmToken(uid).catch(() => {});
+    try {
+      const headers = await getAuthHeaders();
+      await fetch('/api/security/delete-account', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ uid })
+      }).catch(() => {});
+    } catch {
+      // non-fatal
+    }
     await deleteDoc(doc(db, 'users', uid)).catch(() => {});
 
     // 4. Clear local storage caches
@@ -2062,16 +2299,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         localStorage.removeItem(`wavelink_pro_pass_${uid}`);
         localStorage.removeItem(`wavelink_privacy_${uid}`);
         localStorage.removeItem(`wavelink_terms_${uid}`);
+        sessionStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+        localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
       }
     } catch {
       // ignore
     }
 
-    // 5. Delete Firebase Auth user or sign out if recent login is required
+    // 5. Delete Firebase Auth user (re-throw requires-recent-login cleanly if still rejected)
     try {
       await fbDeleteUser(currentUser);
-    } catch {
-      await fbSignOut(auth);
+    } catch (delErr: any) {
+      if (delErr?.code === 'auth/requires-recent-login') {
+        throw new Error('Please enter your current password or sign in again before deleting your account.');
+      }
+      await fbSignOut(auth).catch(() => {});
     }
     setUserProfile(null);
   };
@@ -2151,13 +2393,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // Single canonical source of truth for admin role across Admin Desk, Server Routes, and Firestore rules:
+  // Single canonical source of truth for admin & staff role across Admin Desk, Server Routes, and Firestore rules:
   const isOwnerEmailMatch = Boolean(
-    currentUser?.email && currentUser.email.trim().toLowerCase() === 'keylanmbilinyi5@gmail.com'
+    currentUser?.emailVerified &&
+      currentUser?.email &&
+      currentUser.email.trim().toLowerCase() === 'keylanmbilinyi5@gmail.com'
   );
   const canonicalClaimRole = resolveCanonicalAdminRole(customClaimRole, customClaimRole === 'sub_admin');
   const canonicalProfileRole = resolveCanonicalAdminRole(userProfile?.role, userProfile?.isSubAdmin);
   const canonicalServerRole = resolveCanonicalAdminRole(serverVerifiedRole, serverVerifiedRole === 'sub_admin');
+  const canonicalStaffRole = resolveCanonicalStaffRole(
+    userProfile?.role,
+    userProfile?.isSubAdmin,
+    userProfile?.isModerator,
+    userProfile?.isSupportHelper
+  );
 
   const isSuperAdmin =
     isOwnerEmailMatch ||
@@ -2169,8 +2419,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     !isSuperAdmin &&
     (canonicalClaimRole === 'sub_admin' ||
       canonicalProfileRole === 'sub_admin' ||
-      canonicalServerRole === 'sub_admin');
+      canonicalServerRole === 'sub_admin' ||
+      canonicalStaffRole === 'moderator');
+  const isModerator = isSubAdmin;
+  const isSupportHelper =
+    !isSuperAdmin &&
+    !isSubAdmin &&
+    (canonicalStaffRole === 'support_helper' ||
+      userProfile?.role === 'support_helper' ||
+      Boolean(userProfile?.isSupportHelper));
   const isAdmin = isSuperAdmin || isSubAdmin;
+  const isStaff = isAdmin || isSupportHelper;
 
   // Verification status: verified by admin, has blue star, or verified badge
   const isVerified = Boolean(userProfile?.hasBlueStar || userProfile?.isVerifiedByAdmin || userProfile?.proBadge === 'verified');
@@ -2189,23 +2448,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const isExemptFromPayments = isProEffective;
 
   // Only admins or verified people with the blue star can talk to the admin
-  const canTalkToAdmin = isSuperAdmin || isSubAdmin || isVerified || Boolean(userProfile?.isPro);
+  const canTalkToAdmin = isSuperAdmin || isSubAdmin || isSupportHelper || isVerified || Boolean(userProfile?.isPro);
 
-  // Admin capability to appoint/demote sub-admins (enforced on server + Firestore + audit log)
-  const toggleSubAdmin = async (targetUserId: string, makeSubAdmin: boolean, targetEmail?: string) => {
+  // Owner capability to assign Moderator, Support Helper, or standard User role
+  const assignStaffRole = async (
+    targetUserId: string,
+    role: 'moderator' | 'support_helper' | 'user',
+    targetEmail?: string
+  ) => {
     if (!isSuperAdmin) {
-      console.warn('Permission denied: Only the Platform Owner can manage administrators.');
+      console.warn('Permission denied: Only the Platform Owner can manage staff roles.');
       return;
     }
     if (targetUserId === SUPPORT_BOT_ID) {
-      showGlobalToast('WaveLink Support Bot cannot be granted admin privileges.');
+      showGlobalToast('WaveLink Support Bot cannot be assigned staff roles.');
       return;
     }
-    const nowIso = new Date().toISOString();
+    const isMod = role === 'moderator';
     let serverSucceeded = false;
-    let firestoreSucceeded = false;
     let lastErr: unknown = null;
 
+    // Roles can ONLY be changed by a server function (client writes to role are blocked by Firestore rules)
     try {
       const headers = await getAuthHeaders();
       const resp = await fetch('/api/admin/role', {
@@ -2215,47 +2478,47 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           callerEmail: currentUser?.email,
           targetUserId,
           targetEmail,
-          makeSubAdmin
+          role,
+          makeSubAdmin: isMod
         })
       });
       if (resp.ok) {
         serverSucceeded = true;
+      } else {
+        const errJson = await resp.json().catch(() => ({}));
+        lastErr = new Error(errJson.error || 'Could not update role on server.');
       }
     } catch (err) {
       lastErr = err;
     }
 
-    try {
-      const targetUserRef = doc(db, 'users', targetUserId);
-      await setDoc(
-        targetUserRef,
-        cleanFirestoreData({
-          isSubAdmin: makeSubAdmin,
-          role: makeSubAdmin ? 'sub_admin' : 'user',
-          updatedAt: nowIso
-        }),
-        { merge: true }
-      );
-      firestoreSucceeded = true;
-    } catch (err) {
-      lastErr = err;
-    }
-
-    if (!firestoreSucceeded && !serverSucceeded && lastErr) {
+    if (!serverSucceeded && lastErr) {
       handleFirestoreError(lastErr, OperationType.UPDATE, `users/${targetUserId}`);
     }
+
+    const roleLabel =
+      role === 'moderator'
+        ? 'Moderator (Sub-Admin)'
+        : role === 'support_helper'
+        ? 'Support Helper'
+        : 'Standard Member';
 
     await recordAdminAuditLog({
       action: 'role_change',
       targetId: targetUserId,
       targetLabel: targetEmail,
-      details: `${makeSubAdmin ? 'Promoted user to Sub-Admin' : 'Demoted Sub-Admin to standard User'}`
+      details: `Updated staff role to ${roleLabel}`
     }).catch(() => {});
 
-    showGlobalToast(makeSubAdmin ? 'Appointed user as Sub-Admin!' : 'Revoked Sub-Admin privileges.');
+    showGlobalToast(`Updated member role to ${roleLabel}!`);
   };
 
-  // Admin capability to verify member & grant complimentary Pro status
+  // Admin capability to appoint/demote sub-admins (enforced on server + Firestore + audit log)
+  const toggleSubAdmin = async (targetUserId: string, makeSubAdmin: boolean, targetEmail?: string) => {
+    await assignStaffRole(targetUserId, makeSubAdmin ? 'moderator' : 'user', targetEmail);
+  };
+
+  // Admin capability to verify member & grant complimentary Pro status via server function only
   const toggleVerifyUser = async (targetUserId: string, verify: boolean, targetEmail?: string) => {
     if (!isAdmin) {
       console.warn('Permission denied: Only administrators can verify members.');
@@ -2263,29 +2526,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     if (!targetUserId || targetUserId === SUPPORT_BOT_ID) return;
 
-    const now = new Date();
-    const nowIso = now.toISOString();
-    const expiresAtIso = verify
-      ? new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString()
-      : '';
-
-    const proPayload: Record<string, any> = {
-      hasBlueStar: verify,
-      isVerifiedByAdmin: verify,
-      isPro: verify,
-      proPlan: verify ? 'annual' : 'free',
-      proExpiresAt: expiresAtIso,
-      proBadge: verify ? 'verified' : 'none',
-      proBorderEffect: verify ? 'aura-gold' : 'none',
-      proAccentColor: verify ? 'emerald' : 'purple',
-      updatedAt: nowIso
-    };
-
     let serverSucceeded = false;
-    let firestoreSucceeded = false;
     let lastErr: unknown = null;
 
-    // 1. Server-side Admin SDK + REST update
+    // Pro status can ONLY be changed by a server function (client writes to isPro are blocked by Firestore rules)
     try {
       const headers = await getAuthHeaders();
       const resp = await fetch('/api/admin/grant-pro', {
@@ -2301,37 +2545,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       if (resp.ok) {
         serverSucceeded = true;
+      } else {
+        const errJson = await resp.json().catch(() => ({}));
+        lastErr = new Error(errJson.error || 'Could not update Pro status on server.');
       }
     } catch (err) {
       lastErr = err;
     }
 
-    // 2. Direct client Firestore SDK update (plus any matching profile doc with the same email)
-    try {
-      const targetUserRef = doc(db, 'users', targetUserId);
-      await setDoc(targetUserRef, cleanFirestoreData(proPayload), { merge: true });
-      firestoreSucceeded = true;
-
-      const cleanTargetEmail = (targetEmail || '').trim().toLowerCase();
-      if (cleanTargetEmail && cleanTargetEmail !== 'keylanmbilinyi5@gmail.com') {
-        try {
-          const emailSnap = await getDocs(
-            query(collection(db, 'users'), where('email', '==', cleanTargetEmail))
-          );
-          for (const d of emailSnap.docs) {
-            if (d.id !== targetUserId) {
-              await setDoc(doc(db, 'users', d.id), cleanFirestoreData(proPayload), { merge: true }).catch(() => {});
-            }
-          }
-        } catch {
-          // non-fatal
-        }
-      }
-    } catch (err) {
-      lastErr = err;
-    }
-
-    if (!firestoreSucceeded && !serverSucceeded && lastErr) {
+    if (!serverSucceeded && lastErr) {
       handleFirestoreError(lastErr, OperationType.UPDATE, `users/${targetUserId}`);
     }
 
@@ -2385,6 +2607,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         userProfile,
         isSuperAdmin,
         isSubAdmin,
+        isModerator,
+        isSupportHelper,
+        isStaff,
         isAdmin,
         isProEffective,
         isExemptFromPayments,
@@ -2412,6 +2637,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         recordAdminAuditLog,
         dismissWarning,
         toggleSubAdmin,
+        assignStaffRole,
         toggleVerifyUser,
         activateHarvestPass,
         verifyAndRedeemCoupon,

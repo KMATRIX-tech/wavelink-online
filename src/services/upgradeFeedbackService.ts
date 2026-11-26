@@ -1,5 +1,5 @@
 import { db, cleanFirestoreData, ADMIN_EMAIL } from '../firebase';
-import { collection, addDoc, updateDoc, doc, query, where, getDocs } from 'firebase/firestore';
+import { collection, addDoc, updateDoc, doc, query, where, getDocs, limit } from 'firebase/firestore';
 import { UpgradeFeedbackItem, UpgradeCategory, UpgradeSource, UpgradeStatus } from '../types';
 import { sendNotification } from './notificationService';
 
@@ -122,7 +122,7 @@ export async function recordUpgradeFeedback(item: {
 
   // Find Platform Owner / Super Admin user ID to dispatch in-app notification
   try {
-    const adminUserQuery = query(collection(db, 'users'), where('role', '==', 'super_admin'));
+    const adminUserQuery = query(collection(db, 'users'), where('role', '==', 'super_admin'), limit(5));
     const adminSnap = await getDocs(adminUserQuery);
     if (!adminSnap.empty) {
       const ownerId = adminSnap.docs[0].id;

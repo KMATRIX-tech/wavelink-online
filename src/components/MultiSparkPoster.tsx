@@ -683,8 +683,11 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
           return;
         }
       } catch (err: any) {
-        if (err?.message?.includes('rate limit')) {
-          setFeedbackBanner({ type: 'error', text: err.message });
+        if (err?.message?.toLowerCase?.().includes('rate limit')) {
+          setFeedbackBanner({
+            type: 'error',
+            text: 'You posted Sparks very quickly. Please wait a moment and tap Try again.'
+          });
           setIsPublishing(false);
           setPublishProgress(0);
           return;

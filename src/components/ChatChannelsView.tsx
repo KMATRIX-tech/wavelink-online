@@ -58,6 +58,12 @@ import {
   formatVideoFileSize
 } from '../utils/mediaStorage';
 import {
+  checkClientSpam,
+  checkWordFilter,
+  sanitizeUserFacingError,
+  checkActionRateLimit
+} from '../utils/safetyFilters';
+import {
   Send,
   Smile,
   Image as ImageIcon,
@@ -118,7 +124,7 @@ import {
   computeChatThemeVars,
   getChatThemeDisplayName
 } from '../utils/chatThemes';
-import { sendNotification } from '../services/notificationService';
+import { sendNotification, toggleFollowUser } from '../services/notificationService';
 import {
   detectUpgradeIdea,
   recordUpgradeFeedback,
@@ -441,14 +447,20 @@ interface ChatPersonGridCardProps {
   person: UserProfile;
   language: 'en' | 'sw';
   compact?: boolean;
+  isFollowed?: boolean;
+  onToggleFollow?: (person: UserProfile) => void;
   onSelect: (uid: string) => void;
+  onStartCall?: (person: UserProfile, type: 'voice' | 'video') => void;
 }
 
 const ChatPersonGridCard: React.FC<ChatPersonGridCardProps> = ({
   person,
   language,
   compact = false,
-  onSelect
+  isFollowed = false,
+  onToggleFollow,
+  onSelect,
+  onStartCall
 }) => {
   const cardRef = useRef<HTMLDivElement | null>(null);
   const [inView, setInView] = useState(false);
@@ -598,20 +610,70 @@ const ChatPersonGridCard: React.FC<ChatPersonGridCardProps> = ({
         </p>
       </div>
 
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onSelect(person.id);
-        }}
-        className="w-full min-h-[38px] py-1.5 px-3 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-2xs transition active:scale-95 cursor-pointer"
-        style={{
-          background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-        }}
-      >
-        <MessageSquare size={12} />
-        <span>Message</span>
-      </button>
+      <div className="w-full flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onSelect(person.id);
+          }}
+          className="flex-1 min-h-[40px] py-1.5 px-2.5 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-2xs transition active:scale-95 cursor-pointer"
+          style={{
+            background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+          }}
+        >
+          <MessageSquare size={13} />
+          <span>Chat</span>
+        </button>
+
+        {!isBot && onToggleFollow && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleFollow(person);
+            }}
+            className={`min-h-[40px] px-2.5 py-1.5 rounded-2xl border text-[11px] font-extrabold flex items-center justify-center gap-1 transition active:scale-95 shrink-0 cursor-pointer ${
+              isFollowed
+                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/40'
+                : 'bg-[var(--bg-subtle)] text-[var(--text-primary)] border-[var(--border-hairline)] hover:border-[var(--accent-primary)]'
+            }`}
+            title={isFollowed ? `Unfollow ${person.displayName}` : `Follow ${person.displayName}`}
+          >
+            {isFollowed ? <Check size={13} /> : <UserPlus size={13} />}
+            <span>{isFollowed ? 'Following' : 'Follow'}</span>
+          </button>
+        )}
+
+        {!isBot && onStartCall && (
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onStartCall(person, 'voice');
+              }}
+              className="w-10 h-10 min-w-[40px] min-h-[40px] rounded-2xl bg-[var(--bg-subtle)] hover:border-emerald-500/50 border border-[var(--border-hairline)] text-emerald-600 dark:text-emerald-400 flex items-center justify-center transition active:scale-95 cursor-pointer"
+              title={`Voice call ${person.displayName}`}
+              aria-label={`Voice call ${person.displayName}`}
+            >
+              <PhoneCall size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onStartCall(person, 'video');
+              }}
+              className="w-10 h-10 min-w-[40px] min-h-[40px] rounded-2xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--accent-primary)] flex items-center justify-center transition active:scale-95 cursor-pointer"
+              title={`Video call ${person.displayName}`}
+              aria-label={`Video call ${person.displayName}`}
+            >
+              <Video size={14} />
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
@@ -818,7 +880,106 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const [convoFilter, setConvoFilter] = useState<'chats' | 'people' | 'groups'>('chats');
   const [messageLimit, setMessageLimit] = useState<number>(30);
   const [convoDisplayLimit, setConvoDisplayLimit] = useState<number>(20);
-  const [convoFetchLimit, setConvoFetchLimit] = useState<number>(20);
+  const [convoFetchLimit, setConvoFetchLimit] = useState<number>(50);
+  const [followingMap, setFollowingMap] = useState<Record<string, boolean>>({});
+  const [searchedAllowedUserIds, setSearchedAllowedUserIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_searched_chat_uids');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Load user's follows from both `follows` collection and `userProfile.followingIds`
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    let isMounted = true;
+    const baseMap: Record<string, boolean> = {};
+    (userProfile?.followingIds || []).forEach((fId) => {
+      if (fId) baseMap[fId] = true;
+    });
+    setFollowingMap((prev) => ({ ...prev, ...baseMap }));
+
+    const fetchFollows = async () => {
+      try {
+        const q = query(
+          collection(db, 'follows'),
+          where('followerId', '==', currentUser.uid),
+          limit(100)
+        );
+        const snap = await getDocs(q);
+        if (!isMounted) return;
+        const nextMap: Record<string, boolean> = { ...baseMap };
+        snap.forEach((d) => {
+          const data = d.data();
+          if (data?.targetUserId) {
+            nextMap[data.targetUserId] = true;
+          }
+        });
+        setFollowingMap(nextMap);
+      } catch {
+        // ignore follows read error
+      }
+    };
+    fetchFollows();
+    return () => {
+      isMounted = false;
+    };
+  }, [currentUser?.uid, userProfile?.followingIds]);
+
+  useEffect(() => {
+    if (initialTargetUserId) {
+      setSearchedAllowedUserIds((prev) => {
+        if (prev.includes(initialTargetUserId)) return prev;
+        const next = [initialTargetUserId, ...prev].slice(0, 100);
+        try {
+          localStorage.setItem('wavelink_searched_chat_uids', JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      });
+    }
+  }, [initialTargetUserId]);
+
+  const handleToggleFollowInChat = async (targetPerson: UserProfile) => {
+    if (!currentUser) return;
+    const currentlyFollowed = Boolean(
+      followingMap[targetPerson.id] || (userProfile?.followingIds || []).includes(targetPerson.id)
+    );
+    const nextState = !currentlyFollowed;
+    setFollowingMap((prev) => ({ ...prev, [targetPerson.id]: nextState }));
+
+    const currentIds = Array.from(
+      new Set([
+        ...(userProfile?.followingIds || []),
+        ...Object.keys(followingMap).filter((k) => followingMap[k])
+      ])
+    );
+    const nextIds = nextState
+      ? Array.from(new Set([...currentIds, targetPerson.id]))
+      : currentIds.filter((id) => id !== targetPerson.id);
+
+    updateUserProfile({ followingIds: nextIds }).catch(() => {});
+    try {
+      const serverResult = await toggleFollowUser(
+        currentUser.uid,
+        userProfile?.displayName || currentUser.displayName || 'A waver',
+        targetPerson.id,
+        targetPerson.displayName
+      );
+      setFollowingMap((prev) => ({ ...prev, [targetPerson.id]: serverResult }));
+      showGlobalToast(
+        serverResult
+          ? `You are now following ${targetPerson.displayName}! You can text them anytime.`
+          : `Unfollowed ${targetPerson.displayName}.`
+      );
+    } catch {
+      // keep optimistic update
+    }
+  };
 
   // Group creation modal state
   const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false);
@@ -1291,6 +1452,32 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       currentUser?.uid &&
       (directRecipient.blockedUserIds || []).includes(currentUser.uid)
   );
+  const isFollowingRecipient = Boolean(
+    directRecipient &&
+      (followingMap[directRecipient.id] ||
+        (userProfile?.followingIds || []).includes(directRecipient.id))
+  );
+  const hasExistingDmHistoryWithRecipient = Boolean(
+    isDirectMessage &&
+      directRecipient &&
+      currentUser?.uid &&
+      (() => {
+        const dmId = computeDmConversationId(currentUser.uid, directRecipient.id);
+        return Boolean(
+          latestMessageByChannel[dmId]?.text ||
+            channelMetaMap[dmId]?.lastMessageText ||
+            channelMetaMap[dmId]?.lastMessageAt ||
+            messages.length > 0
+        );
+      })()
+  );
+  const isRecipientSearchedOrFollowed = Boolean(
+    directRecipient &&
+      (isChattingWithSupportBot ||
+        isFollowingRecipient ||
+        hasExistingDmHistoryWithRecipient ||
+        searchedAllowedUserIds.includes(directRecipient.id))
+  );
   const dmPrivacyBlockReason = (() => {
     if (!isDirectMessage || !directRecipient || isChattingWithSupportBot) return null;
     if (isRecipientBlocked) {
@@ -1299,6 +1486,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     if (isBlockedByRecipient && !isAdmin) {
       return 'You cannot message this user.';
     }
+    if (!isAdmin && !isRecipientSearchedOrFollowed) {
+      return `Follow ${directRecipient.displayName} or search for them to start texting.`;
+    }
     if (!isAdmin) {
       const dmPref = directRecipient.privacySettings?.allowDirectMessages || 'everyone';
       if (dmPref === 'none') {
@@ -1306,7 +1496,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       }
       if (
         dmPref === 'followers' &&
-        !(userProfile?.followingIds || []).includes(directRecipient.id) &&
+        !isFollowingRecipient &&
         !(directRecipient.followingIds || []).includes(currentUser?.uid || '')
       ) {
         return `Follow ${directRecipient.displayName} to send a direct message.`;
@@ -2381,7 +2571,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       console.error('Error uploading chat media:', err);
       setChatUploadProgress(null);
       setChatMediaNotice(
-        err instanceof Error ? err.message : 'Could not upload media. Please try again.'
+        sanitizeUserFacingError(
+          err,
+          'Could not upload your photo or video. Check your internet and try again.'
+        )
       );
     }
   };
@@ -2416,7 +2609,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       console.error('Error uploading chat file:', err);
       setChatUploadProgress(null);
       setChatMediaNotice(
-        err instanceof Error ? err.message : 'Could not upload file. Please try again.'
+        sanitizeUserFacingError(
+          err,
+          'Could not upload your file. Check your internet and try again.'
+        )
       );
     }
   };
@@ -2692,6 +2888,30 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     if (dmPrivacyBlockReason) {
       setChatMediaNotice(dmPrivacyBlockReason);
       return;
+    }
+
+    const msgRateCheck = checkActionRateLimit(currentUser.uid, 'message');
+    if (!msgRateCheck.allowed) {
+      setChatMediaNotice(
+        msgRateCheck.message || 'You are sending messages too fast. Please wait a moment and try again.'
+      );
+      setTimeout(() => setChatMediaNotice(null), 4000);
+      return;
+    }
+
+    if (inputText.trim()) {
+      const spamCheck = checkClientSpam('message', inputText.trim());
+      if (spamCheck.isSpam) {
+        setChatMediaNotice(spamCheck.reason || 'Please slow down before sending duplicate messages or links.');
+        setTimeout(() => setChatMediaNotice(null), 4000);
+        return;
+      }
+      const wordCheck = checkWordFilter(inputText.trim());
+      if (wordCheck.flagged) {
+        setChatMediaNotice('Message blocked by WaveLink safety word filter (EN/SW).');
+        setTimeout(() => setChatMediaNotice(null), 4000);
+        return;
+      }
     }
 
     const sanitizedText = sanitizeUserText(inputText.trim(), 2000);
@@ -3137,7 +3357,40 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     }
   };
 
-  // Delete message / Unsend
+  // Local + Firestore "Delete for me" state
+  const [deletedForMeIds, setDeletedForMeIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_chat_deleted_for_me_v1');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const handleDeleteMessageForMe = async (messageId: string) => {
+    setDeletedForMeIds((prev) => {
+      const next = prev.includes(messageId) ? prev : [...prev, messageId];
+      try {
+        localStorage.setItem('wavelink_chat_deleted_for_me_v1', JSON.stringify(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+    if (!currentUser?.uid) return;
+    try {
+      const docRef = isDirectMessage
+        ? doc(db, 'channels', activeChannel, 'messages', messageId)
+        : doc(db, 'groups', activeChannel, 'messages', messageId);
+      await updateDoc(docRef, {
+        deletedFor: arrayUnion(currentUser.uid)
+      });
+    } catch {
+      // Local hide already applied even if rules restrict editing another user's message doc
+    }
+  };
+
+  // Delete message for everyone / Unsend
   const handleDeleteMessage = async (messageId: string) => {
     try {
       const docRef = isDirectMessage
@@ -3146,7 +3399,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
       await updateDoc(docRef, {
         isDeleted: true,
-        text: 'This message was unsent.',
+        text: 'This message was deleted for everyone.',
         mediaUrl: '',
         audioUrl: '',
         gifUrl: '',
@@ -3724,41 +3977,83 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
     });
 
-  const filteredMembers = allMembers
-    .filter(
-      (m) =>
-        (m.displayName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (m.email || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (m.username || '').toLowerCase().includes(searchQuery.toLowerCase())
-    )
-    .sort((a, b) => {
-      if (a.id === SUPPORT_BOT_ID) return -1;
-      if (b.id === SUPPORT_BOT_ID) return 1;
-      if (!currentUser?.uid) return 0;
-      if (onlineFirstSort) {
-        const onlineA = getCachedIsOnline(a.id) ? 1 : 0;
-        const onlineB = getCachedIsOnline(b.id) ? 1 : 0;
-        if (onlineA !== onlineB) return onlineB - onlineA;
-      }
-      const dmA = computeDmConversationId(currentUser.uid, a.id);
-      const dmB = computeDmConversationId(currentUser.uid, b.id);
-      const unreadA = unreadCountsByChannel[dmA] || 0;
-      const unreadB = unreadCountsByChannel[dmB] || 0;
-      if (unreadA !== unreadB) return unreadB - unreadA;
-      const latestA =
-        latestMessageByChannel[dmA]?.createdAt ||
-        channelMetaMap[dmA]?.lastMessageAt ||
-        channelMetaMap[dmA]?.updatedAt ||
-        a.createdAt ||
-        '';
-      const latestB =
-        latestMessageByChannel[dmB]?.createdAt ||
-        channelMetaMap[dmB]?.lastMessageAt ||
-        channelMetaMap[dmB]?.updatedAt ||
-        b.createdAt ||
-        '';
-      return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
-    });
+  const isSearchingUsers = searchQuery.trim().length > 0;
+  const cleanSearch = searchQuery.trim().toLowerCase();
+
+  const isMemberFollowed = (memberId: string): boolean => {
+    if (memberId === SUPPORT_BOT_ID) return true;
+    return Boolean(
+      followingMap[memberId] || (userProfile?.followingIds || []).includes(memberId)
+    );
+  };
+
+  const hasTextedMember = (memberId: string): boolean => {
+    if (memberId === SUPPORT_BOT_ID) return true;
+    if (!currentUser?.uid) return false;
+    const dmId = computeDmConversationId(currentUser.uid, memberId);
+    const meta = channelMetaMap[dmId];
+    const latest = latestMessageByChannel[dmId];
+    return Boolean(
+      (latest && latest.text) ||
+        (meta && (meta.lastMessageText || meta.lastMessageAt || meta.lastMessageSenderId))
+    );
+  };
+
+  const matchesMemberSearch = (m: UserProfile): boolean => {
+    if (!isSearchingUsers) return true;
+    return (
+      (m.displayName || '').toLowerCase().includes(cleanSearch) ||
+      (m.email || '').toLowerCase().includes(cleanSearch) ||
+      (m.username || '').toLowerCase().includes(cleanSearch) ||
+      (m.bio || '').toLowerCase().includes(cleanSearch)
+    );
+  };
+
+  const sortMembersByRecentActivity = (a: UserProfile, b: UserProfile): number => {
+    if (a.id === SUPPORT_BOT_ID) return -1;
+    if (b.id === SUPPORT_BOT_ID) return 1;
+    if (!currentUser?.uid) return 0;
+    if (onlineFirstSort) {
+      const onlineA = getCachedIsOnline(a.id) ? 1 : 0;
+      const onlineB = getCachedIsOnline(b.id) ? 1 : 0;
+      if (onlineA !== onlineB) return onlineB - onlineA;
+    }
+    const dmA = computeDmConversationId(currentUser.uid, a.id);
+    const dmB = computeDmConversationId(currentUser.uid, b.id);
+    const unreadA = unreadCountsByChannel[dmA] || 0;
+    const unreadB = unreadCountsByChannel[dmB] || 0;
+    if (unreadA !== unreadB) return unreadB - unreadA;
+    const latestA =
+      latestMessageByChannel[dmA]?.createdAt ||
+      channelMetaMap[dmA]?.lastMessageAt ||
+      channelMetaMap[dmA]?.updatedAt ||
+      a.createdAt ||
+      '';
+    const latestB =
+      latestMessageByChannel[dmB]?.createdAt ||
+      channelMetaMap[dmB]?.lastMessageAt ||
+      channelMetaMap[dmB]?.updatedAt ||
+      b.createdAt ||
+      '';
+    return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
+  };
+
+  // 1) Recent Conversations: strictly ONLY users you have actually texted (plus Support Bot)
+  const recentChatMembers = allMembers
+    .filter((m) => hasTextedMember(m.id) && matchesMemberSearch(m))
+    .sort(sortMembersByRecentActivity);
+
+  // 2) Connected Contacts (for Active Now & Quick Connect when not searching): ONLY users you follow or have texted
+  const connectedMembers = allMembers
+    .filter((m) => isMemberFollowed(m.id) || hasTextedMember(m.id))
+    .sort(sortMembersByRecentActivity);
+
+  // 3) Search Results / All People: when searching, find any matching user in the app; when not searching, show followed/texted contacts
+  const filteredMembers = (
+    isSearchingUsers
+      ? allMembers.filter(matchesMemberSearch)
+      : connectedMembers
+  ).sort(sortMembersByRecentActivity);
 
   // Total unread conversations count for header badge
   const totalUnreadMessages = Object.entries(unreadCountsByChannel).reduce(
@@ -3787,6 +4082,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   // On mobile/tablet (< 1024px), show the Chat List screen when showMobileChannels is true or no conversation is active
   const isMobileListScreenVisible = showMobileChannels || !activeChannel;
   const visibleMembersList = filteredMembers.slice(0, convoDisplayLimit);
+  const visibleRecentChatMembers = recentChatMembers.slice(0, convoDisplayLimit);
   const isActiveChannelMuted = Boolean(activeChannel && mutedChannelIds.includes(activeChannel));
   const sharedPhotosInChat = messages.flatMap((m) => {
     if (m.isDeleted || m.mediaType === 'audio' || m.mediaType === 'video' || m.mediaType === 'file') return [];
@@ -3842,8 +4138,20 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     }
   );
 
-  const handleOpenMemberChat = (memberId: string) => {
+  const handleOpenMemberChat = (memberId: string, fromSearch = false) => {
     if (!currentUser?.uid) return;
+    if (fromSearch || isSearchingUsers) {
+      setSearchedAllowedUserIds((prev) => {
+        if (prev.includes(memberId)) return prev;
+        const next = [memberId, ...prev].slice(0, 100);
+        try {
+          localStorage.setItem('wavelink_searched_chat_uids', JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      });
+    }
     const dmId = computeDmConversationId(currentUser.uid, memberId);
     setUnreadCountsByChannel((prev) => (prev[dmId] === 0 ? prev : { ...prev, [dmId]: 0 }));
     setActiveChannel(dmId);
@@ -3923,30 +4231,43 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                 </button>
               </div>
             </div>
+          </div>
 
-            {/* Search Input */}
-            <div className="relative">
-              <Search
-                size={16}
-                className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none"
-              />
-              <input
-                ref={searchInputRef}
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search chats, people or groups..."
-                className="w-full min-h-[44px] pl-10 pr-9 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 transition"
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery('')}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-                  aria-label="Clear search"
-                >
-                  <X size={14} />
-                </button>
+          {/* Scrollable Chat Home Body (Search & Tabs scroll away naturally with the list) */}
+          <div
+            ref={chatHomeScrollRef}
+            className="wavelink-chat-home-scroll flex-1 overflow-y-auto p-3.5 space-y-4 pb-28"
+          >
+            {/* Search Input to find other users, chats, or groups in the app */}
+            <div className="space-y-1.5">
+              <div className="relative">
+                <Search
+                  size={16}
+                  className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none"
+                />
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Find users by name or @username to text..."
+                  className="w-full min-h-[44px] pl-10 pr-9 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 transition"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                    aria-label="Clear search"
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+              {isSearchingUsers && (
+                <p className="text-[11px] font-semibold text-[var(--text-secondary)] px-1">
+                  Showing users matching "{searchQuery.trim()}" — tap Chat or Follow to message them.
+                </p>
               )}
             </div>
 
@@ -3955,7 +4276,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               {(
                 [
                   { id: 'chats', label: 'Chats', count: totalUnreadMessages },
-                  { id: 'people', label: 'People', count: 0 },
+                  { id: 'people', label: 'Following', count: 0 },
                   { id: 'groups', label: 'Groups', count: filteredGroups.length }
                 ] as const
               ).map((tab) => {
@@ -3997,14 +4318,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                 );
               })}
             </div>
-          </div>
 
-          {/* Scrollable Chat Home Body */}
-          <div
-            ref={chatHomeScrollRef}
-            className="wavelink-chat-home-scroll flex-1 overflow-y-auto p-3.5 space-y-5 pb-28"
-          >
-            {/* 1. Horizontal "Active now" row of round avatars with colored ring & realtime presence dot */}
+            {/* 1. Horizontal "Active now" row of round avatars (only followed or texted contacts) */}
             <div className="space-y-2">
               <div className="flex items-center justify-between px-1">
                 <div className="flex items-center gap-1.5">
@@ -4014,7 +4329,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   </span>
                 </div>
                 <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
-                  {allMembers
+                  {connectedMembers
                     .slice(0, 12)
                     .filter((m) => m.id === SUPPORT_BOT_ID || getCachedIsOnline(m.id))
                     .length}{' '}
@@ -4023,7 +4338,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </div>
 
               <div className="flex items-center gap-3 overflow-x-auto pb-1.5 pt-0.5 no-scrollbar">
-                {allMembers.slice(0, 12).map((person) => {
+                {connectedMembers.slice(0, 12).map((person) => {
                   const firstName = (person.displayName || 'Waver').split(' ')[0];
                   const isBot = person.id === SUPPORT_BOT_ID;
                   return (
@@ -4070,13 +4385,19 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </div>
             </div>
 
-            {/* 2. People Grid of Large Rounded Avatar Cards (2 to 3 per row on phones) */}
-            {(convoFilter === 'people' || convoFilter === 'chats') && (
+            {/* 2. People Grid of Large Rounded Avatar Cards (shows Search Results when searching, or Followed Contacts) */}
+            {(convoFilter === 'people' || (convoFilter === 'chats' && (isSearchingUsers || connectedMembers.length > 0))) && (
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
                   <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
                     <Sparkles size={13} className="text-[var(--accent-primary)]" />
-                    <span>{convoFilter === 'people' ? `All People (${filteredMembers.length})` : 'Quick Connect'}</span>
+                    <span>
+                      {isSearchingUsers
+                        ? `Found Users (${filteredMembers.filter((m) => m.id !== SUPPORT_BOT_ID).length})`
+                        : convoFilter === 'people'
+                        ? `People You Follow (${connectedMembers.length})`
+                        : 'Following & Contacts'}
+                    </span>
                   </span>
                   <div className="flex items-center gap-2">
                     <button
@@ -4097,7 +4418,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                       />
                       <span>Online first</span>
                     </button>
-                    {convoFilter === 'chats' && filteredMembers.length > 3 && (
+                    {convoFilter === 'chats' && filteredMembers.length > 4 && (
                       <button
                         type="button"
                         onClick={() => setConvoFilter('people')}
@@ -4109,19 +4430,41 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-2.5">
-                  {(convoFilter === 'people'
-                    ? visibleMembersList
-                    : filteredMembers.slice(0, 4)
-                  ).map((person) => (
-                    <ChatPersonGridCard
-                      key={`grid_${person.id}`}
-                      person={person}
-                      language={language === 'sw' ? 'sw' : 'en'}
-                      onSelect={handleOpenMemberChat}
-                    />
-                  ))}
-                </div>
+                {visibleMembersList.length === 0 ? (
+                  <div className="p-5 rounded-3xl bg-[var(--bg-surface)] border border-dashed border-[var(--border-hairline)] text-center space-y-2">
+                    <p className="text-xs font-extrabold text-[var(--text-primary)]">
+                      {isSearchingUsers
+                        ? `No users found matching "${searchQuery.trim()}"`
+                        : 'No followed contacts yet'}
+                    </p>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      Use the search bar above to find anyone in the app by name or @username.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-2.5">
+                    {(convoFilter === 'people' || isSearchingUsers
+                      ? visibleMembersList
+                      : filteredMembers.slice(0, 4)
+                    ).map((person) => (
+                      <ChatPersonGridCard
+                        key={`grid_${person.id}`}
+                        person={person}
+                        language={language === 'sw' ? 'sw' : 'en'}
+                        isFollowed={isMemberFollowed(person.id)}
+                        onToggleFollow={handleToggleFollowInChat}
+                        onSelect={(uid) => handleOpenMemberChat(uid, isSearchingUsers)}
+                        onStartCall={(targetPerson, callType) =>
+                          onOpenCall(callType, {
+                            id: targetPerson.id,
+                            name: targetPerson.displayName,
+                            photoURL: targetPerson.photoURL
+                          })
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -4294,13 +4637,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </div>
             )}
 
-            {/* 4. Conversation List (Comfortable >= 76px row height, big avatar with ring, preview, time, unread badge, typing...) */}
+            {/* 4. Conversation List (Strictly ONLY users you have actually texted, plus Support Bot) */}
             {convoFilter === 'chats' && (
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between px-1">
                   <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
                     <MessageSquare size={13} className="text-[var(--accent-primary)]" />
-                    <span>Recent Conversations ({filteredMembers.length})</span>
+                    <span>Recent Conversations ({recentChatMembers.length})</span>
                   </span>
                 </div>
 
@@ -4319,18 +4662,18 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                       </div>
                     ))}
                   </div>
-                ) : visibleMembersList.length === 0 ? (
+                ) : visibleRecentChatMembers.length === 0 ? (
                   <div className="p-6 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-center space-y-2">
                     <p className="text-sm font-extrabold text-[var(--text-primary)]">
-                      No conversations found
+                      No recent chats yet
                     </p>
                     <p className="text-xs text-[var(--text-secondary)]">
-                      Try another search name or tap a person above to say hello!
+                      Search for someone above or tap a person you follow to start texting!
                     </p>
                   </div>
                 ) : (
                   <div className="space-y-2.5">
-                    {visibleMembersList.map((member) => {
+                    {visibleRecentChatMembers.map((member) => {
                       if (!currentUser) return null;
                       const dmId = computeDmConversationId(currentUser.uid, member.id);
                       const isActive = activeChannel === dmId && !showMobileChannels;
@@ -4730,7 +5073,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               ) : null}
             </div>
 
-            <div className="flex items-center gap-1 shrink-0 relative">
+            <div className="flex items-center gap-1.5 shrink-0 relative">
               {isDirectMessage && directRecipient && !isChattingWithSupportBot && (
                 isBlockedFromAdminChat ? (
                   <button
@@ -4743,7 +5086,38 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                     <span>Pro</span>
                   </button>
                 ) : (
-                  <>
+                  <div
+                    className="wavelink-mobile-convo-call-group inline-flex items-center rounded-full p-0.5 bg-[var(--bg-subtle)] border border-[var(--border-hairline)] shadow-2xs"
+                    role="group"
+                    aria-label="Call options"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (callPrivacyBlockReason) {
+                          setChatMediaNotice(callPrivacyBlockReason);
+                          return;
+                        }
+                        onOpenCall('voice', {
+                          id: directRecipient.id,
+                          name: directRecipient.displayName,
+                          photoURL: directRecipient.photoURL
+                        });
+                      }}
+                      className={`wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-voice text-[var(--text-primary)] cursor-pointer ${
+                        callPrivacyBlockReason ? 'opacity-45' : ''
+                      }`}
+                      title={callPrivacyBlockReason || 'Voice Call'}
+                      aria-label="Voice Call"
+                    >
+                      <PhoneCall size={17} className="text-emerald-500" />
+                    </button>
+
+                    <span
+                      className="w-[1px] h-5 bg-[var(--border-hairline)] shrink-0"
+                      aria-hidden="true"
+                    />
+
                     <button
                       type="button"
                       onClick={() => {
@@ -4764,34 +5138,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                         background:
                           'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
                       }}
-                      title={callPrivacyBlockReason || 'Start Video Call'}
-                      aria-label="Start Video Call"
+                      title={callPrivacyBlockReason || 'Video Call'}
+                      aria-label="Video Call"
                     >
-                      <Video size={18} />
+                      <Video size={17} />
                     </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (callPrivacyBlockReason) {
-                          setChatMediaNotice(callPrivacyBlockReason);
-                          return;
-                        }
-                        onOpenCall('voice', {
-                          id: directRecipient.id,
-                          name: directRecipient.displayName,
-                          photoURL: directRecipient.photoURL
-                        });
-                      }}
-                      className={`wavelink-mobile-convo-header-btn wavelink-mobile-convo-call-voice bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer ${
-                        callPrivacyBlockReason ? 'opacity-45' : ''
-                      }`}
-                      title={callPrivacyBlockReason || 'Start Voice Call'}
-                      aria-label="Start Voice Call"
-                    >
-                      <PhoneCall size={18} className="text-emerald-500" />
-                    </button>
-                  </>
+                  </div>
                 )
               )}
 
@@ -4806,7 +5158,53 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               </button>
 
               {showHeaderMenu && (
-                <div className="wavelink-mobile-convo-menu absolute right-0 top-12 w-56 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-1.5 z-50 space-y-1">
+                <div className="wavelink-mobile-convo-menu absolute right-0 top-13 w-60 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-xl p-2 z-50 space-y-1.5">
+                  {isDirectMessage && directRecipient && !isChattingWithSupportBot && !isBlockedFromAdminChat && (
+                    <div className="grid grid-cols-2 gap-1.5 pb-1.5 border-b border-[var(--border-hairline)]">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowHeaderMenu(false);
+                          if (callPrivacyBlockReason) {
+                            setChatMediaNotice(callPrivacyBlockReason);
+                            return;
+                          }
+                          onOpenCall('voice', {
+                            id: directRecipient.id,
+                            name: directRecipient.displayName,
+                            photoURL: directRecipient.photoURL
+                          });
+                        }}
+                        className="min-h-[44px] px-2.5 py-2 rounded-xl bg-emerald-500/12 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <PhoneCall size={15} className="text-emerald-500 shrink-0" />
+                        <span>Voice Call</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowHeaderMenu(false);
+                          if (callPrivacyBlockReason) {
+                            setChatMediaNotice(callPrivacyBlockReason);
+                            return;
+                          }
+                          onOpenCall('video', {
+                            id: directRecipient.id,
+                            name: directRecipient.displayName,
+                            photoURL: directRecipient.photoURL
+                          });
+                        }}
+                        className="min-h-[44px] px-2.5 py-2 rounded-xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-2xs cursor-pointer"
+                        style={{
+                          background:
+                            'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                        }}
+                      >
+                        <Video size={15} className="shrink-0" />
+                        <span>Video Call</span>
+                      </button>
+                    </div>
+                  )}
                   {activeChannel && (
                     <button
                       type="button"
@@ -5511,6 +5909,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   if (visibleToUid && visibleToUid !== currentUser?.uid) {
                     return null;
                   }
+                  const deletedForArr = (msg as any).deletedFor as string[] | undefined;
+                  if (
+                    deletedForMeIds.includes(msg.id) ||
+                    (Array.isArray(deletedForArr) && currentUser?.uid && deletedForArr.includes(currentUser.uid))
+                  ) {
+                    return null;
+                  }
                   if (msg.expiresAt) {
                     const expMs = Date.parse(msg.expiresAt);
                     if (Number.isFinite(expMs) && expMs <= Date.now()) {
@@ -5963,6 +6368,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                                   <Flag size={12} />
                                 </button>
                               )}
+                              {/* Delete for me (available on any message) */}
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteMessageForMe(msg.id)}
+                                className="px-1.5 py-0.5 rounded-lg hover:bg-rose-500/10 hover:text-rose-500 text-[10px] font-bold flex items-center gap-0.5 cursor-pointer"
+                                title="Delete for me"
+                              >
+                                <Trash2 size={11} />
+                                <span>For me</span>
+                              </button>
                               {isOwn && (
                                 <>
                                   <button
@@ -5979,10 +6394,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                                   <button
                                     type="button"
                                     onClick={() => handleDeleteMessage(msg.id)}
-                                    className="p-1 rounded-lg hover:bg-rose-500/10 hover:text-rose-500 cursor-pointer"
-                                    title="Unsend"
+                                    className="px-1.5 py-0.5 rounded-lg hover:bg-rose-500/10 hover:text-rose-500 text-[10px] font-bold flex items-center gap-0.5 cursor-pointer"
+                                    title="Delete for everyone"
                                   >
-                                    <Trash2 size={12} />
+                                    <Trash2 size={11} />
+                                    <span>Everyone</span>
                                   </button>
                                 </>
                               )}
@@ -6297,7 +6713,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                     {dmPrivacyBlockReason}
                   </p>
                 </div>
-                {isRecipientBlocked && directRecipient && (
+                {isRecipientBlocked && directRecipient ? (
                   <button
                     type="button"
                     onClick={() => toggleBlockUser(directRecipient.id)}
@@ -6305,7 +6721,20 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   >
                     Unblock
                   </button>
-                )}
+                ) : directRecipient && !isFollowingRecipient ? (
+                  <button
+                    type="button"
+                    onClick={() => handleToggleFollowInChat(directRecipient)}
+                    className="min-h-[40px] px-3.5 rounded-full text-white font-extrabold text-xs flex items-center gap-1.5 shadow-2xs shrink-0 cursor-pointer"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                  >
+                    <UserPlus size={13} />
+                    <span>Follow</span>
+                  </button>
+                ) : null}
               </div>
             ) : isBlockedFromAdminChat ? (
               <div className="p-3 bg-[var(--bg-surface)] rounded-3xl border border-[var(--border-hairline)] shadow-lg flex items-center justify-between gap-2.5">
@@ -6628,7 +7057,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                     {dmPrivacyBlockReason}
                   </p>
                 </div>
-                {isRecipientBlocked && directRecipient && (
+                {isRecipientBlocked && directRecipient ? (
                   <button
                     type="button"
                     onClick={() => toggleBlockUser(directRecipient.id)}
@@ -6636,7 +7065,20 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                   >
                     Unblock User
                   </button>
-                )}
+                ) : directRecipient && !isFollowingRecipient ? (
+                  <button
+                    type="button"
+                    onClick={() => handleToggleFollowInChat(directRecipient)}
+                    className="min-h-[40px] py-2 px-4 rounded-2xl text-white font-extrabold text-xs flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                  >
+                    <UserPlus size={14} />
+                    <span>Follow to Text</span>
+                  </button>
+                ) : null}
               </div>
             ) : isBlockedFromAdminChat ? (
               <div className="p-3.5 bg-[var(--bg-subtle)] rounded-2xl border border-[var(--border-hairline)] flex items-center justify-between flex-wrap gap-3">
@@ -7142,11 +7584,11 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               )}
             </div>
 
-            {/* 3. People Grid of Suggested / Online Users */}
+            {/* 3. People Grid of Followed / Texted Contacts */}
             <div className="space-y-2.5">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
-                  People ({Math.min(allMembers.length, 6)})
+                  Following ({Math.min(connectedMembers.length, 6)})
                 </span>
                 <button
                   type="button"
@@ -7157,12 +7599,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                {allMembers.slice(0, 6).map((person) => (
+                {connectedMembers.slice(0, 6).map((person) => (
                   <ChatPersonGridCard
                     key={`desk_person_${person.id}`}
                     person={person}
                     language={language === 'sw' ? 'sw' : 'en'}
                     compact={true}
+                    isFollowed={isMemberFollowed(person.id)}
+                    onToggleFollow={handleToggleFollowInChat}
                     onSelect={handleOpenMemberChat}
                   />
                 ))}

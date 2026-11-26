@@ -1,0 +1,15 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls",
+      "delegate_permission/common.get_login_creds"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "app.wavelink.social",
+      "sha256_cert_fingerprints": [
+        "replace_with_your_play_app_signing_sha256_fingerprint_from_play_console"
+      ]
+    }
+  }
+]

@@ -1,48 +1,26 @@
-import React, { useEffect, useState } from 'react';
-import { auth } from '../firebase';
-
-const ADMIN_EMAILS = ['keylanmbilinyi5@gmail.com'];
+import React from 'react';
+import { useAuth } from '../context/AuthContext';
 
 interface AdminGuardProps {
   children: React.ReactNode;
 }
 
 export default function AdminGuard({ children }: AdminGuardProps) {
-  const initialUser = auth.currentUser;
-  const initialIsOwner = Boolean(
-    initialUser?.email && ADMIN_EMAILS.includes(initialUser.email.trim().toLowerCase())
-  );
+  const { isLoading, isAdmin, isSupportHelper, isSuperAdmin } = useAuth();
 
-  const [loading, setLoading] = useState(!initialUser);
-  const [isAdmin, setIsAdmin] = useState(initialIsOwner);
-
-  useEffect(() => {
-    const unsubscribe = auth.onAuthStateChanged((user) => {
-      if (!user || !user.email) {
-        setIsAdmin(false);
-      } else {
-        const isOwner = ADMIN_EMAILS.includes(user.email.trim().toLowerCase());
-        setIsAdmin(isOwner);
-      }
-      setLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, []);
-
-  if (loading) {
+  if (isLoading) {
     return (
       <div className="text-center p-[60px] text-slate-900 dark:text-white">
-        <h2 className="text-lg font-bold">Verifying Admin Desk clearance...</h2>
+        <h2 className="text-lg font-bold">Verifying Staff &amp; Admin Desk clearance...</h2>
       </div>
     );
   }
 
-  if (!isAdmin) {
+  if (!isAdmin && !isSupportHelper && !isSuperAdmin) {
     return (
       <div className="text-center p-10 text-slate-900 dark:text-white">
         <h2 className="text-xl font-bold mb-2">403 Forbidden</h2>
-        <p className="mb-4">Access restricted to platform administrator.</p>
+        <p className="mb-4">Access restricted to authorized WaveLink Staff (Owner, Moderator, or Support Helper).</p>
         <button
           type="button"
           onClick={() => {

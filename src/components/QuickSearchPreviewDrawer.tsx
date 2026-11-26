@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebase';
-import { collection, query, where, orderBy, limit, getDocs } from 'firebase/firestore';
+import { collection, doc, getDoc, query, where, orderBy, limit, getDocs } from 'firebase/firestore';
 import { UserProfile, Post, ActiveTab } from '../types';
 import { useAuth } from '../context/AuthContext';
 import { toggleFollowUser } from '../services/notificationService';
@@ -106,14 +106,11 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
     if (currentUser && currentUser.uid !== targetUser.id) {
       const checkFollow = async () => {
         try {
-          const followQ = query(
-            collection(db, 'follows'),
-            where('followerId', '==', currentUser.uid),
-            where('targetUserId', '==', targetUser.id),
-            limit(1)
-          );
-          const snap = await getDocs(followQ);
-          setIsFollowing(!snap.empty);
+          const [directFollow, legacyFollow] = await Promise.all([
+            getDoc(doc(db, 'follows', `follow_${currentUser.uid}_${targetUser.id}`)),
+            getDoc(doc(db, 'follows', `${currentUser.uid}_${targetUser.id}`))
+          ]);
+          setIsFollowing(directFollow.exists() || legacyFollow.exists());
         } catch {
           setIsFollowing(false);
         }
@@ -123,35 +120,26 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
       setIsFollowing(false);
     }
 
-    // Fetch up to 4 recent waves by this user
+    // Fetch up to 4 recent waves by this user (single-field query + client sort so no composite index is required)
     const fetchUserPosts = async () => {
       setIsLoadingUserPosts(true);
       try {
         const postsQ = query(
           collection(db, 'posts'),
           where('authorId', '==', targetUser.id),
-          orderBy('createdAt', 'desc'),
-          limit(4)
+          limit(12)
         );
         const snap = await getDocs(postsQ);
         const list: Post[] = [];
-        snap.forEach((doc) => list.push({ id: doc.id, ...doc.data() } as Post));
-        setUserRecentPosts(list);
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
+        list.sort((a, b) => {
+          const timeA = a.createdAt ? Date.parse(a.createdAt) || 0 : 0;
+          const timeB = b.createdAt ? Date.parse(b.createdAt) || 0 : 0;
+          return timeB - timeA;
+        });
+        setUserRecentPosts(list.slice(0, 4));
       } catch {
-        // Fallback: search by authorName
-        try {
-          const fallbackQ = query(
-            collection(db, 'posts'),
-            where('authorName', '==', targetUser.displayName || targetUser.username),
-            limit(4)
-          );
-          const snap = await getDocs(fallbackQ);
-          const list: Post[] = [];
-          snap.forEach((doc) => list.push({ id: doc.id, ...doc.data() } as Post));
-          setUserRecentPosts(list);
-        } catch {
-          setUserRecentPosts([]);
-        }
+        setUserRecentPosts([]);
       } finally {
         setIsLoadingUserPosts(false);
       }

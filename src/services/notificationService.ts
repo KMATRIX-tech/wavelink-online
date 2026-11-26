@@ -9,7 +9,9 @@ import {
   getDocs,
   query,
   where,
-  limit
+  limit,
+  arrayUnion,
+  arrayRemove
 } from 'firebase/firestore';
 import {
   AppNotification,
@@ -179,11 +181,12 @@ export async function markAllNotificationsAsRead(recipientId: string): Promise<v
     const q = query(
       collection(db, 'notifications'),
       where('recipientId', '==', recipientId),
-      where('read', '==', false),
       limit(50)
     );
     const snap = await getDocs(q);
-    const promises = snap.docs.map((d) => updateDoc(d.ref, { read: true }));
+    const promises = snap.docs
+      .filter((d) => d.data()?.read === false)
+      .map((d) => updateDoc(d.ref, { read: true }));
     await Promise.all(promises);
   } catch (err) {
     console.warn('Failed to mark all notifications as read:', err);
@@ -213,20 +216,25 @@ export async function toggleFollowUser(
   if (followerId === targetUserId) return false;
 
   const followId = `follow_${followerId}_${targetUserId}`;
+  const legacyFollowId = `${followerId}_${targetUserId}`;
   const followRef = doc(db, 'follows', followId);
+  const legacyFollowRef = doc(db, 'follows', legacyFollowId);
+  const followerUserRef = doc(db, 'users', followerId);
 
   try {
-    const q = query(
-      collection(db, 'follows'),
-      where('followerId', '==', followerId),
-      where('targetUserId', '==', targetUserId),
-      limit(1)
-    );
-    const snap = await getDocs(q);
+    const [directSnap, legacySnap] = await Promise.all([
+      getDoc(followRef),
+      getDoc(legacyFollowRef)
+    ]);
 
-    if (!snap.empty) {
+    if (directSnap.exists() || legacySnap.exists()) {
       // Unfollow
-      await deleteDoc(snap.docs[0].ref);
+      if (directSnap.exists()) await deleteDoc(followRef);
+      if (legacySnap.exists()) await deleteDoc(legacyFollowRef);
+      await updateDoc(followerUserRef, {
+        followingIds: arrayRemove(targetUserId),
+        updatedAt: new Date().toISOString()
+      }).catch(() => {});
       return false; // Not following anymore
     } else {
       // Follow
@@ -239,6 +247,10 @@ export async function toggleFollowUser(
         createdAt: new Date().toISOString()
       };
       await setDoc(followRef, followData);
+      await updateDoc(followerUserRef, {
+        followingIds: arrayUnion(targetUserId),
+        updatedAt: new Date().toISOString()
+      }).catch(() => {});
 
       // Send follow notification to target user!
       await sendNotification({

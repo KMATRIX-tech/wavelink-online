@@ -1,205 +1,200 @@
 import React, { useState } from 'react';
-import { useLanguage } from '../context/LanguageContext';
-import { triggerHaptic } from '../utils/haptics';
 import {
-  Sparkles,
-  ArrowRight,
-  ArrowLeft,
-  X,
-  Heart,
   Camera,
-  MessageSquare,
+  MessageCircle,
+  Zap,
+  ArrowRight,
   CheckCircle2,
-  Smile
+  X
 } from 'lucide-react';
+import { useLanguage } from '../context/LanguageContext';
 
 interface FirstTimeTourModalProps {
   isOpen: boolean;
-  onClose: () => void;
+  onComplete?: () => void;
+  onClose?: () => void;
+  onNavigateTab?: (tab: string) => void;
 }
 
-export const FirstTimeTourModal: React.FC<FirstTimeTourModalProps> = ({ isOpen, onClose }) => {
+export const FirstTimeTourModal: React.FC<FirstTimeTourModalProps> = ({
+  isOpen,
+  onComplete,
+  onClose,
+  onNavigateTab
+}) => {
   const { language } = useLanguage();
-  const [currentStep, setCurrentStep] = useState(0);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
 
   if (!isOpen) return null;
 
-  const tourSteps = [
+  const finishTour = (targetTab?: string) => {
+    try {
+      localStorage.setItem('wavelink_tour_completed', '1');
+      localStorage.setItem('wavelink_first_tour_completed', 'true');
+      if (localStorage.getItem('wavelink_hint_bubbles_dismissed') !== '1') {
+        localStorage.setItem('wavelink_show_hint_bubbles', '1');
+      }
+      window.dispatchEvent(new CustomEvent('wavelink:tour-completed'));
+    } catch {
+      // ignore storage errors
+    }
+    onComplete?.();
+    onClose?.();
+    if (targetTab && onNavigateTab) {
+      onNavigateTab(targetTab);
+    }
+  };
+
+  const steps = [
     {
-      badge: language === 'sw' ? 'Hatua ya 1 kati ya 3' : 'Step 1 of 3',
-      title: language === 'sw' ? 'Karibu WaveLink! 🌿' : 'Welcome to WaveLink! 🌿',
-      subtitle:
+      num: 1,
+      badge: language === 'sw' ? '1 / 3 • Shiriki' : '1 / 3 • Share',
+      title: language === 'sw' ? 'Shiriki' : 'Share',
+      desc:
         language === 'sw'
-          ? 'Nyumbani kwa marafiki, picha na video za kufurahisha'
-          : 'Your friendly home for friends, photos, and joyful stories',
-      description:
+          ? 'Chapisha picha, video, na Sparks kwa mguso mmoja.'
+          : 'Post photos, videos, and 24-hour Sparks with one tap.',
+      icon: <Camera size={34} className="text-white" />,
+      iconBg: 'from-[#2563EB] to-[#0D9488]',
+      chips:
         language === 'sw'
-          ? 'Tazama machapisho ya marafiki zako, gundua wabunifu wa Afrika Mashariki, na ushiriki wakati wako wa kila siku kwa urahisi kabisa.'
-          : 'See posts from your family and friends, explore East African creators, and share your everyday moments with zero hassle.',
-      icon: <Heart size={36} className="text-[#2563EB]" />,
-      iconBg: 'bg-blue-100 dark:bg-blue-950/60',
-      highlightText:
-        language === 'sw'
-          ? '✨ Ni bure kabisa na rahisi kutumia kama WhatsApp na Facebook!'
-          : '✨ Completely free and as easy to use as WhatsApp and Facebook!'
+          ? ['📸 Picha', '🎬 Video', '⚡ Sparks']
+          : ['📸 Photos', '🎬 Videos', '⚡ Sparks']
     },
     {
-      badge: language === 'sw' ? 'Hatua ya 2 kati ya 3' : 'Step 2 of 3',
-      title: language === 'sw' ? 'Shiriki Picha, Video na Hisia 📷' : 'Share Photos, Videos & Feelings 📷',
-      subtitle:
+      num: 2,
+      badge: language === 'sw' ? '2 / 3 • Soga' : '2 / 3 • Chat',
+      title: language === 'sw' ? 'Soga' : 'Chat',
+      desc:
         language === 'sw'
-          ? 'Gusa kisanduku kilicho juu kuanza kuchapisha'
-          : 'Just tap the friendly box at the top to share',
-      description:
+          ? 'Tuma ujumbe na piga simu bure na marafiki zako.'
+          : 'Message and call friends for free with fun chat themes.',
+      icon: <MessageCircle size={34} className="text-white" />,
+      iconBg: 'from-[#0D9488] to-[#2563EB]',
+      chips:
         language === 'sw'
-          ? 'Weka picha ya familia, video fupi ya siku yako, au chagua jinsi unavyojisikia (kama mwenye furaha au aliyebarikiwa).'
-          : 'Post a family photo, a short clip of your day, or pick how you are feeling (like happy 😊 or blessed 🙏) for your friends to see.',
-      icon: <Camera size={36} className="text-[#0D9488]" />,
-      iconBg: 'bg-teal-100 dark:bg-teal-950/60',
-      highlightText:
-        language === 'sw'
-          ? '💡 Tumia vitufe vikubwa vya Picha, Video na Hisia vilivyo juu ya ukurasa.'
-          : '💡 Use the big Photo, Video, and Feeling buttons right at the top of Home.'
+          ? ['💬 Ujumbe', '📞 Simu Bure', '🎨 Mandhari']
+          : ['💬 Messages', '📞 Free Calls', '🎨 Themes']
     },
     {
-      badge: language === 'sw' ? 'Hatua ya 3 kati ya 3' : 'Step 3 of 3',
-      title: language === 'sw' ? 'Soga Bure na Hali Rahisi 💬' : 'Free Chat & Simple Mode 💬',
-      subtitle:
+      num: 3,
+      badge: language === 'sw' ? '3 / 3 • WavePoints' : '3 / 3 • WavePoints',
+      title: language === 'sw' ? 'Pata WavePoints' : 'Earn WavePoints',
+      desc:
         language === 'sw'
-          ? 'Wasiliana na marafiki bila kulipia'
-          : 'Stay connected with big buttons and clear text',
-      description:
+          ? 'Ingia kila siku na ushiriki machapisho kupata WavePoints.'
+          : 'Check in daily and share posts to earn WavePoints.',
+      icon: <Zap size={34} className="text-white" />,
+      iconBg: 'from-[#D97706] to-[#2563EB]',
+      chips:
         language === 'sw'
-          ? 'Tuma ujumbe wa bure kwenye Chat, tazama Reels za kuchekesha, na ukipenda unaweza kuwasha "Hali Rahisi" kwenye Wasifu kwa maandishi makubwa zaidi!'
-          : 'Send free messages to any friend in Messages, watch funny short Reels, and switch on "Simple Mode" in Settings anytime for extra large text!',
-      icon: <Smile size={36} className="text-[#D97706]" />,
-      iconBg: 'bg-amber-100 dark:bg-amber-950/60',
-      highlightText:
-        language === 'sw'
-          ? '🎉 Ukiwa na swali lolote, gusa kitufe cha Msaada au muulize WELINK!'
-          : '🎉 If you ever need help, just tap the Help button or ask WELINK!'
+          ? ['⚡ +10 Kila Siku', '🏆 Beji', '🎁 Zawadi']
+          : ['⚡ +10 Daily', '🏆 Badges', '🎁 Perks']
     }
   ];
 
-  const step = tourSteps[currentStep];
-
-  const handleNext = () => {
-    triggerHaptic('light');
-    if (currentStep < tourSteps.length - 1) {
-      setCurrentStep((p) => p + 1);
-    } else {
-      handleComplete();
-    }
-  };
-
-  const handlePrev = () => {
-    triggerHaptic('light');
-    if (currentStep > 0) {
-      setCurrentStep((p) => p - 1);
-    }
-  };
-
-  const handleComplete = () => {
-    triggerHaptic('medium');
-    try {
-      localStorage.setItem('wavelink_tour_completed', '1');
-    } catch {
-      // ignore
-    }
-    onClose();
-  };
+  const current = steps[step - 1];
 
   return (
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Welcome Tour"
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-stone-900/60 backdrop-blur-sm animate-fade-in"
+      aria-label={current.title}
+      className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-slate-950/65 backdrop-blur-xs animate-in fade-in duration-200"
     >
-      <div className="w-full max-w-lg bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-3xl p-6 sm:p-8 shadow-2xl relative text-stone-900 dark:text-stone-100 flex flex-col justify-between min-h-[460px]">
-        {/* Top Header: Badge & Skip Button */}
-        <div className="flex items-center justify-between">
-          <span className="px-3 py-1 rounded-full bg-blue-50 dark:bg-blue-950/50 text-[#2563EB] text-xs font-extrabold border border-blue-200/60 dark:border-blue-900/50">
-            {step.badge}
-          </span>
-          <button
-            type="button"
-            onClick={handleComplete}
-            className="text-xs font-bold text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 py-1 px-2.5 rounded-lg transition cursor-pointer"
+      <div className="w-full max-w-sm bg-white dark:bg-slate-900 border border-slate-200/90 dark:border-slate-800 rounded-3xl overflow-hidden shadow-2xl relative">
+        {/* Top Skip button */}
+        <button
+          type="button"
+          onClick={() => finishTour()}
+          className="absolute top-3.5 right-3.5 z-20 min-h-[44px] px-3.5 py-1.5 rounded-full bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-xs font-extrabold text-slate-700 dark:text-slate-200 flex items-center gap-1 transition cursor-pointer"
+        >
+          <span>{language === 'sw' ? 'Ruka' : 'Skip'}</span>
+          <X size={14} />
+        </button>
+
+        {/* Top Soft Gradient Banner with Big Friendly Icon */}
+        <div className="pt-9 pb-6 px-6 bg-gradient-to-b from-blue-500/10 via-teal-500/5 to-transparent flex flex-col items-center text-center">
+          <div
+            className={`w-20 h-20 rounded-3xl bg-gradient-to-tr ${current.iconBg} flex items-center justify-center shadow-lg shadow-blue-500/20 mb-4`}
           >
-            {language === 'sw' ? 'Ruka (Skip)' : 'Skip tour'}
-          </button>
-        </div>
-
-        {/* Center: Friendly Visual Illustration & Copy */}
-        <div className="py-4 my-auto text-center space-y-4">
-          <div className={`w-20 h-20 rounded-3xl ${step.iconBg} mx-auto flex items-center justify-center shadow-inner`}>
-            {step.icon}
+            {current.icon}
           </div>
 
-          <div className="space-y-1.5">
-            <h2 className="text-xl sm:text-2xl font-black text-[#1C1917] dark:text-stone-100 tracking-tight">
-              {step.title}
-            </h2>
-            <p className="text-xs sm:text-sm font-semibold text-[#0D9488]">
-              {step.subtitle}
-            </p>
-          </div>
+          <span className="px-3 py-1 rounded-full text-xs font-extrabold uppercase tracking-wider bg-blue-500/10 text-[#2563EB] dark:text-blue-400 mb-2">
+            {current.badge}
+          </span>
 
-          <p className="text-sm text-stone-600 dark:text-stone-300 max-w-md mx-auto leading-relaxed">
-            {step.description}
+          <h2 className="text-2xl font-extrabold text-slate-900 dark:text-white tracking-tight">
+            {current.title}
+          </h2>
+
+          <p className="text-base text-slate-600 dark:text-slate-300 mt-2 leading-snug max-w-xs">
+            {current.desc}
           </p>
-
-          <div className="p-3 rounded-2xl bg-stone-50 dark:bg-stone-800/60 border border-stone-200/80 dark:border-stone-700 text-xs font-medium text-stone-700 dark:text-stone-300">
-            {step.highlightText}
-          </div>
         </div>
 
-        {/* Bottom Bar: Indicators & Big Arrows Navigation */}
-        <div className="pt-4 border-t border-stone-100 dark:border-stone-800 flex items-center justify-between gap-3">
-          {/* Step Dots */}
-          <div className="flex items-center gap-1.5">
-            {tourSteps.map((_, i) => (
+        {/* Short Visual Pills */}
+        <div className="px-6 pb-6">
+          <div className="flex items-center justify-center gap-2 flex-wrap mb-6">
+            {current.chips.map((chip) => (
               <span
-                key={i}
-                className={`h-2 rounded-full transition-all duration-300 ${
-                  i === currentStep
-                    ? 'w-6 bg-[#2563EB]'
-                    : 'w-2 bg-stone-200 dark:bg-stone-700'
+                key={chip}
+                className="px-3.5 py-2 rounded-2xl bg-slate-100 dark:bg-slate-800/90 border border-slate-200/80 dark:border-slate-700 text-xs font-extrabold text-slate-800 dark:text-slate-100"
+              >
+                {chip}
+              </span>
+            ))}
+          </div>
+
+          {/* Step Dots */}
+          <div className="flex items-center justify-center gap-2 mb-5">
+            {[1, 2, 3].map((dot) => (
+              <button
+                key={dot}
+                type="button"
+                aria-label={`Step ${dot}`}
+                onClick={() => setStep(dot as 1 | 2 | 3)}
+                className={`h-2.5 rounded-full transition-all cursor-pointer ${
+                  step === dot
+                    ? 'w-8 bg-[#2563EB]'
+                    : 'w-2.5 bg-slate-300 dark:bg-slate-700'
                 }`}
               />
             ))}
           </div>
 
-          {/* Action Buttons with Big Arrows */}
-          <div className="flex items-center gap-2">
-            {currentStep > 0 && (
+          {/* Big Action Buttons */}
+          <div className="flex items-center gap-2.5">
+            {step > 1 && (
               <button
                 type="button"
-                onClick={handlePrev}
-                className="min-h-[48px] px-4 rounded-2xl border border-stone-200 dark:border-stone-700 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-700 dark:text-stone-200 font-bold text-sm flex items-center gap-1.5 transition active:scale-95 cursor-pointer"
+                onClick={() => setStep((step - 1) as 1 | 2 | 3)}
+                className="min-h-[50px] px-5 py-3 rounded-2xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-base font-extrabold transition cursor-pointer"
               >
-                <ArrowLeft size={18} />
-                <span className="hidden sm:inline">{language === 'sw' ? 'Nyuma' : 'Back'}</span>
+                {language === 'sw' ? 'Nyuma' : 'Back'}
               </button>
             )}
 
-            <button
-              type="button"
-              onClick={handleNext}
-              className="min-h-[48px] px-6 rounded-2xl bg-[#2563EB] hover:bg-blue-700 text-white font-extrabold text-sm flex items-center gap-2 shadow-md shadow-blue-600/20 transition active:scale-95 cursor-pointer"
-            >
-              <span>
-                {currentStep === tourSteps.length - 1
-                  ? language === 'sw'
-                    ? 'Anza Sasa! 🎉'
-                    : "Let's Go! 🎉"
-                  : language === 'sw'
-                  ? 'Mbele'
-                  : 'Next'}
-              </span>
-              <ArrowRight size={18} />
-            </button>
+            {step < 3 ? (
+              <button
+                type="button"
+                onClick={() => setStep((step + 1) as 1 | 2 | 3)}
+                className="flex-1 min-h-[50px] px-6 py-3 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-base font-extrabold flex items-center justify-center gap-2 shadow-md shadow-blue-500/20 active:scale-95 transition cursor-pointer"
+              >
+                <span>{language === 'sw' ? 'Endelea' : 'Next'}</span>
+                <ArrowRight size={18} />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => finishTour('feed')}
+                className="flex-1 min-h-[50px] px-6 py-3 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] hover:opacity-95 text-white text-base font-extrabold flex items-center justify-center gap-2 shadow-md shadow-blue-500/25 active:scale-95 transition cursor-pointer"
+              >
+                <CheckCircle2 size={18} />
+                <span>{language === 'sw' ? 'Anza Sasa' : 'Start'}</span>
+              </button>
+            )}
           </div>
         </div>
       </div>

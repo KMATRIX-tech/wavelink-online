@@ -21,6 +21,7 @@ import { collection, query, where, orderBy, limit, onSnapshot, updateDoc, setDoc
 import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
 import { getCloudinaryTinyPlaceholderUrl } from './utils/mediaStorage';
+import { checkActionRateLimit } from './utils/safetyFilters';
 import { ActiveTab, CallRecipient } from './types';
 import { AuthPage } from './components/AuthPage';
 import { TopHeader } from './components/TopHeader';
@@ -58,6 +59,7 @@ import {
   subscribeToForegroundPushMessages,
   closeCallNotificationInSW
 } from './services/fcmService';
+import { GlobalServiceStatusBanner, ExternalLinkInterceptorModal } from './components/ExternalLinkModal';
 import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles, Volume2, VolumeX, MessageSquare, Send, X, Bell } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 
@@ -148,7 +150,7 @@ function CustomAppBackgroundLayer({ hidden }: { hidden: boolean }) {
 }
 
 function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
-  const { userProfile, isAdmin } = useAuth();
+  const { userProfile, isAdmin, showGlobalToast } = useAuth();
   const { appearanceTheme, setAppearanceTheme } = useTheme();
   const { setLanguage, language, t } = useLanguage();
 
@@ -225,6 +227,48 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     }
   });
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [showHintBubble, setShowHintBubble] = useState<boolean>(() => {
+    try {
+      return (
+        localStorage.getItem('wavelink_show_hint_bubbles') === '1' &&
+        localStorage.getItem('wavelink_hint_bubbles_dismissed') !== '1'
+      );
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    const handleOpenHelp = () => setIsHelpOpen(true);
+    const handleOpenTour = () => setIsTourOpen(true);
+    const handleTourDone = () => {
+      try {
+        if (localStorage.getItem('wavelink_hint_bubbles_dismissed') !== '1') {
+          setShowHintBubble(true);
+        }
+      } catch {
+        setShowHintBubble(true);
+      }
+    };
+    window.addEventListener('wavelink:open-help', handleOpenHelp);
+    window.addEventListener('wavelink:open-tour', handleOpenTour);
+    window.addEventListener('wavelink:tour-completed', handleTourDone);
+    return () => {
+      window.removeEventListener('wavelink:open-help', handleOpenHelp);
+      window.removeEventListener('wavelink:open-tour', handleOpenTour);
+      window.removeEventListener('wavelink:tour-completed', handleTourDone);
+    };
+  }, []);
+
+  const dismissHintBubble = useCallback(() => {
+    setShowHintBubble(false);
+    try {
+      localStorage.setItem('wavelink_hint_bubbles_dismissed', '1');
+      localStorage.removeItem('wavelink_show_hint_bubbles');
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const [isRingtoneMuted, setIsRingtoneMuted] = useState(false);
   const [incomingAcceptMode, setIncomingAcceptMode] = useState<'video' | 'voice'>('video');
@@ -1145,6 +1189,11 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   ]);
 
   const handleOpenCall = (type: 'video' | 'voice', recipient?: CallRecipient) => {
+    const callRate = checkActionRateLimit(currentUser?.uid || 'user', 'call');
+    if (!callRate.allowed) {
+      showGlobalToast(callRate.message || 'You are starting calls too fast. Please wait a moment and try again.');
+      return;
+    }
     if (recipient?.id) {
       const targetCached = getCachedUserProfile(recipient.id);
       if (
@@ -1490,6 +1539,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       {/* Pro Custom App Background Layer (fixed, lazy-loaded, hidden behind call overlays) */}
       <CustomAppBackgroundLayer hidden={Boolean(activeCall || incomingCall)} />
 
+      {/* Global Service Status Banner & Force Password Reset Prompt */}
+      <GlobalServiceStatusBanner />
+
+      {/* External Link Safety Warning Modal */}
+      <ExternalLinkInterceptorModal />
+
       {/* Top in-app warning notice if issued by admin */}
       <WarningBanner />
 
@@ -1539,6 +1594,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
               onStartChat={handleStartChatWithUser}
               hasNewPosts={hasNewPosts}
               onLoadNewPosts={markFeedVisitedNow}
+              hasUnreadNotifications={unreadNotificationIds.length > 0}
+              unreadNotificationCount={unreadNotificationIds.length}
             />
           )}
           {activeTab === 'trending' && (
@@ -1817,25 +1874,27 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                   <div className="wavelink-incoming-call-mode-toggle" role="group" aria-label="Answer mode">
                     <button
                       type="button"
-                      onClick={() => setIncomingAcceptMode('video')}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-colors ${
-                        incomingAcceptMode === 'video'
-                          ? 'bg-white text-slate-950 shadow-sm'
-                          : 'text-white/80 hover:text-white'
-                      }`}
-                    >
-                      Accept with video
-                    </button>
-                    <button
-                      type="button"
                       onClick={() => setIncomingAcceptMode('voice')}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-colors ${
+                      className={`min-h-[40px] px-3.5 py-1.5 rounded-full text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
                         incomingAcceptMode === 'voice'
                           ? 'bg-white text-slate-950 shadow-sm'
                           : 'text-white/80 hover:text-white'
                       }`}
                     >
-                      Accept voice only
+                      <PhoneCall size={13} />
+                      <span>Voice Call</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIncomingAcceptMode('video')}
+                      className={`min-h-[40px] px-3.5 py-1.5 rounded-full text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                        incomingAcceptMode === 'video'
+                          ? 'bg-white text-slate-950 shadow-sm'
+                          : 'text-white/80 hover:text-white'
+                      }`}
+                    >
+                      <Video size={13} />
+                      <span>Video Call</span>
                     </button>
                   </div>
                 )}
@@ -1844,9 +1903,23 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                   <div className="flex flex-col items-center gap-2">
                     <button
                       type="button"
+                      onClick={handleDeclineIncomingCall}
+                      aria-label={t('call.decline')}
+                      className="wavelink-incoming-call-btn wavelink-incoming-call-btn--reject cursor-pointer"
+                    >
+                      <PhoneOff size={28} />
+                    </button>
+                    <span className="text-xs font-extrabold text-white/90">
+                      {t('call.decline') || 'Decline'}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-col items-center gap-2">
+                    <button
+                      type="button"
                       onClick={() => handleAcceptIncomingCall(incomingAcceptMode)}
                       aria-label={t('call.answer')}
-                      className="wavelink-incoming-call-btn wavelink-incoming-call-btn--accept"
+                      className="wavelink-incoming-call-btn wavelink-incoming-call-btn--accept cursor-pointer"
                     >
                       {incomingCall.callType === 'video' && incomingAcceptMode === 'video' ? (
                         <Video size={28} />
@@ -1854,22 +1927,10 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                         <PhoneCall size={28} />
                       )}
                     </button>
-                    <span className="text-xs font-bold text-white/90">
-                      {t('call.answer') || 'Accept'}
-                    </span>
-                  </div>
-
-                  <div className="flex flex-col items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleDeclineIncomingCall}
-                      aria-label={t('call.decline')}
-                      className="wavelink-incoming-call-btn wavelink-incoming-call-btn--reject"
-                    >
-                      <PhoneOff size={28} />
-                    </button>
-                    <span className="text-xs font-bold text-white/90">
-                      {t('call.decline') || 'Reject'}
+                    <span className="text-xs font-extrabold text-white/90">
+                      {incomingCall.callType === 'video' && incomingAcceptMode === 'video'
+                        ? 'Video'
+                        : t('call.answer') || 'Answer'}
                     </span>
                   </div>
                 </div>
@@ -1945,10 +2006,45 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
       {/* Celebration Toast Banner for Milestones */}
       <CelebrationBanner />
 
+      {/* Small One-Time Hint Bubble right after the 3-screen welcome tour */}
+      {showHintBubble && !isTourOpen && !isHelpOpen && !incomingCall && !activeCall && (
+        <div
+          role="status"
+          className="fixed bottom-24 lg:bottom-8 left-1/2 -translate-x-1/2 z-[88] max-w-xs w-[calc(100%-2rem)] rounded-2xl bg-slate-900/95 text-white px-4 py-3 shadow-xl border border-white/15 flex items-center justify-between gap-3 animate-in fade-in slide-in-from-bottom-2 duration-200"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              dismissHintBubble();
+              setActiveTab('studio');
+            }}
+            className="flex items-center gap-2.5 text-left min-w-0 flex-1 cursor-pointer"
+          >
+            <span className="w-7 h-7 rounded-xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] flex items-center justify-center shrink-0">
+              <Sparkles size={14} className="text-white" />
+            </span>
+            <span className="text-xs font-extrabold leading-tight">
+              {language === 'sw'
+                ? 'Kidokezo: Bonyeza + kushiriki chapisho lako la kwanza!'
+                : 'Tip: Tap + to share your first post or Spark!'}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={dismissHintBubble}
+            aria-label="Dismiss tip"
+            className="min-w-[32px] min-h-[32px] rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center shrink-0 cursor-pointer"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* 3-Step First-Time Welcome Tour Modal */}
       <FirstTimeTourModal
         isOpen={isTourOpen}
         onClose={() => setIsTourOpen(false)}
+        onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
       />
 
       {/* Friendly Help & Answers Modal */}
@@ -1969,24 +2065,22 @@ function RootAppContent() {
   // 1. Build & Runtime Environment Check
   if (!envValidation.isValid) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A] p-6 text-center font-sans">
-        <div className="max-w-md w-full bg-white rounded-2xl shadow-xl border border-amber-200 p-6 sm:p-8">
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A] p-6 text-center font-sans safe-area-top safe-area-bottom">
+        <div className="max-w-[26rem] w-full bg-white rounded-2xl shadow-xl border border-amber-200 p-6 sm:p-8">
           <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center mx-auto mb-4">
             <AlertTriangle size={30} />
           </div>
-          <h2 className="text-xl font-bold text-slate-900 mb-2">Configuration Notice</h2>
+          <h2 className="text-xl font-bold text-slate-900 mb-2">Getting WaveLink ready</h2>
           <p className="text-sm text-slate-600 mb-4 leading-relaxed">
-            {envValidation.message}
+            WaveLink could not finish loading its connection settings. Check your internet connection and tap Try again.
           </p>
-          <div className="bg-slate-100 rounded-xl p-3 text-xs font-mono text-slate-700 text-left overflow-x-auto">
-            Missing configuration: {envValidation.missingKeys.join(', ')}
-          </div>
           <button
             type="button"
             onClick={() => window.location.reload()}
-            className="mt-5 w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition cursor-pointer"
+            className="mt-3 w-full min-h-[2.75rem] py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-2"
           >
-            Retry Loading
+            <Waves size={14} />
+            <span>Try again</span>
           </button>
         </div>
       </div>

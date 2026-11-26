@@ -1720,9 +1720,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                 logFinalFailure(`Caller setRemoteDescription failed: ${err instanceof Error ? err.message : String(err)}`);
                 setFailureReasonLabel('peer connection failed');
                 setFailureNotice(
-                  err instanceof Error
-                    ? `Peer connection setup failed (${err.message}). Tap Try again.`
-                    : 'Peer connection setup failed. Tap Try again.'
+                  'Could not finish connecting the call. Check your internet and tap Try again.'
                 );
                 updateLifecycleState('failed', 'Connection failed');
               }
@@ -1798,9 +1796,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             });
             setFailureReasonLabel('peer connection failed');
             setFailureNotice(
-              err instanceof Error
-                ? `Peer connection answer failed (${err.message}). Tap Try again.`
-                : 'Peer connection failed while answering. Tap Try again.'
+              'Could not answer the call right now. Check your internet and tap Try again.'
             );
             updateLifecycleState('failed', 'Connection failed');
           }
@@ -1880,9 +1876,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
       const detail =
         err instanceof CallInitError
           ? err.userDetail
-          : err instanceof Error
-          ? err.message
-          : 'Unable to initialize call.';
+          : 'Could not start the call right now. Check your internet and tap Try again.';
       logFinalFailure(`Fatal call initialization error [${reasonCode}]: ${detail}`, {
         checkIceRelay: false,
       });
@@ -2498,23 +2492,38 @@ export const CallingModal: React.FC<CallingModalProps> = ({
         >
           <div className="flex items-center justify-between gap-2.5 w-full">
             <div className="flex items-center gap-2.5 min-w-0 flex-1">
-              {/* Mobile & Tablet (<1024px): avatar + caller name + status + top timer */}
+              {/* Mobile & Tablet (<1024px): avatar + caller name + call mode pill + status + top timer */}
               <div className="flex lg:hidden items-center gap-2.5 min-w-0 flex-1">
                 <Avatar
                   uid={resolvedRecipientId}
                   src={resolvedRecipientAvatar}
                   alt={resolvedRecipientName}
                   fallbackName={resolvedRecipientName}
-                  size={36}
+                  size={38}
                   showStatus={false}
                   onlyWhenVisible={false}
                   ringClassName="border border-white/40"
                 />
                 <div className="min-w-0 flex-1">
-                  <h2 className="font-bold text-sm sm:text-base truncate leading-tight text-white">
-                    {resolvedRecipientName}
-                  </h2>
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-white/90 min-w-0">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <h2 className="font-extrabold text-sm sm:text-base truncate leading-tight text-white">
+                      {resolvedRecipientName}
+                    </h2>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/14 border border-white/20 text-[10px] font-extrabold text-white/95 shrink-0">
+                      {normalizedMode === 'video' && !isVideoOff ? (
+                        <>
+                          <Video size={10} className="text-cyan-300" />
+                          <span>Video</span>
+                        </>
+                      ) : (
+                        <>
+                          <PhoneCall size={10} className="text-emerald-300" />
+                          <span>Voice</span>
+                        </>
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-white/90 min-w-0 mt-0.5">
                     <span
                       className={`w-2 h-2 rounded-full shrink-0 ${
                         callState === 'connected' && connectionQuality === 'good'
@@ -2575,8 +2584,20 @@ export const CallingModal: React.FC<CallingModalProps> = ({
               </div>
             </div>
 
-            {/* Mobile & Tablet (<1024px) More (...) Menu Trigger (48x48 touch target) */}
-            <div className="flex lg:hidden items-center gap-2 shrink-0">
+            {/* Mobile & Tablet (<1024px) Quick In-Call Chat + More (...) Menu Triggers (44x44+ touch targets) */}
+            <div className="flex lg:hidden items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowInCallChat(true);
+                }}
+                aria-label="In-call chat"
+                title="In-call chat"
+                className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full bg-black/45 hover:bg-black/60 border border-white/20 text-white flex items-center justify-center backdrop-blur-md transition active:scale-95 cursor-pointer"
+              >
+                <MessageSquare className="w-4 h-4" />
+              </button>
               <button
                 type="button"
                 onClick={(e) => {
@@ -2584,7 +2605,8 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                   setShowMobileMoreSheet(true);
                 }}
                 aria-label="More call options"
-                className="w-12 h-12 min-w-[48px] min-h-[48px] rounded-full bg-black/45 hover:bg-black/60 border border-white/20 text-white flex items-center justify-center backdrop-blur-md transition active:scale-95 cursor-pointer"
+                title="More call options"
+                className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full bg-black/45 hover:bg-black/60 border border-white/20 text-white flex items-center justify-center backdrop-blur-md transition active:scale-95 cursor-pointer"
               >
                 <MoreHorizontal className="w-5 h-5" />
               </button>
@@ -2924,7 +2946,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
             - Desktop (>=1024px): Clean floating dark toolbar with Mic+picker, Cam+picker, Chat, Emoji, ScreenShare, More(...), Recording-style Timer, End */}
         {!isFailureTerminalState && (
           <>
-            {/* Mobile & Tablet (< 1024px) Single-Row 5-Button Control Bar (Center Red End Button) */}
+            {/* Mobile & Tablet (< 1024px) Symmetrical 5-Button Control Dock (Mute, Speaker, Centered Red End, Video, Flip) */}
             <footer
               className={`lg:hidden wavelink-call-controls-bar ${
                 !showMobileControls && !isOutgoingRingingOnly ? 'wavelink-call-controls-bar--hidden' : ''
@@ -2948,50 +2970,7 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                 <span className="wavelink-call-ctrl-label">{isMuted ? 'Unmute' : 'Mute'}</span>
               </div>
 
-              {/* 2. Camera */}
-              <div className="wavelink-call-ctrl-slot">
-                <button
-                  type="button"
-                  onClick={toggleCamera}
-                  aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
-                  className={`wavelink-call-control-btn ${
-                    isVideoOff
-                      ? 'bg-rose-500/35 border-rose-400/75 text-rose-100'
-                      : 'bg-white/14 border-white/22 text-white'
-                  }`}
-                >
-                  {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
-                </button>
-                <span className="wavelink-call-ctrl-label">Camera</span>
-              </div>
-
-              {/* 3. Red End Button in the CENTRE */}
-              <div className="wavelink-call-ctrl-slot">
-                <button
-                  type="button"
-                  onClick={handleEndCall}
-                  aria-label="End call"
-                  className="wavelink-call-control-btn wavelink-call-control-btn--end bg-rose-600 hover:bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-600/45"
-                >
-                  <PhoneOff className="w-5 h-5" />
-                </button>
-                <span className="wavelink-call-ctrl-label text-rose-200">End</span>
-              </div>
-
-              {/* 4. Flip Camera */}
-              <div className="wavelink-call-ctrl-slot">
-                <button
-                  type="button"
-                  onClick={handleFlipCamera}
-                  aria-label="Flip camera"
-                  className="wavelink-call-control-btn bg-white/14 border-white/22 text-white"
-                >
-                  <SwitchCamera className="w-5 h-5" />
-                </button>
-                <span className="wavelink-call-ctrl-label">Flip</span>
-              </div>
-
-              {/* 5. Speaker */}
+              {/* 2. Speaker */}
               <div className="wavelink-call-ctrl-slot">
                 <button
                   type="button"
@@ -3005,299 +2984,125 @@ export const CallingModal: React.FC<CallingModalProps> = ({
                 >
                   {isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
                 </button>
-                <span className="wavelink-call-ctrl-label">Speaker</span>
+                <span className="wavelink-call-ctrl-label">{isSpeakerOn ? 'Speaker' : 'Audio'}</span>
+              </div>
+
+              {/* 3. Centered Red End Call Button */}
+              <div className="wavelink-call-ctrl-slot">
+                <button
+                  type="button"
+                  onClick={handleEndCall}
+                  aria-label="End call"
+                  className="wavelink-call-control-btn wavelink-call-control-btn--end bg-rose-600 hover:bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-600/45"
+                >
+                  <PhoneOff className="w-5 h-5" />
+                </button>
+                <span className="wavelink-call-ctrl-label text-rose-200">End</span>
+              </div>
+
+              {/* 4. Video / Camera */}
+              <div className="wavelink-call-ctrl-slot">
+                <button
+                  type="button"
+                  onClick={toggleCamera}
+                  aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
+                  className={`wavelink-call-control-btn ${
+                    isVideoOff
+                      ? 'bg-white/10 border-white/18 text-white/80'
+                      : 'bg-emerald-500/30 border-emerald-400/70 text-emerald-100'
+                  }`}
+                >
+                  {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+                </button>
+                <span className="wavelink-call-ctrl-label">{isVideoOff ? 'Video' : 'Cam On'}</span>
+              </div>
+
+              {/* 5. Flip Camera */}
+              <div className="wavelink-call-ctrl-slot">
+                <button
+                  type="button"
+                  onClick={handleFlipCamera}
+                  aria-label="Flip camera"
+                  className={`wavelink-call-control-btn bg-white/14 border-white/22 text-white ${
+                    isVideoOff ? 'opacity-60' : ''
+                  }`}
+                >
+                  <SwitchCamera className="w-5 h-5" />
+                </button>
+                <span className="wavelink-call-ctrl-label">Flip</span>
               </div>
             </footer>
 
-            {/* Desktop (>= 1024px) Floating Dark Toolbar */}
-            <footer className="hidden lg:flex wavelink-call-controls-bar">
-              {/* Mic + Device Selector Chevron */}
-              <div className="wavelink-call-split-btn">
-                <div className="wavelink-call-tooltip-host">
-                  <button
-                    type="button"
-                    onClick={toggleMute}
-                    aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
-                    className={`wavelink-call-control-btn border-0 ${
-                      isMuted
-                        ? 'bg-rose-500/30 text-rose-200'
-                        : 'bg-transparent hover:bg-white/12 text-white'
-                    }`}
-                  >
-                    {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-                  </button>
-                  <span className="wavelink-call-tooltip">
-                    {isMuted ? 'Unmute mic' : 'Mute mic'}
-                  </span>
-                </div>
-                <div className="wavelink-call-tooltip-host">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      refreshMediaDevices();
-                      setActivePopover((prev) => (prev === 'mic' ? null : 'mic'));
-                    }}
-                    aria-label="Choose microphone"
-                    className="w-7 h-10 rounded-full flex items-center justify-center text-white/75 hover:text-white hover:bg-white/12 cursor-pointer"
-                  >
-                    <ChevronUp size={15} />
-                  </button>
-                  <span className="wavelink-call-tooltip">Select microphone</span>
-                </div>
-
-                {activePopover === 'mic' && (
-                  <div className="wavelink-call-popover" onClick={(e) => e.stopPropagation()}>
-                    <p className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-white/55">
-                      Microphone
-                    </p>
-                    {audioInputs.length === 0 ? (
-                      <p className="px-2.5 py-2 text-xs text-white/70">Default microphone</p>
-                    ) : (
-                      audioInputs.map((dev, idx) => (
-                        <button
-                          key={dev.deviceId || idx}
-                          type="button"
-                          onClick={() => handleSelectAudioDevice(dev.deviceId)}
-                          className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-medium hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
-                        >
-                          <span className="truncate">
-                            {dev.label || `Microphone ${idx + 1}`}
-                          </span>
-                          {selectedAudioId === dev.deviceId && (
-                            <Check size={14} className="text-emerald-400 shrink-0" />
-                          )}
-                        </button>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Camera + Device Selector Chevron */}
-              <div className="wavelink-call-split-btn">
-                <div className="wavelink-call-tooltip-host">
-                  <button
-                    type="button"
-                    onClick={toggleCamera}
-                    aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
-                    className={`wavelink-call-control-btn border-0 ${
-                      isVideoOff
-                        ? 'bg-rose-500/30 text-rose-200'
-                        : 'bg-transparent hover:bg-white/12 text-white'
-                    }`}
-                  >
-                    {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
-                  </button>
-                  <span className="wavelink-call-tooltip">
-                    {isVideoOff ? 'Turn camera on' : 'Turn camera off'}
-                  </span>
-                </div>
-                <div className="wavelink-call-tooltip-host">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      refreshMediaDevices();
-                      setActivePopover((prev) => (prev === 'cam' ? null : 'cam'));
-                    }}
-                    aria-label="Choose camera"
-                    className="w-7 h-10 rounded-full flex items-center justify-center text-white/75 hover:text-white hover:bg-white/12 cursor-pointer"
-                  >
-                    <ChevronUp size={15} />
-                  </button>
-                  <span className="wavelink-call-tooltip">Select camera</span>
-                </div>
-
-                {activePopover === 'cam' && (
-                  <div className="wavelink-call-popover" onClick={(e) => e.stopPropagation()}>
-                    <p className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-white/55">
-                      Camera
-                    </p>
-                    {videoInputs.length === 0 ? (
-                      <p className="px-2.5 py-2 text-xs text-white/70">Default camera</p>
-                    ) : (
-                      videoInputs.map((dev, idx) => (
-                        <button
-                          key={dev.deviceId || idx}
-                          type="button"
-                          onClick={() => handleSelectVideoDevice(dev.deviceId)}
-                          className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-medium hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
-                        >
-                          <span className="truncate">{dev.label || `Camera ${idx + 1}`}</span>
-                          {selectedVideoId === dev.deviceId && (
-                            <Check size={14} className="text-emerald-400 shrink-0" />
-                          )}
-                        </button>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Chat Toggle */}
+            {/* Desktop (>= 1024px) Floating Control Bar — ONE tidy centered 5-button row: Mute, Camera, Flip, Speaker, red End */}
+            <footer
+              className="hidden lg:flex wavelink-call-controls-bar items-center justify-center gap-3"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* 1. Mute */}
               <div className="wavelink-call-tooltip-host">
                 <button
                   type="button"
-                  onClick={() => {
-                    setActivePopover(null);
-                    setShowInCallChat((prev) => !prev);
-                  }}
-                  aria-label="Toggle call chat"
+                  onClick={toggleMute}
+                  aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
                   className={`wavelink-call-control-btn ${
-                    showInCallChat
-                      ? 'bg-white/25 border-white/35 text-white'
-                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                    isMuted
+                      ? 'bg-rose-500/30 border-rose-400/70 text-rose-200'
+                      : 'bg-white/12 border-white/20 text-white hover:bg-white/20'
                   }`}
                 >
-                  <MessageSquare className="w-[18px] h-[18px]" />
+                  {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                 </button>
-                <span className="wavelink-call-tooltip">Chat</span>
+                <span className="wavelink-call-tooltip">{isMuted ? 'Unmute' : 'Mute'}</span>
               </div>
 
-              {/* Emoji Reaction */}
+              {/* 2. Camera */}
               <div className="wavelink-call-tooltip-host">
                 <button
                   type="button"
-                  onClick={() =>
-                    setActivePopover((prev) => (prev === 'emoji' ? null : 'emoji'))
-                  }
-                  aria-label="Send reaction"
+                  onClick={toggleCamera}
+                  aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'}
                   className={`wavelink-call-control-btn ${
-                    activePopover === 'emoji'
-                      ? 'bg-white/25 border-white/35 text-white'
-                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                    isVideoOff
+                      ? 'bg-rose-500/30 border-rose-400/70 text-rose-200'
+                      : 'bg-white/12 border-white/20 text-white hover:bg-white/20'
                   }`}
                 >
-                  <Smile className="w-[19px] h-[19px]" />
+                  {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
                 </button>
-                <span className="wavelink-call-tooltip">Reactions</span>
-
-                {activePopover === 'emoji' && (
-                  <div
-                    className="wavelink-call-popover flex items-center justify-center gap-1.5"
-                    style={{ minWidth: 'max-content' }}
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {['👍', '❤️', '😂', '👏', '🔥', '🎉'].map((emo) => (
-                      <button
-                        key={emo}
-                        type="button"
-                        onClick={() => handleTriggerEmojiReaction(emo)}
-                        className="w-10 h-10 rounded-full hover:bg-white/15 text-xl flex items-center justify-center transition-transform hover:scale-110 cursor-pointer"
-                      >
-                        {emo}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                <span className="wavelink-call-tooltip">Camera</span>
               </div>
 
-              {/* Screen Share */}
+              {/* 3. Flip Camera */}
               <div className="wavelink-call-tooltip-host">
                 <button
                   type="button"
-                  onClick={handleToggleScreenShare}
-                  aria-label={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
-                  className={`wavelink-call-control-btn ${
-                    isScreenSharing
-                      ? 'bg-emerald-500/30 border-emerald-400/70 text-emerald-200'
-                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
-                  }`}
+                  onClick={handleFlipCamera}
+                  aria-label="Flip camera"
+                  className="wavelink-call-control-btn bg-white/12 border-white/20 text-white hover:bg-white/20"
                 >
-                  {isScreenSharing ? (
-                    <MonitorOff className="w-[18px] h-[18px]" />
-                  ) : (
-                    <Monitor className="w-[18px] h-[18px]" />
-                  )}
+                  <SwitchCamera className="w-5 h-5" />
                 </button>
-                <span className="wavelink-call-tooltip">
-                  {isScreenSharing ? 'Stop share' : 'Share screen'}
-                </span>
+                <span className="wavelink-call-tooltip">Flip</span>
               </div>
 
-              {/* More (...) Menu (Speaker, Captions, AI Notes, Fullscreen) */}
+              {/* 4. Speaker */}
               <div className="wavelink-call-tooltip-host">
                 <button
                   type="button"
-                  onClick={() =>
-                    setActivePopover((prev) => (prev === 'more' ? null : 'more'))
-                  }
-                  aria-label="More call options"
+                  onClick={toggleSpeaker}
+                  aria-label={isSpeakerOn ? 'Mute speaker' : 'Unmute speaker'}
                   className={`wavelink-call-control-btn ${
-                    activePopover === 'more'
-                      ? 'bg-white/25 border-white/35 text-white'
-                      : 'bg-white/10 border-white/15 text-white hover:bg-white/18'
+                    !isSpeakerOn
+                      ? 'bg-amber-500/30 border-amber-400/65 text-amber-100'
+                      : 'bg-white/12 border-white/20 text-white hover:bg-white/20'
                   }`}
                 >
-                  <MoreHorizontal className="w-5 h-5" />
+                  {isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
                 </button>
-                <span className="wavelink-call-tooltip">More options</span>
-
-                {activePopover === 'more' && (
-                  <div className="wavelink-call-popover" onClick={(e) => e.stopPropagation()}>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        toggleSpeaker();
-                        setActivePopover(null);
-                      }}
-                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
-                    >
-                      <span className="flex items-center gap-2">
-                        {isSpeakerOn ? <Volume2 size={15} /> : <VolumeX size={15} />}
-                        <span>{isSpeakerOn ? 'Mute speaker' : 'Unmute speaker'}</span>
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsCaptionsActive((prev) => !prev);
-                        setActivePopover(null);
-                      }}
-                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center justify-between gap-2 cursor-pointer"
-                    >
-                      <span className="flex items-center gap-2">
-                        <Captions size={15} />
-                        <span>Live Captions</span>
-                      </span>
-                      {isCaptionsActive && <Check size={14} className="text-emerald-400" />}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActivePopover(null);
-                        handleGenerateMinutes();
-                      }}
-                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center gap-2 cursor-pointer"
-                    >
-                      <FileText size={15} />
-                      <span>AI Call Notes</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        toggleFullscreen();
-                        setActivePopover(null);
-                      }}
-                      className="w-full px-3 py-2 rounded-xl text-xs font-semibold hover:bg-white/12 flex items-center gap-2 cursor-pointer"
-                    >
-                      {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-                      <span>{isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}</span>
-                    </button>
-                  </div>
-                )}
+                <span className="wavelink-call-tooltip">Speaker</span>
               </div>
 
-              {/* Red Recording-Style Timer Badge */}
-              <div className="wavelink-call-rec-timer" title="Call duration">
-                <span
-                  className={`w-2 h-2 rounded-full bg-rose-500 ${
-                    callState === 'connected' ? 'animate-pulse' : ''
-                  }`}
-                />
-                <span>{formatDuration(callDuration)}</span>
-              </div>
-
-              {/* Red End Call Button */}
+              {/* 5. Red End Call Button */}
               <div className="wavelink-call-tooltip-host">
                 <button
                   type="button"

@@ -119,7 +119,7 @@ export const Avatar: React.FC<AvatarProps> = ({
       const detail = (e as CustomEvent<{ uid?: string; photoURL?: string }>).detail;
       if (detail?.uid === effectiveUid && detail.photoURL) {
         setImageError(false);
-        setResolvedLiveUrl(detail.photoURL);
+        setResolvedLiveUrl((prev) => (prev === detail.photoURL ? prev : detail.photoURL!));
       }
     };
     window.addEventListener('wavelink:user-avatar-resolved', handleResolved as EventListener);

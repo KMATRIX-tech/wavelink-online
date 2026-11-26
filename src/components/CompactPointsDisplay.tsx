@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { useAuth, DAILY_REWARD_SCHEDULE } from '../context/AuthContext';
+import { formatCompactNumber } from '../utils/safetyFilters';
 import { Coins, Sparkles } from 'lucide-react';
 
 interface CompactPointsDisplayProps {
@@ -19,6 +20,7 @@ export const CompactPointsDisplay: React.FC<CompactPointsDisplayProps> = ({
 }) => {
   const { currentUser, userProfile } = useAuth();
   const targetUid = userId || currentUser?.uid;
+  const isCurrentUserTarget = Boolean(targetUid && targetUid === currentUser?.uid);
 
   const fallbackPoints =
     userProfile?.points ??
@@ -29,16 +31,29 @@ export const CompactPointsDisplay: React.FC<CompactPointsDisplayProps> = ({
   const [isAnimating, setIsAnimating] = useState(false);
   const prevPointsRef = useRef<number>(fallbackPoints);
 
-  // Sync fallback if local profile updates before snapshot
+  // Sync live points from AuthContext when displaying the signed-in user (zero extra Firestore listeners)
   useEffect(() => {
-    if (typeof userProfile?.points === 'number' && userProfile.points !== points) {
-      setPoints(userProfile.points);
+    if (!isCurrentUserTarget) return;
+    const livePoints =
+      typeof userProfile?.points === 'number'
+        ? userProfile.points
+        : typeof userProfile?.wavePoints === 'number'
+        ? userProfile.wavePoints
+        : fallbackPoints;
+    if (livePoints !== prevPointsRef.current) {
+      prevPointsRef.current = livePoints;
+      setIsAnimating(true);
+      setPoints(livePoints);
+      const timer = setTimeout(() => setIsAnimating(false), 650);
+      return () => clearTimeout(timer);
+    } else if (livePoints !== points) {
+      setPoints(livePoints);
     }
-  }, [userProfile?.points]);
+  }, [isCurrentUserTarget, userProfile?.points, userProfile?.wavePoints, fallbackPoints, points]);
 
-  // Real-time Firestore listener on the user's document for the 'points' field
+  // Only open a separate Firestore listener when explicitly displaying a DIFFERENT user's points
   useEffect(() => {
-    if (!targetUid) return;
+    if (!targetUid || isCurrentUserTarget) return;
 
     const userDocRef = doc(db, 'users', targetUid);
     const unsubscribe = onSnapshot(
@@ -74,7 +89,7 @@ export const CompactPointsDisplay: React.FC<CompactPointsDisplayProps> = ({
     );
 
     return () => unsubscribe();
-  }, [targetUid, fallbackPoints]);
+  }, [targetUid, isCurrentUserTarget, fallbackPoints]);
 
   if (!targetUid) return null;
 
@@ -82,16 +97,16 @@ export const CompactPointsDisplay: React.FC<CompactPointsDisplayProps> = ({
     <button
       type="button"
       onClick={onClick}
-      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-gradient-to-r from-amber-50 via-yellow-50/90 to-emerald-50/80 hover:from-amber-100/90 hover:to-emerald-100/80 border border-amber-200/90 text-[#0F172A] shadow-2xs transition-all duration-200 active:scale-95 ${
+      className={`min-h-[44px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-gradient-to-r from-amber-50 via-yellow-50/90 to-emerald-50/80 hover:from-amber-100/90 hover:to-emerald-100/80 border border-amber-200/90 text-[#0F172A] shadow-2xs transition-all duration-200 active:scale-95 ${
         isAnimating ? 'scale-105 ring-2 ring-amber-400/60 bg-amber-100/80' : ''
       } ${onClick ? 'cursor-pointer' : 'cursor-default'} ${className}`}
-      title={`${points.toLocaleString()} Points (Real-time synced)`}
+      title={`${points.toLocaleString()} Points`}
     >
       <span className="flex items-center justify-center w-4 h-4 rounded-full bg-amber-500 text-white shadow-2xs shrink-0">
         <Coins size={10} className={isAnimating ? 'animate-spin' : ''} />
       </span>
       <span className="font-mono text-xs font-black tracking-tight text-amber-900">
-        {points.toLocaleString()}
+        {formatCompactNumber(points)}
       </span>
       {showLabel && (
         <span className="text-[10px] font-extrabold uppercase tracking-wider text-amber-700/90 hidden sm:inline">
@@ -104,3 +119,4 @@ export const CompactPointsDisplay: React.FC<CompactPointsDisplayProps> = ({
     </button>
   );
 };
+

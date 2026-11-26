@@ -101,14 +101,14 @@ export function validateStrongPassword(password: string): {
   if (clean.length < 8) {
     return {
       valid: false,
-      message: 'Password must be 8 to 24 characters long and include at least one letter and one number (currently too short).',
+      message: 'Your password is too short. Please use eight to twenty-four characters with a letter and a number.',
       score: 1
     };
   }
   if (clean.length > 24) {
     return {
       valid: false,
-      message: 'Password must be between 8 and 24 characters long (maximum 24 characters exceeded).',
+      message: 'Your password is too long. Please use eight to twenty-four characters with a letter and a number.',
       score: 1
     };
   }
@@ -120,21 +120,21 @@ export function validateStrongPassword(password: string): {
   if (!hasLetter && !hasNumber) {
     return {
       valid: false,
-      message: 'Password must be 8–24 characters and contain at least one letter and one number.',
+      message: 'Your password needs at least one letter and one number.',
       score: 2
     };
   }
   if (!hasLetter) {
     return {
       valid: false,
-      message: 'Password must include at least one letter (8–24 characters total).',
+      message: 'Your password needs at least one letter.',
       score: 2
     };
   }
   if (!hasNumber) {
     return {
       valid: false,
-      message: 'Password must include at least one number (8–24 characters total).',
+      message: 'Your password needs at least one number.',
       score: 2
     };
   }

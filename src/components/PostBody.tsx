@@ -23,6 +23,7 @@ import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase';
 import {
   doc,
+  getDoc,
   setDoc,
   deleteDoc,
   updateDoc,
@@ -943,14 +944,11 @@ export const PostBody: React.FC<PostBodyProps> = ({
 
         let following = false;
         if (currentUser && currentUser.uid !== userData.id) {
-          const followQ = query(
-            collection(db, 'follows'),
-            where('followerId', '==', currentUser.uid),
-            where('targetUserId', '==', userData.id),
-            limit(1)
-          );
-          const followSnap = await getDocs(followQ);
-          following = !followSnap.empty;
+          const [directFollow, legacyFollow] = await Promise.all([
+            getDoc(doc(db, 'follows', `follow_${currentUser.uid}_${userData.id}`)),
+            getDoc(doc(db, 'follows', `${currentUser.uid}_${userData.id}`))
+          ]);
+          following = directFollow.exists() || legacyFollow.exists();
         }
 
         setProfileModal((prev) =>

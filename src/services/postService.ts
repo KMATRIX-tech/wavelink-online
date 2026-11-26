@@ -1,13 +1,35 @@
 import { doc, setDoc } from 'firebase/firestore';
 import { db, cleanFirestoreData, getAuthHeaders } from '../firebase';
 import type { Post } from '../types';
+import { checkActionRateLimit } from '../utils/safetyFilters';
 
 /**
- * Saves a post document to Firestore with a client race timeout and server-side fallback.
- * Prevents the application from hanging at 95% when browser IndexedDB tab manager or WebChannel stalls.
+ * Saves a post document to Firestore with per-user posting rate limits, client race timeout, and server-side fallback.
  */
 export async function savePostDocument(postPayload: Post): Promise<Post> {
   const postId = postPayload.id;
+  const rateCheck = checkActionRateLimit(postPayload.authorId || 'user', 'post');
+  if (!rateCheck.allowed) {
+    throw new Error(rateCheck.message || 'You are posting too fast. Please wait a moment and try again.');
+  }
+
+  try {
+    const headers = await getAuthHeaders();
+    const rateResp = await fetch('/api/security/rate-limit-action', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'post' })
+    });
+    if (rateResp.status === 429) {
+      const rateJson = await rateResp.json().catch(() => ({}));
+      throw new Error(rateJson.error || 'You are posting too fast. Please wait a moment and try again.');
+    }
+  } catch (rateErr: any) {
+    if (rateErr?.message && rateErr.message.includes('too fast')) {
+      throw rateErr;
+    }
+  }
+
   const cleanedPost = cleanFirestoreData(postPayload);
 
   let savedSuccessfully = false;

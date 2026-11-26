@@ -8,97 +8,133 @@ service firebase.storage {
     }
 
     function isSignedIn() {
-      return request.auth != null;
+      return request.auth != null && request.auth.uid != null;
     }
 
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
 
-    // Profile Cover images (<= 5 MB, image/*)
+    // Strict raster image allowlist (explicitly blocks image/svg+xml to prevent Stored XSS)
+    function isSafeRasterImage() {
+      return request.resource != null
+        && request.resource.contentType != null
+        && request.resource.contentType.matches('image/(jpeg|jpg|png|webp|gif|heic|heif)');
+    }
+
+    // Strict video MIME allowlist
+    function isSafeVideo() {
+      return request.resource != null
+        && request.resource.contentType != null
+        && request.resource.contentType.matches('video/(mp4|webm|quicktime|x-m4v)');
+    }
+
+    // Strict audio MIME allowlist
+    function isSafeAudio() {
+      return request.resource != null
+        && request.resource.contentType != null
+        && request.resource.contentType.matches('audio/(webm|mp4|mpeg|ogg|wav|aac|x-m4a)');
+    }
+
+    function isSafeFileName(fileName) {
+      return fileName is string
+        && fileName.size() > 0
+        && fileName.size() <= 180
+        && !fileName.matches('.*\\.svg$');
+    }
+
+    // Profile Cover images (<= 5 MB, safe raster image only)
     match /users/{userId}/covers/{fileName} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
-        && request.resource != null
-        && request.resource.size <= 5 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+        && isSafeFileName(fileName)
+        && isSafeRasterImage()
+        && request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024;
       allow delete: if isOwner(userId);
     }
 
-    // Profile Avatar / Photo images (<= 5 MB, image/*)
+    // Profile Avatar / Photo images (<= 5 MB, safe raster image only)
     match /users/{userId}/avatars/{fileName} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
-        && request.resource != null
-        && request.resource.size <= 5 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+        && isSafeFileName(fileName)
+        && isSafeRasterImage()
+        && request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024;
       allow delete: if isOwner(userId);
     }
 
-    // Custom App / Profile Background images (<= 5 MB, image/*)
+    // Custom App / Profile Background images (<= 5 MB, safe raster image only)
     match /users/{userId}/backgrounds/{fileName} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
-        && request.resource != null
-        && request.resource.size <= 5 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+        && isSafeFileName(fileName)
+        && isSafeRasterImage()
+        && request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024;
       allow delete: if isOwner(userId);
     }
 
-    // Per-Chat Custom Background Photos (<= 400 KB, image/*)
+    // Per-Chat Custom Background Photos (<= 400 KB, safe raster image only)
     match /users/{userId}/chatThemes/{fileName} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
-        && request.resource != null
-        && request.resource.size <= 400 * 1024
-        && request.resource.contentType.matches('image/.*');
+        && isSafeFileName(fileName)
+        && isSafeRasterImage()
+        && request.resource.size > 0
+        && request.resource.size <= 400 * 1024;
       allow delete: if isOwner(userId);
     }
 
-    // Feed Post & Reel Media (<= 100 MB video or <= 10 MB image)
+    // Feed Post & Reel Media (<= 100 MB video or <= 10 MB safe raster image)
     match /posts/{userId}/{allPaths=**} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
         && request.resource != null
+        && request.resource.size > 0
         && (
-          (request.resource.contentType.matches('image/.*') && request.resource.size <= 10 * 1024 * 1024) ||
-          (request.resource.contentType.matches('video/.*') && request.resource.size <= 100 * 1024 * 1024)
+          (isSafeRasterImage() && request.resource.size <= 10 * 1024 * 1024) ||
+          (isSafeVideo() && request.resource.size <= 100 * 1024 * 1024)
         );
       allow delete: if isOwner(userId);
     }
 
-    // 24-Hour Spark Media (<= 80 MB video or <= 10 MB image)
+    // 24-Hour Spark Media (<= 80 MB video or <= 10 MB safe raster image)
     match /sparks/{userId}/{allPaths=**} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
         && request.resource != null
+        && request.resource.size > 0
         && (
-          (request.resource.contentType.matches('image/.*') && request.resource.size <= 10 * 1024 * 1024) ||
-          (request.resource.contentType.matches('video/.*') && request.resource.size <= 80 * 1024 * 1024)
+          (isSafeRasterImage() && request.resource.size <= 10 * 1024 * 1024) ||
+          (isSafeVideo() && request.resource.size <= 80 * 1024 * 1024)
         );
       allow delete: if isOwner(userId);
     }
 
-    // Direct & Group Chat Media Attachments (<= 100 MB video or <= 10 MB image)
+    // Direct & Group Chat Media Attachments (<= 100 MB video or <= 10 MB safe raster image)
     match /chats/{userId}/{allPaths=**} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
         && request.resource != null
+        && request.resource.size > 0
         && (
-          (request.resource.contentType.matches('image/.*') && request.resource.size <= 10 * 1024 * 1024) ||
-          (request.resource.contentType.matches('video/.*') && request.resource.size <= 100 * 1024 * 1024)
+          (isSafeRasterImage() && request.resource.size <= 10 * 1024 * 1024) ||
+          (isSafeVideo() && request.resource.size <= 100 * 1024 * 1024)
         );
       allow delete: if isOwner(userId);
     }
 
-    // Chat Voice Notes (<= 10 MB audio/*)
+    // Chat Voice Notes (<= 10 MB safe audio)
     match /voiceNotes/{userId}/{allPaths=**} {
       allow read: if isSignedIn();
       allow create, update: if isOwner(userId)
-        && request.resource != null
-        && request.resource.size <= 10 * 1024 * 1024
-        && request.resource.contentType.matches('audio/.*');
+        && isSafeAudio()
+        && request.resource.size > 0
+        && request.resource.size <= 10 * 1024 * 1024;
       allow delete: if isOwner(userId);
     }
   }
 }
+

@@ -18,13 +18,18 @@ import {
   OperationType,
   getCachedUserProfile,
 } from '../firebase';
-import { uploadImageToCloudinary } from '../utils/mediaStorage';
+import {
+  uploadImageToCloudinary,
+  compressImageForUpload,
+  optimizeCloudinaryThumbnailUrl,
+} from '../utils/mediaStorage';
 import {
   enqueueVideoUploadJob,
   clearFailedVideoAndStudioDrafts,
 } from '../services/videoUploadQueue';
 import { savePostDocument } from '../services/postService';
 import { SongSelectorModal } from './SongSelectorModal';
+import { SongPlayerCard } from './SongPlayerCard';
 import { useBottomSheetLock } from '../utils/sheetLock';
 import { OnlineSong, Post } from '../types';
 import {
@@ -295,7 +300,7 @@ const QUICK_HASHTAGS = [
 ];
 
 const STUDIO_DRAFT_STORAGE_KEY = 'wavelink_creator_studio_draft_v2';
-const FREE_MAX_DURATION_SECONDS = 60;
+const FREE_MAX_DURATION_SECONDS = 90;
 const PRO_MAX_DURATION_SECONDS = 90;
 
 export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateToFeed }) => {
@@ -1487,19 +1492,30 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
   // Bake filters, comedy templates, text overlays, and stickers onto an exported image or video cover
   const bakeEditedCanvasDataUrl = async (sourceImgOrVideo: HTMLImageElement | HTMLVideoElement): Promise<string> => {
     const canvas = document.createElement('canvas');
-    const w =
+    const rawW =
       sourceImgOrVideo instanceof HTMLVideoElement
         ? sourceImgOrVideo.videoWidth || 720
         : sourceImgOrVideo.naturalWidth || 1080;
-    const h =
+    const rawH =
       sourceImgOrVideo instanceof HTMLVideoElement
         ? sourceImgOrVideo.videoHeight || 1280
         : sourceImgOrVideo.naturalHeight || 1350;
+
+    // Downscale high-resolution 4K photos proportionally to max 1280px before baking filters/overlays
+    const MAX_EXPORT_DIM = 1280;
+    const scaleRatio =
+      rawW > MAX_EXPORT_DIM || rawH > MAX_EXPORT_DIM
+        ? Math.min(MAX_EXPORT_DIM / rawW, MAX_EXPORT_DIM / rawH)
+        : 1;
+    const w = Math.max(1, Math.round(rawW * scaleRatio));
+    const h = Math.max(1, Math.round(rawH * scaleRatio));
 
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Canvas context unavailable');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
 
     ctx.filter = getCombinedFilterStyle();
     ctx.drawImage(sourceImgOrVideo, 0, 0, w, h);
@@ -1581,7 +1597,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       }
     }
 
-    return canvas.toDataURL('image/jpeg', 0.9);
+    return canvas.toDataURL('image/jpeg', 0.84);
   };
 
   // ==========================================
@@ -1678,16 +1694,26 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
 
         if (hasVisualCoverEdits) {
           try {
-            setUploadStatusText('Uploading cover thumbnail to Cloudinary...');
+            setUploadStatusText('Compressing & uploading cover thumbnail...');
             const coverDataUrl =
               customCoverDataUrl ||
               (videoPreviewRef.current ? await bakeEditedCanvasDataUrl(videoPreviewRef.current) : '');
             if (coverDataUrl) {
-              const uploadedCover = await uploadImageToCloudinary(coverDataUrl, (pct) => {
-                setUploadProgress(Math.max(5, Math.min(18, Math.round(pct * 0.18))));
+              const compressedCover = await compressImageForUpload(coverDataUrl, {
+                maxWidth: 720,
+                maxHeight: 1280,
+                targetMaxBytes: 180 * 1024,
               });
-              if (uploadedCover.secureUrl && uploadedCover.secureUrl.startsWith('http')) {
-                customCoverHttpUrl = uploadedCover.secureUrl;
+              const uploadedCover = await uploadImageToCloudinary(
+                compressedCover.blob,
+                (pct) => {
+                  setUploadProgress(Math.max(5, Math.min(18, Math.round(pct * 0.18))));
+                },
+                { maxWidth: 720, maxHeight: 1280, targetMaxBytes: 180 * 1024, thumbnailWidth: 720 }
+              );
+              const coverThumbUrl = uploadedCover.thumbnailUrl || uploadedCover.secureUrl;
+              if (coverThumbUrl && coverThumbUrl.startsWith('http')) {
+                customCoverHttpUrl = optimizeCloudinaryThumbnailUrl(coverThumbUrl, { width: 720 });
               }
             }
           } catch (coverErr) {
@@ -1739,14 +1765,15 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       }
 
       // IMAGE / CAROUSEL / TEXT POST FLOW -> Direct browser upload to Cloudinary (monarcking72 / monarcking72)
-      // Never stores base64 or data URLs in Firestore.
+      // Automatically compresses images and saves only optimized https:// thumbnail URLs in Firestore.
       let finalImageUrl: string | undefined = undefined;
+      let finalThumbnailUrl: string | undefined = undefined;
       let finalWidth: number | undefined = undefined;
       let finalHeight: number | undefined = undefined;
       const uploadedCarouselUrls: string[] = [];
 
       if (selectedFile && mediaType === 'image') {
-        setUploadStatusText('Rendering edited photo...');
+        setUploadStatusText('Compressing & optimizing photo...');
         setUploadProgress(12);
         const imgEl = new Image();
         imgEl.crossOrigin = 'anonymous';
@@ -1757,34 +1784,57 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
         });
 
         const bakedDataUrl = await bakeEditedCanvasDataUrl(imgEl);
-        setUploadStatusText('Uploading photo to Cloudinary...');
-        const mainUploaded = await uploadImageToCloudinary(bakedDataUrl, (pct) => {
-          const totalFiles = Math.max(1, carouselFiles.length);
-          const scaled = Math.round(15 + (pct / totalFiles) * 0.75);
-          setUploadProgress(Math.max(15, Math.min(90, scaled)));
-          setUploadStatusText(`Uploading photo to Cloudinary (${pct}%)...`);
+        const compressedMain = await compressImageForUpload(bakedDataUrl, {
+          maxWidth: 1280,
+          maxHeight: 1280,
+          targetMaxBytes: 240 * 1024,
         });
+        setUploadStatusText('Uploading optimized photo to Cloudinary...');
+        const mainUploaded = await uploadImageToCloudinary(
+          compressedMain.blob,
+          (pct) => {
+            const totalFiles = Math.max(1, carouselFiles.length);
+            const scaled = Math.round(15 + (pct / totalFiles) * 0.75);
+            setUploadProgress(Math.max(15, Math.min(90, scaled)));
+            setUploadStatusText(`Uploading optimized photo (${pct}%)...`);
+          },
+          { maxWidth: 1080, maxHeight: 1080, targetMaxBytes: 240 * 1024, thumbnailWidth: 720 }
+        );
 
         if (!mainUploaded.secureUrl || !mainUploaded.secureUrl.startsWith('http')) {
           throw new Error('Cloudinary photo upload did not return a valid secure_url.');
         }
 
-        finalImageUrl = mainUploaded.secureUrl;
+        finalImageUrl = optimizeCloudinaryThumbnailUrl(mainUploaded.secureUrl, { width: 1080 });
+        finalThumbnailUrl =
+          mainUploaded.thumbnailUrl ||
+          optimizeCloudinaryThumbnailUrl(mainUploaded.secureUrl, { width: 720 });
         finalWidth = mainUploaded.width;
         finalHeight = mainUploaded.height;
-        uploadedCarouselUrls.push(mainUploaded.secureUrl);
+        uploadedCarouselUrls.push(finalImageUrl);
 
         if (carouselFiles.length > 1) {
           for (let i = 1; i < carouselFiles.length; i++) {
-            const extraUploaded = await uploadImageToCloudinary(carouselFiles[i], (pct) => {
-              const basePct = 15 + Math.round(((i + pct / 100) / carouselFiles.length) * 75);
-              setUploadProgress(Math.max(20, Math.min(92, basePct)));
-              setUploadStatusText(
-                `Uploading carousel photo ${i + 1} of ${carouselFiles.length} (${pct}%)...`
-              );
+            const compressedItem = await compressImageForUpload(carouselFiles[i], {
+              maxWidth: 1280,
+              maxHeight: 1280,
+              targetMaxBytes: 240 * 1024,
             });
+            const extraUploaded = await uploadImageToCloudinary(
+              compressedItem.blob,
+              (pct) => {
+                const basePct = 15 + Math.round(((i + pct / 100) / carouselFiles.length) * 75);
+                setUploadProgress(Math.max(20, Math.min(92, basePct)));
+                setUploadStatusText(
+                  `Uploading optimized photo ${i + 1} of ${carouselFiles.length} (${pct}%)...`
+                );
+              },
+              { maxWidth: 1080, maxHeight: 1080, targetMaxBytes: 240 * 1024, thumbnailWidth: 720 }
+            );
             if (extraUploaded.secureUrl && extraUploaded.secureUrl.startsWith('http')) {
-              uploadedCarouselUrls.push(extraUploaded.secureUrl);
+              uploadedCarouselUrls.push(
+                optimizeCloudinaryThumbnailUrl(extraUploaded.secureUrl, { width: 1080 })
+              );
             }
           }
         }
@@ -1803,6 +1853,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
         authorPhotoURL,
         content: caption.trim() || 'Created with WaveLink Studio ✨',
         imageUrl: finalImageUrl,
+        thumbnailUrl: finalThumbnailUrl,
         imageUrls: uploadedCarouselUrls.length > 1 ? uploadedCarouselUrls : undefined,
         mediaType: mediaType === 'image' ? 'image' : undefined,
         videoWidth: finalWidth,
@@ -1914,7 +1965,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
             }`}
           >
             <Camera size={15} />
-            <span>1. Capture</span>
+            <span>1. Choose</span>
           </button>
 
           <button
@@ -4052,7 +4103,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
               ) : (
                 <>
                   <Send size={18} />
-                  <span>Export & Publish Wave</span>
+                  <span>Post</span>
                 </>
               )}
             </button>
@@ -4060,59 +4111,215 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
         </div>
       )}
 
-      {/* Full-Screen Live Preview Modal */}
-      {isFullPreviewOpen && (
-        <div className="fixed inset-0 z-50 bg-black/90 flex flex-col items-center justify-center p-4">
-          <div className="w-full max-w-sm flex items-center justify-between text-white mb-3">
-            <span className="text-sm font-extrabold">Live Full Preview</span>
+      {/* Always-Visible Sticky Bottom Bar with Caption Box, Audience, Feed Preview & Post Button Above Keyboard & Safe Area */}
+      {step !== 3 && (
+        <div
+          className="sticky z-30 mt-3 rounded-3xl bg-white/95 backdrop-blur-md border border-[#EFECE6] shadow-lg p-3 space-y-2.5"
+          style={{
+            bottom: 'calc(var(--kb-offset, 0px) + env(safe-area-inset-bottom, 0px) + 0.5rem)'
+          }}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={caption}
+              onChange={(e) => setCaption(e.target.value)}
+              placeholder="Write a caption, #hashtags or @mentions..."
+              className="flex-1 min-h-[44px] px-3.5 py-2 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-xs sm:text-sm font-medium text-[#1C1917] focus:outline-none focus:border-[#2563EB]"
+            />
             <button
               type="button"
-              onClick={() => setIsFullPreviewOpen(false)}
-              className="min-w-[44px] min-h-[44px] rounded-xl bg-white/15 flex items-center justify-center cursor-pointer"
+              onClick={handleSmartCaptionGenerate}
+              disabled={isGeneratingCaption}
+              title="Smart Caption (AI)"
+              className="min-h-[44px] px-3 rounded-2xl bg-[#EEF2FF] text-[#2563EB] font-extrabold text-xs flex items-center gap-1 shrink-0 cursor-pointer"
             >
-              <X size={18} />
+              <Sparkles size={14} />
+              <span className="hidden sm:inline">{isGeneratingCaption ? 'Writing...' : 'AI Caption'}</span>
             </button>
           </div>
-          <div className="relative w-full max-w-[450px] aspect-[9/16] rounded-3xl overflow-hidden bg-stone-950 border border-white/20 flex items-center justify-center">
-            {previewUrl &&
-              (mediaType === 'video' ? (
+
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setIsFullPreviewOpen(true)}
+                disabled={!previewUrl && !caption.trim()}
+                className="min-h-[44px] px-3 py-2 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#1C1917] text-xs font-extrabold flex items-center gap-1.5 disabled:opacity-40 cursor-pointer"
+              >
+                <Eye size={15} />
+                <span>Preview</span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setAudience((prev) =>
+                    prev === 'public' ? 'followers' : prev === 'followers' ? 'close_friends' : 'public'
+                  )
+                }
+                className="min-h-[44px] px-3 py-2 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] text-[#57534E] text-xs font-bold flex items-center gap-1 cursor-pointer"
+                title="Change audience"
+              >
+                {audience === 'public' ? (
+                  <>
+                    <Globe size={14} className="text-[#2563EB]" />
+                    <span>Public</span>
+                  </>
+                ) : audience === 'followers' ? (
+                  <>
+                    <Users size={14} className="text-[#0D9488]" />
+                    <span>Followers</span>
+                  </>
+                ) : (
+                  <>
+                    <Lock size={14} className="text-amber-600" />
+                    <span>Close friends</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            <button
+              type="button"
+              disabled={isPublishing || (!selectedFile && !caption.trim())}
+              onClick={handlePublish}
+              className="min-h-[44px] px-5 py-2.5 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1.5 shadow-sm disabled:opacity-45 cursor-pointer"
+            >
+              {isPublishing ? (
                 <>
-                  <video
-                    src={previewUrl}
-                    autoPlay
-                    loop
-                    muted
-                    playsInline
-                    aria-hidden="true"
-                    style={{ filter: getCombinedFilterStyle() }}
-                    className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
-                  />
-                  <video
-                    src={previewUrl}
-                    autoPlay
-                    loop
-                    playsInline
-                    style={{ filter: getCombinedFilterStyle() }}
-                    className="relative z-10 w-full h-full object-contain"
-                  />
+                  <Loader2 size={15} className="animate-spin" />
+                  <span>{uploadProgress}%</span>
                 </>
               ) : (
                 <>
-                  <img
-                    src={previewUrl}
-                    alt=""
-                    aria-hidden="true"
-                    style={{ filter: getCombinedFilterStyle() }}
-                    className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50 pointer-events-none"
-                  />
-                  <img
-                    src={previewUrl}
-                    alt="Full preview"
-                    style={{ filter: getCombinedFilterStyle() }}
-                    className="relative z-10 w-full h-full object-contain"
-                  />
+                  <Send size={15} />
+                  <span>Post</span>
                 </>
-              ))}
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Feed-Exact Live Post Card Preview Modal */}
+      {isFullPreviewOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex flex-col items-center justify-center p-4 overflow-y-auto"
+          onClick={() => setIsFullPreviewOpen(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-3xl bg-white border border-[#EFECE6] shadow-2xl overflow-hidden text-[#1C1917]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Preview Top Bar */}
+            <div className="px-4 py-3 bg-[#FAF7F2] border-b border-[#EFECE6] flex items-center justify-between">
+              <span className="text-xs font-extrabold uppercase tracking-wider text-[#2563EB]">
+                Feed Preview
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsFullPreviewOpen(false)}
+                className="min-w-[40px] min-h-[40px] rounded-xl bg-white border border-[#EFECE6] flex items-center justify-center text-[#1C1917] cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Feed Post Card Author Header */}
+            <div className="p-4 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white font-extrabold text-sm flex items-center justify-center">
+                  {(auth.currentUser?.displayName || 'You').slice(0, 1).toUpperCase()}
+                </div>
+                <div>
+                  <div className="text-sm font-extrabold text-[#1C1917]">
+                    {auth.currentUser?.displayName || 'Wave Creator'}
+                  </div>
+                  <div className="text-[11px] text-[#57534E] flex items-center gap-1.5">
+                    <span>Just now</span>
+                    <span>·</span>
+                    <span className="capitalize">{audience.replace('_', ' ')}</span>
+                    {locationTag.trim() && (
+                      <>
+                        <span>·</span>
+                        <span>{locationTag.trim()}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Caption */}
+            {caption.trim() && (
+              <div className="px-4 pb-3 text-sm text-[#1C1917] whitespace-pre-wrap">
+                {caption.trim()}
+              </div>
+            )}
+
+            {/* Media Container with Aspect Ratio & Filters */}
+            {previewUrl && (
+              <div
+                className={`relative w-full bg-stone-950 overflow-hidden flex items-center justify-center ${
+                  aspectRatio === '1:1'
+                    ? 'aspect-square'
+                    : aspectRatio === '4:5'
+                    ? 'aspect-[4/5]'
+                    : 'aspect-[9/16] max-h-[60dvh]'
+                }`}
+              >
+                {mediaType === 'video' ? (
+                  <video
+                    src={previewUrl}
+                    autoPlay
+                    loop
+                    playsInline
+                    style={{ filter: getCombinedFilterStyle() }}
+                    className="w-full h-full object-contain"
+                  />
+                ) : (
+                  <img
+                    src={previewUrl}
+                    alt="Feed preview"
+                    style={{ filter: getCombinedFilterStyle() }}
+                    className="w-full h-full object-contain"
+                  />
+                )}
+              </div>
+            )}
+
+            {/* Attached Music Player Inside the Post Card */}
+            {selectedSong && (
+              <div className="px-4 pt-3">
+                <SongPlayerCard
+                  title={selectedSong.trackName}
+                  artist={selectedSong.artistName}
+                  albumArt={selectedSong.artworkUrl100}
+                  previewUrl={selectedSong.previewUrl}
+                  startTime={songStartTime}
+                  volume={songVolume}
+                />
+              </div>
+            )}
+
+            {/* Post Card Action Footer */}
+            <div className="p-4 flex items-center justify-between border-t border-[#EFECE6] mt-3">
+              <span className="text-xs font-bold text-[#57534E]">
+                {allowComments ? 'Comments on' : 'Comments off'}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsFullPreviewOpen(false);
+                  handlePublish();
+                }}
+                disabled={isPublishing || (!selectedFile && !caption.trim())}
+                className="min-h-[44px] px-5 py-2 rounded-2xl bg-gradient-to-r from-[#2563EB] to-[#0D9488] text-white font-extrabold text-xs flex items-center gap-1.5 cursor-pointer"
+              >
+                <Send size={14} />
+                <span>Post Now</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

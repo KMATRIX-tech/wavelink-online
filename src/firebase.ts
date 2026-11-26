@@ -211,11 +211,18 @@ export function recordDiscoveredUserAvatar(
   if (changed) {
     persistDiscoveredAvatarsToStorage();
     if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('wavelink:user-avatar-resolved', {
-          detail: { uid: cleanUid, photoURL: cleanUrl }
-        })
-      );
+      const dispatchResolvedEvent = () => {
+        window.dispatchEvent(
+          new CustomEvent('wavelink:user-avatar-resolved', {
+            detail: { uid: cleanUid, photoURL: cleanUrl }
+          })
+        );
+      };
+      if (typeof queueMicrotask === 'function') {
+        queueMicrotask(dispatchResolvedEvent);
+      } else {
+        window.setTimeout(dispatchResolvedEvent, 0);
+      }
     }
   }
 
@@ -629,8 +636,8 @@ export async function getAuthHeaders(extraHeaders: Record<string, string> = {}):
 export const ADMIN_EMAIL = 'Platform Administrator';
 
 /**
- * Single canonical source of truth for admin role resolution across UI, Server, and Firestore rules:
- * Based on the user's `role` field (`'admin'` / `'super_admin'` / `'sub_admin'`).
+ * Single canonical source of truth for admin & staff role resolution across UI, Server, and Firestore rules:
+ * Based on the user's `role` field (`'admin'` / `'super_admin'` / `'sub_admin'` / `'moderator'` / `'support_helper'`).
  */
 export function resolveCanonicalAdminRole(
   role?: string | null,
@@ -639,10 +646,61 @@ export function resolveCanonicalAdminRole(
   if (role === 'admin' || role === 'super_admin') {
     return 'admin';
   }
-  if (role === 'sub_admin' || isSubAdmin === true) {
+  if (role === 'sub_admin' || role === 'moderator' || isSubAdmin === true) {
     return 'sub_admin';
   }
   return 'user';
+}
+
+export function resolveCanonicalStaffRole(
+  role?: string | null,
+  isSubAdmin?: boolean | null,
+  isModerator?: boolean | null,
+  isSupportHelper?: boolean | null
+): 'admin' | 'moderator' | 'support_helper' | 'user' {
+  if (role === 'admin' || role === 'super_admin') {
+    return 'admin';
+  }
+  if (role === 'moderator' || role === 'sub_admin' || isSubAdmin === true || isModerator === true) {
+    return 'moderator';
+  }
+  if (role === 'support_helper' || isSupportHelper === true) {
+    return 'support_helper';
+  }
+  return 'user';
+}
+
+export function detectClientDeviceMetadata(): {
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  browser: string;
+} {
+  const deviceId = getClientDeviceId();
+  if (typeof navigator === 'undefined') {
+    return { deviceId, deviceName: 'WaveLink Web Session', platform: 'Web', browser: 'Browser' };
+  }
+  const ua = navigator.userAgent || '';
+  let platform = 'Web Desktop';
+  if (/Android/i.test(ua)) platform = 'Android';
+  else if (/iPhone|iPad|iPod/i.test(ua)) platform = 'iOS';
+  else if (/Windows/i.test(ua)) platform = 'Windows';
+  else if (/Mac OS X|Macintosh/i.test(ua)) platform = 'macOS';
+  else if (/Linux/i.test(ua)) platform = 'Linux';
+
+  let browser = 'Browser';
+  if (/Edg\//i.test(ua)) browser = 'Edge';
+  else if (/OPR\/|Opera/i.test(ua)) browser = 'Opera';
+  else if (/Chrome\//i.test(ua)) browser = 'Chrome';
+  else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+  else if (/Safari\//i.test(ua)) browser = 'Safari';
+
+  return {
+    deviceId,
+    deviceName: `${browser} on ${platform}`,
+    platform,
+    browser
+  };
 }
 
 export function isOwnerEmail(_email?: string | null): boolean {
@@ -719,32 +777,32 @@ export function formatEmailVerificationError(err: unknown): { message: string; c
 
   if (code === 'auth/unauthorized-domain') {
     return {
-      message: 'Could not send verification email because this domain is not authorized in Firebase Authentication.',
+      message: 'We could not send the email right now. Please try again in a moment.',
       code
     };
   }
   if (code === 'auth/operation-not-allowed') {
     return {
-      message: 'Could not send verification email because this sign-in operation is not enabled in Firebase Authentication.',
+      message: 'Email check is not turned on right now. Please try again later.',
       code
     };
   }
   if (code === 'auth/too-many-requests') {
     return {
-      message: 'Too many verification email requests. Please wait a few minutes and try again.',
+      message: 'You asked for too many emails. Please wait one minute and tap Try again.',
       code
     };
   }
   if (code === 'auth/invalid-continue-uri' || code === 'auth/missing-continue-uri' || code === 'auth/unauthorized-continue-uri') {
     return {
-      message: 'Could not send verification email due to an invalid or unauthorized continue URL configuration.',
+      message: 'We could not send the email link right now. Please tap Try again.',
       code
     };
   }
 
   const friendly = sanitizeErrorTextNoTokensOrLinks(getFriendlyAuthErrorMessage(err, 'email'));
   return {
-    message: friendly || 'Could not send verification email. Please try again.',
+    message: friendly || 'We could not send the email. Please check your internet and tap Try again.',
     code
   };
 }
@@ -759,9 +817,9 @@ export function getFriendlyAuthErrorMessage(
 
   if (isAuthNetworkError(err)) {
     if (context === 'google') {
-      return 'Google Sign-In popup could not connect (often blocked by browser iframe third-party cookie restrictions). Please sign in with Email & Password or use the 1-Click Platform Owner button.';
+      return 'Google sign-in could not connect. Please check your internet or sign in with your email and password.';
     }
-    return 'Authentication connection timed out. Please check your internet connection and try again.';
+    return 'No internet connection. Please check your internet and tap Try again.';
   }
 
   if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
@@ -771,13 +829,34 @@ export function getFriendlyAuthErrorMessage(
     return '';
   }
   if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
-    return 'Popup was blocked by your browser. Please allow popups or use Email Sign-In.';
+    return 'Your browser blocked the sign-in window. Please allow popups or use your email and password.';
   }
   if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
-    return 'This domain is not authorized for Firebase Authentication operations.';
+    return 'Sign-in is not ready on this web address yet. Please try again soon.';
+  }
+  if (code === 'auth/multi-factor-auth-required' || msg.includes('multi-factor-auth-required')) {
+    return 'Please type the code from your authenticator app.';
+  }
+  if (code === 'auth/invalid-verification-code' || msg.includes('invalid-verification-code')) {
+    return 'That code did not match. Please check your authenticator app and try again.';
+  }
+  if (code === 'auth/code-expired' || msg.includes('code-expired')) {
+    return 'That code expired. Please check your authenticator app for a new code and try again.';
+  }
+  if (code === 'auth/requires-recent-login' || msg.includes('requires-recent-login')) {
+    return 'Please type your password again so we know it is really you.';
+  }
+  if (code === 'auth/unverified-email' || msg.includes('unverified-email')) {
+    return 'Please open your email and tap the verify link first.';
+  }
+  if (code === 'auth/maximum-second-factor-count-exceeded' || msg.includes('maximum-second-factor-count-exceeded')) {
+    return 'You already have an authenticator app connected to your account.';
+  }
+  if (code === 'auth/unsupported-first-factor' || msg.includes('unsupported-first-factor')) {
+    return 'Please sign in with your email or Google account first.';
   }
   if (code === 'auth/operation-not-allowed' || msg.includes('operation-not-allowed')) {
-    return 'This authentication method is currently not enabled in Firebase Authentication.';
+    return 'This sign-in option is not turned on yet. Please try another way to sign in.';
   }
   if (
     code === 'auth/user-not-found' ||
@@ -785,31 +864,43 @@ export function getFriendlyAuthErrorMessage(
     msg.includes('user-not-found') ||
     msg.includes('invalid-credential')
   ) {
-    return 'Invalid credentials. Please check your username/email and password.';
+    return 'Your email, username, or password did not match. Please check them and try again.';
   }
   if (code === 'auth/wrong-password' || msg.includes('wrong-password')) {
-    return 'Incorrect password. Please verify and try again.';
+    return 'That password is not right. Please type it again or tap Forgot password.';
   }
   if (code === 'auth/email-already-in-use' || msg.includes('email-already-in-use')) {
-    return 'An account with this email already exists. Please sign in instead.';
+    return 'This email already has an account. Please sign in instead.';
   }
   if (code === 'auth/weak-password' || msg.includes('weak-password')) {
-    return 'Password must be between 8 and 24 characters and contain at least one letter and one number.';
+    return 'Please pick a stronger password with eight to twenty-four characters, including a letter and a number.';
   }
   if (code === 'auth/invalid-email' || msg.includes('invalid-email')) {
-    return 'Please enter a valid email address.';
+    return 'Please type a real email address, like name@example.com.';
   }
   if (code === 'auth/too-many-requests' || msg.includes('too-many-requests')) {
-    return 'Too many attempts. Please wait a minute and try again.';
+    return 'Too many tries right now. Please wait one minute and tap Try again.';
   }
 
   const cleaned = sanitizeErrorTextNoTokensOrLinks(
     msg
       .replace(/^Firebase:\s*/i, '')
-      .replace(/\(auth\/[^)]+\)\.?/i, '')
+      .replace(/\(auth\/[^)]+\)\.?/gi, '')
+      .replace(/\bauth\/[a-z0-9-]+\b/gi, '')
+      .replace(/\b\d+\b/g, '')
+      .replace(/\s{2,}/g, ' ')
       .trim()
   );
-  return cleaned || 'Authentication failed. Please try again.';
+  return cleaned || 'We could not complete your request right now. Please tap Try again.';
+}
+
+/**
+ * Formats Firebase Auth / MFA errors in plain, friendly words without raw error codes or numbers.
+ */
+export function formatFirebaseMfaError(err: unknown): string {
+  if (!err) return 'Something went wrong with your verification code. Please tap Try again.';
+  const friendly = getFriendlyAuthErrorMessage(err, 'email');
+  return friendly || 'Something went wrong with your verification code. Please check your authenticator app and tap Try again.';
 }
 
 export enum OperationType {

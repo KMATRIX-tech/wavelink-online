@@ -160,6 +160,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
 
   const navItems: {
     id: ActiveTab;
+    shortLabel: string;
     ariaLabel: string;
     isCenterCreate?: boolean;
     badgeCount?: number;
@@ -168,53 +169,59 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   }[] = [
     {
       id: 'feed',
+      shortLabel: language === 'sw' ? 'Nyumbani' : 'Home',
       ariaLabel: t('nav.home') || 'Home',
       showDot: Boolean(hasNewPosts || hasUnreadNotifications),
       renderIcon: (active) => (
         <Home
-          size={22}
+          size={20}
           strokeWidth={active ? 2.6 : 2}
-          className="transition-transform duration-300"
+          className="transition-transform duration-200 shrink-0"
         />
       )
     },
     {
       id: 'videos',
-      ariaLabel: language === 'sw' ? 'Gundua na Reels' : 'Explore & Reels',
+      shortLabel: language === 'sw' ? 'Gundua' : 'Explore',
+      ariaLabel: language === 'sw' ? 'Gundua na Reels' : 'Explore',
       renderIcon: (active) => (
         <Compass
-          size={22}
+          size={20}
           strokeWidth={active ? 2.6 : 2}
-          className="transition-transform duration-300"
+          className="transition-transform duration-200 shrink-0"
         />
       )
     },
     {
       id: 'studio',
+      shortLabel: language === 'sw' ? 'Unda' : 'Create',
       ariaLabel: t('nav.create') || 'Create',
       isCenterCreate: true,
       renderIcon: (active) => (
         <Plus
-          size={26}
+          size={24}
           strokeWidth={2.8}
-          className={`transition-transform duration-300 ${active ? 'rotate-90' : ''}`}
+          className={`transition-transform duration-200 shrink-0 ${active ? 'rotate-90' : ''}`}
         />
       )
     },
     {
       id: 'chat',
+      shortLabel: language === 'sw' ? 'Soga' : 'Chat',
       ariaLabel: t('nav.chat') || 'Chat',
       badgeCount: effectiveUnreadChat,
+      showDot: effectiveUnreadChat > 0,
       renderIcon: (active) => (
         <MessageSquare
-          size={22}
+          size={20}
           strokeWidth={active ? 2.6 : 2}
-          className="transition-transform duration-300"
+          className="transition-transform duration-200 shrink-0"
         />
       )
     },
     {
       id: 'settings',
+      shortLabel: language === 'sw' ? 'Wasifu' : 'Profile',
       ariaLabel: t('nav.profile') || 'Profile',
       renderIcon: (active) => {
         const avatarUrl = userProfile?.photoURL || currentUser?.photoURL;
@@ -225,21 +232,21 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               src={avatarUrl}
               alt="Profile"
               fallbackName={userProfile?.displayName || currentUser?.displayName || 'Waver'}
-              size={24}
+              size={22}
               showStatus={true}
               onlyWhenVisible={false}
               targetProfile={userProfile}
               ringClassName={
-                active ? 'ring-2 ring-stone-950 scale-105 transition-all' : 'ring-1 ring-white/40 transition-all'
+                active ? 'ring-2 ring-stone-950 transition-all' : 'ring-1 ring-white/40 transition-all'
               }
             />
           );
         }
         return (
           <User
-            size={22}
+            size={20}
             strokeWidth={active ? 2.6 : 2}
-            className="transition-transform duration-300"
+            className="transition-transform duration-200 shrink-0"
           />
         );
       }
@@ -255,7 +262,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
     <nav
       aria-label="Mobile Navigation"
       aria-hidden={shouldHideNav ? 'true' : undefined}
-      className={`wavelink-mobile-bottom-nav md:hidden fixed left-3 right-3 bottom-3 z-40 pointer-events-none transition-all duration-300 ease-out ${
+      className={`wavelink-mobile-bottom-nav md:hidden fixed left-2.5 right-2.5 bottom-3 z-40 pointer-events-none transition-all duration-200 ease-out ${
         shouldHideNav
           ? 'translate-y-28 opacity-0 pointer-events-none'
           : 'translate-y-0 opacity-100'
@@ -265,7 +272,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
       }}
     >
       <div
-        className={`wavelink-glass-pill-nav wavelink-float-gentle mx-auto max-w-[23rem] rounded-full px-3 py-1.5 flex items-center justify-between gap-1 ${
+        className={`wavelink-glass-pill-nav mx-auto max-w-[24.5rem] rounded-full px-2 py-1.5 flex items-center justify-between gap-1 ${
           shouldHideNav ? 'pointer-events-none' : 'pointer-events-auto'
         }`}
       >
@@ -281,28 +288,33 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               aria-label={item.ariaLabel}
               title={item.ariaLabel}
               aria-current={isActive ? 'page' : undefined}
-              className="relative flex items-center justify-center min-w-[48px] min-h-[48px] rounded-full select-none cursor-pointer transition-transform duration-200 active:scale-95 focus:outline-none"
+              className="relative flex items-center justify-center min-w-[44px] min-h-[44px] rounded-full select-none cursor-pointer transition-transform duration-150 active:scale-95 focus:outline-none"
             >
-              {/* Animated White Circular Highlight behind active icon, or Soft Glowing Pastel Gradient Circle for Centre Create "+" */}
+              {/* Active item expands into a white pill with icon + 1 short label; Center Create is a vibrant gradient button */}
               <span
                 aria-hidden="true"
-                className={`flex items-center justify-center rounded-full transition-all duration-300 ease-out ${
+                className={`flex items-center justify-center rounded-full transition-all duration-200 ease-out ${
                   isCreate
-                    ? `w-13 h-13 wavelink-nav-pastel-create text-slate-950 ${
+                    ? `w-12 h-12 bg-gradient-to-tr from-[#A855F7] via-[#EC4899] to-[#F97316] text-white shadow-[0_6px_20px_rgba(236,72,153,0.45)] ${
                         isActive ? 'scale-105 ring-2 ring-white' : 'hover:scale-105'
                       }`
                     : isActive
-                    ? 'w-11 h-11 bg-white text-[#0F172A] shadow-[0_6px_20px_rgba(255,255,255,0.35)] scale-100'
-                    : 'w-11 h-11 bg-transparent text-white/80 hover:text-white hover:bg-white/10 scale-95'
+                    ? 'h-11 px-3.5 gap-1.5 bg-white text-[#0F172A] shadow-[0_6px_20px_rgba(255,255,255,0.32)]'
+                    : 'w-11 h-11 bg-transparent text-white/85 hover:text-white hover:bg-white/10'
                 }`}
               >
                 {item.renderIcon(isActive)}
+                {!isCreate && isActive && (
+                  <span className="text-xs font-extrabold tracking-tight whitespace-nowrap">
+                    {item.shortLabel}
+                  </span>
+                )}
               </span>
 
-              {/* Unread Badge on Chat */}
+              {/* Unread Red Dot / Count Badge on Chat */}
               {typeof item.badgeCount === 'number' && item.badgeCount > 0 && (
                 <span
-                  className="absolute top-1 right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-[#F43F5E] text-white text-[10px] font-extrabold flex items-center justify-center ring-2 ring-[#0F172A] shadow-xs"
+                  className="absolute top-0.5 right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#F43F5E] text-white text-[10px] font-extrabold flex items-center justify-center ring-2 ring-[#0F172A] shadow-xs tabular-nums"
                   aria-label={`${item.badgeCount} unread messages`}
                 >
                   {item.badgeCount > 99 ? '99+' : item.badgeCount}
@@ -312,7 +324,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               {/* Red Dot on Home if new posts or unread activity */}
               {!item.badgeCount && item.showDot && (
                 <span
-                  className="absolute top-1.5 right-2 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-[#0F172A] shadow-xs"
+                  className="absolute top-1 right-1.5 w-2.5 h-2.5 rounded-full bg-[#F43F5E] ring-2 ring-[#0F172A] shadow-xs"
                   aria-label="New posts available"
                 />
               )}

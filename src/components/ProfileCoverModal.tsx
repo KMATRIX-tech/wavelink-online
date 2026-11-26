@@ -177,17 +177,17 @@ export function getThemeDefaultCoverStyle(theme?: AppearanceTheme): React.CSSPro
 }
 
 /**
- * Crops an image file to a 3:1 cover aspect ratio (1600x534 max width) with vertical pan & zoom,
- * and compresses it to ~300 KB JPEG (never exceeding 5 MB).
+ * Crops an image file to a 3:1 cover aspect ratio (1280x426 optimized banner) with vertical pan & zoom,
+ * and compresses it to ~220 KB JPEG (never exceeding 500 KB).
  */
 async function cropAndCompressCoverImage(
   imageElement: HTMLImageElement,
   panYPercent: number, // 0 to 100
   zoomLevel: number // 1 to 2.5
 ): Promise<{ blob: Blob; previewDataUrl: string }> {
-  const TARGET_W = 1600;
-  const TARGET_H = 534; // 3:1 cover aspect ratio, max 1600px wide
-  const TARGET_BYTES = 300 * 1024; // ~300 KB target
+  const TARGET_W = 1280;
+  const TARGET_H = 426; // 3:1 cover aspect ratio, optimized 1280px thumbnail width
+  const TARGET_BYTES = 220 * 1024; // ~220 KB target
 
   const canvas = document.createElement('canvas');
   canvas.width = TARGET_W;
@@ -228,7 +228,7 @@ async function cropAndCompressCoverImage(
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(imageElement, srcX, srcY, cropW, cropH, 0, 0, TARGET_W, TARGET_H);
 
-  // Iteratively compress JPEG toward ~300 KB
+  // Iteratively compress JPEG toward ~220 KB
   let quality = 0.84;
   let finalBlob: Blob | null = null;
 
@@ -250,13 +250,13 @@ async function cropAndCompressCoverImage(
     throw new Error('Failed to compress cover image.');
   }
 
-  // Guarantee cover is strictly under 500 KB before uploading to Cloudinary
-  if (finalBlob.size >= 450 * 1024) {
+  // Guarantee cover is strictly under 350 KB before uploading to Cloudinary
+  if (finalBlob.size >= 320 * 1024) {
     try {
       finalBlob = await compressProfileImageToBlob(finalBlob, {
-        maxWidth: 1400,
-        maxHeight: 467,
-        targetMaxBytes: 420 * 1024,
+        maxWidth: 1280,
+        maxHeight: 426,
+        targetMaxBytes: 240 * 1024,
         mimeType: 'image/jpeg'
       });
     } catch {
@@ -619,24 +619,24 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
         </div>
 
         {/* Mode Tabs */}
-        <div className="px-5 pt-3 flex items-center gap-2 border-b border-[var(--border-hairline)] pb-3">
+        <div className="px-5 pt-3 flex items-center gap-2 border-b border-[var(--border-hairline)] pb-3 flex-wrap">
           <button
             type="button"
             onClick={() => setTab('presets')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer ${
+            className={`min-h-[2.75rem] px-3.5 py-2 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer ${
               tab === 'presets'
                 ? 'bg-[var(--accent-primary)] text-white'
                 : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)]'
             }`}
           >
             <Sparkles size={14} />
-            <span>{language === 'sw' ? 'Maktaba ya Majalada' : 'Built-in Covers'}</span>
+            <span>{language === 'sw' ? 'Majalada' : 'Covers'}</span>
           </button>
 
           <button
             type="button"
             onClick={() => setTab('upload')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer ${
+            className={`min-h-[2.75rem] px-3.5 py-2 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer ${
               tab === 'upload'
                 ? 'bg-[var(--accent-primary)] text-white'
                 : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)]'
@@ -649,42 +649,40 @@ export const ProfileCoverModal: React.FC<ProfileCoverModalProps> = ({
           <button
             type="button"
             onClick={() => setTab('video')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer ${
+            className={`min-h-[2.75rem] px-3.5 py-2 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer ${
               tab === 'video'
                 ? 'bg-[var(--accent-primary)] text-white'
                 : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)]'
             }`}
           >
             <Video size={14} />
-            <span>{language === 'sw' ? 'Jalada la Video' : 'Looping Video'}</span>
+            <span>{language === 'sw' ? 'Video' : 'Video'}</span>
           </button>
         </div>
 
         {/* Body */}
         <div className="p-5 overflow-y-auto overscroll-contain space-y-4 flex-1 min-h-0">
           {errorMsg && (
-            <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-rose-700 dark:text-rose-200 space-y-2">
-              <div className="flex items-start gap-2 text-xs font-bold">
+            <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-rose-700 dark:text-rose-200 flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-start gap-2 text-xs font-bold flex-1 min-w-0">
                 <AlertCircle size={16} className="shrink-0 mt-0.5 text-rose-500" />
-                <div className="flex-1 min-w-0">
-                  <p>{errorMsg}</p>
-                  {errorCode && (
-                    <p className="text-[11px] font-mono opacity-80 mt-1">
-                      Error code: {errorCode}
-                    </p>
-                  )}
-                </div>
+                <p className="flex-1 min-w-0">{errorMsg}</p>
               </div>
-              {canRetryUpload && !isSaving && (
-                <button
-                  type="button"
-                  onClick={handleSave}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold transition cursor-pointer"
-                >
-                  <RotateCcw size={13} />
-                  <span>{language === 'sw' ? 'Jaribu Tena' : 'Retry Upload'}</span>
-                </button>
-              )}
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={() => {
+                  if (canRetryUpload) {
+                    handleSave();
+                  } else {
+                    setErrorMsg(null);
+                  }
+                }}
+                className="min-h-[2.75rem] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold transition cursor-pointer shrink-0"
+              >
+                <RotateCcw size={13} />
+                <span>{language === 'sw' ? 'Jaribu tena' : 'Try again'}</span>
+              </button>
             </div>
           )}
 

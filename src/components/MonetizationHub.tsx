@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth, DAILY_REWARD_SCHEDULE, getLocalDateKey, getLocalPointTransactions } from '../context/AuthContext';
 import { db } from '../firebase';
-import { collection, query, where, onSnapshot, orderBy } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, orderBy, limit } from 'firebase/firestore';
+import { sanitizeUserFacingError } from '../utils/safetyFilters';
 import {
   Post,
   SubscriptionTier,
@@ -118,7 +119,12 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
         setHubPromoError('Invalid or expired coupon code. Please verify your code and try again.');
       }
     } catch (err: any) {
-      setHubPromoError(err?.message || 'Could not redeem coupon right now. Please try again or request Admin verification.');
+      setHubPromoError(
+        sanitizeUserFacingError(
+          err,
+          'Could not check your code right now. Please tap Try again.'
+        )
+      );
     } finally {
       setIsRedeemingHubPromo(false);
     }
@@ -180,34 +186,43 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
   // General Subscription Modal fallback
   const [isGeneralModalOpen, setIsGeneralModalOpen] = useState(false);
 
-  // Load user posts for boosting
+  // Load user posts for boosting (bounded with limit(30))
   useEffect(() => {
     if (!currentUser) return;
-    const q = query(collection(db, 'posts'), where('authorId', '==', currentUser.uid));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: Post[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
-      setUserPosts(list);
-      if (list.length > 0 && !selectedPostToBoost) {
-        setSelectedPostToBoost(list[0].id);
-      }
-    });
+    const q = query(collection(db, 'posts'), where('authorId', '==', currentUser.uid), limit(30));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: Post[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Post));
+        setUserPosts(list);
+        if (list.length > 0 && !selectedPostToBoost) {
+          setSelectedPostToBoost(list[0].id);
+        }
+      },
+      () => {}
+    );
     return () => unsub();
   }, [currentUser]);
 
-  // Load tips received
+  // Load tips received (single-field query + limit(50) to avoid composite index failure)
   useEffect(() => {
     if (!currentUser) return;
     const q = query(
       collection(db, 'subscriptions'),
       where('recipientId', '==', currentUser.uid),
-      where('planId', '==', 'tip')
+      limit(50)
     );
     const unsub = onSnapshot(
       q,
       (snap) => {
         const list: PaymentTransaction[] = [];
-        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as PaymentTransaction));
+        snap.forEach((d) => {
+          const tx = { id: d.id, ...d.data() } as PaymentTransaction;
+          if (tx.planId === 'tip') {
+            list.push(tx);
+          }
+        });
         setUserTips(list);
         setIsLoadingTips(false);
       },
@@ -218,13 +233,14 @@ export const MonetizationHub: React.FC<MonetizationHubProps> = ({
     return () => unsub();
   }, [currentUser]);
 
-  // Load user's own payment/subscription/boost/tip transactions for history enrichment
+  // Load user's own payment/subscription/boost/tip transactions for history enrichment (bounded to 50)
   const [userSentSubscriptions, setUserSentSubscriptions] = useState<PaymentTransaction[]>([]);
   useEffect(() => {
     if (!currentUser) return;
     const q = query(
       collection(db, 'subscriptions'),
-      where('userId', '==', currentUser.uid)
+      where('userId', '==', currentUser.uid),
+      limit(50)
     );
     const unsub = onSnapshot(
       q,

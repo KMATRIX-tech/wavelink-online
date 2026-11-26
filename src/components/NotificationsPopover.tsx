@@ -100,6 +100,26 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
       return;
     }
 
+    let fallbackUnsub: (() => void) | null = null;
+    const blockedIds = userProfile?.blockedUserIds || [];
+
+    const applySnapshot = (snap: any) => {
+      const list: AppNotification[] = [];
+      snap.forEach((d: any) => {
+        const data = d.data() as AppNotification;
+        if (!blockedIds.includes(data.actorId)) {
+          list.push({ ...data, id: d.id });
+        }
+      });
+      list.sort((a, b) => {
+        const timeA = a.createdAt ? Date.parse(a.createdAt) || 0 : 0;
+        const timeB = b.createdAt ? Date.parse(b.createdAt) || 0 : 0;
+        return timeB - timeA;
+      });
+      setNotifications(list.slice(0, 15));
+      setIsLoading(false);
+    };
+
     const q = query(
       collection(db, 'notifications'),
       where('recipientId', '==', currentUser.uid),
@@ -109,25 +129,26 @@ export const NotificationsPopover: React.FC<NotificationsPopoverProps> = ({
 
     const unsub = onSnapshot(
       q,
-      (snap) => {
-        const blockedIds = userProfile?.blockedUserIds || [];
-        const list: AppNotification[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as AppNotification;
-          if (!blockedIds.includes(data.actorId)) {
-            list.push({ ...data, id: d.id });
-          }
-        });
-        setNotifications(list);
-        setIsLoading(false);
-      },
-      (err) => {
-        console.warn('Notifications snapshot error (non-fatal):', err);
-        setIsLoading(false);
+      applySnapshot,
+      () => {
+        // Fallback to single-field query if composite index is still building
+        const simpleQ = query(
+          collection(db, 'notifications'),
+          where('recipientId', '==', currentUser.uid),
+          limit(25)
+        );
+        fallbackUnsub = onSnapshot(
+          simpleQ,
+          applySnapshot,
+          () => setIsLoading(false)
+        );
       }
     );
 
-    return () => unsub();
+    return () => {
+      unsub();
+      if (fallbackUnsub) fallbackUnsub();
+    };
   }, [currentUser, userProfile?.blockedUserIds]);
 
   // Click outside to close

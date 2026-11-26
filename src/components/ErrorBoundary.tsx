@@ -79,8 +79,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       }
 
       return (
-        <div className="min-h-screen w-full flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A] p-4 sm:p-6 select-none font-sans">
-          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl border border-slate-200/80 p-6 sm:p-8 text-center flex flex-col items-center">
+        <div className="min-h-[100dvh] w-full flex flex-col items-center justify-center bg-[#F8FAFC] text-[#0F172A] p-4 sm:p-6 select-none font-sans safe-area-top safe-area-bottom">
+          <div className="max-w-[26rem] w-full bg-white rounded-2xl shadow-xl border border-slate-200/80 p-6 sm:p-8 text-center flex flex-col items-center">
             {/* WaveLink Logo & Icon */}
             <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-blue-600 to-teal-500 flex items-center justify-center text-white shadow-lg shadow-blue-500/20 mb-4 animate-pulse">
               <Waves size={36} />
@@ -92,65 +92,36 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
             <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-xs font-semibold mb-4">
               <AlertTriangle size={14} className="text-amber-600 shrink-0" />
-              <span>Something went wrong, tap to reload</span>
+              <span>Something went wrong</span>
             </div>
 
             <p className="text-sm text-slate-600 mb-6 leading-relaxed">
-              We encountered an unexpected glitch while displaying this page. Tap the button below to reload fresh and continue your session.
+              This page had a hiccup while loading. Tap Try again below to open it fresh.
             </p>
 
             <div className="w-full space-y-2.5">
               <button
                 type="button"
                 onClick={this.handleReload}
-                className="w-full py-3 px-4 bg-gradient-to-r from-blue-600 to-teal-600 hover:from-blue-700 hover:to-teal-700 text-white font-bold rounded-xl shadow-md hover:shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2 cursor-pointer text-sm"
+                className="w-full min-h-[2.75rem] py-3 px-4 bg-gradient-to-r from-blue-600 to-teal-600 hover:from-blue-700 hover:to-teal-700 text-white font-bold rounded-xl shadow-md hover:shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2 cursor-pointer text-sm"
               >
                 <RefreshCw size={16} />
-                <span>Tap to reload</span>
+                <span>Try again</span>
               </button>
 
               <button
                 type="button"
                 onClick={this.handleResetAndReload}
-                className="w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl transition-all active:scale-[0.98] cursor-pointer text-xs"
+                className="w-full min-h-[2.75rem] py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl transition-all active:scale-[0.98] cursor-pointer text-xs flex items-center justify-center gap-1.5"
               >
-                Reset session and reload
+                <RefreshCw size={14} />
+                <span>Reset</span>
               </button>
             </div>
-
-            {/* Expandable Technical Diagnostics for Admins / Developers */}
-            {this.state.error && (
-              <div className="w-full mt-6 pt-4 border-t border-slate-100 text-left">
-                <button
-                  type="button"
-                  onClick={this.toggleDetails}
-                  className="w-full flex items-center justify-between text-xs font-medium text-slate-500 hover:text-slate-800 py-1 cursor-pointer transition-colors"
-                >
-                  <span>Technical details</span>
-                  {this.state.showDetails ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                </button>
-
-                {this.state.showDetails && (
-                  <div className="mt-2 p-3 bg-slate-900 text-slate-200 rounded-lg text-[11px] font-mono overflow-x-auto max-h-48 leading-relaxed select-text">
-                    <p className="font-bold text-red-400 mb-1">
-                      {this.state.error.name}: {this.state.error.message}
-                    </p>
-                    {this.state.error.stack && (
-                      <p className="text-slate-400 whitespace-pre-wrap">{this.state.error.stack}</p>
-                    )}
-                    {this.state.errorInfo?.componentStack && (
-                      <p className="text-slate-500 whitespace-pre-wrap mt-2">
-                        {this.state.errorInfo.componentStack}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
           </div>
 
           <p className="mt-6 text-xs text-slate-400 font-medium">
-            WaveLink Secure Community Platform
+            WaveLink
           </p>
         </div>
       );

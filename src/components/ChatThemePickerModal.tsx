@@ -23,6 +23,7 @@ import {
   X
 } from 'lucide-react';
 import { useBottomSheetLock } from '../utils/sheetLock';
+import { sanitizeUserFacingError } from '../utils/safetyFilters';
 
 interface ChatThemePickerModalProps {
   isOpen: boolean;
@@ -192,11 +193,12 @@ export const ChatThemePickerModal: React.FC<ChatThemePickerModalProps> = ({
       onPreviewChange(null);
       onClose();
     } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : 'Could not save chat theme. Please try again.';
-      setErrorText(msg);
+      setErrorText(
+        sanitizeUserFacingError(
+          err,
+          'Could not save your chat theme. Check your internet and tap Try again.'
+        )
+      );
     } finally {
       setIsSaving(false);
     }
@@ -211,11 +213,12 @@ export const ChatThemePickerModal: React.FC<ChatThemePickerModalProps> = ({
       onPreviewChange(null);
       onClose();
     } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : 'Could not reset chat theme. Please try again.';
-      setErrorText(msg);
+      setErrorText(
+        sanitizeUserFacingError(
+          err,
+          'Could not reset your chat theme. Check your internet and tap Try again.'
+        )
+      );
     } finally {
       setIsSaving(false);
     }

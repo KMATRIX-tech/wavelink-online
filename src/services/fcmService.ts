@@ -6,7 +6,9 @@ import {
   setDoc,
   deleteDoc,
   collection,
-  getDocs
+  getDocs,
+  query,
+  limit
 } from 'firebase/firestore';
 import { db, cleanFirestoreData, getAuthHeaders } from '../firebase';
 import { UserNotificationSettings, FcmDeviceTokenDoc, FcmTokenEntry } from '../types';
@@ -157,7 +159,7 @@ export async function fetchDeviceTokenFromUserDoc(userId: string): Promise<{
   tokenInDoc: string | null;
   allTokens: FcmTokenEntry[];
 }> {
-  const snap = await getDocs(collection(db, 'users', userId, 'fcmTokens'));
+  const snap = await getDocs(query(collection(db, 'users', userId, 'fcmTokens'), limit(25)));
   const allTokens: FcmTokenEntry[] = [];
   const localToken = getSavedDeviceToken();
   const currentDeviceName = getDeviceDisplayName();
@@ -673,7 +675,7 @@ export async function syncExistingDeviceTokenState(
 
   // Also sync any existing tokens from subcollection to server cache
   try {
-    const snap = await getDocs(collection(db, 'users', userId, 'fcmTokens'));
+    const snap = await getDocs(query(collection(db, 'users', userId, 'fcmTokens'), limit(25)));
     const headers = await getAuthHeaders();
     snap.forEach((docSnap) => {
       const data = docSnap.data() as FcmDeviceTokenDoc;

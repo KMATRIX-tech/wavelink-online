@@ -12,7 +12,12 @@ import {
   linkWithCredential,
   updatePassword,
   updateProfile as fbUpdateProfile,
-  signOut as fbSignOut
+  signOut as fbSignOut,
+  getMultiFactorResolver,
+  TotpMultiFactorGenerator,
+  type MultiFactorError,
+  type MultiFactorResolver,
+  type MultiFactorInfo
 } from 'firebase/auth';
 import {
   collection,
@@ -21,7 +26,8 @@ import {
   getDocs,
   doc,
   getDoc,
-  setDoc
+  setDoc,
+  limit
 } from 'firebase/firestore';
 import {
   auth,
@@ -33,11 +39,14 @@ import {
   extractSafeFirebaseAuthCode,
   cleanFirestoreData,
   getBestAuthUserPhotoUrl,
-  isRealUserPhotoUrl
+  isRealUserPhotoUrl,
+  formatFirebaseMfaError,
+  getFriendlyAuthErrorMessage
 } from '../firebase';
 import { recordSystemDomain } from '../services/verificationService';
-import { validateStrongPassword } from '../utils/security';
+import { validateStrongPassword, clearClientFailedLogins } from '../utils/security';
 import { useAuth } from '../context/AuthContext';
+import { LegalModal, LegalDocType } from './LegalModals';
 import {
   Waves,
   Mail,
@@ -47,11 +56,14 @@ import {
   ShieldCheck,
   KeyRound,
   CheckCircle2,
-  X
+  X,
+  ArrowLeft,
+  Smartphone,
+  RotateCcw
 } from 'lucide-react';
 
-const GENERIC_OWNER_ERROR = 'Authentication failed. Unable to verify owner credentials.';
-const GENERIC_USER_AUTH_ERROR = 'Unable to complete authentication. Please check your details and try again.';
+const GENERIC_OWNER_ERROR = 'We could not verify the owner code. Please check your code and tap Try again.';
+const GENERIC_USER_AUTH_ERROR = 'We could not sign you in. Please check your details and tap Try again.';
 const EXISTING_ACCOUNT_EMAIL_STORAGE_KEY = 'wavelink_existing_account_email';
 
 async function logFailureOnServerOnly(
@@ -86,7 +98,8 @@ async function logFailureOnServerOnly(
 }
 
 export const AuthPage: React.FC = () => {
-  const { refreshAdminVerification, completeVerifiedAuthSession } = useAuth();
+  const { refreshAdminVerification, completeVerifiedAuthSession, sendPasswordReset } = useAuth();
+  const [isSendingPasswordReset, setIsSendingPasswordReset] = useState(false);
 
   // Tab state: 'signin' | 'signup' | 'existing' ("I already have an account")
   const [authMode, setAuthMode] = useState<'signin' | 'signup' | 'existing'>('signin');
@@ -127,6 +140,19 @@ export const AuthPage: React.FC = () => {
   const [ownerError, setOwnerError] = useState<string | null>(null);
   const [ownerLockedOut, setOwnerLockedOut] = useState(false);
   const [isOwnerSubmitting, setIsOwnerSubmitting] = useState(false);
+
+  // Firebase Built-In TOTP Multi-Factor Sign-In Challenge state
+  const [mfaResolver, setMfaResolver] = useState<MultiFactorResolver | null>(null);
+  const [mfaHints, setMfaHints] = useState<MultiFactorInfo[]>([]);
+  const [mfaDigits, setMfaDigits] = useState<string[]>(['', '', '', '', '', '']);
+  const [isVerifyingMfa, setIsVerifyingMfa] = useState(false);
+  const [mfaError, setMfaError] = useState<string | null>(null);
+  const [showLostAuthHelp, setShowLostAuthHelp] = useState(false);
+  const [mfaFlowContext, setMfaFlowContext] = useState<{
+    type: 'signin' | 'google' | 'existing' | 'owner';
+    ownerAccessCode?: string;
+  } | null>(null);
+  const mfaOtpRefs = useRef<Array<HTMLInputElement | null>>([]);
 
   // System domains are recorded by signed-in admins inside App.tsx
 
@@ -200,6 +226,21 @@ export const AuthPage: React.FC = () => {
     })();
   }, [loadExistingAccountProfileIntoForm]);
 
+  // Clear stale auth flow session flags if landing unauthenticated without an active email link callback
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const isEmailLink = isSignInWithEmailLink(auth, window.location.href);
+    if (!isEmailLink && !auth.currentUser) {
+      try {
+        sessionStorage.removeItem('wavelink_signup_verification_pending');
+        sessionStorage.removeItem('wavelink_existing_account_setup_pending');
+        sessionStorage.removeItem('wavelink_owner_flow_pending');
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
   // 60-second resend cooldown timer
   useEffect(() => {
     if (resendCooldownSeconds <= 0) return;
@@ -232,15 +273,16 @@ export const AuthPage: React.FC = () => {
   };
 
   /**
-   * Resolve a username or email identifier to the Firebase Auth email
+   * Resolve a username or email identifier to the Firebase Auth email (returns null if unknown username)
    */
-  const resolveAuthEmailFromIdentifier = async (rawIdentifier: string): Promise<string> => {
+  const resolveAuthEmailFromIdentifier = async (rawIdentifier: string): Promise<string | null> => {
     const trimmed = rawIdentifier.trim();
     if (trimmed.includes('@') && !trimmed.startsWith('@')) {
       return trimmed.toLowerCase();
     }
 
     const cleanHandle = trimmed.replace(/^@/, '').toLowerCase().replace(/[^a-z0-9_.-]/g, '');
+    if (!cleanHandle) return null;
 
     // 1. Check server-side username lookup
     try {
@@ -259,25 +301,27 @@ export const AuthPage: React.FC = () => {
         }
       }
     } catch {
-      // continue to Firestore lookup
+      // continue to Firestore lookup if signed in
     }
 
-    // 2. Check Firestore users collection by username (@handle or handle)
-    try {
-      const candidates = [`@${cleanHandle}`, cleanHandle];
-      const q = query(collection(db, 'users'), where('username', 'in', candidates));
-      const snap = await getDocs(q);
-      if (!snap.empty) {
-        const docData = snap.docs[0].data();
-        if (docData?.email && typeof docData.email === 'string' && docData.email.includes('@')) {
-          return docData.email.trim().toLowerCase();
+    // 2. Check Firestore users collection by username if currently authenticated
+    if (auth.currentUser) {
+      try {
+        const candidates = [`@${cleanHandle}`, cleanHandle];
+        const q = query(collection(db, 'users'), where('username', 'in', candidates), limit(5));
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          const docData = snap.docs[0].data();
+          if (docData?.email && typeof docData.email === 'string' && docData.email.includes('@')) {
+            return docData.email.trim().toLowerCase();
+          }
         }
+      } catch {
+        // ignore
       }
-    } catch {
-      // fallback to deterministic handle email
     }
 
-    return `${cleanHandle || 'member'}@users.wavelink.app`;
+    return null;
   };
 
   /**
@@ -409,7 +453,7 @@ export const AuthPage: React.FC = () => {
     if (!pwValidation.valid) {
       setError(
         pwValidation.message ||
-          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
       );
       return;
     }
@@ -428,30 +472,37 @@ export const AuthPage: React.FC = () => {
       const pwServerData = await pwServerResp.json().catch(() => ({}));
       if (!pwServerResp.ok || !pwServerData?.valid) {
         setError(
-          pwServerData?.error ||
-            'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
         );
         return;
       }
 
-      // 2. Check if email already belongs to an existing account on the server
-      try {
-        const checkResp = await fetch('/api/auth/check-email-availability', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-WaveLink-Device-Id': getClientDeviceId()
-          },
-          body: JSON.stringify({ email: cleanEmail })
-        });
-        const checkData = await checkResp.json().catch(() => ({}));
-        if (checkData?.exists) {
-          setExistingAccountDetected(true);
-          setError('This email already has an account');
-          return;
+      const alreadySignedInSameUnverified = Boolean(
+        auth.currentUser &&
+          auth.currentUser.email?.toLowerCase() === cleanEmail &&
+          !auth.currentUser.emailVerified
+      );
+
+      // 2. Check if email already belongs to a completed/verified account on the server
+      if (!alreadySignedInSameUnverified) {
+        try {
+          const checkResp = await fetch('/api/auth/check-email-availability', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-WaveLink-Device-Id': getClientDeviceId()
+            },
+            body: JSON.stringify({ email: cleanEmail })
+          });
+          const checkData = await checkResp.json().catch(() => ({}));
+          if (checkData?.exists) {
+            setExistingAccountDetected(true);
+            setError('This email already has an account');
+            return;
+          }
+        } catch {
+          // continue
         }
-      } catch {
-        // continue
       }
 
       // 2B. Check 60-second resend cooldown on the server
@@ -486,7 +537,7 @@ export const AuthPage: React.FC = () => {
         // ignore
       }
 
-      // 4. Create or use the user's Firebase Auth account
+      // 4. Create or reuse the user's Firebase Auth account
       let targetUser = auth.currentUser;
       if (!targetUser || targetUser.email?.toLowerCase() !== cleanEmail) {
         if (targetUser) {
@@ -497,9 +548,21 @@ export const AuthPage: React.FC = () => {
           targetUser = createRes.user;
         } catch (authErr: any) {
           if (authErr?.code === 'auth/email-already-in-use') {
-            setExistingAccountDetected(true);
-            setError('This email already has an account');
-            return;
+            // Attempt sign-in with the supplied password to resume an incomplete/unverified sign-up
+            try {
+              const resumeRes = await signInWithEmailAndPassword(auth, cleanEmail, password);
+              if (!resumeRes.user.emailVerified) {
+                targetUser = resumeRes.user;
+              } else {
+                setExistingAccountDetected(true);
+                setError('This email already has an account');
+                return;
+              }
+            } catch {
+              setExistingAccountDetected(true);
+              setError('This email already has an account');
+              return;
+            }
           } else if (isAuthNetworkError(authErr)) {
             await new Promise((r) => setTimeout(r, 600));
             const retryRes = await createUserWithEmailAndPassword(auth, cleanEmail, password);
@@ -616,8 +679,15 @@ export const AuthPage: React.FC = () => {
         'Google account verified! Choose your username and password below to keep all your posts, followers, points, and Pro status.'
       );
     } catch (err) {
-      await logFailureOnServerOnly('existing_account_google_verify', err);
-      setError(GENERIC_USER_AUTH_ERROR);
+      if ((err as { code?: string })?.code === 'auth/multi-factor-auth-required') {
+        handleMultiFactorRequiredError(err, { type: 'existing' });
+        return;
+      }
+      const friendly = getFriendlyAuthErrorMessage(err, 'google');
+      if (friendly) {
+        await logFailureOnServerOnly('existing_account_google_verify', err);
+        setError(friendly);
+      }
     } finally {
       setIsVerifyingExisting(false);
     }
@@ -689,7 +759,7 @@ export const AuthPage: React.FC = () => {
       }
       const code = extractSafeFirebaseAuthCode(err);
       setVerificationErrorCode(code);
-      setError(GENERIC_USER_AUTH_ERROR);
+      setError(getFriendlyAuthErrorMessage(err) || GENERIC_USER_AUTH_ERROR);
     } finally {
       setIsVerifyingExisting(false);
     }
@@ -717,7 +787,7 @@ export const AuthPage: React.FC = () => {
     if (!pwValidation.valid) {
       setError(
         pwValidation.message ||
-          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
       );
       return;
     }
@@ -739,8 +809,7 @@ export const AuthPage: React.FC = () => {
       const pwServerData = await pwServerResp.json().catch(() => ({}));
       if (!pwServerResp.ok || !pwServerData?.valid) {
         setError(
-          pwServerData?.error ||
-            'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
         );
         setStatusMessage(null);
         setIsLoading(false);
@@ -773,7 +842,7 @@ export const AuthPage: React.FC = () => {
       await fbUpdateProfile(activeUser, { displayName: name }).catch(() => {});
       const idToken = await activeUser.getIdToken(true);
 
-      // 3. Register username -> email mapping on the server for this existing UID
+      // 3. Register username -> email mapping on the server for this existing UID (with isLinkingExisting: true)
       const regResp = await fetch('/api/auth/register-username', {
         method: 'POST',
         headers: {
@@ -787,7 +856,8 @@ export const AuthPage: React.FC = () => {
           displayName: name,
           authEmail: targetEmail,
           channel: 'email',
-          password
+          password,
+          isLinkingExisting: true
         })
       });
       const regData = await regResp.json().catch(() => ({}));
@@ -797,7 +867,7 @@ export const AuthPage: React.FC = () => {
           regData?.error || 'Server rejected username registration',
           activeUser.uid
         );
-        setError(GENERIC_USER_AUTH_ERROR);
+        setError(regData?.error || GENERIC_USER_AUTH_ERROR);
         setStatusMessage(null);
         setIsLoading(false);
         return;
@@ -822,7 +892,7 @@ export const AuthPage: React.FC = () => {
       setStatusMessage('Account updated! Signing you in with all your existing data...');
     } catch (err) {
       await logFailureOnServerOnly('existing_account_setup_complete', err, activeUser?.uid);
-      setError(GENERIC_USER_AUTH_ERROR);
+      setError(getFriendlyAuthErrorMessage(err) || GENERIC_USER_AUTH_ERROR);
       setStatusMessage(null);
     } finally {
       setIsLoading(false);
@@ -847,7 +917,7 @@ export const AuthPage: React.FC = () => {
     if (!pwValidation.valid) {
       setError(
         pwValidation.message ||
-          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
       );
       return;
     }
@@ -868,8 +938,7 @@ export const AuthPage: React.FC = () => {
       const pwServerData = await pwServerResp.json().catch(() => ({}));
       if (!pwServerResp.ok || !pwServerData?.valid) {
         setError(
-          pwServerData?.error ||
-            'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
         );
         setIsLoading(false);
         return;
@@ -993,18 +1062,107 @@ export const AuthPage: React.FC = () => {
 
       try {
         const resolvedEmail = await resolveAuthEmailFromIdentifier(rawUsername);
+        if (!resolvedEmail) {
+          setError('Username not found. Please sign in using your email address instead.');
+          setStatusMessage(null);
+          setIsLoading(false);
+          return;
+        }
+
+        // 1. Check server-side temporary lockout (15-min lockout after 5 failed attempts)
+        try {
+          const lockCheckResp = await fetch('/api/auth/check-lockout', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-WaveLink-Device-Id': getClientDeviceId()
+            },
+            body: JSON.stringify({ email: resolvedEmail })
+          });
+          const lockCheckData = await lockCheckResp.json().catch(() => ({}));
+          if (lockCheckData?.locked) {
+            setLockedAccountEmail(resolvedEmail);
+            setLockoutSecondsLeft(lockCheckData.remainingSeconds || 900);
+            setError(
+              lockCheckData.message ||
+                'Account temporarily locked after repeated failed login attempts. Unlock below with an email verification code.'
+            );
+            setStatusMessage(null);
+            setIsLoading(false);
+            return;
+          }
+        } catch {
+          // continue if offline
+        }
 
         let signInRes;
         try {
           signInRes = await signInWithEmailAndPassword(auth, resolvedEmail, password);
-        } catch (initialErr) {
+        } catch (initialErr: any) {
+          if (initialErr?.code === 'auth/multi-factor-auth-required') {
+            handleMultiFactorRequiredError(initialErr, { type: 'signin' });
+            setIsLoading(false);
+            return;
+          }
           if (isAuthNetworkError(initialErr)) {
             await new Promise((r) => setTimeout(r, 600));
-            signInRes = await signInWithEmailAndPassword(auth, resolvedEmail, password);
+            try {
+              signInRes = await signInWithEmailAndPassword(auth, resolvedEmail, password);
+            } catch (retryErr: any) {
+              if (retryErr?.code === 'auth/multi-factor-auth-required') {
+                handleMultiFactorRequiredError(retryErr, { type: 'signin' });
+                setIsLoading(false);
+                return;
+              }
+              throw retryErr;
+            }
           } else {
+            // Record failed login attempt on server (never triggered for MFA challenge)
+            try {
+              const failResp = await fetch('/api/auth/record-failed-login', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-WaveLink-Device-Id': getClientDeviceId()
+                },
+                body: JSON.stringify({ email: resolvedEmail })
+              });
+              const failData = await failResp.json().catch(() => ({}));
+              if (failData?.locked) {
+                setLockedAccountEmail(resolvedEmail);
+                setLockoutSecondsLeft(failData.remainingSeconds || 900);
+                setError(
+                  'Your account is locked for a short time after repeated failed sign-in tries. You can unlock it below by email.'
+                );
+                setStatusMessage(null);
+                setIsLoading(false);
+                return;
+              }
+            } catch {
+              // ignore
+            }
             throw initialErr;
           }
         }
+
+        // Clear failed login counter on successful sign-in (authenticated)
+        setLockedAccountEmail(null);
+        setLockoutSecondsLeft(0);
+        clearClientFailedLogins();
+        signInRes.user
+          .getIdToken()
+          .then((token) =>
+            fetch('/api/auth/clear-failed-login', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+                'X-WaveLink-Device-Id': getClientDeviceId()
+              },
+              body: JSON.stringify({ email: resolvedEmail })
+            })
+          )
+          .catch(() => {});
 
         await signInRes.user.reload();
         const hasGoogleProvider = signInRes.user.providerData.some(
@@ -1019,9 +1177,18 @@ export const AuthPage: React.FC = () => {
           setAuthMode('signup');
           setEmailInput(signInRes.user.email || resolvedEmail);
           setIsEmailVerified(false);
-          setStatusMessage(null);
+          setVerificationLinkSent(true);
+          try {
+            await sendEmailVerification(signInRes.user);
+            setResendCooldownSeconds(60);
+            setVerificationNotice('Verification link sent. Open it in your inbox, then tap "I\'ve verified".');
+            setStatusMessage('Verification link sent. Check your inbox and spam folder.');
+          } catch {
+            setVerificationNotice('Tap "Send verification link" or confirm after verifying your email.');
+            setStatusMessage(null);
+          }
           setError(
-            'Your email address is not verified yet. Please tap Verify on your email to receive a verification link before continuing.'
+            'Your email address is not verified yet. Please verify your email using the link sent to your inbox, then tap "I\'ve verified".'
           );
           return;
         }
@@ -1030,7 +1197,7 @@ export const AuthPage: React.FC = () => {
         setStatusMessage('Welcome back! Logging you in...');
       } catch (err: any) {
         await logFailureOnServerOnly('signin_username_password', err);
-        setError(GENERIC_USER_AUTH_ERROR);
+        setError(getFriendlyAuthErrorMessage(err) || GENERIC_USER_AUTH_ERROR);
         setStatusMessage(null);
       } finally {
         setIsLoading(false);
@@ -1038,9 +1205,128 @@ export const AuthPage: React.FC = () => {
     }
   };
 
+  // Account Lockout Countdown & Self-Service Email Verification Unlock state
+  const [lockedAccountEmail, setLockedAccountEmail] = useState<string | null>(null);
+  const [lockoutSecondsLeft, setLockoutSecondsLeft] = useState<number>(0);
+  const [unlockCodeSent, setUnlockCodeSent] = useState(false);
+  const [unlockCodeInput, setUnlockCodeInput] = useState('');
+  const [unlockPreviewCode, setUnlockPreviewCode] = useState<string | null>(null);
+  const [isSendingUnlock, setIsSendingUnlock] = useState(false);
+
+  useEffect(() => {
+    if (lockoutSecondsLeft <= 0) return;
+    const t = setInterval(() => {
+      setLockoutSecondsLeft((prev) => {
+        if (prev <= 1) {
+          setLockedAccountEmail(null);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [lockoutSecondsLeft]);
+
+  const handleRequestLockoutUnlockCode = async () => {
+    const rawTarget = (lockedAccountEmail || emailInput || usernameInput).trim();
+    if (!rawTarget) return;
+    setIsSendingUnlock(true);
+    try {
+      const resolvedEmail = await resolveAuthEmailFromIdentifier(rawTarget);
+      const targetEmail = resolvedEmail || rawTarget;
+      const resp = await fetch('/api/auth/request-unlock-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: targetEmail, identifier: rawTarget })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.success) {
+        setUnlockCodeSent(true);
+        const hint = data.previewFallbackCode || data.demoCodeHint;
+        if (hint) setUnlockPreviewCode(String(hint));
+        setStatusMessage(data.message || `6-digit unlock code sent to ${targetEmail}.`);
+      } else {
+        setError(data.error || 'Could not send unlock verification code.');
+      }
+    } catch {
+      setError('Could not request unlock verification code.');
+    } finally {
+      setIsSendingUnlock(false);
+    }
+  };
+
+  const handleVerifyLockoutUnlockCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const rawTarget = (lockedAccountEmail || emailInput || usernameInput).trim();
+    if (!rawTarget || !unlockCodeInput.trim()) return;
+    setIsSendingUnlock(true);
+    try {
+      const resolvedEmail = await resolveAuthEmailFromIdentifier(rawTarget);
+      const targetEmail = resolvedEmail || rawTarget;
+      const resp = await fetch('/api/auth/verify-unlock-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: targetEmail, identifier: rawTarget, code: unlockCodeInput.trim() })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.success) {
+        clearClientFailedLogins();
+        setLockedAccountEmail(null);
+        setLockoutSecondsLeft(0);
+        setUnlockCodeSent(false);
+        setUnlockCodeInput('');
+        setUnlockPreviewCode(null);
+        setError(null);
+        setStatusMessage('Account unlocked! You may now sign in.');
+      } else {
+        setError(data.error || 'Invalid or expired unlock code.');
+      }
+    } catch {
+      setError('Could not verify unlock code.');
+    } finally {
+      setIsSendingUnlock(false);
+    }
+  };
+
+  const handleForgotPasswordReset = async () => {
+    if (isSendingPasswordReset) return;
+    const rawTarget = (emailInput || usernameInput).trim();
+    if (!rawTarget) {
+      setError('Please enter your email address or username first.');
+      return;
+    }
+    setError(null);
+    setStatusMessage(null);
+    setIsSendingPasswordReset(true);
+    try {
+      const resolvedEmail = await resolveAuthEmailFromIdentifier(rawTarget);
+      if (!resolvedEmail || !resolvedEmail.includes('@')) {
+        setError('Please enter your email address to receive a password reset link.');
+        return;
+      }
+      await sendPasswordReset(resolvedEmail);
+      setStatusMessage(`Password reset link sent to ${resolvedEmail}. Check your inbox and spam folder.`);
+    } catch (err) {
+      setError(getFriendlyAuthErrorMessage(err) || 'Could not send password reset email right now.');
+    } finally {
+      setIsSendingPasswordReset(false);
+    }
+  };
+
   const [authStep, setAuthStep] = useState<'landing' | 'email' | 'password'>('landing');
   const [isStepTransitioning, setIsStepTransitioning] = useState(false);
-  const [activeLegalNotice, setActiveLegalNotice] = useState<'terms' | 'privacy' | null>(null);
+  const [activeLegalNotice, setActiveLegalNotice] = useState<LegalDocType | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const path = window.location.pathname.toLowerCase();
+    const params = new URLSearchParams(window.location.search);
+    const legalParam = params.get('legal');
+    if (path === '/privacy' || legalParam === 'privacy') return 'privacy';
+    if (path === '/terms' || legalParam === 'terms') return 'terms';
+    if (legalParam === 'security') return 'security';
+    if (legalParam === 'refund') return 'refund';
+    return null;
+  });
+  const [isAgeConfirmed, setIsAgeConfirmed] = useState(false);
   const stepTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const emailFieldRef = useRef<HTMLInputElement | null>(null);
   const passwordFieldRef = useRef<HTMLInputElement | null>(null);
@@ -1100,7 +1386,8 @@ export const AuthPage: React.FC = () => {
         existingData?.username || `@${fallbackHandle}`;
       const resolvedDisplayName =
         existingData?.displayName || fbUser.displayName || fallbackHandle;
-      const isOwnerAccount = cleanEmail === 'keylanmbilinyi5@gmail.com';
+      const isOwnerAccount =
+        cleanEmail === 'keylanmbilinyi5@gmail.com' && Boolean(fbUser.emailVerified);
 
       const resolvedPhotoUrl = getBestAuthUserPhotoUrl(fbUser, existingData);
 
@@ -1124,10 +1411,234 @@ export const AuthPage: React.FC = () => {
         await refreshAdminVerification().catch(() => {});
       }
     } catch (err) {
-      await logFailureOnServerOnly('google_direct_signin', err);
-      setError(GENERIC_USER_AUTH_ERROR);
+      if ((err as { code?: string })?.code === 'auth/multi-factor-auth-required') {
+        handleMultiFactorRequiredError(err, { type: 'google' });
+        return;
+      }
+      const friendly = getFriendlyAuthErrorMessage(err, 'google');
+      if (friendly) {
+        await logFailureOnServerOnly('google_direct_signin', err);
+        setError(friendly);
+      }
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // =========================================================================
+  // FIREBASE TOTP MULTI-FACTOR CHALLENGE HANDLERS
+  // =========================================================================
+  function handleMultiFactorRequiredError(
+    err: unknown,
+    context: { type: 'signin' | 'google' | 'existing' | 'owner'; ownerAccessCode?: string }
+  ) {
+    try {
+      const resolver = getMultiFactorResolver(auth, err as MultiFactorError);
+      setMfaResolver(resolver);
+      setMfaHints(resolver.hints || []);
+      setMfaDigits(['', '', '', '', '', '']);
+      setMfaError(null);
+      setShowLostAuthHelp(false);
+      setMfaFlowContext(context);
+      setError(null);
+      setStatusMessage(null);
+      setOwnerError(null);
+      setTimeout(() => mfaOtpRefs.current[0]?.focus(), 80);
+    } catch (resolverErr) {
+      setError(formatFirebaseMfaError(resolverErr));
+    }
+  }
+
+  const handleMfaDigitChange = (index: number, rawValue: string) => {
+    const cleaned = rawValue.replace(/\D/g, '');
+    if (cleaned.length > 1) {
+      const next = ['', '', '', '', '', ''];
+      for (let i = 0; i < Math.min(6, cleaned.length); i++) {
+        next[i] = cleaned[i];
+      }
+      setMfaDigits(next);
+      mfaOtpRefs.current[Math.min(5, cleaned.length - 1)]?.focus();
+      return;
+    }
+    const next = [...mfaDigits];
+    next[index] = cleaned;
+    setMfaDigits(next);
+    if (cleaned && index < 5) {
+      mfaOtpRefs.current[index + 1]?.focus();
+    }
+  };
+
+  const handleMfaDigitKeyDown = (index: number, e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Backspace' && !mfaDigits[index] && index > 0) {
+      mfaOtpRefs.current[index - 1]?.focus();
+    } else if (e.key === 'ArrowLeft' && index > 0) {
+      mfaOtpRefs.current[index - 1]?.focus();
+    } else if (e.key === 'ArrowRight' && index < 5) {
+      mfaOtpRefs.current[index + 1]?.focus();
+    }
+  };
+
+  const handleMfaDigitPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    const pasted = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6);
+    if (!pasted) return;
+    e.preventDefault();
+    const next = ['', '', '', '', '', ''];
+    for (let i = 0; i < pasted.length; i++) {
+      next[i] = pasted[i];
+    }
+    setMfaDigits(next);
+    mfaOtpRefs.current[Math.min(5, Math.max(0, pasted.length - 1))]?.focus();
+  };
+
+  const handleCancelMfaChallenge = () => {
+    try {
+      sessionStorage.removeItem('wavelink_owner_flow_pending');
+    } catch {
+      // ignore
+    }
+    setMfaResolver(null);
+    setMfaHints([]);
+    setMfaDigits(['', '', '', '', '', '']);
+    setMfaError(null);
+    setShowLostAuthHelp(false);
+    setMfaFlowContext(null);
+  };
+
+  const handleVerifyMfaSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mfaResolver || isVerifyingMfa) return;
+    const code = mfaDigits.join('').trim();
+    if (!/^\d{6}$/.test(code)) {
+      setMfaError('Please enter all six digits from your authenticator app.');
+      return;
+    }
+
+    const totpHint =
+      mfaHints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID) || mfaHints[0];
+    if (!totpHint) {
+      setMfaError('We could not find an authenticator app on this sign-in session. Please go back and sign in again.');
+      return;
+    }
+
+    setMfaError(null);
+    setIsVerifyingMfa(true);
+    try {
+      const assertion = TotpMultiFactorGenerator.assertionForSignIn(totpHint.uid, code);
+      const userCredential = await mfaResolver.resolveSignIn(assertion);
+      const fbUser = userCredential.user;
+      const flow = mfaFlowContext;
+
+      if (flow?.type === 'existing') {
+        await loadExistingAccountProfileIntoForm(
+          fbUser.uid,
+          fbUser.email || '',
+          fbUser.displayName
+        );
+        setMfaResolver(null);
+        setMfaFlowContext(null);
+        setAuthMode('existing');
+        setStatusMessage(
+          '2-step verification complete! Choose your username and password below to keep all your existing data.'
+        );
+        return;
+      }
+
+      if (flow?.type === 'owner' && flow.ownerAccessCode) {
+        const freshToken = await fbUser.getIdToken(true);
+        const resp = await fetch('/api/auth/owner-signin', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-WaveLink-Device-Id': getClientDeviceId(),
+            Authorization: `Bearer ${freshToken}`
+          },
+          body: JSON.stringify({
+            accessCode: flow.ownerAccessCode,
+            idToken: freshToken,
+            deviceId: getClientDeviceId()
+          })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data?.success || !data?.authorized) {
+          try {
+            sessionStorage.removeItem('wavelink_owner_flow_pending');
+            sessionStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+            localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+          } catch {
+            // ignore
+          }
+          await fbSignOut(auth).catch(() => {});
+          setMfaResolver(null);
+          setMfaFlowContext(null);
+          setError(data?.error || GENERIC_OWNER_ERROR);
+          return;
+        }
+        try {
+          if (data.ownerSessionToken) {
+            sessionStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken);
+            localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
+          }
+          sessionStorage.removeItem('wavelink_owner_flow_pending');
+        } catch {
+          // ignore
+        }
+        await fbUser.getIdToken(true).catch(() => {});
+        await fbUser.getIdTokenResult(true).catch(() => {});
+        await completeVerifiedAuthSession('Keylan', '@keylan');
+        await refreshAdminVerification();
+        setMfaResolver(null);
+        setMfaFlowContext(null);
+        return;
+      }
+
+      // Google or Email/Password sign-in completion
+      const cleanEmail = (fbUser.email || '').trim().toLowerCase();
+      if (flow?.type === 'google') {
+        const userRef = doc(db, 'users', fbUser.uid);
+        const userSnap = await getDoc(userRef).catch(() => null);
+        const existingData = userSnap && userSnap.exists() ? userSnap.data() : null;
+        const fallbackHandle =
+          (cleanEmail.split('@')[0] || 'waver').replace(/[^a-z0-9_.-]/g, '') || 'waver';
+        const resolvedUsername = existingData?.username || `@${fallbackHandle}`;
+        const resolvedDisplayName =
+          existingData?.displayName || fbUser.displayName || fallbackHandle;
+        const isOwnerAccount =
+          cleanEmail === 'keylanmbilinyi5@gmail.com' && Boolean(fbUser.emailVerified);
+        const resolvedPhotoUrl = getBestAuthUserPhotoUrl(fbUser, existingData);
+
+        await setDoc(
+          userRef,
+          cleanFirestoreData({
+            id: fbUser.uid,
+            email: cleanEmail,
+            username: resolvedUsername,
+            displayName: resolvedDisplayName,
+            photoURL: resolvedPhotoUrl,
+            avatar: resolvedPhotoUrl,
+            ...(isOwnerAccount ? { role: 'admin', isOwner: true } : {}),
+            updatedAt: new Date().toISOString()
+          }),
+          { merge: true }
+        ).catch(() => {});
+
+        await completeVerifiedAuthSession(resolvedDisplayName, resolvedUsername);
+        if (isOwnerAccount) {
+          await refreshAdminVerification().catch(() => {});
+        }
+      } else {
+        await completeVerifiedAuthSession();
+        if (cleanEmail === 'keylanmbilinyi5@gmail.com' && Boolean(fbUser.emailVerified)) {
+          await refreshAdminVerification().catch(() => {});
+        }
+      }
+
+      setMfaResolver(null);
+      setMfaFlowContext(null);
+      setStatusMessage('Welcome back! Logging you in...');
+    } catch (err) {
+      setMfaError(formatFirebaseMfaError(err));
+    } finally {
+      setIsVerifyingMfa(false);
     }
   };
 
@@ -1199,7 +1710,16 @@ export const AuthPage: React.FC = () => {
       googleProvider.setCustomParameters({ prompt: 'select_account' });
       const popupRes = await signInWithPopup(auth, googleProvider);
       idToken = await popupRes.user.getIdToken(true);
-    } catch (popupErr) {
+    } catch (popupErr: any) {
+      if (popupErr?.code === 'auth/multi-factor-auth-required') {
+        setShowOwnerModal(false);
+        setIsOwnerSubmitting(false);
+        handleMultiFactorRequiredError(popupErr, {
+          type: 'owner',
+          ownerAccessCode: trimmedCode
+        });
+        return;
+      }
       await logFailureOnServerOnly('owner_signin_google_popup', popupErr);
       // Still report attempt to server so device rate limit and server logging are enforced
       idToken = '';
@@ -1247,7 +1767,7 @@ export const AuthPage: React.FC = () => {
       try {
         if (data.ownerSessionToken) {
           sessionStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken);
-          localStorage.setItem(OWNER_SESSION_STORAGE_KEY, data.ownerSessionToken);
+          localStorage.removeItem(OWNER_SESSION_STORAGE_KEY);
         }
         sessionStorage.removeItem('wavelink_owner_flow_pending');
       } catch {
@@ -1280,10 +1800,10 @@ export const AuthPage: React.FC = () => {
   return (
     <div className="min-h-[100dvh] w-full bg-white text-[#0F172A] flex flex-col justify-between items-center px-6 py-8 sm:py-12 overflow-x-hidden overflow-y-auto safe-area-top safe-area-bottom">
       {/* Top balanced spacer */}
-      <div className="w-full max-w-[380px] h-2" aria-hidden="true" />
+      <div className="w-full max-w-[23.75rem] h-2" aria-hidden="true" />
 
       {/* Centered Authentication Content */}
-      <main className="w-full max-w-[360px] mx-auto my-auto flex flex-col items-center">
+      <main className="w-full max-w-[22.5rem] mx-auto my-auto flex flex-col items-center">
         {/* Centered Branding — Tapping the WaveLink Logo 5 times opens Hidden Owner Sign-In */}
         <div className="flex flex-col items-center text-center mb-8">
           <button
@@ -1294,8 +1814,10 @@ export const AuthPage: React.FC = () => {
           >
             <Waves className="w-6 h-6 text-white" />
           </button>
-          <h1 className="text-2xl sm:text-[26px] font-semibold tracking-tight text-[#0F172A]">
-            {authMode === 'existing'
+          <h1 className="text-2xl sm:text-[1.625rem] font-semibold tracking-tight text-[#0F172A]">
+            {mfaResolver
+              ? 'Enter your 6-digit code'
+              : authMode === 'existing'
               ? 'Link your account'
               : authStep === 'landing'
               ? 'Welcome to WaveLink'
@@ -1308,7 +1830,12 @@ export const AuthPage: React.FC = () => {
               : 'Enter your password'}
           </h1>
           <p className="mt-1.5 text-sm text-slate-500 font-normal leading-relaxed">
-            {authMode === 'existing'
+            {mfaResolver
+              ? `Open your authenticator app (${
+                  (mfaHints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID) || mfaHints[0])
+                    ?.displayName || 'Authenticator app'
+                }) and enter the current 6-digit code`
+              : authMode === 'existing'
               ? 'Verify once to attach a username and password to your account'
               : authStep === 'landing'
               ? 'Sign in or create an account to continue'
@@ -1326,12 +1853,65 @@ export const AuthPage: React.FC = () => {
         {error && (
           <div className="w-full mb-5 px-4 py-3 rounded-2xl bg-rose-50/90 border border-rose-200/80 text-rose-700 text-xs flex items-start gap-2.5 transition-opacity duration-200">
             <AlertCircle size={15} className="text-rose-500 shrink-0 mt-0.5" />
-            <div className="flex-1 space-y-1">
-              <span className="block font-medium leading-relaxed">{error}</span>
-              {verificationErrorCode && (
-                <span className="block text-[11px] font-mono text-rose-600/90">
-                  {verificationErrorCode}
-                </span>
+            <div className="flex-1 space-y-2">
+              <div className="flex items-start justify-between gap-2 flex-wrap">
+                <span className="block font-medium leading-relaxed flex-1 min-w-0">{error}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setError(null);
+                    setVerificationErrorCode(null);
+                  }}
+                  className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                >
+                  <RotateCcw size={12} />
+                  <span>Try again</span>
+                </button>
+              </div>
+              {lockoutSecondsLeft > 0 && (
+                <div className="p-2.5 rounded-xl bg-white border border-rose-200 text-[#0F172A] space-y-2">
+                  <div className="flex items-center justify-between text-[11px] font-bold">
+                    <span>Wait time left:</span>
+                    <span className="font-mono text-rose-600">
+                      {Math.floor(lockoutSecondsLeft / 60)}:
+                      {String(lockoutSecondsLeft % 60).padStart(2, '0')}
+                    </span>
+                  </div>
+                  {!unlockCodeSent ? (
+                    <button
+                      type="button"
+                      disabled={isSendingUnlock}
+                      onClick={handleRequestLockoutUnlockCode}
+                      className="w-full min-h-[2.75rem] py-2 px-3 rounded-xl bg-[#0F172A] text-white text-xs font-semibold cursor-pointer"
+                    >
+                      {isSendingUnlock ? 'Sending...' : 'Unlock by email'}
+                    </button>
+                  ) : (
+                    <form onSubmit={handleVerifyLockoutUnlockCode} className="space-y-1.5">
+                      {unlockPreviewCode && (
+                        <p className="text-[10px] text-slate-600">
+                          Code sent (Preview: <strong className="font-mono">{unlockPreviewCode}</strong>)
+                        </p>
+                      )}
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={unlockCodeInput}
+                          onChange={(e) => setUnlockCodeInput(e.target.value)}
+                          placeholder="6-digit code"
+                          className="flex-1 min-h-[2.75rem] px-3 py-2 rounded-xl border border-slate-300 text-xs font-mono"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isSendingUnlock}
+                          className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
+                        >
+                          Unlock
+                        </button>
+                      </div>
+                    </form>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -1352,7 +1932,114 @@ export const AuthPage: React.FC = () => {
               : 'opacity-100 translate-y-0'
           }`}
         >
-          {authMode === 'existing' ? (
+          {mfaResolver ? (
+            /* =====================================================================
+               FIREBASE BUILT-IN TOTP 2-STEP VERIFICATION CHALLENGE
+               ===================================================================== */
+            <form onSubmit={handleVerifyMfaSignIn} className="w-full space-y-4" noValidate>
+              {mfaError && (
+                <div className="w-full px-4 py-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-2.5 flex-wrap">
+                  <div className="flex items-start gap-2 flex-1 min-w-0">
+                    <AlertCircle size={15} className="text-rose-600 shrink-0 mt-0.5" />
+                    <span className="font-medium leading-relaxed break-words">{mfaError}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMfaError(null);
+                      setMfaDigits(['', '', '', '', '', '']);
+                      mfaOtpRefs.current[0]?.focus();
+                    }}
+                    className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  >
+                    <RotateCcw size={12} />
+                    <span>Try again</span>
+                  </button>
+                </div>
+              )}
+
+              <div className="p-4 rounded-2xl bg-slate-50/80 border border-slate-200/80 space-y-3">
+                <div className="flex items-center justify-center gap-2 text-xs font-medium text-slate-600">
+                  <Smartphone size={14} className="text-[#0F172A] shrink-0" />
+                  <span>Enter the 6-digit verification code</span>
+                </div>
+
+                <div className="grid grid-cols-6 gap-1.5 sm:gap-2">
+                  {mfaDigits.map((digit, idx) => (
+                    <input
+                      key={idx}
+                      ref={(el) => {
+                        mfaOtpRefs.current[idx] = el;
+                      }}
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete={idx === 0 ? 'one-time-code' : 'off'}
+                      maxLength={6}
+                      value={digit}
+                      onChange={(e) => handleMfaDigitChange(idx, e.target.value)}
+                      onKeyDown={(e) => handleMfaDigitKeyDown(idx, e)}
+                      onPaste={handleMfaDigitPaste}
+                      aria-label={`Authenticator digit ${idx + 1} of 6`}
+                      className="w-full min-h-[48px] h-12 text-center rounded-xl bg-white border border-slate-200 focus:border-[#0F172A] focus:outline-none font-mono text-lg font-semibold text-[#0F172A] transition-colors"
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isVerifyingMfa || mfaDigits.join('').length !== 6}
+                className="w-full min-h-[48px] h-12 px-6 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium tracking-tight flex items-center justify-center gap-2 shadow-2xs transition-all duration-200 cursor-pointer disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed"
+              >
+                {isVerifyingMfa ? (
+                  <div className="flex items-center gap-2">
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    <span>Verifying...</span>
+                  </div>
+                ) : (
+                  <span>Verify &amp; sign in</span>
+                )}
+              </button>
+
+              <div className="pt-1 flex flex-col items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowLostAuthHelp((prev) => !prev)}
+                  className="min-h-[44px] px-3 text-xs font-medium text-slate-600 hover:text-[#0F172A] underline underline-offset-2 transition-colors cursor-pointer"
+                >
+                  Lost my phone
+                </button>
+
+                {showLostAuthHelp && (
+                  <div className="w-full p-3.5 rounded-2xl bg-slate-50 border border-slate-200 text-left space-y-2 text-xs text-slate-600 leading-relaxed">
+                    <p className="font-semibold text-[#0F172A]">
+                      How to get help if you lost your phone
+                    </p>
+                    <p>
+                      Because WaveLink uses Firebase Authenticator App 2-step verification, an admin must verify your identity to turn off your old authenticator app.
+                    </p>
+                    <p>
+                      Send an email from your registered account address to WaveLink Support at{' '}
+                      <span className="font-mono font-semibold text-[#0F172A] break-all">
+                        keylanmbilinyi5@gmail.com
+                      </span>{' '}
+                      asking to reset your 2-step verification so you can sign in and set up a new phone.
+                    </p>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleCancelMfaChallenge}
+                  disabled={isVerifyingMfa}
+                  className="min-h-[44px] px-4 text-xs font-medium text-slate-500 hover:text-[#0F172A] inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <ArrowLeft size={14} />
+                  <span>Back to sign in</span>
+                </button>
+              </div>
+            </form>
+          ) : authMode === 'existing' ? (
             /* =====================================================================
                "I ALREADY HAVE AN ACCOUNT" FLOW (Existing Google-Linked Users)
                ===================================================================== */
@@ -1630,7 +2317,7 @@ export const AuthPage: React.FC = () => {
                     setError(null);
                     setStatusMessage(null);
                   }}
-                  className={`h-9 rounded-full text-xs font-medium transition-all duration-200 cursor-pointer ${
+                  className={`min-h-[2.75rem] rounded-full text-xs font-medium transition-all duration-200 cursor-pointer ${
                     authMode === 'signin'
                       ? 'bg-white text-[#0F172A] shadow-2xs'
                       : 'text-slate-500 hover:text-[#0F172A]'
@@ -1646,7 +2333,7 @@ export const AuthPage: React.FC = () => {
                     setStatusMessage(null);
                     setExistingAccountDetected(false);
                   }}
-                  className={`h-9 rounded-full text-xs font-medium transition-all duration-200 cursor-pointer ${
+                  className={`min-h-[2.75rem] rounded-full text-xs font-medium transition-all duration-200 cursor-pointer ${
                     authMode === 'signup'
                       ? 'bg-white text-[#0F172A] shadow-2xs'
                       : 'text-slate-500 hover:text-[#0F172A]'
@@ -1776,6 +2463,18 @@ export const AuthPage: React.FC = () => {
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
+                {authMode === 'signin' && (
+                  <div className="mt-2 flex justify-end px-1">
+                    <button
+                      type="button"
+                      onClick={handleForgotPasswordReset}
+                      disabled={isSendingPasswordReset}
+                      className="text-xs font-medium text-slate-500 hover:text-[#0F172A] transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {isSendingPasswordReset ? 'Sending reset link...' : 'Forgot password?'}
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Built-In Email Verification Control for Sign-Up */}
@@ -1861,10 +2560,47 @@ export const AuthPage: React.FC = () => {
                 </div>
               )}
 
+              {/* Google Play Readiness: 13+ Age Gate & Community Content Rules Checkbox on Sign-Up */}
+              {authMode === 'signup' && (
+                <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-slate-50/80 border border-slate-200/80 text-xs text-slate-700 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={isAgeConfirmed}
+                    onChange={(e) => setIsAgeConfirmed(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded border-slate-300 text-[#0F172A] focus:ring-[#0F172A]"
+                  />
+                  <span className="leading-snug">
+                    I confirm I am <strong>13 years or older</strong> and agree to WaveLink&apos;s{' '}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setActiveLegalNotice('terms');
+                      }}
+                      className="underline font-semibold text-[#0F172A]"
+                    >
+                      Terms &amp; Content Rules
+                    </button>{' '}
+                    and{' '}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setActiveLegalNotice('privacy');
+                      }}
+                      className="underline font-semibold text-[#0F172A]"
+                    >
+                      Privacy Policy
+                    </button>
+                    .
+                  </span>
+                </label>
+              )}
+
               {/* Full-Width Rounded Pill Submit Button */}
               <button
                 type="submit"
-                disabled={isLoading || (authMode === 'signup' && !isEmailVerified)}
+                disabled={isLoading || (authMode === 'signup' && (!isEmailVerified || !isAgeConfirmed))}
                 className="w-full h-12 px-6 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium tracking-tight flex items-center justify-center gap-2 shadow-2xs transition-all duration-200 cursor-pointer disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed"
               >
                 {isLoading ? (
@@ -1890,9 +2626,15 @@ export const AuthPage: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => {
+                    try {
+                      sessionStorage.removeItem('wavelink_signup_verification_pending');
+                    } catch {
+                      // ignore
+                    }
                     setAuthMode(authMode === 'signup' ? 'signin' : 'signup');
                     setError(null);
                     setStatusMessage(null);
+                    setExistingAccountDetected(false);
                   }}
                   className="hover:text-[#0F172A] transition-colors cursor-pointer"
                 >
@@ -1905,7 +2647,7 @@ export const AuthPage: React.FC = () => {
       </main>
 
       {/* Clean Compact Terms Text at the Bottom */}
-      <footer className="w-full max-w-[320px] mx-auto pt-8 text-center">
+      <footer className="w-full max-w-[20rem] mx-auto pt-8 text-center">
         <p className="text-[11px] leading-relaxed text-slate-400 font-normal">
           By continuing, you agree to WaveLink&apos;s{' '}
           <button
@@ -1927,45 +2669,13 @@ export const AuthPage: React.FC = () => {
         </p>
       </footer>
 
-      {/* Compact Legal Sheet Modal (Terms / Privacy) */}
+      {/* Full Legal & Privacy Policy Modal (Privacy Policy, Terms & Content Rules, Security, Refunds) */}
       {activeLegalNotice && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs transition-opacity duration-200"
-          onClick={() => setActiveLegalNotice(null)}
-        >
-          <div
-            className="w-full max-w-sm rounded-3xl bg-white border border-slate-200 shadow-xl p-6 text-[#0F172A]"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-[#0F172A]">
-                {activeLegalNotice === 'terms' ? 'Terms of Service' : 'Privacy Policy'}
-              </h3>
-              <button
-                type="button"
-                onClick={() => setActiveLegalNotice(null)}
-                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 transition-colors cursor-pointer"
-                aria-label="Close"
-              >
-                <X size={14} />
-              </button>
-            </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              {activeLegalNotice === 'terms'
-                ? 'By using WaveLink, you agree to share respectful, authentic content, respect creator intellectual property, and follow community guidelines across feeds, reels, and creator monetization features.'
-                : 'WaveLink protects your account credentials with Firebase Authentication and only stores the profile, post, and creator studio information needed to deliver your social experience.'}
-            </p>
-            <button
-              type="button"
-              onClick={() => setActiveLegalNotice(null)}
-              className="mt-5 w-full h-10 rounded-full bg-[#0F172A] text-white text-xs font-medium hover:bg-slate-800 transition-colors cursor-pointer"
-            >
-              Done
-            </button>
-          </div>
-        </div>
+        <LegalModal
+          isOpen={true}
+          initialDoc={activeLegalNotice}
+          onClose={() => setActiveLegalNotice(null)}
+        />
       )}
 
       {/* Hidden Owner Sign-In Modal (Opened only after tapping WaveLink logo 5 times) */}
@@ -1986,7 +2696,7 @@ export const AuthPage: React.FC = () => {
                   setOwnerError(null);
                 }
               }}
-              className="absolute top-4 right-4 w-9 h-9 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 transition"
+              className="absolute top-4 right-4 min-w-[2.75rem] min-h-[2.75rem] rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 transition"
               aria-label="Close Owner Sign-In"
             >
               <X size={16} />
@@ -2007,9 +2717,19 @@ export const AuthPage: React.FC = () => {
             </div>
 
             {ownerError && (
-              <div className="mb-4 p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-start gap-2.5 font-medium">
-                <AlertCircle size={16} className="text-rose-600 shrink-0 mt-0.5" />
-                <span>{ownerError}</span>
+              <div className="mb-4 p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center justify-between gap-2.5 flex-wrap font-medium">
+                <div className="flex items-start gap-2 flex-1 min-w-0">
+                  <AlertCircle size={16} className="text-rose-600 shrink-0 mt-0.5" />
+                  <span>{ownerError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOwnerError(null)}
+                  className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                >
+                  <RotateCcw size={12} />
+                  <span>Try again</span>
+                </button>
               </div>
             )}
 

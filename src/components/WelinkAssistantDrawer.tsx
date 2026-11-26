@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { useAuth } from '../context/AuthContext';
+import { sanitizeUserFacingError } from '../utils/safetyFilters';
 import {
   Waves,
   Sparkles,
@@ -590,7 +591,12 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
 
       localStorage.setItem(dailyCountKey, String(usedTodayCount + 1));
     } catch (err: any) {
-      setImageError(err.message || 'Image creation is resting right now, please try again later.');
+      setImageError(
+        sanitizeUserFacingError(
+          err,
+          'Image creation is resting right now. Please tap Try again in a moment.'
+        )
+      );
     } finally {
       setIsImageLoading(false);
     }

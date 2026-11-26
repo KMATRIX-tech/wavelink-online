@@ -41,7 +41,7 @@ interface CrystalBadgeProps {
   isBot?: boolean;
   weeklyWinnerUntil?: string | null;
   isWeeklyWinner?: boolean;
-  role?: 'admin' | 'super_admin' | 'sub_admin' | 'user' | 'bot';
+  role?: 'admin' | 'super_admin' | 'sub_admin' | 'moderator' | 'support_helper' | 'user' | 'bot';
   proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
   size?: 'sm' | 'md' | 'lg';
 }

@@ -14,16 +14,14 @@ import { deleteSparkAndStorageFile } from '../utils/mediaStorage';
 import { useSparkUploadQueue } from '../services/sparkUploadQueue';
 import { SparkUploadQueueBanner } from './SparkUploadQueueBanner';
 import {
-  Flame,
   Plus,
-  Sparkles,
   Play,
-  Layers,
-  Loader2
+  Loader2,
+  X
 } from 'lucide-react';
 import { Avatar } from './Avatar';
 
-const WEEKLY_SPARK_THEMES = [
+export const WEEKLY_SPARK_THEMES = [
   'Share a quiet moment of gratitude today 🌿',
   'A favorite local meal or tea spot ☕',
   'Something small that made you smile this week ☀️',
@@ -50,20 +48,56 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
   const [activeSparks, setActiveSparks] = useState<Spark[]>([]);
   const [viewingGroup, setViewingGroup] = useState<UserSparkGroup | null>(null);
   const [isMultiPosterOpen, setIsMultiPosterOpen] = useState(false);
+  const [isSeeAllOpen, setIsSeeAllOpen] = useState(false);
 
-  const dayOfWeek = new Date().getDay();
-  const todayTheme = WEEKLY_SPARK_THEMES[dayOfWeek % WEEKLY_SPARK_THEMES.length];
+  const seenStorageKey = `wavelink_seen_sparks_${currentUser?.uid || 'guest'}`;
+  const [seenAuthorMap, setSeenAuthorMap] = useState<Record<string, string>>(() => {
+    try {
+      const raw = localStorage.getItem(`wavelink_seen_sparks_${currentUser?.uid || 'guest'}`);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
 
-  // Open MultiSparkPosterModal automatically when external posts are passed from FeedView
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(seenStorageKey);
+      setSeenAuthorMap(raw ? JSON.parse(raw) : {});
+    } catch {
+      setSeenAuthorMap({});
+    }
+  }, [seenStorageKey]);
+
+  const markGroupSeen = (group: UserSparkGroup) => {
+    const latestId = group.sparks[group.sparks.length - 1]?.id || group.latestCreatedAt;
+    setSeenAuthorMap((prev) => {
+      const next = { ...prev, [group.authorId]: latestId };
+      try {
+        localStorage.setItem(seenStorageKey, JSON.stringify(next));
+      } catch {
+        // ignore storage quota
+      }
+      return next;
+    });
+  };
+
+  // Open MultiSparkPosterModal automatically when external posts are passed from FeedView or custom event
   useEffect(() => {
     if (externalPostsToShare && externalPostsToShare.length > 0) {
       setIsMultiPosterOpen(true);
     }
   }, [externalPostsToShare]);
 
-  // Real-time listener for sparks + automatic 24-hour expiry & Firebase Storage file cleanup (capped at 30 most recent)
   useEffect(() => {
-    const q = query(collection(db, 'sparks'), orderBy('createdAt', 'desc'), limit(30));
+    const handleOpenSparkPoster = () => setIsMultiPosterOpen(true);
+    window.addEventListener('wavelink:open-spark-poster', handleOpenSparkPoster);
+    return () => window.removeEventListener('wavelink:open-spark-poster', handleOpenSparkPoster);
+  }, []);
+
+  // Single limited query (limit 10) for stories/Sparks, detached when leaving screen
+  useEffect(() => {
+    const q = query(collection(db, 'sparks'), orderBy('createdAt', 'desc'), limit(10));
     const unsub = onSnapshot(
       q,
       (snapshot) => {
@@ -83,7 +117,6 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
 
         setActiveSparks(list);
 
-        // Delete expired Spark files from Firebase Storage and remove expired Spark documents
         if (expiredList.length > 0 && currentUser) {
           expiredList.forEach((expiredSpark) => {
             deleteSparkAndStorageFile(expiredSpark, true);
@@ -98,7 +131,7 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
     return () => unsub();
   }, [currentUser?.uid]);
 
-  // Periodic tick every minute to expire 24-hour Sparks and delete their Storage files
+  // Periodic tick every minute to expire 24-hour Sparks
   useEffect(() => {
     const timer = setInterval(() => {
       const now = Date.now();
@@ -118,7 +151,7 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
     return () => clearInterval(timer);
   }, []);
 
-  // Group sparks by authorId so multiple posts by the same user appear together as their Spark story
+  // Group sparks by authorId so multiple posts by the same user appear together as their story
   const userSparkGroups = useMemo(
     () => groupSparksByAuthor(activeSparks, currentUser?.uid),
     [activeSparks, currentUser?.uid]
@@ -145,95 +178,132 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
     if (onClearExternalPosts) onClearExternalPosts();
   };
 
+  const handleOpenGroup = (group: UserSparkGroup) => {
+    markGroupSeen(group);
+    setViewingGroup(group);
+    setIsSeeAllOpen(false);
+  };
+
+  const isGroupSeen = (group: UserSparkGroup) => {
+    const latestId = group.sparks[group.sparks.length - 1]?.id || group.latestCreatedAt;
+    return seenAuthorMap[group.authorId] === latestId;
+  };
+
   return (
     <>
-      <div className="wavelink-glass-post-card w-full max-w-full overflow-hidden rounded-[26px] p-3 sm:p-3.5 space-y-2.5">
-        {/* Friendly Subtitle: Sparks moments that last 24 hours */}
-        <div className="flex items-center justify-between px-1">
-          <span className="text-xs font-bold text-[var(--text-primary)] flex items-center gap-1.5">
-            <Flame size={14} className="text-[#D97706]" />
-            <span>
-              {language === 'sw'
-                ? 'Sparks · Matukio yanayodumu saa 24'
-                : 'Sparks · Moments that last 24 hours'}
-            </span>
-          </span>
+      <section
+        aria-label={language === 'sw' ? 'Hadithi mpya' : 'Fresh stories'}
+        className="wavelink-fresh-stories-section w-full max-w-full overflow-hidden rounded-[26px] p-3.5 sm:p-4 space-y-3"
+      >
+        {/* Section Title + "See all" Link */}
+        <div className="flex items-center justify-between px-0.5">
+          <h2 className="text-sm sm:text-base font-extrabold text-[var(--text-primary)] tracking-tight">
+            {language === 'sw' ? 'Hadithi mpya' : 'Fresh stories'}
+          </h2>
           <button
             type="button"
-            onClick={() => setIsMultiPosterOpen(true)}
-            className="wavelink-glass-chip px-2.5 py-0.5 rounded-full text-[11px] font-extrabold text-[#2563EB] dark:text-sky-300 flex items-center gap-1 shrink-0 transition-transform active:scale-95 cursor-pointer"
+            onClick={() => {
+              if (userSparkGroups.length > 0) {
+                setIsSeeAllOpen(true);
+              } else {
+                setIsMultiPosterOpen(true);
+              }
+            }}
+            className="min-h-[36px] px-2.5 py-1 rounded-xl text-xs font-extrabold text-[var(--accent-primary)] hover:underline transition cursor-pointer"
           >
-            <Sparkles size={11} className="text-[#D97706]" />
-            <span>{language === 'sw' ? '+ Hadithi' : '+ Story'}</span>
+            {language === 'sw' ? 'Ona zote' : 'See all'}
           </button>
         </div>
 
         {/* Inline Background Spark Upload Queue Progress */}
         <SparkUploadQueueBanner variant="inline" />
 
-        {/* Horizontal row of round story avatars with gradient ring, "+ Add story" first item, and small italic names below */}
+        {/* Horizontal scroll of round story avatars: "+" own story first, bright gradient ring (unseen) or grey ring (seen), name under each, online green dot */}
         <div className="flex items-center gap-3.5 overflow-x-auto pt-0.5 pb-1 scrollbar-none max-w-full">
-          {/* 1. "+ Add story" First Item */}
+          {/* 1. "+" for my own story first */}
           <button
             type="button"
             onClick={() => setIsMultiPosterOpen(true)}
-            className="flex flex-col items-center gap-1.5 shrink-0 group focus:outline-none min-w-[60px] cursor-pointer transition-transform active:scale-95"
+            className="flex flex-col items-center gap-1.5 shrink-0 group focus:outline-none min-w-[64px] min-h-[44px] cursor-pointer transition-transform active:scale-95"
+            aria-label={language === 'sw' ? 'Ongeza hadithi' : 'Add your story'}
           >
             <div
-              className={`relative w-14 h-14 rounded-full p-[2px] bg-gradient-to-tr from-white/50 via-[#2563EB]/60 to-[#0D9488]/70 transition-transform duration-200 group-hover:scale-105 shadow-sm ${
-                isUploadingAny ? 'ring-2 ring-[#2563EB] ring-offset-1' : ''
+              className={`relative w-15 h-15 rounded-full p-[2.5px] bg-gradient-to-tr from-[#A855F7] via-[#EC4899] to-[#F97316] transition-transform duration-200 group-hover:scale-105 shadow-xs ${
+                isUploadingAny ? 'ring-2 ring-[var(--accent-primary)] ring-offset-1' : ''
               }`}
             >
-              <div className="w-full h-full rounded-full bg-slate-900/20 dark:bg-white/10 backdrop-blur-md border border-white/40 flex items-center justify-center overflow-hidden relative">
-                {isUploadingAny ? (
+              <div className="w-full h-full rounded-full bg-[var(--bg-surface)] flex items-center justify-center overflow-hidden relative">
+                {userProfile?.photoURL || currentUser?.photoURL ? (
+                  <>
+                    <Avatar
+                      uid={currentUser?.uid}
+                      src={userProfile?.photoURL || currentUser?.photoURL || undefined}
+                      alt="You"
+                      fallbackName={userProfile?.displayName || currentUser?.displayName || 'You'}
+                      size={52}
+                      showStatus={true}
+                      onlyWhenVisible={false}
+                      targetProfile={userProfile}
+                      imageClassName="opacity-85"
+                    />
+                    <span className="absolute bottom-0 right-0 w-5 h-5 rounded-full bg-[var(--accent-primary)] text-white ring-2 ring-[var(--bg-surface)] flex items-center justify-center shadow-xs z-20">
+                      {isUploadingAny ? (
+                        <Loader2 size={11} className="animate-spin" />
+                      ) : (
+                        <Plus size={12} strokeWidth={3} />
+                      )}
+                    </span>
+                  </>
+                ) : isUploadingAny ? (
                   <div className="flex flex-col items-center justify-center text-[var(--text-primary)]">
-                    <Loader2 size={16} className="animate-spin text-[#2563EB]" />
-                    <span className="text-[9px] font-extrabold font-mono">{overallProgress}%</span>
+                    <Loader2 size={16} className="animate-spin text-[var(--accent-primary)]" />
+                    <span className="text-[9px] font-extrabold font-mono tabular-nums">{overallProgress}%</span>
                   </div>
                 ) : (
                   <Plus
                     size={22}
-                    strokeWidth={2.2}
+                    strokeWidth={2.5}
                     className="text-[var(--text-primary)] group-hover:scale-110 transition-transform"
                   />
                 )}
               </div>
             </div>
-            <span className="text-[11px] italic font-medium text-[var(--text-primary)] max-w-[66px] truncate">
+            <span className="text-xs font-bold text-[var(--text-primary)] max-w-[68px] truncate">
               {isUploadingAny
                 ? `${overallProgress}%`
                 : language === 'sw'
-                ? 'Add story'
-                : 'Add story'}
+                ? 'Yako +'
+                : 'Your story'}
             </span>
           </button>
 
-          {/* 2. Active Community Stories (Grouped by Author with Gradient Ring & Small Italic Names Below) */}
+          {/* 2. Active Stories with Bright Gradient Ring (Unseen) or Grey Ring (Seen) & Online Green Dot */}
           {userSparkGroups.map((group) => {
             const isMine = group.authorId === currentUser?.uid;
             const postCount = group.sparks.length;
             const latestSpark = group.sparks[group.sparks.length - 1];
+            const seen = isGroupSeen(group);
 
             return (
               <button
                 key={group.authorId}
                 type="button"
-                onClick={() => setViewingGroup(group)}
-                className="flex flex-col items-center gap-1.5 shrink-0 group focus:outline-none min-w-[60px] cursor-pointer transition-transform active:scale-95"
+                onClick={() => handleOpenGroup(group)}
+                className="flex flex-col items-center gap-1.5 shrink-0 group focus:outline-none min-w-[64px] min-h-[44px] cursor-pointer transition-transform active:scale-95"
                 title={
                   postCount > 1
-                    ? `${group.authorName}'s Story (${postCount} moments · ${getHoursLeft(group.latestExpiresAt)} left)`
-                    : `${group.authorName}'s Story (${getHoursLeft(group.latestExpiresAt)} left)`
+                    ? `${group.authorName} (${postCount} stories · ${getHoursLeft(group.latestExpiresAt)} left)`
+                    : `${group.authorName} (${getHoursLeft(group.latestExpiresAt)} left)`
                 }
               >
                 <div
-                  className={`relative w-14 h-14 rounded-full p-[2.5px] transition-transform duration-200 group-hover:scale-105 shadow-sm ${
-                    postCount > 1
-                      ? 'bg-gradient-to-tr from-[#2563EB] via-[#0D9488] to-[#F59E0B]'
-                      : 'bg-gradient-to-tr from-[#2563EB] via-[#38BDF8] to-[#0D9488]'
+                  className={`relative w-15 h-15 rounded-full p-[2.5px] transition-transform duration-200 group-hover:scale-105 ${
+                    seen
+                      ? 'bg-slate-300 dark:bg-slate-600'
+                      : 'bg-gradient-to-tr from-[#A855F7] via-[#EC4899] to-[#F97316] shadow-xs'
                   }`}
                 >
-                  <div className="w-full h-full rounded-full bg-[var(--bg-surface)] ring-2 ring-white/80 dark:ring-slate-900 relative flex items-center justify-center">
+                  <div className="w-full h-full rounded-full bg-[var(--bg-surface)] p-[1.5px] relative flex items-center justify-center">
                     <Avatar
                       uid={group.authorId}
                       src={
@@ -247,7 +317,7 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
                       }
                       alt={group.authorName}
                       fallbackName={group.authorName}
-                      size={49}
+                      size={50}
                       showStatus={true}
                       imageClassName={latestSpark.mediaType === 'video' ? 'opacity-90' : ''}
                     >
@@ -261,33 +331,113 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
 
                   {/* Multi-moment count badge if > 1 */}
                   {postCount > 1 && (
-                    <div className="absolute -top-1 -right-1 px-1.5 min-w-[18px] h-[18px] rounded-full bg-[#2563EB] border border-white text-white text-[9px] font-extrabold flex items-center justify-center shadow-2xs z-20">
+                    <div className="absolute -top-0.5 -right-0.5 px-1.5 min-w-[18px] h-[18px] rounded-full bg-[var(--accent-primary)] border border-white text-white text-[9px] font-extrabold flex items-center justify-center shadow-2xs z-20 tabular-nums">
                       {postCount}
                     </div>
                   )}
                 </div>
 
-                <span className="text-[11px] italic font-medium text-[var(--text-primary)] max-w-[66px] truncate">
-                  {isMine ? 'Your story' : group.authorName.split(' ')[0]}
+                <span
+                  className={`text-xs max-w-[68px] truncate ${
+                    seen
+                      ? 'font-medium text-[var(--text-secondary)]'
+                      : 'font-bold text-[var(--text-primary)]'
+                  }`}
+                >
+                  {isMine ? (language === 'sw' ? 'Wewe' : 'You') : group.authorName.split(' ')[0]}
                 </span>
               </button>
             );
           })}
-
-          {/* Compact Spark of the Day prompt chip at the end of the row */}
-          <button
-            type="button"
-            onClick={() => setIsMultiPosterOpen(true)}
-            className="wavelink-glass-chip shrink-0 px-3 py-2 rounded-2xl text-left max-w-[210px] flex items-center gap-2 transition-transform active:scale-95 cursor-pointer"
-            title="Share today's Spark prompt"
-          >
-            <Sparkles size={14} className="text-[#D97706] shrink-0" />
-            <span className="text-[11px] italic text-[var(--text-secondary)] line-clamp-2 leading-tight">
-              {todayTheme}
-            </span>
-          </button>
         </div>
-      </div>
+      </section>
+
+      {/* "See all" Stories Modal */}
+      {isSeeAllOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="All fresh stories"
+          onClick={() => setIsSeeAllOpen(false)}
+          className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 animate-in fade-in"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-5 shadow-2xl space-y-4 max-h-[82dvh] flex flex-col"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-extrabold text-[var(--text-primary)]">
+                {language === 'sw' ? 'Hadithi Zote Mpya' : 'All Fresh Stories'}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setIsSeeAllOpen(false)}
+                className="min-w-[44px] min-h-[44px] rounded-full bg-[var(--bg-subtle)] text-[var(--text-primary)] flex items-center justify-center cursor-pointer"
+                aria-label="Close"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-3 overflow-y-auto py-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsSeeAllOpen(false);
+                  setIsMultiPosterOpen(true);
+                }}
+                className="flex flex-col items-center gap-1.5 p-2 rounded-2xl hover:bg-[var(--bg-subtle)] transition cursor-pointer"
+              >
+                <div className="w-14 h-14 rounded-full bg-gradient-to-tr from-[#A855F7] via-[#EC4899] to-[#F97316] p-[2px]">
+                  <div className="w-full h-full rounded-full bg-[var(--bg-surface)] flex items-center justify-center text-[var(--accent-primary)]">
+                    <Plus size={22} />
+                  </div>
+                </div>
+                <span className="text-xs font-bold text-[var(--text-primary)] truncate max-w-full">
+                  {language === 'sw' ? '+ Ongeza' : '+ Add story'}
+                </span>
+              </button>
+
+              {userSparkGroups.map((group) => {
+                const seen = isGroupSeen(group);
+                return (
+                  <button
+                    key={group.authorId}
+                    type="button"
+                    onClick={() => handleOpenGroup(group)}
+                    className="flex flex-col items-center gap-1.5 p-2 rounded-2xl hover:bg-[var(--bg-subtle)] transition cursor-pointer"
+                  >
+                    <div
+                      className={`w-14 h-14 rounded-full p-[2.5px] ${
+                        seen
+                          ? 'bg-slate-300 dark:bg-slate-600'
+                          : 'bg-gradient-to-tr from-[#A855F7] via-[#EC4899] to-[#F97316]'
+                      }`}
+                    >
+                      <div className="w-full h-full rounded-full bg-[var(--bg-surface)] flex items-center justify-center">
+                        <Avatar
+                          uid={group.authorId}
+                          src={
+                            group.authorPhotoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${group.authorId}`
+                          }
+                          alt={group.authorName}
+                          fallbackName={group.authorName}
+                          size={48}
+                          showStatus={true}
+                        />
+                      </div>
+                    </div>
+                    <span className="text-xs font-bold text-[var(--text-primary)] truncate max-w-full">
+                      {group.authorName.split(' ')[0]}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       <MultiSparkPosterModal
         isOpen={isMultiPosterOpen}
@@ -310,3 +460,4 @@ export const SparkTray: React.FC<SparkTrayProps> = ({
     </>
   );
 };
+

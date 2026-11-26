@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
 import { db, batchCacheUserProfiles } from '../firebase';
-import { collection, query, orderBy, limit, getDocs, doc, updateDoc, arrayUnion, arrayRemove } from 'firebase/firestore';
+import { collection, query, orderBy, limit, getDocs, doc, setDoc, deleteDoc, updateDoc, arrayUnion, arrayRemove } from 'firebase/firestore';
 import { ActiveTab, UserProfile, CreatorChallenge } from '../types';
 import { LegalModal, LegalDocType } from './LegalModals';
 import { triggerHaptic } from '../utils/haptics';
@@ -124,21 +124,21 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
         }
       }
 
-      // 2. Suggested creators
+      // 2. Trending & Suggested creators (single light query limit(8), cached)
       if (currentUser?.uid) {
         try {
           const qUsers = query(collection(db, 'users'), limit(8));
           const snapUsers = await getDocs(qUsers);
           if (!isMounted) return;
-          const list: UserProfile[] = [];
+          const allOthers: UserProfile[] = [];
           snapUsers.forEach((d) => {
             const u = { ...(d.data() as UserProfile), id: d.id };
-            if (u.id !== currentUser.uid && !followedIds.includes(u.id)) {
-              list.push(u);
+            if (u.id !== currentUser.uid) {
+              allOthers.push(u);
             }
           });
-          batchCacheUserProfiles(list);
-          setSuggestedCreators(list.slice(0, 4));
+          batchCacheUserProfiles(allOthers);
+          setSuggestedCreators(allOthers);
         } catch {
           // ignore
         }
@@ -164,23 +164,45 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
     try {
       await updateUserProfile({ followingIds: nextFollowed });
       const userRef = doc(db, 'users', currentUser.uid);
-      const targetRef = doc(db, 'users', creator.id);
+      const followDocId = `${currentUser.uid}_${creator.id}`;
+      const followRef = doc(db, 'follows', followDocId);
 
       if (isCurrentlyFollowing) {
         await updateDoc(userRef, { followingIds: arrayRemove(creator.id) });
-        await updateDoc(targetRef, { followerIds: arrayRemove(currentUser.uid) }).catch(() => {});
+        await deleteDoc(followRef).catch(() => {});
       } else {
         await updateDoc(userRef, { followingIds: arrayUnion(creator.id) });
-        await updateDoc(targetRef, { followerIds: arrayUnion(currentUser.uid) }).catch(() => {});
+        await setDoc(
+          followRef,
+          {
+            id: followDocId,
+            followerId: currentUser.uid,
+            followingId: creator.id,
+            createdAt: new Date().toISOString()
+          },
+          { merge: true }
+        ).catch(() => {});
       }
     } catch {
       setFollowedIds(followedIds);
     }
   };
 
+  const trendingCreatorsList = [...suggestedCreators]
+    .sort(
+      (a, b) =>
+        ((b.wavePoints || 0) + (b.loginStreak || 0) * 10) -
+        ((a.wavePoints || 0) + (a.loginStreak || 0) * 10)
+    )
+    .slice(0, 3);
+
+  const suggestedPeopleList = suggestedCreators
+    .filter((u) => !followedIds.includes(u.id))
+    .slice(0, 4);
+
   return (
     <aside
-      aria-label="Trending and suggestions"
+      aria-label="Trending creators, suggested people, and trending tags"
       className={`wavelink-right-panel hidden lg:block shrink-0 sticky top-16 h-[calc(100dvh-4.5rem)] transition-all duration-300 ease-in-out ${
         isCollapsed ? 'wavelink-right-panel--collapsed' : 'wavelink-right-panel--expanded'
       }`}
@@ -192,8 +214,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
             type="button"
             onClick={handleToggleCollapse}
             aria-label="Expand right panel"
-            title="Expand Trending & Challenges"
-            className="w-9 h-9 rounded-xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] flex items-center justify-center transition active:scale-95 cursor-pointer"
+            title="Expand Trending & Suggestions"
+            className="w-10 h-10 rounded-xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] flex items-center justify-center transition active:scale-95 cursor-pointer"
           >
             <ChevronLeft size={16} />
           </button>
@@ -201,61 +223,222 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
           <button
             type="button"
             onClick={handleToggleCollapse}
-            title="Trending Topics"
-            className="w-9 h-9 rounded-xl bg-[var(--bg-subtle)] text-[var(--accent-primary)] flex items-center justify-center transition cursor-pointer"
-          >
-            <TrendingUp size={16} />
-          </button>
-          <button
-            type="button"
-            onClick={handleToggleCollapse}
-            title="Weekly Challenge"
-            className="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center transition cursor-pointer"
+            title="Trending Creators"
+            className="w-10 h-10 rounded-xl bg-[var(--bg-subtle)] text-[var(--accent-primary)] flex items-center justify-center transition cursor-pointer"
           >
             <Trophy size={16} />
           </button>
           <button
             type="button"
             onClick={handleToggleCollapse}
-            title="Suggested Creators"
-            className="w-9 h-9 rounded-xl bg-[var(--bg-subtle)] text-[var(--accent-secondary)] flex items-center justify-center transition cursor-pointer"
+            title="Suggested People"
+            className="w-10 h-10 rounded-xl bg-[var(--bg-subtle)] text-[var(--accent-secondary)] flex items-center justify-center transition cursor-pointer"
           >
             <UserPlus size={16} />
           </button>
+          <button
+            type="button"
+            onClick={handleToggleCollapse}
+            title="Trending Tags"
+            className="w-10 h-10 rounded-xl bg-[var(--bg-subtle)] text-[var(--accent-primary)] flex items-center justify-center transition cursor-pointer"
+          >
+            <TrendingUp size={16} />
+          </button>
         </div>
       ) : (
-        /* Full Clean Right Panel (Trending, Challenge, Suggested Creators) */
+        /* Full Right Panel: Trending Creators, Suggested People, Trending Tags */
         <div className="h-full overflow-y-auto space-y-3.5 py-1 pr-1 pl-1 scrollbar-none">
           {/* Collapse Header */}
           <div className="flex items-center justify-between px-3.5 py-2 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xs">
-            <span className="text-[11px] font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
-              <TrendingUp size={13} className="text-[var(--accent-primary)]" />
-              <span>Explore &amp; Trends</span>
+            <span className="text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5">
+              <TrendingUp size={14} className="text-[var(--accent-primary)]" />
+              <span>Discover</span>
             </span>
             <button
               type="button"
               onClick={handleToggleCollapse}
               aria-label="Collapse right sidebar"
-              className="text-[11px] font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center gap-0.5 cursor-pointer"
+              className="min-h-[32px] px-2 text-xs font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center gap-0.5 cursor-pointer"
             >
               <span>Hide</span>
               <ChevronRight size={13} />
             </button>
           </div>
 
-          {/* 1. Trending Topics Card */}
+          {/* 1. Trending Creators Card */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 shadow-2xs space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <Trophy size={15} className="text-amber-500" />
+                <h3 className="font-extrabold text-xs sm:text-sm text-[var(--text-primary)]">
+                  Trending creators
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => onNavigateTab('directory')}
+                className="text-xs font-bold text-[var(--accent-primary)] hover:underline cursor-pointer"
+              >
+                All
+              </button>
+            </div>
+
+            {trendingCreatorsList.length === 0 ? (
+              <p className="text-xs text-[var(--text-secondary)] py-1">
+                Creators will appear here as posts gain likes.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {trendingCreatorsList.map((creator, idx) => (
+                  <button
+                    key={`trend_${creator.id}`}
+                    type="button"
+                    onClick={() => {
+                      window.dispatchEvent(
+                        new CustomEvent('wavelink:navigate-profile', {
+                          detail: { userId: creator.id, username: creator.username }
+                        })
+                      );
+                    }}
+                    className="w-full p-2 rounded-2xl hover:bg-[var(--bg-subtle)] transition flex items-center justify-between gap-2 text-left cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Avatar
+                        uid={creator.id}
+                        src={
+                          creator.photoURL ||
+                          `https://api.dicebear.com/7.x/shapes/svg?seed=${creator.id}`
+                        }
+                        alt={creator.displayName}
+                        fallbackName={creator.displayName}
+                        size={34}
+                        showStatus={true}
+                        targetProfile={creator}
+                        ringClassName="ring-2 ring-[var(--accent-primary)]/30"
+                      />
+                      <div className="min-w-0">
+                        <span className="text-xs font-extrabold text-[var(--text-primary)] group-hover:text-[var(--accent-primary)] block truncate">
+                          {creator.displayName || 'Wave Creator'}
+                        </span>
+                        <span className="text-[11px] text-[var(--text-secondary)] block truncate">
+                          {creator.username ||
+                            `@${creator.displayName?.toLowerCase().replace(/\s+/g, '') || 'creator'}`}
+                        </span>
+                      </div>
+                    </div>
+                    <span className="text-[11px] font-mono font-bold text-[var(--accent-primary)] tabular-nums shrink-0">
+                      #{idx + 1}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 2. Suggested People Card */}
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 shadow-2xs space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <UserPlus size={15} className="text-[var(--accent-secondary)]" />
+                <h3 className="font-extrabold text-xs sm:text-sm text-[var(--text-primary)]">
+                  Suggested people
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => onNavigateTab('directory')}
+                className="text-xs font-bold text-[var(--accent-primary)] hover:underline cursor-pointer"
+              >
+                All
+              </button>
+            </div>
+
+            {suggestedPeopleList.length === 0 ? (
+              <p className="text-xs text-[var(--text-secondary)] py-1">
+                You are following everyone suggested right now.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {suggestedPeopleList.map((creator) => {
+                  const isFollowing = followedIds.includes(creator.id);
+                  return (
+                    <div
+                      key={creator.id}
+                      className="flex items-center justify-between gap-2 py-1"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          window.dispatchEvent(
+                            new CustomEvent('wavelink:navigate-profile', {
+                              detail: { userId: creator.id, username: creator.username }
+                            })
+                          );
+                        }}
+                        className="flex items-center gap-2 min-w-0 text-left group cursor-pointer"
+                      >
+                        <Avatar
+                          uid={creator.id}
+                          src={
+                            creator.photoURL ||
+                            `https://api.dicebear.com/7.x/shapes/svg?seed=${creator.id}`
+                          }
+                          alt={creator.displayName}
+                          fallbackName={creator.displayName}
+                          size={34}
+                          showStatus={true}
+                          targetProfile={creator}
+                          ringClassName="ring-2 ring-[var(--accent-primary)]/25"
+                        />
+                        <div className="min-w-0">
+                          <span className="text-xs font-bold text-[var(--text-primary)] group-hover:text-[var(--accent-primary)] block truncate">
+                            {creator.displayName || 'Wave Creator'}
+                          </span>
+                          <span className="text-[11px] text-[var(--text-secondary)] block truncate">
+                            {creator.username ||
+                              `@${creator.displayName?.toLowerCase().replace(/\s+/g, '') || 'creator'}`}
+                          </span>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleToggleFollow(creator)}
+                        className={`min-h-[36px] py-1.5 px-3 rounded-xl text-xs font-extrabold transition shrink-0 cursor-pointer ${
+                          isFollowing
+                            ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30'
+                            : 'bg-[var(--accent-primary)] text-white hover:opacity-95 shadow-2xs'
+                        }`}
+                      >
+                        {isFollowing ? (
+                          <span className="inline-flex items-center gap-1">
+                            <Check size={11} />
+                            <span>Following</span>
+                          </span>
+                        ) : (
+                          'Follow'
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* 3. Trending Tags Card */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 shadow-2xs space-y-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-1.5">
                 <TrendingUp size={15} className="text-[var(--accent-primary)]" />
                 <h3 className="font-extrabold text-xs sm:text-sm text-[var(--text-primary)]">
-                  {t('nav.trending')}
+                  Trending tags
                 </h3>
               </div>
               <button
                 type="button"
                 onClick={() => onNavigateTab('trending')}
-                className="text-[11px] font-bold text-[var(--accent-primary)] hover:underline flex items-center gap-0.5 cursor-pointer"
+                className="text-xs font-bold text-[var(--accent-primary)] hover:underline flex items-center gap-0.5 cursor-pointer"
               >
                 <span>All</span>
                 <ArrowRight size={11} />
@@ -275,17 +458,17 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
                       onNavigateTab('feed');
                     }
                   }}
-                  className="w-full text-left py-1.5 px-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] transition group cursor-pointer flex items-center justify-between"
+                  className="w-full text-left py-2 px-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] transition group cursor-pointer flex items-center justify-between"
                 >
                   <div className="min-w-0">
                     <span className="text-xs font-bold text-[var(--text-primary)] group-hover:text-[var(--accent-primary)] block truncate">
                       {item.tag}
                     </span>
-                    <span className="text-[10px] text-[var(--text-secondary)] block">
+                    <span className="text-[11px] text-[var(--text-secondary)] block tabular-nums">
                       {item.count}
                     </span>
                   </div>
-                  <span className="text-[10px] font-extrabold text-emerald-600 dark:text-emerald-400 bg-emerald-500/15 px-1.5 py-0.5 rounded-md shrink-0">
+                  <span className="text-[11px] font-mono font-bold text-emerald-600 dark:text-emerald-400 tabular-nums shrink-0">
                     {item.growth}
                   </span>
                 </button>
@@ -293,17 +476,17 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
             </div>
           </div>
 
-          {/* 2. Weekly Creator Challenge Card */}
+          {/* 4. Weekly Creator Challenge Card */}
           {activeChallenge && (
             <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 shadow-2xs space-y-2.5">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5">
-                  <Trophy size={15} className="text-amber-500" />
-                  <span className="text-[10px] font-extrabold uppercase tracking-wider text-amber-500">
+                  <Sparkles size={14} className="text-amber-500" />
+                  <span className="text-xs font-extrabold text-[var(--text-primary)]">
                     {t('trends.weekly_challenge')}
                   </span>
                 </div>
-                <span className="inline-flex items-center gap-1 text-[10px] text-[var(--text-secondary)] font-medium">
+                <span className="inline-flex items-center gap-1 text-[11px] text-[var(--text-secondary)] font-medium">
                   <Clock size={10} />
                   <span>5d left</span>
                 </span>
@@ -332,87 +515,11 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
                   background:
                     'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
                 }}
-                className="w-full py-2 px-3 rounded-2xl hover:opacity-95 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 shadow-2xs cursor-pointer"
+                className="w-full min-h-[40px] py-2 px-3 rounded-2xl hover:opacity-95 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 shadow-2xs cursor-pointer"
               >
                 <Sparkles size={12} />
                 <span>{t('trends.join_challenge')}</span>
               </button>
-            </div>
-          )}
-
-          {/* 3. Suggested Creators Card */}
-          {suggestedCreators.length > 0 && (
-            <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 shadow-2xs space-y-2.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  <UserPlus size={15} className="text-[var(--accent-secondary)]" />
-                  <h3 className="font-extrabold text-xs sm:text-sm text-[var(--text-primary)]">
-                    Suggested Creators
-                  </h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => onNavigateTab('directory')}
-                  className="text-[11px] font-bold text-[var(--accent-primary)] hover:underline cursor-pointer"
-                >
-                  All
-                </button>
-              </div>
-
-              <div className="space-y-2">
-                {suggestedCreators.map((creator) => {
-                  const isFollowing = followedIds.includes(creator.id);
-                  return (
-                    <div
-                      key={creator.id}
-                      className="flex items-center justify-between gap-2"
-                    >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <Avatar
-                          uid={creator.id}
-                          src={
-                            creator.photoURL ||
-                            `https://api.dicebear.com/7.x/shapes/svg?seed=${creator.id}`
-                          }
-                          alt={creator.displayName}
-                          fallbackName={creator.displayName}
-                          size={32}
-                          showStatus={true}
-                          targetProfile={creator}
-                          ringClassName="ring-2 ring-[var(--accent-primary)]/25"
-                        />
-                        <div className="min-w-0">
-                          <span className="text-xs font-bold text-[var(--text-primary)] block truncate">
-                            {creator.displayName || 'Wave Creator'}
-                          </span>
-                          <span className="text-[10px] text-[var(--text-secondary)] block truncate">
-                            {creator.username || `@${creator.displayName?.toLowerCase().replace(/\s+/g, '') || 'creator'}`}
-                          </span>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => handleToggleFollow(creator)}
-                        className={`py-1 px-2.5 rounded-xl text-[11px] font-bold transition shrink-0 cursor-pointer ${
-                          isFollowing
-                            ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30'
-                            : 'bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-[var(--text-primary)]'
-                        }`}
-                      >
-                        {isFollowing ? (
-                          <span className="inline-flex items-center gap-1">
-                            <Check size={11} />
-                            <span>Following</span>
-                          </span>
-                        ) : (
-                          'Follow'
-                        )}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
             </div>
           )}
 

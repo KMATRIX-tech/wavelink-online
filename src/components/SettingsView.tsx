@@ -34,6 +34,7 @@ import {
 } from '../types';
 import { CrystalBadge } from './CrystalBadge';
 import { SupportDeskView } from './SupportDeskView';
+import { SecurityCenterPanel } from './SecurityCenterPanel';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { DailyRewardModal } from './DailyRewardModal';
 import {
@@ -100,11 +101,13 @@ import { inviteFriends, sharePost } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
 import {
   compressProfileImageToBlob,
+  optimizeCloudinaryThumbnailUrl,
   ProfileStorageUploadError,
   uploadProfileImageToCloudinary,
   validateProfileImageFile
 } from '../utils/mediaStorage';
 import { validateStrongPassword } from '../utils/security';
+import { sanitizeUserFacingError } from '../utils/safetyFilters';
 import {
   db,
   formatCloudinaryUploadError,
@@ -288,6 +291,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     userProfile,
     isAdmin,
     isSubAdmin,
+    isSupportHelper,
+    isStaff,
     adminCheckFailedReason,
     isProEffective,
     isVerified,
@@ -389,6 +394,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [isLoadingPosts, setIsLoadingPosts] = useState<boolean>(true);
   const [visiblePostsCount, setVisiblePostsCount] = useState<number>(12);
   const postsGridSectionRef = React.useRef<HTMLDivElement | null>(null);
+  const changePasswordSectionRef = React.useRef<HTMLDivElement | null>(null);
 
   // Load person's posts, followers, and active 24h Sparks with cleanup
   useEffect(() => {
@@ -795,9 +801,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setIsUploadingAvatar(true);
     try {
       const compressedBlob = await compressProfileImageToBlob(file, {
-        maxWidth: 512,
-        maxHeight: 512,
-        targetMaxBytes: 220 * 1024,
+        maxWidth: 400,
+        maxHeight: 400,
+        targetMaxBytes: 120 * 1024,
         mimeType: 'image/jpeg'
       });
       const uploaded = await uploadProfileImageToCloudinary({
@@ -808,8 +814,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         onProgress: (pct) => setAvatarUploadProgress(pct)
       });
 
-      setPhotoURL(uploaded.downloadUrl);
-      await updateUserProfile({ photoURL: uploaded.downloadUrl });
+      const optimizedAvatarUrl = optimizeCloudinaryThumbnailUrl(uploaded.downloadUrl, {
+        width: 400
+      });
+      setPhotoURL(optimizedAvatarUrl);
+      await updateUserProfile({ photoURL: optimizedAvatarUrl });
       setLastFailedAvatarFile(null);
     } catch (err: any) {
       if (err instanceof ProfileStorageUploadError) {
@@ -857,9 +866,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setTimeout(() => setSaveSuccess(false), 3000);
     } catch (err: any) {
       console.error('Failed to update profile:', err);
-      const code = err?.code ? ` (${err.code})` : '';
       setProfileSaveError(
-        `${err?.message || 'Could not save profile changes to Firestore.'}${code}`
+        sanitizeUserFacingError(
+          err,
+          'We could not save your profile changes. Please check your internet connection and tap Try again.'
+        )
       );
     } finally {
       setIsSaving(false);
@@ -929,13 +940,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     e.preventDefault();
     setPasswordStatus(null);
 
+    const hasPasswordProvider = Boolean(
+      currentUser?.providerData.some((p) => p.providerId === 'password')
+    );
+    if (hasPasswordProvider && !currentPassword.trim()) {
+      setPasswordStatus({
+        type: 'error',
+        message: 'Please enter your current password first.'
+      });
+      return;
+    }
+
     const strength = validateStrongPassword(newPassword);
     if (!strength.valid) {
       setPasswordStatus({
         type: 'error',
         message:
           strength.message ||
-          'Password must be between 8 and 24 characters and contain at least one letter and one number.'
+          'Please choose a password with eight to twenty-four characters, including a letter and a number.'
       });
       return;
     }
@@ -943,7 +965,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     if (newPassword !== confirmPassword) {
       setPasswordStatus({
         type: 'error',
-        message: 'New password and confirmation password do not match.'
+        message: 'Your new password and confirm password do not match.'
       });
       return;
     }
@@ -956,12 +978,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setConfirmPassword('');
       setPasswordStatus({
         type: 'success',
-        message: 'Your password has been changed successfully!'
+        message: 'Your password has been changed!'
       });
     } catch (err: any) {
       setPasswordStatus({
         type: 'error',
-        message: err.message || 'Could not update password. Please try again.'
+        message:
+          sanitizeUserFacingError(
+            err,
+            'We could not update your password right now. Please check your current password and try again.'
+          )
       });
     } finally {
       setIsChangingPassword(false);
@@ -975,12 +1001,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       await sendPasswordReset();
       setPasswordStatus({
         type: 'success',
-        message: `Password reset link sent to ${currentUser?.email || 'your email'}!`
+        message: `Password reset email sent to ${currentUser?.email || 'your email'}. Please check your inbox and spam folder.`
       });
     } catch (err: any) {
       setPasswordStatus({
         type: 'error',
-        message: err.message || 'Could not send password reset email right now.'
+        message: sanitizeUserFacingError(
+          err,
+          'We could not send the password reset email right now. Please try again.'
+        )
       });
     } finally {
       setIsSendingResetEmail(false);
@@ -1000,7 +1029,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     if (verifyCooldownSeconds > 0) {
       setPasswordStatus({
         type: 'error',
-        message: `Please wait ${verifyCooldownSeconds} seconds before resending the verification email.`
+        message: 'Please wait a moment before asking for another verification email.'
       });
       return;
     }
@@ -1013,7 +1042,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setVerifyCooldownSeconds(60);
       setPasswordStatus({
         type: 'success',
-        message: 'Verification link sent. Check your inbox and spam folder.'
+        message: 'Verification email sent! Please open the link in your inbox or spam folder.'
       });
     } catch (err: any) {
       const formatted = formatEmailVerificationError(err);
@@ -1021,7 +1050,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setVerifyErrorCode(code);
       setPasswordStatus({
         type: 'error',
-        message: formatted.message || 'Could not send verification email right now.'
+        message: formatted.message || 'We could not send your verification email right now. Please try again.'
       });
     } finally {
       setIsSendingVerifyEmail(false);
@@ -1374,24 +1403,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         id: 'edit_profile',
         icon: <User size={18} className="text-[#2563EB]" />,
         iconBg: 'bg-blue-500/15 border-blue-500/25',
-        label: language === 'sw' ? 'Hariri wasifu' : 'Edit profile',
+        label: language === 'sw' ? 'Hariri' : 'Edit profile',
         onClick: () => setActiveSettingsSection('edit_profile')
       },
       {
         id: 'wavepoints',
         icon: <Coins size={18} className="text-amber-500" />,
         iconBg: 'bg-amber-500/15 border-amber-500/25',
-        label:
-          language === 'sw'
-            ? `WavePoints zangu na mfululizo (${ currentStreak }d)`
-            : `My WavePoints & check-in streak`,
+        label: 'WavePoints',
         onClick: () => setIsDailyRewardModalOpen(true)
       },
       {
         id: 'saved_posts',
         icon: <Bookmark size={18} className="text-[#0D9488]" />,
         iconBg: 'bg-teal-500/15 border-teal-500/25',
-        label: language === 'sw' ? 'Machapisho yaliyohifadhiwa' : 'Saved posts',
+        label: language === 'sw' ? ' Zilizohifadhiwa' : 'Saved',
         onClick: () => {
           setActiveSettingsSection('profile');
           setActiveProfileTab('saved');
@@ -1402,21 +1428,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         id: 'themes',
         icon: <Palette size={18} className="text-purple-500" />,
         iconBg: 'bg-purple-500/15 border-purple-500/25',
-        label: language === 'sw' ? 'Mandhari na muonekano' : 'Themes and backgrounds',
+        label: language === 'sw' ? 'Mandhari' : 'Themes',
         onClick: () => setActiveSettingsSection('appearance')
       },
       {
         id: 'notifications',
         icon: <Bell size={18} className="text-blue-500" />,
         iconBg: 'bg-blue-500/15 border-blue-500/25',
-        label: language === 'sw' ? 'Arifa (Notifications)' : 'Notifications',
+        label: language === 'sw' ? 'Arifa' : 'Alerts',
         onClick: () => setActiveSettingsSection('notifications')
+      },
+      {
+        id: 'security_center',
+        icon: <ShieldCheck size={18} className="text-emerald-600" />,
+        iconBg: 'bg-emerald-500/15 border-emerald-500/25',
+        label: language === 'sw' ? 'Usalama' : 'Security',
+        onClick: () => setActiveSettingsSection('security')
       },
       {
         id: 'privacy',
         icon: <Lock size={18} className="text-emerald-500" />,
         iconBg: 'bg-emerald-500/15 border-emerald-500/25',
-        label: language === 'sw' ? 'Faragha na usalama' : 'Privacy and security',
+        label: language === 'sw' ? 'Faragha' : 'Privacy',
         onClick: () => setActiveSettingsSection('privacy')
       },
       {
@@ -1431,7 +1464,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         icon: <HelpCircle size={18} className="text-rose-500" />,
         iconBg: 'bg-rose-500/15 border-rose-500/25',
         label: language === 'sw' ? 'Msaada' : 'Help',
-        onClick: () => setActiveSettingsSection('support')
+        onClick: () => window.dispatchEvent(new CustomEvent('wavelink:open-help'))
       }
     ];
 
@@ -1444,7 +1477,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           className="wavelink-profile-pro-highlight"
         >
           <div className="flex items-center gap-3.5 min-w-0">
-            <div className="w-11 h-11 rounded-2xl bg-white/20 backdrop-blur-xs border border-white/30 flex items-center justify-center shrink-0">
+            <div className="w-11 h-11 rounded-2xl bg-white/20 border border-white/30 flex items-center justify-center shrink-0">
               <Crown size={21} className="text-amber-200" />
             </div>
             <div className="min-w-0">
@@ -1503,8 +1536,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           ))}
 
-          {/* Admin Panel quick row if admin */}
+          {/* Admin / Staff Panel quick row if staff */}
           {(isAdmin ||
+            isStaff ||
             adminCheckFailedReason === 'owner sign-in not used' ||
             adminCheckFailedReason === 'session needs refresh') &&
             onOpenAdminPanel && (
@@ -1518,7 +1552,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <ShieldCheck size={18} />
                   </div>
                   <span className="font-extrabold text-sm text-[var(--text-primary)] truncate">
-                    {language === 'sw' ? 'Dashibodi ya Admin' : 'Admin Panel'}
+                    {isSupportHelper
+                      ? language === 'sw'
+                        ? 'Dawati la Msaidizi wa Msaada'
+                        : 'Support Helper Desk'
+                      : language === 'sw'
+                      ? 'Dashibodi ya Admin'
+                      : 'Admin Panel'}
                   </span>
                 </div>
                 <span className="wavelink-profile-menu-arrow">
@@ -1526,6 +1566,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </span>
               </button>
             )}
+
+          {/* Direct 1-Tap Log Out Row on Main Profile */}
+          <button
+            type="button"
+            onClick={handleLogOut}
+            disabled={isLoggingOut}
+            className="wavelink-profile-menu-row !border-rose-500/30 !bg-rose-500/10 hover:!bg-rose-500/15 disabled:opacity-50"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-9 h-9 rounded-xl bg-rose-600 text-white flex items-center justify-center shrink-0">
+                <LogOut size={18} />
+              </div>
+              <span className="font-extrabold text-sm text-rose-600 dark:text-rose-400 truncate">
+                {isLoggingOut
+                  ? language === 'sw'
+                    ? 'Inatoka...'
+                    : 'Logging Out...'
+                  : language === 'sw'
+                  ? 'Toka (Log Out)'
+                  : 'Log Out'}
+              </span>
+            </div>
+            <span className="wavelink-profile-menu-arrow !text-rose-600 dark:!text-rose-400">
+              <ChevronRight size={16} />
+            </span>
+          </button>
         </div>
       </div>
     );
@@ -1715,6 +1781,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         {language === 'sw' ? 'Jalada' : 'Cover'}
                       </span>
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={handleLogOut}
+                      disabled={isLoggingOut}
+                      title={language === 'sw' ? 'Toka' : 'Log Out'}
+                      className="min-h-[44px] px-4 py-2 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white text-xs sm:text-sm font-extrabold inline-flex items-center justify-center gap-1.5 shadow-xs transition active:scale-95 cursor-pointer disabled:opacity-50"
+                    >
+                      <LogOut size={15} />
+                      <span>
+                        {isLoggingOut
+                          ? language === 'sw'
+                            ? 'Inatoka...'
+                            : 'Logging Out...'
+                          : language === 'sw'
+                          ? 'Toka'
+                          : 'Log Out'}
+                      </span>
+                    </button>
                   </>
                 ) : (
                   <>
@@ -1759,30 +1844,66 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <span>{language === 'sw' ? 'Ujumbe' : 'Message'}</span>
                     </button>
 
-                    {/* Call Icon Button */}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (onStartCallWithUser && effectiveTargetUid) {
-                          onStartCallWithUser(
-                            {
-                              id: effectiveTargetUid,
-                              name: displayedName,
-                              username: displayedUsername,
-                              photoURL: displayedAvatar
-                            },
-                            'voice'
-                          );
-                        } else if (onStartChatWithUser && effectiveTargetUid) {
-                          onStartChatWithUser(effectiveTargetUid);
-                        }
-                      }}
-                      aria-label={`Call ${displayedName}`}
-                      title={language === 'sw' ? 'Piga Simu' : 'Voice / Video Call'}
-                      className="min-w-[44px] min-h-[44px] rounded-2xl bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] flex items-center justify-center transition active:scale-95 cursor-pointer"
+                    {/* Organized Voice & Video Call Buttons */}
+                    <div
+                      className="inline-flex items-center gap-1.5 shrink-0"
+                      role="group"
+                      aria-label={language === 'sw' ? 'Chaguo za kupiga simu' : 'Call options'}
                     >
-                      <PhoneCall size={16} className="text-[#0D9488]" />
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (onStartCallWithUser && effectiveTargetUid) {
+                            onStartCallWithUser(
+                              {
+                                id: effectiveTargetUid,
+                                name: displayedName,
+                                username: displayedUsername,
+                                photoURL: displayedAvatar
+                              },
+                              'voice'
+                            );
+                          } else if (onStartChatWithUser && effectiveTargetUid) {
+                            onStartChatWithUser(effectiveTargetUid);
+                          }
+                        }}
+                        aria-label={`Voice call ${displayedName}`}
+                        title={language === 'sw' ? 'Simu ya Sauti' : 'Voice Call'}
+                        className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:border-emerald-500/50 text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+                      >
+                        <PhoneCall size={15} className="text-emerald-500 shrink-0" />
+                        <span>{language === 'sw' ? 'Sauti' : 'Voice'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (onStartCallWithUser && effectiveTargetUid) {
+                            onStartCallWithUser(
+                              {
+                                id: effectiveTargetUid,
+                                name: displayedName,
+                                username: displayedUsername,
+                                photoURL: displayedAvatar
+                              },
+                              'video'
+                            );
+                          } else if (onStartChatWithUser && effectiveTargetUid) {
+                            onStartChatWithUser(effectiveTargetUid);
+                          }
+                        }}
+                        aria-label={`Video call ${displayedName}`}
+                        title={language === 'sw' ? 'Simu ya Video' : 'Video Call'}
+                        className="min-w-[44px] min-h-[44px] px-3 py-2 rounded-2xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-2xs transition active:scale-95 cursor-pointer"
+                        style={{
+                          background:
+                            'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                        }}
+                      >
+                        <Video size={15} className="shrink-0" />
+                        <span>{language === 'sw' ? 'Video' : 'Video'}</span>
+                      </button>
+                    </div>
 
                     {/* More Menu: Block & Report */}
                     <div className="relative">
@@ -1994,7 +2115,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 { id: 'edit_profile', label: language === 'sw' ? 'Hariri' : 'Edit Profile' },
                 { id: 'appearance', label: language === 'sw' ? 'Mandhari' : 'Themes' },
                 { id: 'privacy', label: language === 'sw' ? 'Faragha' : 'Privacy' },
-                { id: 'security', label: language === 'sw' ? 'Nenosiri' : 'Password' },
+                { id: 'security', label: language === 'sw' ? 'Kituo cha Usalama' : 'Security Center' },
                 { id: 'notifications', label: language === 'sw' ? 'Arifa' : 'Notifications' },
                 { id: 'stats', label: language === 'sw' ? 'Takwimu' : 'Stats' },
                 { id: 'pro', label: 'Pro' },
@@ -2316,10 +2437,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Choose Your Privacy Settings
                 </h3>
                 <p className="text-xs text-[#78716C]">
-                  Control who can view your profile, see your online activity, message you, or call you.
+                  Control who can view your profile, see your online activity, message you, call you, or follow you.
                 </p>
               </div>
             </div>
+            <button
+              type="button"
+              onClick={() => setActiveSettingsSection('security')}
+              className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-[#0D9488] border border-emerald-200 text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <ShieldCheck size={14} />
+              <span>{language === 'sw' ? 'Fungua Kituo cha Usalama' : 'Open Security Center'}</span>
+            </button>
           </div>
 
           {privacySavedBanner && (
@@ -2380,8 +2509,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            {/* 2. Who Can Message & Call You */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {/* 2. Who Can Message, Call & Follow You */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
                 <label className="text-xs font-extrabold text-[#1C1917] flex items-center gap-1.5">
                   <MessageSquare size={14} className="text-[#0D9488]" />
@@ -2421,6 +2550,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <option value="everyone">Everyone on WaveLink</option>
                   <option value="followers">Followers Only</option>
                   <option value="none">No One (Calls Off)</option>
+                </select>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
+                <label className="text-xs font-extrabold text-[#1C1917] flex items-center gap-1.5">
+                  <UserCheck size={14} className="text-[#0D9488]" />
+                  <span>Who Can Follow You</span>
+                </label>
+                <select
+                  value={privacySettings.whoCanFollow || 'everyone'}
+                  onChange={(e) =>
+                    setPrivacySettings((prev) => ({
+                      ...prev,
+                      whoCanFollow: e.target.value as 'everyone' | 'followers' | 'none'
+                    }))
+                  }
+                  className="w-full min-h-[42px] px-3 py-2 rounded-xl bg-white border border-[var(--border-hairline)] text-xs font-bold text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                >
+                  <option value="everyone">Everyone on WaveLink</option>
+                  <option value="followers">Mutual Friends Only</option>
+                  <option value="none">No New Followers</option>
                 </select>
               </div>
             </div>
@@ -2655,10 +2805,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       )}
 
       {/* =====================================================================
-          SECTION 2: CHANGE PASSWORD, EMAIL VERIFICATION, LOG OUT & DELETE ACCOUNT
+          SECTION 2: SECURITY CENTER, CHANGE PASSWORD, EMAIL VERIFICATION, LOG OUT & DELETE ACCOUNT
       ===================================================================== */}
       {activeSettingsSection === 'security' && (
         <div className="space-y-6">
+          <SecurityCenterPanel
+            onOpenPasswordSection={() =>
+              changePasswordSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            }
+            onOpenDeleteAccountSection={() => setShowDeleteAccountConfirm(true)}
+          />
+
           {/* Email Verification Card */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-4">
             <div className="flex items-center justify-between gap-4 flex-wrap">
@@ -2669,7 +2826,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div>
                   <div className="flex items-center gap-2">
                     <h4 className="font-extrabold text-base text-[#1C1917]">Email Verification</h4>
-                    {currentUser?.emailVerified || reloadedEmailVerified || isAdmin ? (
+                    {currentUser?.emailVerified || reloadedEmailVerified ? (
                       <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-50 text-[#0D9488] border border-emerald-200">
                         Email verified ✓
                       </span>
@@ -2680,14 +2837,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     )}
                   </div>
                   <p className="text-xs text-[#78716C] mt-0.5">
-                    {currentUser?.emailVerified || reloadedEmailVerified || isAdmin
+                    {currentUser?.emailVerified || reloadedEmailVerified
                       ? `Your email (${currentUser?.email}) is verified for posting and messaging.`
                       : `Verify ${currentUser?.email || 'your email'} via Firebase Authentication email verification link.`}
                   </p>
                 </div>
               </div>
 
-              {!currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
+              {!currentUser?.emailVerified && !reloadedEmailVerified && (
                 <button
                   type="button"
                   onClick={handleSendVerifyEmail}
@@ -2708,16 +2865,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               )}
             </div>
 
-            {verifyErrorCode && !currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
-              <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 space-y-1">
-                {passwordStatus?.type === 'error' && (
-                  <p className="text-xs font-bold">{passwordStatus.message}</p>
-                )}
-                <p className="text-[11px] font-mono text-rose-600">{verifyErrorCode}</p>
+            {verifyErrorCode && !currentUser?.emailVerified && !reloadedEmailVerified && (
+              <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 flex items-center justify-between gap-3 flex-wrap">
+                <div className="space-y-1 flex-1 min-w-0">
+                  <p className="text-xs font-bold">
+                    {passwordStatus?.type === 'error'
+                      ? passwordStatus.message
+                      : 'We could not send your verification email right now. Check your internet connection and tap Try again.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSendVerifyEmail}
+                  disabled={isSendingVerifyEmail || verifyCooldownSeconds > 0}
+                  className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  <RotateCcw size={13} />
+                  <span>Try again</span>
+                </button>
               </div>
             )}
 
-            {verifyLinkSent && !currentUser?.emailVerified && !reloadedEmailVerified && !isAdmin && (
+            {verifyLinkSent && !currentUser?.emailVerified && !reloadedEmailVerified && (
               <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
                 <p className="text-xs font-extrabold text-[#0D9488]">
                   Verification link sent. Check your inbox and spam folder.
@@ -2729,7 +2898,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
           </div>
 
-          <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-5">
+          <div
+            ref={changePasswordSectionRef}
+            className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-6 shadow-xs space-y-5"
+          >
             <div className="flex items-start justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-2xl bg-teal-50 text-[#0D9488] border border-teal-200/70 flex items-center justify-center shrink-0">
@@ -2748,45 +2920,55 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             {passwordStatus && (
               <div
-                className={`p-3.5 rounded-2xl border text-xs font-bold flex items-start gap-2 ${
+                className={`p-3.5 rounded-2xl border text-xs font-bold flex items-center justify-between gap-3 flex-wrap ${
                   passwordStatus.type === 'success'
                     ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
                     : 'bg-amber-50 border-amber-200 text-amber-900'
                 }`}
               >
-                {passwordStatus.type === 'success' ? (
-                  <CheckCircle2 size={16} className="text-[#0D9488] shrink-0 mt-0.5" />
-                ) : (
-                  <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
-                )}
-                <div className="space-y-1">
-                  <span className="block">{passwordStatus.message}</span>
-                  {passwordStatus.type === 'error' && verifyErrorCode && (
-                    <span className="block text-[11px] font-mono text-rose-700">
-                      {verifyErrorCode}
-                    </span>
+                <div className="flex items-start gap-2 flex-1 min-w-0">
+                  {passwordStatus.type === 'success' ? (
+                    <CheckCircle2 size={16} className="text-[#0D9488] shrink-0 mt-0.5" />
+                  ) : (
+                    <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
                   )}
+                  <span className="block">{passwordStatus.message}</span>
                 </div>
+                {passwordStatus.type === 'error' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPasswordStatus(null);
+                      setVerifyErrorCode(null);
+                    }}
+                    className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  >
+                    <RotateCcw size={13} />
+                    <span>Try again</span>
+                  </button>
+                )}
               </div>
             )}
 
             <form onSubmit={handlePasswordSubmit} className="space-y-4">
               <div>
                 <label className="block text-xs font-bold text-[#1C1917] mb-1">
-                  Current Password <span className="text-[#78716C] font-normal">(recommended for security verification)</span>
+                  Current Password <span className="text-rose-600 font-bold">(required)</span>
                 </label>
                 <div className="relative">
                   <input
                     type={showCurrentPassword ? 'text' : 'password'}
+                    required={Boolean(currentUser?.providerData.some((p) => p.providerId === 'password'))}
                     value={currentPassword}
                     onChange={(e) => setCurrentPassword(e.target.value)}
                     placeholder="Enter your current password"
-                    className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                    autoComplete="current-password"
+                    className="w-full min-h-[44px] px-3.5 py-2.5 pr-10 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                   />
                   <button
                     type="button"
                     onClick={() => setShowCurrentPassword((prev) => !prev)}
-                    className="absolute right-3 top-2.5 text-[#78716C] hover:text-[#1C1917]"
+                    className="min-w-[44px] min-h-[44px] absolute right-0 top-0 flex items-center justify-center text-[#78716C] hover:text-[#1C1917]"
                     aria-label="Toggle current password visibility"
                   >
                     {showCurrentPassword ? <EyeOff size={16} /> : <Eye size={16} />}
@@ -2808,12 +2990,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       value={newPassword}
                       onChange={(e) => setNewPassword(e.target.value)}
                       placeholder="8–24 chars with letter & number"
-                      className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                      autoComplete="new-password"
+                      className="w-full min-h-[44px] px-3.5 py-2.5 pr-10 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                     />
                     <button
                       type="button"
                       onClick={() => setShowNewPassword((prev) => !prev)}
-                      className="absolute right-3 top-2.5 text-[#78716C] hover:text-[#1C1917]"
+                      className="min-w-[44px] min-h-[44px] absolute right-0 top-0 flex items-center justify-center text-[#78716C] hover:text-[#1C1917]"
                       aria-label="Toggle new password visibility"
                     >
                       {showNewPassword ? <EyeOff size={16} /> : <Eye size={16} />}
@@ -2833,7 +3016,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     placeholder="Re-enter new password"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                    autoComplete="new-password"
+                    className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                   />
                 </div>
               </div>
@@ -2841,8 +3025,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="flex items-center justify-between gap-3 flex-wrap pt-2">
                 <button
                   type="submit"
-                  disabled={isChangingPassword || !newPassword.trim()}
-                  className="min-h-[48px] px-6 py-3 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-xs transition active:scale-95 disabled:opacity-50"
+                  disabled={
+                    isChangingPassword ||
+                    !newPassword.trim() ||
+                    (Boolean(currentUser?.providerData.some((p) => p.providerId === 'password')) &&
+                      !currentPassword.trim())
+                  }
+                  className="min-h-[48px] px-6 py-3 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-xs transition active:scale-95 disabled:opacity-50 cursor-pointer"
                 >
                   <KeyRound size={16} />
                   <span>{isChangingPassword ? 'Updating Password...' : 'Update Password'}</span>
@@ -2853,11 +3042,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     type="button"
                     onClick={handleSendResetLink}
                     disabled={isSendingResetEmail}
-                    className="min-h-[44px] px-4 py-2.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-extrabold flex items-center gap-1.5 transition"
+                    className="min-h-[44px] px-4 py-2.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-extrabold flex items-center gap-1.5 transition cursor-pointer"
                   >
                     <Mail size={14} />
                     <span>
-                      {isSendingResetEmail ? 'Sending Reset Email...' : 'Send Password Reset Email'}
+                      {isSendingResetEmail ? 'Sending Reset Email...' : 'Forgot Password? Send Reset Email'}
                     </span>
                   </button>
                 )}
@@ -2900,9 +3089,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setShowDeleteAccountConfirm(true)}
-                  className="px-4 py-2.5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-extrabold text-xs transition"
+                  className="min-h-[2.75rem] px-4 py-2.5 rounded-2xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-extrabold text-xs transition inline-flex items-center gap-1.5 cursor-pointer"
                 >
-                  Delete My Account
+                  <Trash2 size={14} />
+                  <span>Delete account</span>
                 </button>
               )}
             </div>
@@ -2916,8 +3106,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Are you sure you want to permanently erase your WaveLink account and data?
                 </p>
                 {deleteAccountError && (
-                  <div className="p-2.5 rounded-xl bg-white border border-rose-300 text-rose-700 text-xs font-semibold">
-                    {deleteAccountError}
+                  <div className="p-3 rounded-xl bg-white border border-rose-300 text-rose-700 text-xs font-semibold flex items-center justify-between gap-2.5 flex-wrap">
+                    <span className="flex-1 min-w-0">{deleteAccountError}</span>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteAccountError(null)}
+                      className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                    >
+                      <RotateCcw size={13} />
+                      <span>Try again</span>
+                    </button>
                   </div>
                 )}
                 <input
@@ -2925,15 +3123,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   value={deleteAccountPassword}
                   onChange={(e) => setDeleteAccountPassword(e.target.value)}
                   placeholder="Enter your password to confirm deletion (optional for Google sign-in)"
-                  className="w-full px-3.5 py-2 rounded-xl bg-white border border-rose-200 text-xs text-[#1C1917]"
+                  className="w-full min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-white border border-rose-200 text-xs text-[#1C1917]"
                 />
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="submit"
                     disabled={isDeletingAccount}
-                    className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-xs transition disabled:opacity-50"
+                    className="min-h-[2.75rem] px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-xs transition disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
                   >
-                    {isDeletingAccount ? 'Deleting Account & Data...' : 'Permanently Delete My Account'}
+                    <Trash2 size={14} />
+                    <span>{isDeletingAccount ? 'Deleting...' : 'Delete account'}</span>
                   </button>
                   <button
                     type="button"
@@ -2942,7 +3141,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       setDeleteAccountPassword('');
                       setDeleteAccountError(null);
                     }}
-                    className="px-4 py-2 rounded-xl bg-white border border-stone-200 text-[#57534E] font-bold text-xs"
+                    className="min-h-[2.75rem] px-4 py-2 rounded-xl bg-white border border-stone-200 text-[#57534E] font-bold text-xs cursor-pointer"
                   >
                     Cancel
                   </button>
@@ -3320,44 +3519,45 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 ))}
               </div>
             ) : paginatedTabPosts.length === 0 ? (
-              <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-3">
-                <div className="w-14 h-14 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-secondary)] flex items-center justify-center mx-auto">
+              <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-4">
+                <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center mx-auto shadow-md shadow-blue-500/20">
                   {activeProfileTab === 'reels' ? (
-                    <Video size={24} />
+                    <Video size={28} />
                   ) : activeProfileTab === 'saved' ? (
-                    <Bookmark size={24} />
+                    <Bookmark size={28} />
                   ) : activeProfileTab === 'tagged' ? (
-                    <Tag size={24} />
+                    <Tag size={28} />
                   ) : (
-                    <Grid size={24} />
+                    <Grid size={28} />
                   )}
                 </div>
-                <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                <p className="font-extrabold text-base text-[var(--text-primary)] max-w-xs mx-auto leading-snug">
                   {activeProfileTab === 'reels'
                     ? language === 'sw'
-                      ? 'Bado hakuna Reels'
-                      : 'No reels yet'
+                      ? 'Bado hakuna Reels. Bonyeza + kushiriki video yako ya kwanza.'
+                      : 'No reels yet. Tap + to share your first video.'
                     : activeProfileTab === 'saved'
                     ? language === 'sw'
-                      ? 'Bado hakuna machapisho yaliyohifadhiwa'
-                      : 'No saved posts yet'
+                      ? 'Bado hakuna machapisho yaliyohifadhiwa.'
+                      : 'No saved posts yet. Tap Save on any post to keep it here.'
                     : activeProfileTab === 'tagged'
                     ? language === 'sw'
-                      ? 'Bado hakuna machapisho uliyotajwa'
-                      : 'No tagged posts yet'
+                      ? 'Bado hakuna machapisho uliyotajwa.'
+                      : 'No tagged posts yet. Friends can tag you with @username.'
                     : language === 'sw'
-                    ? 'Bado hakuna machapisho'
-                    : 'No posts yet'}
-                </h3>
-                <p className="text-xs text-[var(--text-secondary)] max-w-sm mx-auto">
-                  {isOwnProfile
-                    ? language === 'sw'
-                      ? 'Machapisho, picha na video unazoshiriki zitaonekana hapa.'
-                      : 'Photos, videos, and moments you share will appear here in your profile grid.'
-                    : language === 'sw'
-                    ? `${displayedName} bado hajachapisha chochote hapa.`
-                    : `${displayedName} hasn't shared any posts in this tab yet.`}
+                    ? 'Bado hakuna machapisho. Bonyeza + kushiriki la kwanza.'
+                    : 'No posts yet. Tap + to share your first one.'}
                 </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.location.href = '/?tab=studio';
+                  }}
+                  className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-sm font-extrabold inline-flex items-center justify-center gap-2 shadow-sm active:scale-95 transition cursor-pointer"
+                >
+                  <Sparkles size={16} />
+                  <span>{language === 'sw' ? '+ Shiriki' : '+ Share'}</span>
+                </button>
               </div>
             ) : (
               <div className="space-y-4">
@@ -4154,10 +4354,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   onClick={() => saveProfileChanges()}
                   disabled={isSaving}
-                  className="min-h-[36px] px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
                 >
                   <RotateCcw size={13} />
-                  <span>Retry</span>
+                  <span>Try again</span>
                 </button>
               </div>
             )}
@@ -4183,13 +4383,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Profile Photo
                   </span>
                   <label
-                    className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold transition ${
+                    className={`min-h-[2.75rem] inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white hover:bg-blue-50 text-[#2563EB] border border-[var(--border-hairline)] text-xs font-bold transition ${
                       isUploadingAvatar ? 'opacity-60 pointer-events-none' : 'cursor-pointer'
                     }`}
                   >
                     <Upload size={14} />
                     <span>
-                      {isUploadingAvatar ? `Uploading (${avatarUploadProgress}%)` : 'Upload Photo'}
+                      {isUploadingAvatar ? `Uploading (${avatarUploadProgress}%)` : 'Upload photo'}
                     </span>
                     <input
                       type="file"
@@ -4212,23 +4412,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   )}
 
                   {avatarUploadError && (
-                    <div className="p-2.5 rounded-xl bg-rose-500/12 border border-rose-500/30 text-rose-700 text-xs space-y-1.5">
-                      <p className="font-semibold">{avatarUploadError.message}</p>
-                      {avatarUploadError.code && (
-                        <p className="text-[11px] font-mono opacity-80">
-                          Error code: {avatarUploadError.code}
-                        </p>
-                      )}
-                      {lastFailedAvatarFile && !isUploadingAvatar && (
-                        <button
-                          type="button"
-                          onClick={() => uploadAvatarFileToFirebase(lastFailedAvatarFile)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-extrabold transition cursor-pointer"
-                        >
-                          <RotateCcw size={12} />
-                          <span>Retry</span>
-                        </button>
-                      )}
+                    <div className="p-3 rounded-xl bg-rose-500/12 border border-rose-500/30 text-rose-700 text-xs flex items-center justify-between gap-2.5 flex-wrap">
+                      <p className="font-semibold flex-1 min-w-0">{avatarUploadError.message}</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (lastFailedAvatarFile && !isUploadingAvatar) {
+                            uploadAvatarFileToFirebase(lastFailedAvatarFile);
+                          } else {
+                            setAvatarUploadError(null);
+                          }
+                        }}
+                        className="min-h-[2.75rem] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold transition cursor-pointer shrink-0"
+                      >
+                        <RotateCcw size={12} />
+                        <span>Try again</span>
+                      </button>
                     </div>
                   )}
                 </div>

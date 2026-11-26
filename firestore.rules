@@ -37,7 +37,7 @@ service cloud.firestore {
     }
 
     function isValidStringList(data, field, maxItems) {
-      return !(field in data) || (data[field] is list && data[field].size() <= maxItems);
+      return !(field in data) || data[field] == null || (data[field] is list && data[field].size() <= maxItems);
     }
 
     // Platform owner identity (must be verified email token)
@@ -84,16 +84,34 @@ service cloud.firestore {
 
     function isSubAdmin() {
       return isSignedIn() && (
-        request.auth.token.get('role', '') == 'sub_admin' ||
-        getUserRole() == 'sub_admin' ||
+        request.auth.token.get('role', '') in ['sub_admin', 'moderator'] ||
+        getUserRole() in ['sub_admin', 'moderator'] ||
         (hasUserDoc() &&
-         getUserDoc().data.get('isSubAdmin', false) == true &&
+         (getUserDoc().data.get('isSubAdmin', false) == true || getUserDoc().data.get('isModerator', false) == true) &&
+         getUserDoc().data.get('isBot', false) != true)
+      );
+    }
+
+    function isModerator() {
+      return isSubAdmin();
+    }
+
+    function isSupportHelper() {
+      return isSignedIn() && (
+        request.auth.token.get('role', '') == 'support_helper' ||
+        getUserRole() == 'support_helper' ||
+        (hasUserDoc() &&
+         getUserDoc().data.get('isSupportHelper', false) == true &&
          getUserDoc().data.get('isBot', false) != true)
       );
     }
 
     function isAdmin() {
       return isSuperAdmin() || isSubAdmin();
+    }
+
+    function isStaff() {
+      return isAdmin() || isSupportHelper();
     }
 
     function isNotBanned() {
@@ -106,11 +124,16 @@ service cloud.firestore {
     // Verify if the authenticated user is strictly one of the two participants in a Direct Message conversation (`dm_<uidA>_<uidB>`)
     function isDmParticipant(channelId) {
       return isSignedIn() && (
-        channelId == 'dm_' + request.auth.uid ||
-        channelId.matches('^dm_' + request.auth.uid + '_.*$') ||
-        channelId.matches('^dm_.*_' + request.auth.uid + '$') ||
-        (exists(/databases/$(database)/documents/channels/$(channelId)) &&
-         request.auth.uid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('participants', []))
+        exists(/databases/$(database)/documents/channels/$(channelId)) &&
+        get(/databases/$(database)/documents/channels/$(channelId)).data.get('participants', []).size() > 0
+          ? (request.auth.uid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('participants', []))
+          : (
+              channelId == 'dm_' + request.auth.uid ||
+              channelId.matches('^dm_' + request.auth.uid + '_[^_]+$') ||
+              channelId.matches('^dm_[^_]+_' + request.auth.uid + '$') ||
+              channelId.matches('^dm_' + request.auth.uid + '_wavelink_support_bot$') ||
+              channelId.matches('^dm_wavelink_support_bot_' + request.auth.uid + '$')
+            )
       );
     }
 
@@ -152,7 +175,7 @@ service cloud.firestore {
     function isValidCustomBackgroundUrl(val) {
       return val is string &&
         val.size() > 10 &&
-        val.size() <= 500 &&
+        val.size() <= 1024 &&
         val.matches('^https://.*') &&
         !val.matches('^data:.*') &&
         !val.matches('^blob:.*');
@@ -161,57 +184,64 @@ service cloud.firestore {
     function isValidCustomBackgroundItem(bg) {
       return bg is map &&
         ('url' in bg) && isValidCustomBackgroundUrl(bg.url) &&
-        (!('mobileUrl' in bg) || bg.mobileUrl == null || isValidCustomBackgroundUrl(bg.mobileUrl)) &&
+        (!('mobileUrl' in bg) || bg.mobileUrl == null || bg.mobileUrl == '' || isValidCustomBackgroundUrl(bg.mobileUrl)) &&
         ('darken' in bg) && bg.darken is number && bg.darken >= 0 && bg.darken <= 70 &&
         ('blur' in bg) && bg.blur is number && bg.blur >= 0 && bg.blur <= 12 &&
         ('textMode' in bg) && bg.textMode in ['light', 'dark'];
     }
 
     function isValidCustomBackgroundHistory(hist) {
-      return hist is list &&
+      return hist == null || (
+        hist is list &&
         hist.size() <= 5 &&
         (hist.size() < 1 || isValidCustomBackgroundItem(hist[0])) &&
         (hist.size() < 2 || isValidCustomBackgroundItem(hist[1])) &&
         (hist.size() < 3 || isValidCustomBackgroundItem(hist[2])) &&
         (hist.size() < 4 || isValidCustomBackgroundItem(hist[3])) &&
-        (hist.size() < 5 || isValidCustomBackgroundItem(hist[4]));
+        (hist.size() < 5 || isValidCustomBackgroundItem(hist[4]))
+      );
     }
 
     function isValidFcmTokenEntry(entry) {
       return entry is map &&
         ('token' in entry) && entry.token is string && entry.token.size() > 10 && entry.token.size() <= 1024 &&
-        (!('deviceId' in entry) || (entry.deviceId is string && entry.deviceId.size() <= 128)) &&
-        (!('deviceName' in entry) || (entry.deviceName is string && entry.deviceName.size() <= 120)) &&
-        (!('platform' in entry) || (entry.platform is string && entry.platform.size() <= 80)) &&
-        (!('createdAt' in entry) || (entry.createdAt is string && entry.createdAt.size() <= 64)) &&
-        (!('lastUsedAt' in entry) || (entry.lastUsedAt is string && entry.lastUsedAt.size() <= 64));
+        (!('deviceId' in entry) || entry.deviceId == null || (entry.deviceId is string && entry.deviceId.size() <= 128)) &&
+        (!('deviceName' in entry) || entry.deviceName == null || (entry.deviceName is string && entry.deviceName.size() <= 120)) &&
+        (!('platform' in entry) || entry.platform == null || (entry.platform is string && entry.platform.size() <= 80)) &&
+        (!('createdAt' in entry) || entry.createdAt == null || (entry.createdAt is string && entry.createdAt.size() <= 64)) &&
+        (!('lastUsedAt' in entry) || entry.lastUsedAt == null || (entry.lastUsedAt is string && entry.lastUsedAt.size() <= 64));
     }
 
     function isValidFcmTokensArray(arr) {
-      return arr is list &&
+      return arr == null || (
+        arr is list &&
         arr.size() <= 5 &&
         (arr.size() < 1 || isValidFcmTokenEntry(arr[0])) &&
         (arr.size() < 2 || isValidFcmTokenEntry(arr[1])) &&
         (arr.size() < 3 || isValidFcmTokenEntry(arr[2])) &&
         (arr.size() < 4 || isValidFcmTokenEntry(arr[3])) &&
-        (arr.size() < 5 || isValidFcmTokenEntry(arr[4]));
+        (arr.size() < 5 || isValidFcmTokenEntry(arr[4]))
+      );
     }
 
     function isValidPrivacySettings(p) {
-      return p is map &&
-        (!('allowDirectMessages' in p) || p.allowDirectMessages in ['everyone', 'followers', 'none']) &&
-        (!('allowCalls' in p) || p.allowCalls in ['everyone', 'followers', 'none']) &&
-        (!('onlineStatusAudience' in p) || p.onlineStatusAudience in ['everyone', 'followers', 'close_friends', 'nobody']) &&
-        (!('profileVisibility' in p) || p.profileVisibility in ['public', 'followers', 'private', 'everyone', 'nobody']) &&
-        (!('sparkVisibility' in p) || p.sparkVisibility in ['everyone', 'followers', 'close_friends']) &&
-        (!('whoCanComment' in p) || p.whoCanComment in ['everyone', 'followers', 'none']) &&
-        (!('showLastSeen' in p) || p.showLastSeen is bool) &&
-        (!('showOnlineStatus' in p) || p.showOnlineStatus is bool) &&
-        (!('showReadReceipts' in p) || p.showReadReceipts is bool) &&
-        (!('showTypingIndicator' in p) || p.showTypingIndicator is bool);
+      return p == null || (
+        p is map &&
+        (!('allowDirectMessages' in p) || p.allowDirectMessages == null || p.allowDirectMessages in ['everyone', 'followers', 'none']) &&
+        (!('allowCalls' in p) || p.allowCalls == null || p.allowCalls in ['everyone', 'followers', 'none']) &&
+        (!('whoCanFollow' in p) || p.whoCanFollow == null || p.whoCanFollow in ['everyone', 'followers', 'none']) &&
+        (!('onlineStatusAudience' in p) || p.onlineStatusAudience == null || p.onlineStatusAudience in ['everyone', 'followers', 'close_friends', 'nobody']) &&
+        (!('profileVisibility' in p) || p.profileVisibility == null || p.profileVisibility in ['public', 'followers', 'private', 'everyone', 'nobody']) &&
+        (!('sparkVisibility' in p) || p.sparkVisibility == null || p.sparkVisibility in ['everyone', 'followers', 'close_friends']) &&
+        (!('whoCanComment' in p) || p.whoCanComment == null || p.whoCanComment in ['everyone', 'followers', 'none']) &&
+        (!('showLastSeen' in p) || p.showLastSeen == null || p.showLastSeen is bool) &&
+        (!('showOnlineStatus' in p) || p.showOnlineStatus == null || p.showOnlineStatus is bool) &&
+        (!('showReadReceipts' in p) || p.showReadReceipts == null || p.showReadReceipts is bool) &&
+        (!('showTypingIndicator' in p) || p.showTypingIndicator == null || p.showTypingIndicator is bool)
+      );
     }
 
-    // Validate User Profile payload lengths & types (used on both create and update)
+    // Validate full User Profile payload lengths & types on create
     function isValidUserProfilePayload(data) {
       return isValidOptionalString(data, 'displayName', 80) &&
         isValidOptionalString(data, 'username', 50) &&
@@ -233,20 +263,61 @@ service cloud.firestore {
         isValidOptionalString(data, 'proBorderEffect', 32) &&
         isValidOptionalString(data, 'proAccentColor', 32) &&
         isValidOptionalString(data, 'proBadge', 32) &&
-        (!('chatThemes' in data) || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
+        (!('chatThemes' in data) || data.chatThemes == null || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
         (!('fcmTokens' in data) || isValidFcmTokensArray(data.fcmTokens)) &&
         isValidStringList(data, 'mutedChannelIds', 200) &&
         isValidStringList(data, 'followingIds', 500) &&
         isValidStringList(data, 'blockedUserIds', 500) &&
         isValidStringList(data, 'closeFriendIds', 500) &&
         isValidStringList(data, 'savedPostIds', 500) &&
-        (!('notificationSettings' in data) || data.notificationSettings is map) &&
+        (!('notificationSettings' in data) || data.notificationSettings == null || data.notificationSettings is map) &&
         (!('privacySettings' in data) || isValidPrivacySettings(data.privacySettings)) &&
-        (!('customThemeMix' in data) || data.customThemeMix == null || (data.customThemeMix is map && data.customThemeMix.size() <= 12)) &&
-        (!('savedThemeMixes' in data) || (data.savedThemeMixes is list && data.savedThemeMixes.size() <= 3)) &&
+        (!('customThemeMix' in data) || data.customThemeMix == null || (data.customThemeMix is map && data.customThemeMix.size() <= 16)) &&
+        (!('savedThemeMixes' in data) || data.savedThemeMixes == null || (data.savedThemeMixes is list && data.savedThemeMixes.size() <= 3)) &&
         (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*')) &&
         (!('customBackground' in data) || data.customBackground == null || isValidCustomBackgroundItem(data.customBackground)) &&
         (!('customBackgroundHistory' in data) || isValidCustomBackgroundHistory(data.customBackgroundHistory));
+    }
+
+    // Validate only the fields actually modified in a User Profile update so untouched legacy fields
+    // on existing documents do not block valid self-profile updates.
+    function isValidUserProfileUpdatePayload(data, changed) {
+      return (!changed.hasAny(['displayName']) || isValidOptionalString(data, 'displayName', 80)) &&
+        (!changed.hasAny(['username']) || isValidOptionalString(data, 'username', 50)) &&
+        (!changed.hasAny(['bio']) || isValidOptionalString(data, 'bio', 500)) &&
+        (!changed.hasAny(['email']) || isValidOptionalString(data, 'email', 160)) &&
+        (!changed.hasAny(['photoURL']) || isValidOptionalString(data, 'photoURL', 150000)) &&
+        (!changed.hasAny(['avatar']) || isValidOptionalString(data, 'avatar', 1024)) &&
+        (!changed.hasAny(['coverImageUrl']) || (
+          isValidOptionalString(data, 'coverImageUrl', 4096) &&
+          (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*'))
+        )) &&
+        (!changed.hasAny(['coverPresetId']) || isValidOptionalString(data, 'coverPresetId', 80)) &&
+        (!changed.hasAny(['coverType']) || isValidOptionalString(data, 'coverType', 32)) &&
+        (!changed.hasAny(['pinnedPostId']) || isValidOptionalString(data, 'pinnedPostId', 160)) &&
+        (!changed.hasAny(['appearanceTheme']) || isValidOptionalString(data, 'appearanceTheme', 40)) &&
+        (!changed.hasAny(['language']) || isValidOptionalString(data, 'language', 16)) &&
+        (!changed.hasAny(['panAfricanLanguage']) || isValidOptionalString(data, 'panAfricanLanguage', 24)) &&
+        (!changed.hasAny(['countryCode']) || isValidOptionalString(data, 'countryCode', 12)) &&
+        (!changed.hasAny(['regionName']) || isValidOptionalString(data, 'regionName', 80)) &&
+        (!changed.hasAny(['preferredCurrency']) || isValidOptionalString(data, 'preferredCurrency', 12)) &&
+        (!changed.hasAny(['patternFrame']) || isValidOptionalString(data, 'patternFrame', 32)) &&
+        (!changed.hasAny(['proBorderEffect']) || isValidOptionalString(data, 'proBorderEffect', 32)) &&
+        (!changed.hasAny(['proAccentColor']) || isValidOptionalString(data, 'proAccentColor', 32)) &&
+        (!changed.hasAny(['proBadge']) || isValidOptionalString(data, 'proBadge', 32)) &&
+        (!changed.hasAny(['chatThemes']) || !('chatThemes' in data) || data.chatThemes == null || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
+        (!changed.hasAny(['fcmTokens']) || !('fcmTokens' in data) || isValidFcmTokensArray(data.fcmTokens)) &&
+        (!changed.hasAny(['mutedChannelIds']) || isValidStringList(data, 'mutedChannelIds', 200)) &&
+        (!changed.hasAny(['followingIds']) || isValidStringList(data, 'followingIds', 500)) &&
+        (!changed.hasAny(['blockedUserIds']) || isValidStringList(data, 'blockedUserIds', 500)) &&
+        (!changed.hasAny(['closeFriendIds']) || isValidStringList(data, 'closeFriendIds', 500)) &&
+        (!changed.hasAny(['savedPostIds']) || isValidStringList(data, 'savedPostIds', 500)) &&
+        (!changed.hasAny(['notificationSettings']) || !('notificationSettings' in data) || data.notificationSettings == null || data.notificationSettings is map) &&
+        (!changed.hasAny(['privacySettings']) || !('privacySettings' in data) || isValidPrivacySettings(data.privacySettings)) &&
+        (!changed.hasAny(['customThemeMix']) || !('customThemeMix' in data) || data.customThemeMix == null || (data.customThemeMix is map && data.customThemeMix.size() <= 16)) &&
+        (!changed.hasAny(['savedThemeMixes']) || !('savedThemeMixes' in data) || data.savedThemeMixes == null || (data.savedThemeMixes is list && data.savedThemeMixes.size() <= 3)) &&
+        (!changed.hasAny(['customBackground']) || !('customBackground' in data) || data.customBackground == null || isValidCustomBackgroundItem(data.customBackground)) &&
+        (!changed.hasAny(['customBackgroundHistory']) || !('customBackgroundHistory' in data) || isValidCustomBackgroundHistory(data.customBackgroundHistory));
     }
 
     // Check if the authenticated user is a Pro member, verified by Admin, or an Admin
@@ -269,23 +340,29 @@ service cloud.firestore {
         data.get('isSubAdmin', false) == false;
     }
 
-    // Protect RBAC, contact verification flags, Pro status, badges, and points from unauthorized client self-escalation
+    // Protect RBAC, contact verification flags, Pro status, badges, followers counts, and points from ANY client self-escalation.
+    // Pro status and roles can ONLY be changed by a server function (Firebase Admin SDK).
     function isSafeUserProfileCreate(userId) {
       let data = request.resource.data;
       return isOwner(userId) &&
         isValidUserProfilePayload(data) &&
         (!('uid' in data) || data.uid == userId) &&
-        (!('role' in data) || data.role == 'user' || isSuperAdmin() || isOwnerBootstrapProfile(userId)) &&
-        (!('admin' in data) || data.admin == false || isSuperAdmin() || isOwnerBootstrapProfile(userId)) &&
-        (!('isOwner' in data) || data.isOwner == false || isSuperAdmin() || isOwnerBootstrapProfile(userId)) &&
-        (!('isSubAdmin' in data) || data.isSubAdmin == false || isSuperAdmin()) &&
+        (!('role' in data) || data.role == 'user') &&
+        (!('admin' in data) || data.admin == false) &&
+        (!('isOwner' in data) || data.isOwner == false) &&
+        (!('isSubAdmin' in data) || data.isSubAdmin == false) &&
+        (!('isModerator' in data) || data.isModerator == false) &&
+        (!('isSupportHelper' in data) || data.isSupportHelper == false) &&
         (!('isBot' in data) || data.isBot == false) &&
         (!('isBanned' in data) || data.isBanned == false) &&
-        (!('isPro' in data) || data.isPro == false || isAdmin()) &&
-        (!('hasBlueStar' in data) || data.hasBlueStar == false || isAdmin()) &&
-        (!('isVerifiedByAdmin' in data) || data.isVerifiedByAdmin == false || isAdmin()) &&
-        (!('proPlan' in data) || data.proPlan == null || isAdmin()) &&
-        (!('proExpiresAt' in data) || data.proExpiresAt == null || isAdmin()) &&
+        (!('isPro' in data) || data.isPro == false) &&
+        (!('hasBlueStar' in data) || data.hasBlueStar == false) &&
+        (!('isVerifiedByAdmin' in data) || data.isVerifiedByAdmin == false) &&
+        (!('proPlan' in data) || data.proPlan == null || data.proPlan == 'free') &&
+        (!('proExpiresAt' in data) || data.proExpiresAt == null || data.proExpiresAt == '') &&
+        (!('followersCount' in data) || data.followersCount == 0) &&
+        (!('followingCount' in data) || data.followingCount == 0) &&
+        (!('followerIds' in data) || (data.followerIds is list && data.followerIds.size() == 0)) &&
         (!('customBackground' in data) || data.customBackground == null || isUserProOrAdmin()) &&
         (!('customBackgroundHistory' in data) || data.customBackgroundHistory.size() == 0 || isUserProOrAdmin()) &&
         (!('emailVerified' in data) || data.emailVerified == isEmailVerified()) &&
@@ -296,30 +373,45 @@ service cloud.firestore {
     }
 
     // Users can update ONLY their own safe profile fields (photo, cover, bio, displayName, username, theme, language, settings),
-    // and NEVER role, admin, sub-admin, Pro, verified badges, ban state, or arbitrary points.
+    // and NEVER role, admin, sub-admin, Pro, verified badges, follower counts, ban state, or arbitrary points.
     function isSafeUserProfileUpdate(userId) {
       let incoming = request.resource.data;
       let existing = resource.data;
       let changed = incoming.diff(existing).affectedKeys();
+      let isProSelf = isAdmin() ||
+        existing.get('isPro', false) == true ||
+        existing.get('hasBlueStar', false) == true ||
+        existing.get('isVerifiedByAdmin', false) == true;
       return isOwner(userId) &&
-        isValidUserProfilePayload(incoming) &&
-        (!('uid' in incoming) || incoming.uid == userId) &&
+        isValidUserProfileUpdatePayload(incoming, changed) &&
+        (!changed.hasAny(['uid']) || !('uid' in incoming) || incoming.uid == userId) &&
         (
           !changed.hasAny(['customBackground', 'customBackgroundHistory']) ||
-          isUserProOrAdmin() ||
+          isProSelf ||
           (('customBackground' in incoming) && incoming.customBackground == null && !changed.hasAny(['customBackgroundHistory']))
         ) &&
         (
-          !changed.hasAny(['role', 'admin', 'isOwner']) ||
-          (isOwnerEmailToken() && isEmailVerified() && incoming.get('isSubAdmin', false) == false)
+          !changed.hasAny(['proBadge']) ||
+          (
+            isProSelf &&
+            (!('proBadge' in incoming) || incoming.proBadge == null || incoming.proBadge != 'founder' || isSuperAdmin())
+          )
         ) &&
         !changed.hasAny([
+          'role',
+          'admin',
+          'isOwner',
           'isSubAdmin',
+          'isModerator',
+          'isSupportHelper',
           'isPro',
           'hasBlueStar',
           'isVerifiedByAdmin',
           'proPlan',
           'proExpiresAt',
+          'followersCount',
+          'followingCount',
+          'followerIds',
           'isBanned',
           'points',
           'wavePoints',
@@ -331,20 +423,26 @@ service cloud.firestore {
         ]);
     }
 
-    // Allow signed-in user to heal a missing or DiceBear placeholder photoURL on a user document ONLY from trusted HTTPS image CDNs
-    function isSafeAvatarHealUpdate() {
-      let incoming = request.resource.data;
-      let existing = resource.data;
-      let existingPhoto = existing.get('photoURL', '');
-      let incomingPhoto = incoming.get('photoURL', '');
-      return isSignedIn() &&
-        incoming.diff(existing).affectedKeys().hasOnly(['photoURL', 'updatedAt']) &&
-        incomingPhoto is string &&
-        incomingPhoto.size() >= 12 &&
-        incomingPhoto.size() <= 500 &&
-        incomingPhoto.matches('^https://(lh3\\.googleusercontent\\.com|res\\.cloudinary\\.com|firebasestorage\\.googleapis\\.com|storage\\.googleapis\\.com)/.*') &&
-        !incomingPhoto.matches('.*dicebear\\.com.*') &&
-        (existingPhoto == '' || !(existingPhoto is string) || existingPhoto.matches('.*dicebear\\.com.*'));
+    // Admins can moderate user accounts (warnings, ban status), but CANNOT mutate role or isPro from the client SDK
+    // because Pro status and roles can ONLY be changed by a server function.
+    function isAdminModerationUserUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return isAdmin() &&
+        changed.hasOnly([
+          'status',
+          'isBanned',
+          'banReason',
+          'bannedAt',
+          'warnings',
+          'warningMessage',
+          'lastWarningAt',
+          'isDuplicateDisabled',
+          'mergedIntoUid',
+          'disabledAt',
+          'keptUntil',
+          'disabledReason',
+          'updatedAt'
+        ]);
     }
 
     // Check mutual block relationship against an author/user UID
@@ -410,18 +508,10 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Server/Owner-managed Admins registry (strictly verified owner email token or super admin — NO hardcoded grant secret)
+    // Server-managed Admins registry (roles can ONLY be changed by a server function via Admin SDK)
     match /admins/{adminId} {
       allow read: if isOwner(adminId) || isAdmin();
-      allow create, update: if isSuperAdmin() || (
-        isOwner(adminId) &&
-        isOwnerEmailToken() &&
-        isEmailVerified() &&
-        request.resource.data.uid == adminId &&
-        request.resource.data.role in ['admin', 'super_admin'] &&
-        request.resource.data.get('isSubAdmin', false) == false
-      );
-      allow delete: if isSuperAdmin();
+      allow create, update, delete: if false;
     }
 
     // Read-only connection health test document
@@ -430,11 +520,11 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // User profiles: directory read for signed-in users, guarded create/update, owner/super-admin delete
+    // User profiles: directory read for signed-in users, guarded create/update (no client writes to isPro or role), owner/super-admin delete
     match /users/{userId} {
       allow read: if isSignedIn();
-      allow create: if isAdmin() || (isValidId(userId) && isSafeUserProfileCreate(userId));
-      allow update: if isAdmin() || (isValidId(userId) && (isSafeUserProfileUpdate(userId) || isSafeAvatarHealUpdate()));
+      allow create: if isValidId(userId) && (isSafeUserProfileCreate(userId) || isOwnerBootstrapProfile(userId));
+      allow update: if isValidId(userId) && (isSafeUserProfileUpdate(userId) || isAdminModerationUserUpdate());
       allow delete: if isSuperAdmin() || (isValidId(userId) && isOwner(userId));
 
       // Device FCM Push Notification Tokens — strictly private to the user
@@ -474,6 +564,16 @@ service cloud.firestore {
       match /privatePushMeta/{docId} {
         allow read, write: if false;
       }
+
+      // Active Device Sessions subcollection (users/{uid}/sessions/{sessionId})
+      match /sessions/{sessionId} {
+        allow read, delete: if isOwner(userId) || isSuperAdmin();
+        allow create, update: if isOwner(userId) &&
+          isValidId(sessionId) &&
+          isValidOptionalString(request.resource.data, 'deviceName', 140) &&
+          isValidOptionalString(request.resource.data, 'platform', 80) &&
+          isValidOptionalString(request.resource.data, 'browser', 80);
+      }
     }
 
     // Top-level Private Creator Stats collection
@@ -500,10 +600,9 @@ service cloud.firestore {
       allow update, delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
     }
 
-    // Social feed posts (enforces post audience & mutual blocks on get; blocks client self-boosting/tip spoofing)
+    // Social feed posts (enforces post audience & mutual blocks on get & list; bounds engagement deltas; blocks client self-boosting/tip spoofing)
     match /posts/{postId} {
-      allow list: if isSignedIn();
-      allow get: if isSignedIn() && canReadPostDoc(resource.data);
+      allow get, list: if isSignedIn() && canReadPostDoc(resource.data);
       allow create: if isSignedIn() && isNotBanned() && isValidPostPayload(request.resource.data) && (
         request.resource.data.authorId == request.auth.uid ||
         (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
@@ -519,11 +618,25 @@ service cloud.firestore {
       allow update: if isSignedIn() && isValidPostPayload(request.resource.data) && (
         isAdmin() ||
         (
+          isSupportHelper() &&
+          request.resource.data.get('isHidden', false) == true &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'isHidden',
+            'moderationStatus',
+            'moderationReason',
+            'updatedAt'
+          ])
+        ) ||
+        (
           resource.data.authorId == request.auth.uid &&
           areImmutableFieldsUnchanged(['authorId', 'createdAt', 'isBoosted', 'boostedUntil', 'boostTier', 'tipsTotalTZS', 'tipsCount'])
         ) ||
         (
           !isBlockedMutual(resource.data.get('authorId', '')) &&
+          math.abs(request.resource.data.get('likesCount', 0) - resource.data.get('likesCount', 0)) <= 1 &&
+          math.abs(request.resource.data.get('commentsCount', 0) - resource.data.get('commentsCount', 0)) <= 1 &&
+          math.abs(request.resource.data.get('savesCount', 0) - resource.data.get('savesCount', 0)) <= 1 &&
+          math.abs(request.resource.data.get('sharesCount', 0) - resource.data.get('sharesCount', 0)) <= 1 &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'likes',
             'likesCount',
@@ -535,6 +648,20 @@ service cloud.firestore {
             'sharedBy',
             'updatedAt'
           ])
+        ) ||
+        (
+          !isBlockedMutual(resource.data.get('authorId', '')) &&
+          !(request.auth.uid in resource.data.get('reportedBy', [])) &&
+          (request.auth.uid in request.resource.data.get('reportedBy', [])) &&
+          request.resource.data.get('reportCount', 0) == resource.data.get('reportCount', 0) + 1 &&
+          request.resource.data.get('isHidden', false) == (resource.data.get('isHidden', false) || request.resource.data.get('reportCount', 0) >= 3) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'reportCount',
+            'reportedBy',
+            'isHidden',
+            'moderationStatus',
+            'updatedAt'
+          ])
         )
       );
       allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
@@ -543,7 +670,9 @@ service cloud.firestore {
         allow read: if isSignedIn();
         allow create: if isSignedIn() && isNotBanned() &&
           isValidCommentPayload(request.resource.data) &&
-          request.resource.data.authorId == request.auth.uid;
+          request.resource.data.authorId == request.auth.uid &&
+          (!exists(/databases/$(database)/documents/posts/$(postId)) ||
+           !isBlockedMutual(get(/databases/$(database)/documents/posts/$(postId)).data.get('authorId', '')));
         allow update: if isSignedIn() &&
           isValidCommentPayload(request.resource.data) &&
           areImmutableFieldsUnchanged(['authorId', 'postId', 'createdAt']) &&
@@ -551,8 +680,23 @@ service cloud.firestore {
             resource.data.authorId == request.auth.uid ||
             isAdmin() ||
             (
+              isSupportHelper() &&
+              request.resource.data.get('isHidden', false) == true &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isHidden', 'moderationStatus', 'updatedAt'])
+            ) ||
+            (
+              !isBlockedMutual(resource.data.get('authorId', '')) &&
               areImmutableFieldsUnchanged(['content']) &&
               request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions', 'reactionCounts', 'updatedAt'])
+            ) ||
+            (
+              !isBlockedMutual(resource.data.get('authorId', '')) &&
+              areImmutableFieldsUnchanged(['content']) &&
+              !(request.auth.uid in resource.data.get('reportedBy', [])) &&
+              (request.auth.uid in request.resource.data.get('reportedBy', [])) &&
+              request.resource.data.get('reportCount', 0) == resource.data.get('reportCount', 0) + 1 &&
+              request.resource.data.get('isHidden', false) == (resource.data.get('isHidden', false) || request.resource.data.get('reportCount', 0) >= 3) &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reportCount', 'reportedBy', 'isHidden', 'moderationStatus', 'updatedAt'])
             )
           );
         allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
@@ -593,14 +737,19 @@ service cloud.firestore {
       allow update: if isSignedIn() && isValidSparkPayload() && (
         (resource.data.authorId == request.auth.uid && areImmutableFieldsUnchanged(['authorId', 'createdAt'])) ||
         isAdmin() ||
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'likes',
-          'likesCount',
-          'likedUsers',
-          'viewers',
-          'viewersCount',
-          'viewerUsers'
-        ])
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'likes',
+            'likesCount',
+            'likedUsers',
+            'viewers',
+            'viewersCount',
+            'viewerUsers'
+          ]) &&
+          request.resource.data.get('viewersCount', 0) >= resource.data.get('viewersCount', 0) &&
+          request.resource.data.get('likesCount', 0) >= resource.data.get('likesCount', 0) - 1 &&
+          request.resource.data.get('likesCount', 0) <= resource.data.get('likesCount', 0) + 1
+        )
       );
       allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
 
@@ -641,11 +790,11 @@ service cloud.firestore {
       }
     }
 
-    // Support Tickets & Complaints (readable/writable only by ticket owner or Admin)
+    // Support Tickets & Complaints (readable/writable by ticket owner, Admin, Moderator, or Support Helper)
     match /supportTickets/{ticketId} {
-      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && (request.resource.data.userId == request.auth.uid || isAdmin());
-      allow update: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isStaff());
+      allow create: if isSignedIn() && (request.resource.data.userId == request.auth.uid || isStaff());
+      allow update: if isSignedIn() && (resource.data.userId == request.auth.uid || isStaff());
       allow delete: if isAdmin();
     }
 
@@ -657,10 +806,10 @@ service cloud.firestore {
 
     // WaveLink Support Bot Conversation Logs & Bad Reply Reports
     match /supportBotLogs/{logId} {
-      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isStaff());
       allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
       allow update: if isSignedIn() && (
-        isAdmin() ||
+        isStaff() ||
         (resource.data.userId == request.auth.uid &&
          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reportedBadReply', 'reportReason', 'escalatedToTicketId']))
       );
@@ -672,21 +821,43 @@ service cloud.firestore {
       allow read, write: if isAdmin();
     }
 
-    // Content & User Reports (Posts, Comments, Messages, Accounts, Bad Bot Replies)
+    // Content & User Reports (Posts, Comments, Reels, Messages, Accounts, Bad Bot Replies)
     match /contentReports/{reportId} {
-      allow read: if isSignedIn() && (resource.data.reporterId == request.auth.uid || isAdmin());
+      allow read: if isSignedIn() && (resource.data.reporterId == request.auth.uid || isStaff());
       allow create: if isSignedIn() &&
         request.resource.data.reporterId == request.auth.uid &&
-        request.resource.data.get('status', 'open') == 'open' &&
+        request.resource.data.get('status', 'open') in ['open', 'auto_hidden'] &&
         isValidOptionalString(request.resource.data, 'reason', 500) &&
         isValidOptionalString(request.resource.data, 'details', 2000);
+      allow update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    // Appeals for Hidden Content & Account Suspensions
+    match /appeals/{appealId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        isValidOptionalString(request.resource.data, 'reason', 2000);
       allow update, delete: if isAdmin();
     }
 
-    // Admin Security Audit Log (Bans, Role Changes, Verifications, Deletions)
+    // Global Service Status Banner & System Config (readable by all, writable ONLY by Owner)
+    match /system_config/{configId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // Server-managed Staff Roles Registry (roles can ONLY be changed by a server function via Admin SDK)
+    match /staff_roles/{staffUid} {
+      allow read: if isOwner(staffUid) || isStaff();
+      allow create, update, delete: if false;
+    }
+
+    // Admin Security Audit Log (Bans, Role Changes, Verifications, Deletions, Support Actions)
     match /adminAuditLogs/{auditId} {
       allow read: if isAdmin();
-      allow create: if isAdmin();
+      allow create: if isStaff();
       allow update, delete: if isSuperAdmin();
     }
 
@@ -805,11 +976,12 @@ service cloud.firestore {
           (request.resource.data.senderId == request.auth.uid && (channelId != 'official_updates' || isAdmin())) ||
           (request.resource.data.senderId == 'wavelink_support_bot' && channelId.matches('.*wavelink_support_bot.*'))
         ) &&
+        (!('receiverId' in request.resource.data) || !isBlockedMutual(request.resource.data.get('receiverId', ''))) &&
         isValidOptionalString(request.resource.data, 'text', 4000) &&
         isValidOptionalString(request.resource.data, 'expiresAt', 64);
         allow update: if isDmMember(channelId) && (
           resource.data.senderId == request.auth.uid ||
-          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'lastSeenAt', 'reportedBadReply', 'reactions'])
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'lastSeenAt', 'reportedBadReply', 'reactions', 'reportedBy', 'reportCount', 'isHidden'])
         );
         allow delete: if isDmMember(channelId) && (resource.data.senderId == request.auth.uid || isAdmin());
       }
@@ -873,11 +1045,16 @@ service cloud.firestore {
       allow read, write: if isSuperAdmin();
     }
 
-    // In-App Notifications (actorId must match caller or Admin; recipient can only mark read)
+    // In-App Notifications (actorId must match caller or Admin; blocked users cannot send notifications; recipient can only mark read)
     match /notifications/{notificationId} {
       allow read: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
       allow create: if isSignedIn() &&
         (request.resource.data.actorId == request.auth.uid || isAdmin()) &&
+        ('recipientId' in request.resource.data) &&
+        request.resource.data.recipientId is string &&
+        request.resource.data.recipientId.size() <= 128 &&
+        !isBlockedMutual(request.resource.data.recipientId) &&
+        (isAdmin() || request.resource.data.get('type', '') != 'system' || request.resource.data.recipientId == 'keylan_admin') &&
         isValidOptionalString(request.resource.data, 'title', 160) &&
         isValidOptionalString(request.resource.data, 'body', 600);
       allow update: if isSignedIn() && (
@@ -888,10 +1065,17 @@ service cloud.firestore {
       allow delete: if isSignedIn() && (resource.data.recipientId == request.auth.uid || isAdmin());
     }
 
-    // User Follows
+    // User Follows (prevents self-follow, duplicate follow inflation, and following when mutually blocked)
     match /follows/{followId} {
       allow read: if isSignedIn();
-      allow create: if isSignedIn() && request.resource.data.followerId == request.auth.uid;
+      allow create, update: if isSignedIn() &&
+        request.resource.data.followerId == request.auth.uid &&
+        ('followingId' in request.resource.data) &&
+        request.resource.data.followingId is string &&
+        request.resource.data.followingId != request.auth.uid &&
+        !isBlockedMutual(request.resource.data.followingId) &&
+        (followId == request.auth.uid + '_' + request.resource.data.followingId ||
+         followId == 'follow_' + request.auth.uid + '_' + request.resource.data.followingId);
       allow delete: if isSignedIn() && (resource.data.followerId == request.auth.uid || isAdmin());
     }
 
@@ -1000,13 +1184,21 @@ service cloud.firestore {
         isCallParticipantData(resource.data);
 
       match /callerCandidates/{candidateId} {
-        allow get, create, update, delete: if isValidId(candidateId) && isCallParticipant(callId);
-        allow list: if isCallParticipant(callId);
+        allow get, list: if isCallParticipant(callId);
+        allow create, update: if isValidId(candidateId) &&
+          isCallParticipant(callId) &&
+          (!('candidate' in request.resource.data) ||
+           (request.resource.data.candidate is string && request.resource.data.candidate.size() <= 2048));
+        allow delete: if isValidId(candidateId) && isCallParticipant(callId);
       }
 
       match /calleeCandidates/{candidateId} {
-        allow get, create, update, delete: if isValidId(candidateId) && isCallParticipant(callId);
-        allow list: if isCallParticipant(callId);
+        allow get, list: if isCallParticipant(callId);
+        allow create, update: if isValidId(candidateId) &&
+          isCallParticipant(callId) &&
+          (!('candidate' in request.resource.data) ||
+           (request.resource.data.candidate is string && request.resource.data.candidate.size() <= 2048));
+        allow delete: if isValidId(candidateId) && isCallParticipant(callId);
       }
     }
   }

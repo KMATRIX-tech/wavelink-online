@@ -72,18 +72,18 @@ export const QuotaExceededBanner: React.FC<QuotaExceededBannerProps> = ({
           <Database size={14} className="text-amber-600 shrink-0" />
           <span className="truncate font-medium">
             {isSw
-              ? 'Hali ya nje ya mtandao: maudhui yaliyohifadhiwa yanaonyeshwa.'
-              : 'Cached mode: browsing from local offline storage.'}
+              ? 'Unaona machapisho yaliyohifadhiwa kwenye simu.'
+              : 'Showing saved posts while offline.'}
           </span>
         </div>
         <button
           type="button"
           onClick={handleRetry}
           disabled={isRetrying}
-          className="px-2 py-1 rounded-lg bg-amber-200/80 hover:bg-amber-200 text-amber-950 font-semibold text-[11px] shrink-0 transition active:scale-95 cursor-pointer flex items-center gap-1"
+          className="min-h-[2.75rem] px-3 py-2 rounded-xl bg-amber-200/80 hover:bg-amber-200 text-amber-950 font-semibold text-xs shrink-0 transition active:scale-95 cursor-pointer flex items-center gap-1.5"
         >
-          <RefreshCw size={11} className={isRetrying ? 'animate-spin' : ''} />
-          <span>{isSw ? 'Onyesha Upya' : 'Retry'}</span>
+          <RefreshCw size={13} className={isRetrying ? 'animate-spin' : ''} />
+          <span>{isSw ? 'Jaribu tena' : 'Try again'}</span>
         </button>
       </div>
     );
@@ -103,26 +103,26 @@ export const QuotaExceededBanner: React.FC<QuotaExceededBannerProps> = ({
             <div className="flex items-center gap-2 flex-wrap">
               <h4 className="text-sm font-bold text-stone-900 tracking-tight">
                 {isSw
-                  ? 'WaveLink Inatumia Hifadhi ya Kwenye Simu (Hali ya Nje ya Mtandao)'
-                  : 'WaveLink is Running in Cached Offline Mode'}
+                  ? 'Machapisho Yaliyohifadhiwa'
+                  : 'Saved Mode'}
               </h4>
               <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-teal-100/80 text-teal-800">
                 <ShieldCheck size={11} />
-                {isSw ? 'Maudhui Yapo Salama' : 'Data Preserved'}
+                {isSw ? 'Salama' : 'Safe'}
               </span>
             </div>
             <p className="text-xs text-stone-700 leading-relaxed max-w-2xl">
               {isSw
-                ? 'Kikomo cha kila siku cha usomaji wa bure kimefikiwa kwa sasa. Hakuna kitakachopotea: machapisho yako yaliyohifadhiwa, jumbe, na maelezo bado yapo hapa kwenye simu yako. Data mpya itasasishwa mara tu kikomo kinapowekwa upya.'
-                : 'The free daily database read quota has been reached. Don\'t worry! Your cached posts, stories, chats, and saved waves remain fully readable from local storage. New updates will refresh automatically when the daily quota resets.'}
+                ? 'Seva ina shughuli nyingi sasa hivi. Bado unaweza kusoma machapisho na jumbe zako zilizohifadhiwa. Gusa Jaribu tena kupata mapya.'
+                : 'WaveLink is busy right now. You can still read your saved posts and chats. Tap Try again to check for new updates.'}
             </p>
           </div>
         </div>
         <button
           type="button"
           onClick={() => setIsDismissed(true)}
-          className="p-1 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-100 transition shrink-0 cursor-pointer"
-          title={isSw ? 'Funga' : 'Dismiss'}
+          className="min-w-[2.75rem] min-h-[2.75rem] p-2 rounded-xl text-stone-500 hover:text-stone-800 hover:bg-stone-100 transition shrink-0 cursor-pointer flex items-center justify-center"
+          title={isSw ? 'Funga' : 'Close'}
         >
           <X size={16} />
         </button>
@@ -131,17 +131,17 @@ export const QuotaExceededBanner: React.FC<QuotaExceededBannerProps> = ({
       <div className="mt-3 pt-2.5 border-t border-amber-200/50 flex items-center justify-between gap-2 flex-wrap">
         <span className="text-[11px] text-stone-500 font-medium">
           {isSw
-            ? 'Unaweza kuendelea kusoma machapisho na kutumia vipengele vyote vilivyohifadhiwa.'
-            : 'You can continue reading posts, viewing profiles, and accessing offline data.'}
+            ? 'Kazi zako zote ziko salama.'
+            : 'All your saved posts and chats are safe.'}
         </span>
         <button
           type="button"
           onClick={handleRetry}
           disabled={isRetrying}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold transition active:scale-95 shadow-xs cursor-pointer"
+          className="min-h-[2.75rem] inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold transition active:scale-95 shadow-xs cursor-pointer"
         >
-          <RefreshCw size={13} className={isRetrying ? 'animate-spin' : ''} />
-          <span>{isSw ? 'Jaribu Kuonyesha Upya' : 'Refresh / Retry'}</span>
+          <RefreshCw size={14} className={isRetrying ? 'animate-spin' : ''} />
+          <span>{isSw ? 'Jaribu tena' : 'Try again'}</span>
         </button>
       </div>
     </div>

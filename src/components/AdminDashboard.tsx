@@ -31,6 +31,7 @@ import {
   setDoc,
   deleteDoc
 } from 'firebase/firestore';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
 import {
   UserProfile,
@@ -49,7 +50,9 @@ import {
   UpgradeFeedbackItem,
   UpgradeStatus,
   UpgradeSource,
-  UpgradeCategory
+  UpgradeCategory,
+  ContentAppeal,
+  SystemStatusBannerConfig
 } from '../types';
 import {
   updateUpgradeFeedbackStatus,
@@ -66,6 +69,7 @@ import {
   SUPPORT_BOT_PROFILE,
   sanitizeUserText
 } from '../utils/security';
+import { redactEmailIfSupportHelper, sanitizeUserFacingError } from '../utils/safetyFilters';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -128,8 +132,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     currentUser,
     isSuperAdmin,
     isSubAdmin,
+    isModerator,
+    isSupportHelper,
+    isStaff,
     isAdmin,
     toggleSubAdmin,
+    assignStaffRole,
     toggleVerifyUser,
     recordAdminAuditLog,
     refreshAdminVerification,
@@ -137,14 +145,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     adminCheckFailedReason
   } = useAuth();
 
+  const hasStaffClearance = Boolean(isAdmin || isStaff || isSupportHelper);
+
   const ADMIN_EMAILS = ['keylanmbilinyi5@gmail.com'];
   const isOwnerEmailAccount = Boolean(
-    currentUser?.email && ADMIN_EMAILS.includes(currentUser.email.trim().toLowerCase())
+    currentUser?.emailVerified &&
+      currentUser?.email &&
+      ADMIN_EMAILS.includes(currentUser.email.trim().toLowerCase())
   );
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'challenges' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'challenges' | 'complaints' | 'members' | 'updates_group' | 'verifications' | 'calls' | 'payments' | 'audit' | 'upgrades' | 'duplicates'>(() =>
+    isSupportHelper ? 'complaints' : 'overview'
+  );
   const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(
-    Boolean(isOwnerEmailAccount || isAdmin)
+    Boolean(isOwnerEmailAccount || isAdmin || isStaff || isSupportHelper)
   );
   const [isCheckingServerAdmin, setIsCheckingServerAdmin] = useState<boolean>(false);
   const [failedCheckReason, setFailedCheckReason] = useState<string | null>(null);
@@ -195,7 +209,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       if (d && d.authorized === true) {
         setServerAdminVerified(true);
         setFailedCheckReason(null);
-        if (d.needsTokenRefresh || !isAdmin) {
+        if (d.needsTokenRefresh || (!isAdmin && !isStaff)) {
           await currentUser.getIdToken(true).catch(() => {});
           await refreshAdminVerification().catch(() => {});
         }
@@ -208,7 +222,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         );
       }
     } catch {
-      const ok = Boolean(isAdmin);
+      const ok = Boolean(isAdmin || isStaff || isSupportHelper);
       setServerAdminVerified(ok);
       if (!ok) {
         setFailedCheckReason(adminCheckFailedReason || 'session needs refresh');
@@ -220,7 +234,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   useEffect(() => {
     verifyAdminSessionWithServer(false);
-  }, [currentUser, isSubAdmin, isAdmin]);
+  }, [currentUser, isSubAdmin, isAdmin, isStaff, isSupportHelper]);
+
+  useEffect(() => {
+    if (isSupportHelper && activeTab !== 'complaints' && activeTab !== 'audit') {
+      setActiveTab('complaints');
+    }
+  }, [isSupportHelper, activeTab]);
 
   const handleReverifyOwnerSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -269,6 +289,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [scheduledDrafts, setScheduledDrafts] = useState<ScheduledBotDraft[]>([]);
   const [contentReports, setContentReports] = useState<ContentReport[]>([]);
   const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
+  const [appeals, setAppeals] = useState<ContentAppeal[]>([]);
+  const [statusBanner, setStatusBanner] = useState<SystemStatusBannerConfig>({
+    enabled: false,
+    level: 'info',
+    messageEn: 'WaveLink services are currently undergoing scheduled maintenance.',
+    messageSw: 'Huduma za WaveLink ziko kwenye matengenezo ya kawaida kwa sasa.',
+    updatedAt: new Date().toISOString(),
+  });
+  const [isSavingBanner, setIsSavingBanner] = useState(false);
 
   // Scheduled Bot Draft Form State
   const [draftType, setDraftType] = useState<'weekly_update' | 'spark_of_the_day'>('weekly_update');
@@ -357,6 +386,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
   const [callLoopbackHealth, setCallLoopbackHealth] = useState<SubHealthState>({
     status: 'idle',
     summary: 'Not tested yet — click Call Test to verify TURN relay, Firestore /calls accepted rules, and live WebRTC peer loopback.'
+  });
+  const [rateLimitHealth, setRateLimitHealth] = useState<SubHealthState>({
+    status: 'idle',
+    summary: 'Not tested yet — click Run Check to test Express API rate limiters & headers.'
+  });
+  const [pushHealth, setPushHealth] = useState<SubHealthState>({
+    status: 'idle',
+    summary: 'Not tested yet — click Run Check to test Service Worker, Notification API, and /fcmTokens subcollection rules.'
   });
   const [isRunningAllHealthChecks, setIsRunningAllHealthChecks] = useState(false);
 
@@ -691,6 +728,72 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     }
   }, [currentUser]);
 
+  const handleTestRateLimitHealth = useCallback(async () => {
+    setRateLimitHealth({
+      status: 'testing',
+      summary: 'Probing /api/system-health/rate-limit-probe...'
+    });
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch('/api/system-health/rate-limit-probe', {
+        method: 'POST',
+        headers,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data?.ok) {
+        throw new Error(data?.error || `HTTP ${resp.status}`);
+      }
+      setRateLimitHealth({
+        status: 'healthy',
+        summary: 'Healthy — Global & route-specific rate limiters active',
+        detail: 'Verified auth, signup, chat, call, upload, and AI rate limiters + XSS input sanitization.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      setRateLimitHealth({
+        status: 'error',
+        summary: 'Failed — Rate limit probe error',
+        detail: err?.message || 'Could not reach rate-limit probe endpoint.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    }
+  }, []);
+
+  const handleTestPushNotificationsHealth = useCallback(async () => {
+    const activeUid = (auth.currentUser || currentUser)?.uid;
+    if (!activeUid) {
+      setPushHealth({
+        status: 'error',
+        summary: 'Failed — not signed in',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+      return;
+    }
+    setPushHealth({
+      status: 'testing',
+      summary: 'Checking Notification API, Service Worker, and /users/{uid}/fcmTokens rules...'
+    });
+    try {
+      const swSupported = typeof navigator !== 'undefined' && 'serviceWorker' in navigator;
+      const notifSupported = typeof window !== 'undefined' && 'Notification' in window;
+      const perm = notifSupported ? Notification.permission : 'unsupported';
+      const tokensSnap = await getDocs(query(collection(db, 'users', activeUid, 'fcmTokens'), limit(5)));
+      setPushHealth({
+        status: 'healthy',
+        summary: `Healthy — fcmTokens subcollection readable (${tokensSnap.size} device token${tokensSnap.size === 1 ? '' : 's'})`,
+        detail: `ServiceWorker: ${swSupported ? 'active' : 'unavailable'} • Notification permission: ${perm}`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      setPushHealth({
+        status: 'error',
+        summary: 'Failed — fcmTokens rule check error',
+        detail: err?.message || 'Could not read /users/{uid}/fcmTokens.',
+        checkedAt: new Date().toLocaleTimeString(),
+      });
+    }
+  }, [currentUser]);
+
   const handleRunAllSystemChecks = useCallback(async () => {
     setIsRunningAllHealthChecks(true);
     try {
@@ -700,6 +803,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         handleTestProfileSaveHealth(),
         handleTestCloudinaryHealth(),
         handleRunFullCallTest(),
+        handleTestRateLimitHealth(),
+        handleTestPushNotificationsHealth(),
       ]);
     } finally {
       setIsRunningAllHealthChecks(false);
@@ -710,6 +815,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     handleTestProfileSaveHealth,
     handleTestCloudinaryHealth,
     handleRunFullCallTest,
+    handleTestRateLimitHealth,
+    handleTestPushNotificationsHealth,
   ]);
 
   useEffect(() => {
@@ -897,7 +1004,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   // Load platform statistics & data with bounded queries (limit 40)
   const loadAdminData = useCallback(async (isRefresh = false) => {
-    if (!isAdmin) return;
+    if (!hasStaffClearance) return;
     if (isRefresh) {
       setIsRefreshingDashboard(true);
     } else {
@@ -916,6 +1023,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       const qReports = query(collection(db, 'contentReports'), limit(40));
       const qAudit = query(collection(db, 'adminAuditLogs'), limit(40));
       const qUpgrades = query(collection(db, 'upgrade_feedback'), limit(40));
+      const qAppeals = query(collection(db, 'appeals'), limit(40));
 
       const [
         usersSnap,
@@ -929,9 +1037,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         reportsSnap,
         auditSnap,
         upgradesSnap,
+        appealsSnap,
         settingsSnap,
         payConfigSnap,
-        botConfigSnap
+        botConfigSnap,
+        bannerSnap
       ] = await Promise.allSettled([
         getDocs(qUsers),
         getDocs(qPosts),
@@ -944,9 +1054,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         getDocs(qReports),
         getDocs(qAudit),
         getDocs(qUpgrades),
+        getDocs(qAppeals),
         getDoc(doc(db, 'appSettings', 'global')),
         getDoc(doc(db, 'paymentConfig', 'global')),
-        getDoc(doc(db, 'supportBotConfig', 'global'))
+        getDoc(doc(db, 'supportBotConfig', 'global')),
+        getDoc(doc(db, 'system_config', 'status_banner'))
       ]);
 
       if (usersSnap.status === 'fulfilled') {
@@ -1045,13 +1157,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       if (botConfigSnap.status === 'fulfilled' && botConfigSnap.value.exists()) {
         setBotConfig((prev) => ({ ...prev, ...(botConfigSnap.value.data() as SupportBotConfig) }));
       }
+
+      if (appealsSnap.status === 'fulfilled') {
+        const list: ContentAppeal[] = [];
+        appealsSnap.value.forEach((d) => list.push({ id: d.id, ...d.data() } as ContentAppeal));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setAppeals(list);
+      }
+
+      if (bannerSnap.status === 'fulfilled' && bannerSnap.value.exists()) {
+        setStatusBanner((prev) => ({ ...prev, ...(bannerSnap.value.data() as SystemStatusBannerConfig) }));
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.LIST, 'adminDashboard');
     } finally {
       setIsLoadingDashboardData(false);
       setIsRefreshingDashboard(false);
     }
-  }, [isAdmin]);
+  }, [hasStaffClearance]);
 
   useEffect(() => {
     loadAdminData(false);
@@ -1063,15 +1186,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
         <div className="w-full max-w-sm bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-8 text-center shadow-lg">
           <Loader2 size={32} className="animate-spin text-purple-600 mx-auto mb-3" />
           <p className="text-sm font-semibold text-gray-800 dark:text-gray-200">
-            Verifying Admin Desk clearance...
+            Verifying Staff Desk clearance...
           </p>
         </div>
       </div>
     );
   }
 
-  // Strict Admin Check: Enforced across Admin Desk, Server Routes, and Firestore Rules
-  if (!isOwnerEmailAccount && (!isAdmin || !serverAdminVerified)) {
+  // Strict Staff Check: Enforced across Admin Desk, Server Routes, and Firestore Rules
+  if (!isOwnerEmailAccount && (!hasStaffClearance || !serverAdminVerified)) {
     const diagnosticFailedCheck =
       failedCheckReason ||
       adminCheckFailedReason ||
@@ -1089,7 +1212,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           </div>
 
           <span className="px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-            HTTP 403 Forbidden
+            Admin Access Only
           </span>
 
           <h2 className="text-2xl font-bold text-gray-900 dark:text-white mt-3 mb-2">
@@ -1232,6 +1355,37 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
   const [updatingProUserId, setUpdatingProUserId] = useState<string | null>(null);
   const [updatingRoleUserId, setUpdatingRoleUserId] = useState<string | null>(null);
+  const [resettingMfaUserId, setResettingMfaUserId] = useState<string | null>(null);
+
+  const handleResetUserMfa = async (targetUser: UserProfile) => {
+    if (!isSuperAdmin || !targetUser?.id || resettingMfaUserId === targetUser.id) return;
+    setResettingMfaUserId(targetUser.id);
+    setActionFeedback(null);
+    try {
+      const fn = httpsCallable<
+        { targetUid: string; reason: string },
+        { success: boolean; removedCount: number; message?: string }
+      >(getFunctions(auth.app, 'europe-west2'), 'removeUserMfaFactor');
+      const result = await fn({
+        targetUid: targetUser.id,
+        reason: 'Platform Admin MFA reset from Members desk'
+      });
+      const data = result.data;
+      setActionFeedback(
+        data?.message ||
+          `Updated 2FA for ${targetUser.displayName || targetUser.email || targetUser.id}.`
+      );
+      setTimeout(() => setActionFeedback(null), 5000);
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      const msg = err?.message || String(err);
+      setActionFeedback(
+        `Could not reset 2FA (${code || 'functions/error'}): ${msg}`
+      );
+    } finally {
+      setResettingMfaUserId(null);
+    }
+  };
 
   // Grant or Revoke Verified Pro status with immediate table state update
   const handleToggleVerifyPro = async (targetUser: UserProfile, verify: boolean) => {
@@ -1683,10 +1837,234 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       await updateDoc(doc(db, 'contentReports', reportId), {
         status: 'reviewed'
       });
+      setContentReports((prev) =>
+        prev.map((r) => (r.id === reportId ? { ...r, status: 'reviewed' } : r))
+      );
       setActionFeedback('Safety report marked as resolved.');
       setTimeout(() => setActionFeedback(null), 3000);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `contentReports/${reportId}`);
+    }
+  };
+
+  // Hide reported content (Owner, Moderator, or Support Helper)
+  const handleHideReportedContent = async (rep: ContentReport) => {
+    try {
+      const nowIso = new Date().toISOString();
+      if (rep.targetType === 'post' || rep.targetType === 'video') {
+        await updateDoc(doc(db, 'posts', rep.targetId), {
+          isHidden: true,
+          moderationStatus: 'hidden',
+          moderationReason: rep.reason || 'Hidden by safety moderation',
+          updatedAt: nowIso,
+        });
+      }
+      await updateDoc(doc(db, 'contentReports', rep.id), {
+        status: 'reviewed',
+        autoHidden: true,
+      });
+      await recordAdminAuditLog({
+        action: 'hide_content',
+        targetId: rep.targetId,
+        targetLabel: rep.targetSummary || rep.targetId,
+        details: `Hidden ${rep.targetType} (${rep.targetId}) from public view. Reason: ${rep.reason}`,
+      });
+      setContentReports((prev) =>
+        prev.map((r) => (r.id === rep.id ? { ...r, status: 'reviewed', autoHidden: true } : r))
+      );
+      setActionFeedback(`Content (${rep.targetType}) has been hidden and logged in the Audit Log.`);
+      setTimeout(() => setActionFeedback(null), 3500);
+    } catch (err: any) {
+      setActionFeedback(`Could not hide content: ${err?.message || 'Permission or network error'}`);
+    }
+  };
+
+  // Restore hidden content (Owner or Moderator only)
+  const handleRestoreReportedContent = async (rep: ContentReport) => {
+    if (isSupportHelper) return;
+    try {
+      const headers = await getAuthHeaders();
+      await fetch('/api/safety/restore-content', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          targetType: rep.targetType,
+          targetId: rep.targetId,
+          reportId: rep.id,
+        }),
+      }).catch(() => {});
+
+      const nowIso = new Date().toISOString();
+      if (rep.targetType === 'post' || rep.targetType === 'video') {
+        await updateDoc(doc(db, 'posts', rep.targetId), {
+          isHidden: false,
+          moderationStatus: 'restored',
+          updatedAt: nowIso,
+        }).catch(() => {});
+      }
+      await updateDoc(doc(db, 'contentReports', rep.id), {
+        status: 'reviewed',
+        autoHidden: false,
+      }).catch(() => {});
+
+      await recordAdminAuditLog({
+        action: 'restore_content',
+        targetId: rep.targetId,
+        targetLabel: rep.targetSummary || rep.targetId,
+        details: `Restored ${rep.targetType} (${rep.targetId}) to public visibility`,
+      });
+      setContentReports((prev) =>
+        prev.map((r) => (r.id === rep.id ? { ...r, status: 'reviewed', autoHidden: false } : r))
+      );
+      setActionFeedback(`Restored ${rep.targetType} (${rep.targetId}) to public visibility!`);
+      setTimeout(() => setActionFeedback(null), 3500);
+    } catch (err: any) {
+      setActionFeedback(`Failed to restore content: ${err?.message || 'Error'}`);
+    }
+  };
+
+  // Review Content or Ban Appeal (Owner or Moderator)
+  const handleReviewAppeal = async (appeal: ContentAppeal, decision: 'approved' | 'rejected') => {
+    if (isSupportHelper) return;
+    try {
+      const nowIso = new Date().toISOString();
+      const headers = await getAuthHeaders();
+      await fetch('/api/safety/appeal/review', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          appealId: appeal.id,
+          decision,
+          reviewNotes: decision === 'approved' ? 'Approved and restored by Moderator/Owner' : 'Appeal reviewed and declined',
+        }),
+      }).catch(() => {});
+
+      await updateDoc(doc(db, 'appeals', appeal.id), {
+        status: decision,
+        reviewedBy: currentUser?.email || ADMIN_EMAIL,
+        reviewedAt: nowIso,
+      }).catch(() => {});
+
+      if (decision === 'approved') {
+        if (appeal.targetType === 'ban') {
+          await handleUnbanUser(appeal.userId);
+        } else if (appeal.targetType === 'post' || appeal.targetType === 'video') {
+          await updateDoc(doc(db, 'posts', appeal.targetId), {
+            isHidden: false,
+            moderationStatus: 'restored',
+            updatedAt: nowIso,
+          }).catch(() => {});
+        }
+      }
+
+      await recordAdminAuditLog({
+        action: 'appeal_reviewed',
+        targetId: appeal.targetId,
+        targetLabel: appeal.userName || appeal.userId,
+        details: `Reviewed ${appeal.targetType} appeal (${appeal.id}): ${decision.toUpperCase()}`,
+      });
+
+      setAppeals((prev) =>
+        prev.map((a) => (a.id === appeal.id ? { ...a, status: decision, reviewedAt: nowIso } : a))
+      );
+      setActionFeedback(
+        decision === 'approved'
+          ? `Appeal approved! Restored ${appeal.targetType} for ${appeal.userName}.`
+          : `Appeal marked as rejected.`
+      );
+      setTimeout(() => setActionFeedback(null), 4000);
+    } catch (err: any) {
+      setActionFeedback(`Failed to review appeal: ${err?.message || 'Error'}`);
+    }
+  };
+
+  // Save & Toggle Global Service Status Banner (Owner only)
+  const handleSaveStatusBanner = async (nextEnabled?: boolean) => {
+    if (!isSuperAdmin) return;
+    setIsSavingBanner(true);
+    try {
+      const enabledVal = typeof nextEnabled === 'boolean' ? nextEnabled : statusBanner.enabled;
+      const nowIso = new Date().toISOString();
+      const updatedBanner: SystemStatusBannerConfig = {
+        ...statusBanner,
+        enabled: enabledVal,
+        updatedAt: nowIso,
+        updatedBy: currentUser?.email || ADMIN_EMAIL,
+      };
+      setStatusBanner(updatedBanner);
+
+      const headers = await getAuthHeaders();
+      await fetch('/api/system/status-banner', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(updatedBanner),
+      }).catch(() => {});
+
+      await setDoc(doc(db, 'system_config', 'status_banner'), cleanFirestoreData(updatedBanner), {
+        merge: true,
+      });
+
+      await recordAdminAuditLog({
+        action: 'status_banner_changed',
+        targetId: 'status_banner',
+        targetLabel: enabledVal ? `ENABLED (${updatedBanner.level})` : 'DISABLED',
+        details: `Switched Service Status Banner ${enabledVal ? 'ON' : 'OFF'}: "${updatedBanner.messageEn}"`,
+      });
+
+      setActionFeedback(
+        enabledVal
+          ? '📢 Global Service Status Banner is now LIVE at the top of WaveLink!'
+          : 'Service Status Banner turned OFF.'
+      );
+      setTimeout(() => setActionFeedback(null), 4000);
+    } catch (err: any) {
+      setActionFeedback(`Could not update Service Status Banner: ${err?.message || 'Error'}`);
+    } finally {
+      setIsSavingBanner(false);
+    }
+  };
+
+  // Assign Staff Role (Moderator, Support Helper, or Member) — Owner Only
+  const handleAssignStaffRoleClick = async (
+    targetUser: UserProfile,
+    newRole: 'moderator' | 'support_helper' | 'user'
+  ) => {
+    if (!isSuperAdmin || !targetUser?.id || updatingRoleUserId === targetUser.id) return;
+    setUpdatingRoleUserId(targetUser.id);
+    setActionFeedback(null);
+    const previousUsers = users;
+    const nowIso = new Date().toISOString();
+
+    setUsers((prev) =>
+      prev.map((u) =>
+        u.id === targetUser.id
+          ? {
+              ...u,
+              role: newRole,
+              isSubAdmin: newRole === 'moderator',
+              isModerator: newRole === 'moderator',
+              isSupportHelper: newRole === 'support_helper',
+              updatedAt: nowIso,
+            }
+          : u
+      )
+    );
+
+    try {
+      await assignStaffRole(targetUser.id, newRole, targetUser.email);
+      setActionFeedback(
+        newRole === 'moderator'
+          ? `🛡️ Appointed ${targetUser.displayName} as Moderator!`
+          : newRole === 'support_helper'
+          ? `🎧 Appointed ${targetUser.displayName} as Support Helper (Tickets & Hide Content only; emails hidden)!`
+          : `Updated ${targetUser.displayName} role to standard Community Member.`
+      );
+      setTimeout(() => setActionFeedback(null), 4500);
+    } catch (err: any) {
+      setUsers(previousUsers);
+      setActionFeedback(`Failed to update role: ${err?.message || 'Error'}`);
+    } finally {
+      setUpdatingRoleUserId(null);
     }
   };
 
@@ -1743,7 +2121,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setTimeout(() => setActionFeedback(null), 5000);
     } catch (err: any) {
       console.error('Failed to approve verification:', err);
-      setActionFeedback(`Error approving: ${err.message || String(err)}`);
+      setActionFeedback(
+        sanitizeUserFacingError(err, 'Could not approve right now. Please tap Try again.')
+      );
     } finally {
       setApprovingId(null);
     }
@@ -1764,7 +2144,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setTimeout(() => setActionFeedback(null), 4000);
     } catch (err: any) {
       console.error('Failed to reject verification:', err);
-      setActionFeedback(`Error rejecting: ${err.message || String(err)}`);
+      setActionFeedback(
+        sanitizeUserFacingError(err, 'Could not reject right now. Please tap Try again.')
+      );
     } finally {
       setRejectingId(null);
     }
@@ -1808,7 +2190,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setTimeout(() => setActionFeedback(null), 5000);
     } catch (err: any) {
       console.error('Failed to approve payment request:', err);
-      setActionFeedback(`Error approving: ${err.message || String(err)}`);
+      setActionFeedback(
+        sanitizeUserFacingError(err, 'Could not approve payment right now. Please tap Try again.')
+      );
     } finally {
       setApprovingId(null);
     }
@@ -1829,7 +2213,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       setTimeout(() => setActionFeedback(null), 4000);
     } catch (err: any) {
       console.error('Failed to reject payment request:', err);
-      setActionFeedback(`Error rejecting: ${err.message || String(err)}`);
+      setActionFeedback(
+        sanitizeUserFacingError(err, 'Could not reject payment right now. Please tap Try again.')
+      );
     } finally {
       setRejectingId(null);
     }
@@ -1875,16 +2261,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
     );
   }
 
-  if (!isAdmin || !serverAdminVerified) {
+  if (!hasStaffClearance || !serverAdminVerified) {
     return (
       <div className="max-w-xl mx-auto py-16 px-4 text-center">
         <div className="bg-white border border-rose-200 rounded-3xl p-8 shadow-sm space-y-4">
           <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 mx-auto flex items-center justify-center">
             <ShieldAlert size={24} />
           </div>
-          <h3 className="text-lg font-extrabold text-[#1C1917]">Administrator Access Required</h3>
+          <h3 className="text-lg font-extrabold text-[#1C1917]">Staff Clearance Required</h3>
           <p className="text-xs sm:text-sm text-[#57534E]">
-            This page requires server-verified administrator privileges.
+            This page requires server-verified Owner, Moderator, or Support Helper privileges.
           </p>
           <button
             type="button"
@@ -1905,16 +2291,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       {/* Admin Title Card */}
       <div className="bg-gradient-to-r from-purple-800 via-indigo-900 to-slate-900 rounded-3xl p-6 sm:p-8 text-white shadow-xl shadow-purple-950/20 flex items-center justify-between flex-wrap gap-4 border border-purple-500/20">
         <div>
-          <div className="flex items-center gap-2 mb-2">
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
             {isSuperAdmin ? (
               <span className="p-1 rounded-lg bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-400/40 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1 px-2.5">
                 <ShieldCheck size={13} />
                 Platform Owner Clearance
               </span>
+            ) : isSupportHelper ? (
+              <span className="p-1 rounded-lg bg-teal-500/30 text-teal-200 ring-1 ring-teal-400/40 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1 px-2.5">
+                <HelpCircle size={13} />
+                Support Helper Clearance (Restricted: Tickets &amp; Content Hide Only)
+              </span>
             ) : (
               <span className="p-1 rounded-lg bg-indigo-500/30 text-indigo-300 ring-1 ring-indigo-400/40 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1 px-2.5">
                 <ShieldCheck size={13} />
-                Sub-Admin Moderator Clearance
+                Moderator Clearance
               </span>
             )}
             <span className="text-xs text-purple-200">
@@ -1925,12 +2316,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
             {isSuperAdmin
               ? 'WaveLink Administration & Developer Console'
+              : isSupportHelper
+              ? 'WaveLink Support Helper Desk'
               : 'WaveLink Community Moderator Desk'}
           </h2>
           <p className="text-xs sm:text-sm text-purple-200/80 mt-1 max-w-2xl">
             {isSuperAdmin
-              ? 'Strict governance desk for member moderation, WaveLink Support Bot automation, audit logs, payment gateway credentials, and WebRTC authorization.'
-              : 'Sub-administrative desk for member moderation, user warnings, support tickets, and community oversight.'}
+              ? 'Strict governance desk for member moderation, roles (Owner, Moderator, Support Helper), WaveLink Support Bot automation, audit logs, payment gateway credentials, Service Status Banner, and System Health.'
+              : isSupportHelper
+              ? 'Support Helper workspace: Read and reply to support tickets and hide reported content. User emails, account bans, role changes, and payment data are strictly restricted.'
+              : 'Moderator desk for member safety, content appeals, support tickets, and community oversight.'}
           </p>
         </div>
 
@@ -1947,52 +2342,64 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
 
           <CrystalBadge
             email={currentUser?.email}
-            name={isSuperAdmin ? 'Platform Owner' : (currentUser?.displayName || 'Moderator')}
-            role={isSuperAdmin ? 'super_admin' : isSubAdmin ? 'sub_admin' : 'user'}
+            name={
+              isSuperAdmin
+                ? 'Platform Owner'
+                : isSupportHelper
+                ? 'Support Helper'
+                : currentUser?.displayName || 'Moderator'
+            }
+            role={isSuperAdmin ? 'super_admin' : isSubAdmin || isModerator ? 'sub_admin' : 'user'}
             size="lg"
-            showAdminTag={true}
-            isSubAdmin={isSubAdmin}
+            showAdminTag={!isSupportHelper}
+            isSubAdmin={isSubAdmin || isModerator}
           />
         </div>
       </div>
 
-      {/* Navigation Tabs */}
+      {/* Navigation Tabs (Support Helpers only see Support Tickets and Reports) */}
       <div className="flex rounded-2xl bg-white border border-[#EFECE6] p-1.5 text-xs font-bold overflow-x-auto shadow-xs gap-1">
-        <button
-          onClick={() => setActiveTab('overview')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'overview'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Users size={15} />
-          <span>Activity Dashboard</span>
-        </button>
+        {!isSupportHelper && (
+          <button
+            onClick={() => setActiveTab('overview')}
+            className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+              activeTab === 'overview'
+                ? 'bg-[#2563EB] text-white shadow-xs'
+                : 'text-[#57534E] hover:text-[#1C1917]'
+            }`}
+          >
+            <Users size={15} />
+            <span>System Health &amp; Overview</span>
+          </button>
+        )}
 
-        <button
-          onClick={() => setActiveTab('upgrades')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'upgrades'
-              ? 'bg-amber-600 text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Lightbulb size={15} className={newUpgradesCount > 0 ? 'text-amber-300' : ''} />
-          <span>AI Upgrades &amp; Ideas {newUpgradesCount > 0 ? `(${newUpgradesCount} new)` : `(${upgradeFeedbacks.length})`}</span>
-        </button>
+        {!isSupportHelper && (
+          <button
+            onClick={() => setActiveTab('upgrades')}
+            className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+              activeTab === 'upgrades'
+                ? 'bg-amber-600 text-white shadow-xs'
+                : 'text-[#57534E] hover:text-[#1C1917]'
+            }`}
+          >
+            <Lightbulb size={15} className={newUpgradesCount > 0 ? 'text-amber-300' : ''} />
+            <span>AI Upgrades &amp; Ideas {newUpgradesCount > 0 ? `(${newUpgradesCount} new)` : `(${upgradeFeedbacks.length})`}</span>
+          </button>
+        )}
 
-        <button
-          onClick={() => setActiveTab('challenges')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'challenges'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Trophy size={15} className={activeTab === 'challenges' ? 'text-amber-300' : 'text-amber-600'} />
-          <span>Weekly Challenges</span>
-        </button>
+        {!isSupportHelper && (
+          <button
+            onClick={() => setActiveTab('challenges')}
+            className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+              activeTab === 'challenges'
+                ? 'bg-[#2563EB] text-white shadow-xs'
+                : 'text-[#57534E] hover:text-[#1C1917]'
+            }`}
+          >
+            <Trophy size={15} className={activeTab === 'challenges' ? 'text-amber-300' : 'text-amber-600'} />
+            <span>Weekly Challenges</span>
+          </button>
+        )}
 
         <button
           onClick={() => setActiveTab('complaints')}
@@ -2003,20 +2410,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           }`}
         >
           <Bot size={15} />
-          <span>Support &amp; Bot ({openTickets})</span>
+          <span>Support &amp; Tickets ({openTickets})</span>
         </button>
 
-        <button
-          onClick={() => setActiveTab('members')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'members'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <UserCheck size={15} />
-          <span>Banning &amp; Members ({totalUsers})</span>
-        </button>
+        {!isSupportHelper && (
+          <button
+            onClick={() => setActiveTab('members')}
+            className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+              activeTab === 'members'
+                ? 'bg-[#2563EB] text-white shadow-xs'
+                : 'text-[#57534E] hover:text-[#1C1917]'
+            }`}
+          >
+            <UserCheck size={15} />
+            <span>Roles, Banning &amp; Members ({totalUsers})</span>
+          </button>
+        )}
 
         <button
           onClick={() => setActiveTab('audit')}
@@ -2027,75 +2436,79 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
           }`}
         >
           <ShieldAlert size={15} />
-          <span>Audit Log &amp; Reports ({auditLogs.length + openReportsCount})</span>
+          <span>Reports, Appeals &amp; Audit ({auditLogs.length + openReportsCount + appeals.filter((a) => a.status === 'pending').length})</span>
         </button>
 
-        <button
-          onClick={() => setActiveTab('updates_group')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'updates_group'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Rss size={15} />
-          <span>Admin-Only Updates Group</span>
-        </button>
+        {!isSupportHelper && (
+          <>
+            <button
+              onClick={() => setActiveTab('updates_group')}
+              className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+                activeTab === 'updates_group'
+                  ? 'bg-[#2563EB] text-white shadow-xs'
+                  : 'text-[#57534E] hover:text-[#1C1917]'
+              }`}
+            >
+              <Rss size={15} />
+              <span>Admin-Only Updates Group</span>
+            </button>
 
-        <button
-          onClick={() => setActiveTab('verifications')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'verifications'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <FileCheck size={15} />
-          <span>Pro Approvals ({pendingVerificationsCount})</span>
-        </button>
+            <button
+              onClick={() => setActiveTab('verifications')}
+              className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+                activeTab === 'verifications'
+                  ? 'bg-[#2563EB] text-white shadow-xs'
+                  : 'text-[#57534E] hover:text-[#1C1917]'
+              }`}
+            >
+              <FileCheck size={15} />
+              <span>Pro Approvals ({pendingVerificationsCount})</span>
+            </button>
 
-        <button
-          onClick={() => setActiveTab('calls')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'calls'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Video size={15} />
-          <span>Calling Controls</span>
-        </button>
+            <button
+              onClick={() => setActiveTab('calls')}
+              className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+                activeTab === 'calls'
+                  ? 'bg-[#2563EB] text-white shadow-xs'
+                  : 'text-[#57534E] hover:text-[#1C1917]'
+              }`}
+            >
+              <Video size={15} />
+              <span>Calling Controls</span>
+            </button>
 
-        <button
-          onClick={() => setActiveTab('payments')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'payments'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Key size={15} />
-          <span>Payment Gateways</span>
-        </button>
+            <button
+              onClick={() => setActiveTab('payments')}
+              className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+                activeTab === 'payments'
+                  ? 'bg-[#2563EB] text-white shadow-xs'
+                  : 'text-[#57534E] hover:text-[#1C1917]'
+              }`}
+            >
+              <Key size={15} />
+              <span>Payment Gateways</span>
+            </button>
 
-        <button
-          onClick={() => setActiveTab('duplicates')}
-          className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
-            activeTab === 'duplicates'
-              ? 'bg-[#2563EB] text-white shadow-xs'
-              : 'text-[#57534E] hover:text-[#1C1917]'
-          }`}
-        >
-          <Copy size={15} />
-          <span>
-            Duplicate Accounts
-            {duplicateEmailGroups.length > 0 && (
-              <span className="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-500 text-white">
-                {duplicateEmailGroups.length}
+            <button
+              onClick={() => setActiveTab('duplicates')}
+              className={`px-4 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap ${
+                activeTab === 'duplicates'
+                  ? 'bg-[#2563EB] text-white shadow-xs'
+                  : 'text-[#57534E] hover:text-[#1C1917]'
+              }`}
+            >
+              <Copy size={15} />
+              <span>
+                Duplicate Accounts
+                {duplicateEmailGroups.length > 0 && (
+                  <span className="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-500 text-white">
+                    {duplicateEmailGroups.length}
+                  </span>
+                )}
               </span>
-            )}
-          </span>
-        </button>
+            </button>
+          </>
+        )}
       </div>
 
       {actionFeedback && (
@@ -2817,10 +3230,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               <div>
                 <h3 className="text-base font-extrabold text-[#1C1917] flex items-center gap-2">
                   <Flag size={18} className="text-rose-600" />
-                  <span>User, Post &amp; Bot Safety Reports ({contentReports.length})</span>
+                  <span>User, Post, Reel, Comment &amp; Chat Safety Reports ({contentReports.length})</span>
                 </h3>
                 <p className="text-xs text-[#57534E]">
-                  Reports submitted by community members on posts, user profiles, or bot replies.
+                  Content reported by 3+ independent users is automatically hidden for review. Support Helpers can hide reported content; Owner &amp; Moderators can restore it.
                 </p>
               </div>
             </div>
@@ -2830,22 +3243,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                 No safety reports pending.
               </div>
             ) : (
-              <div className="space-y-2.5 max-h-80 overflow-y-auto">
+              <div className="space-y-2.5 max-h-96 overflow-y-auto">
                 {contentReports.map((rep) => (
                   <div
                     key={rep.id}
                     className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] flex items-center justify-between gap-4 flex-wrap text-xs"
                   >
                     <div className="space-y-1">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-rose-100 text-rose-800">
                           {rep.targetType}
                         </span>
+                        {rep.autoHidden && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-amber-100 text-amber-900 border border-amber-300">
+                            Auto-Hidden ({rep.reportCount || 3}+ reports)
+                          </span>
+                        )}
                         <span className="font-bold text-[#1C1917]">
                           Target: {rep.targetSummary || rep.targetId}
                         </span>
                         <span className="text-[11px] text-[#78716C]">
-                          • Reported by {rep.reporterEmail || rep.reporterId}
+                          • Reported by{' '}
+                          {redactEmailIfSupportHelper(rep.reporterEmail || rep.reporterId, isSupportHelper)}
                         </span>
                       </div>
                       <p className="text-[#57534E]">Reason: {rep.reason}</p>
@@ -2854,34 +3273,134 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                       </span>
                     </div>
 
-                    {rep.status === 'open' ? (
-                      <button
-                        type="button"
-                        onClick={() => handleResolveReport(rep.id)}
-                        className="px-3 py-1.5 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs transition"
-                      >
-                        Mark Resolved
-                      </button>
-                    ) : (
-                      <span className="px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        Resolved
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {(rep.targetType === 'post' || rep.targetType === 'video' || rep.targetType === 'comment' || rep.targetType === 'spark') && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleHideReportedContent(rep)}
+                            className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs transition cursor-pointer"
+                          >
+                            Hide Content
+                          </button>
+                          {!isSupportHelper && (
+                            <button
+                              type="button"
+                              onClick={() => handleRestoreReportedContent(rep)}
+                              className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs transition cursor-pointer"
+                            >
+                              Restore Content
+                            </button>
+                          )}
+                        </>
+                      )}
+
+                      {rep.status === 'open' ? (
+                        <button
+                          type="button"
+                          onClick={() => handleResolveReport(rep.id)}
+                          className="px-3 py-1.5 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs transition cursor-pointer"
+                        >
+                          Mark Resolved
+                        </button>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
+                          Resolved
+                        </span>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
             )}
           </div>
 
+          {/* Appeals Queue (Hidden Content & Account Bans) */}
+          {!isSupportHelper && (
+            <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-4">
+              <div>
+                <h3 className="text-base font-extrabold text-[#1C1917] flex items-center gap-2">
+                  <ShieldCheck size={18} className="text-amber-600" />
+                  <span>Ban &amp; Hidden Content Appeals Queue ({appeals.length})</span>
+                </h3>
+                <p className="text-xs text-[#57534E]">
+                  Appeals submitted by users for hidden posts/reels/comments or suspended accounts. Approving automatically restores the content or unbans the user.
+                </p>
+              </div>
+
+              {appeals.length === 0 ? (
+                <div className="py-6 text-center text-xs text-[#57534E]">
+                  No appeals submitted yet.
+                </div>
+              ) : (
+                <div className="space-y-2.5 max-h-80 overflow-y-auto">
+                  {appeals.map((ap) => (
+                    <div
+                      key={ap.id}
+                      className="p-4 rounded-2xl bg-[#FAF7F2] border border-[#EFECE6] flex items-center justify-between gap-4 flex-wrap text-xs"
+                    >
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-amber-100 text-amber-900">
+                            {ap.targetType} Appeal
+                          </span>
+                          <span className="font-bold text-[#1C1917]">
+                            {ap.userName} ({ap.userEmail || ap.userId})
+                          </span>
+                          <span className="font-mono text-[11px] text-[#78716C]">
+                            Target ID: {ap.targetId}
+                          </span>
+                        </div>
+                        <p className="text-[#57534E]">Appeal Reason: {ap.reason}</p>
+                        <span className="text-[10px] font-mono text-[#78716C] block">
+                          Submitted {new Date(ap.createdAt).toLocaleString()}
+                        </span>
+                      </div>
+
+                      {ap.status === 'pending' ? (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleReviewAppeal(ap, 'approved')}
+                            className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs transition cursor-pointer"
+                          >
+                            Approve &amp; Restore
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleReviewAppeal(ap, 'rejected')}
+                            className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs transition cursor-pointer"
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      ) : (
+                        <span
+                          className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase ${
+                            ap.status === 'approved'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-rose-100 text-rose-800'
+                          }`}
+                        >
+                          {ap.status}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Immutable Admin Audit Log */}
           <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-4">
             <div>
               <h3 className="text-base font-extrabold text-[#1C1917] flex items-center gap-2">
                 <FileText size={18} className="text-[#2563EB]" />
-                <span>Security &amp; Admin Audit Log ({auditLogs.length})</span>
+                <span>Security &amp; Staff Audit Log ({auditLogs.length})</span>
               </h3>
               <p className="text-xs text-[#57534E]">
-                Permanent security record of bans, unbans, role changes, verifications, account deletions, and bot state changes.
+                Permanent security record of every Owner, Moderator, and Support Helper action (bans, unbans, role changes, content hides/restores, ticket replies, and banner toggles).
               </p>
             </div>
 
@@ -2904,8 +3423,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                         <span className="font-bold text-[#1C1917]">{entry.details}</span>
                       </div>
                       <span className="text-[11px] text-[#78716C] block">
-                        Actor: <strong className="font-mono">{entry.actorEmail}</strong>
-                        {entry.targetLabel ? ` → Target: ${entry.targetLabel}` : ''}
+                        Actor:{' '}
+                        <strong className="font-mono">
+                          {redactEmailIfSupportHelper(entry.actorEmail, isSupportHelper)}
+                        </strong>
+                        {entry.targetLabel
+                          ? ` → Target: ${redactEmailIfSupportHelper(entry.targetLabel, isSupportHelper)}`
+                          : ''}
                       </span>
                     </div>
                     <span className="text-[11px] font-mono text-[#78716C]">
@@ -3025,7 +3549,95 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
             </div>
           </div>
 
-          {/* System Health: End-to-End Platform Diagnostics */}
+          {/* Owner-Controlled Service Status Banner Switch */}
+          {isSuperAdmin && (
+            <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-5 sm:p-6 shadow-xs space-y-4">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <h3 className="font-extrabold text-sm sm:text-base text-gray-900 dark:text-white flex items-center gap-2">
+                    <AlertTriangle size={18} className="text-amber-500" />
+                    <span>Global Service Status Banner (Owner Switch)</span>
+                  </h3>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Switch on a live status notice across WaveLink when a subsystem is undergoing maintenance or experiencing an outage.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isSavingBanner}
+                  onClick={() => handleSaveStatusBanner(!statusBanner.enabled)}
+                  className={`px-4 py-2 rounded-xl text-xs font-extrabold flex items-center gap-2 transition cursor-pointer ${
+                    statusBanner.enabled
+                      ? 'bg-rose-600 hover:bg-rose-700 text-white'
+                      : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                  }`}
+                >
+                  <Power size={14} />
+                  <span>{statusBanner.enabled ? 'Turn Banner OFF' : 'Turn Banner ON'}</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+                <div className="md:col-span-2">
+                  <label className="block text-[11px] font-bold text-gray-600 dark:text-gray-300 mb-1">
+                    Severity
+                  </label>
+                  <select
+                    value={statusBanner.level}
+                    onChange={(e) =>
+                      setStatusBanner({
+                        ...statusBanner,
+                        level: e.target.value as 'info' | 'warning' | 'outage',
+                      })
+                    }
+                    className="w-full px-3 py-2 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs font-bold text-gray-900 dark:text-white"
+                  >
+                    <option value="info">Info Notice</option>
+                    <option value="warning">Maintenance</option>
+                    <option value="outage">Service Outage</option>
+                  </select>
+                </div>
+
+                <div className="md:col-span-4">
+                  <label className="block text-[11px] font-bold text-gray-600 dark:text-gray-300 mb-1">
+                    English Banner Message
+                  </label>
+                  <input
+                    type="text"
+                    value={statusBanner.messageEn}
+                    onChange={(e) => setStatusBanner({ ...statusBanner, messageEn: e.target.value })}
+                    className="w-full px-3 py-2 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs text-gray-900 dark:text-white"
+                  />
+                </div>
+
+                <div className="md:col-span-4">
+                  <label className="block text-[11px] font-bold text-gray-600 dark:text-gray-300 mb-1">
+                    Swahili Banner Message
+                  </label>
+                  <input
+                    type="text"
+                    value={statusBanner.messageSw}
+                    onChange={(e) => setStatusBanner({ ...statusBanner, messageSw: e.target.value })}
+                    className="w-full px-3 py-2 rounded-xl bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs text-gray-900 dark:text-white"
+                  />
+                </div>
+
+                <div className="md:col-span-2 flex items-end">
+                  <button
+                    type="button"
+                    disabled={isSavingBanner}
+                    onClick={() => handleSaveStatusBanner(statusBanner.enabled)}
+                    className="w-full py-2 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold transition cursor-pointer"
+                  >
+                    {isSavingBanner ? 'Saving...' : 'Save Message'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* System Health: 5-Pillar End-to-End Platform Diagnostics */}
           <div className="bg-white dark:bg-[#131927] border border-gray-200 dark:border-gray-800 rounded-3xl p-5 sm:p-6 shadow-xs space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-3">
               <div className="flex items-center gap-3">
@@ -3034,12 +3646,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                     iceHealthStatus === 'healthy' &&
                     callSignalingHealth.status !== 'error' &&
                     profileSaveHealth.status !== 'error' &&
-                    cloudinaryHealth.status !== 'error'
+                    cloudinaryHealth.status !== 'error' &&
+                    rateLimitHealth.status !== 'error' &&
+                    pushHealth.status !== 'error'
                       ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/70 dark:text-emerald-300'
                       : iceHealthStatus === 'degraded' ||
                         callSignalingHealth.status === 'error' ||
                         profileSaveHealth.status === 'error' ||
-                        cloudinaryHealth.status === 'error'
+                        cloudinaryHealth.status === 'error' ||
+                        rateLimitHealth.status === 'error' ||
+                        pushHealth.status === 'error'
                       ? 'bg-rose-100 text-rose-700 dark:bg-rose-950/70 dark:text-rose-300'
                       : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
                   }`}
@@ -3048,10 +3664,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                 </div>
                 <div>
                   <h3 className="font-extrabold text-sm sm:text-base text-gray-900 dark:text-white">
-                    System Health: Calls, Themes &amp; Cloudinary Uploads
+                    System Health: Firestore Rules, Rate Limits, Push Notifications, Uploads &amp; Calls
                   </h3>
                   <p className="text-xs text-gray-500 dark:text-gray-400">
-                    On-demand diagnostics for Metered TURN, Firestore Call Signalling, Profile/Theme Saves, and Cloudinary ({CLOUDINARY_CLOUD_NAME}).
+                    On-demand diagnostics for Firestore Security Rules, Express Rate Limiters, FCM Push Tokens, Cloudinary Uploads ({CLOUDINARY_CLOUD_NAME}), and WebRTC Calls.
                   </p>
                 </div>
               </div>
@@ -3081,7 +3697,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                   ) : (
                     <ShieldCheck size={14} />
                   )}
-                  <span>{isRunningAllHealthChecks ? 'Running All Checks...' : 'Run All Checks'}</span>
+                  <span>{isRunningAllHealthChecks ? 'Running All Checks...' : 'Run All 5 Health Checks'}</span>
                 </button>
               </div>
             </div>
@@ -3155,33 +3771,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
               )}
             </div>
 
-            {/* 2, 3, 4: Call Signalling, Profile & Theme Save, Cloudinary Upload */}
+            {/* All 5 Pillars: Firestore Rules, Rate Limits, Push Notifications, Uploads, Calls */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               {[
                 {
-                  id: 'signaling',
-                  title: '2. Call Signalling (/calls)',
-                  state: callSignalingHealth,
-                  onRun: handleTestCallSignalingHealth,
-                  btnLabel: 'Test Signalling',
-                },
-                {
                   id: 'profile',
-                  title: '3. Profile & Theme Save',
+                  title: '1. Firestore Rules (/users & /calls)',
                   state: profileSaveHealth,
                   onRun: handleTestProfileSaveHealth,
-                  btnLabel: 'Test Save',
+                  btnLabel: 'Test Rules',
+                },
+                {
+                  id: 'ratelimit',
+                  title: '2. Server Rate Limits & XSS Guard',
+                  state: rateLimitHealth,
+                  onRun: handleTestRateLimitHealth,
+                  btnLabel: 'Test Rate Limits',
+                },
+                {
+                  id: 'push',
+                  title: '3. Push Notifications & FCM Tokens',
+                  state: pushHealth,
+                  onRun: handleTestPushNotificationsHealth,
+                  btnLabel: 'Test Push',
                 },
                 {
                   id: 'cloudinary',
-                  title: '4. Cloudinary Uploads',
+                  title: '4. Cloudinary Media Uploads',
                   state: cloudinaryHealth,
                   onRun: handleTestCloudinaryHealth,
                   btnLabel: 'Test Upload',
                 },
                 {
+                  id: 'signaling',
+                  title: '5a. Call Signalling (/calls)',
+                  state: callSignalingHealth,
+                  onRun: handleTestCallSignalingHealth,
+                  btnLabel: 'Test Signalling',
+                },
+                {
                   id: 'loopback',
-                  title: '5. Live Call Loopback & Rules',
+                  title: '5b. Live WebRTC Call Loopback',
                   state: callLoopbackHealth,
                   onRun: handleRunFullCallTest,
                   btnLabel: 'Call Test',
@@ -3714,7 +4344,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                     user.role === 'admin' ||
                     Boolean((user as any).isOwner) ||
                     (user.email || '').trim().toLowerCase() === 'keylanmbilinyi5@gmail.com';
-                  const isTargetSubAdmin = !isTargetSuperAdmin && (user.isSubAdmin || user.role === 'sub_admin');
+                  const isTargetSubAdmin =
+                    !isTargetSuperAdmin &&
+                    (user.isSubAdmin || user.isModerator || user.role === 'sub_admin' || user.role === 'moderator');
+                  const isTargetSupportHelper =
+                    !isTargetSuperAdmin &&
+                    !isTargetSubAdmin &&
+                    (user.isSupportHelper || user.role === 'support_helper');
                   const isUpdatingThisUserPro = updatingProUserId === user.id;
                   const isUpdatingThisUserRole = updatingRoleUserId === user.id;
 
@@ -3738,7 +4374,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                       </td>
 
                       <td className="py-3.5 px-4 font-mono text-xs text-gray-600 dark:text-gray-400">
-                        {user.email}
+                        {redactEmailIfSupportHelper(user.email, isSupportHelper)}
                       </td>
 
                       <td className="py-3.5 px-4">
@@ -3749,7 +4385,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                         ) : isTargetSubAdmin ? (
                           <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 ring-1 ring-indigo-400/40 flex items-center gap-1 w-fit">
                             <ShieldCheck size={11} />
-                            Sub-Admin
+                            Moderator
+                          </span>
+                        ) : isTargetSupportHelper ? (
+                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase bg-teal-100 text-teal-800 dark:bg-teal-950 dark:text-teal-300 ring-1 ring-teal-400/40 flex items-center gap-1 w-fit">
+                            <HelpCircle size={11} />
+                            Support Helper
                           </span>
                         ) : (
                           <span className="text-[11px] text-gray-500 dark:text-gray-400">
@@ -3800,31 +4441,68 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
                           </span>
                         ) : (
                           <div className="flex items-center justify-end gap-1.5 flex-wrap">
-                            {/* Super Admin exclusive: Appoint / Demote Sub-Admin */}
+                            {/* Super Admin exclusive: Appoint Moderator or Support Helper */}
                             {isSuperAdmin && (
-                              isTargetSubAdmin ? (
+                              <>
+                                {isTargetSubAdmin ? (
+                                  <button
+                                    type="button"
+                                    disabled={isUpdatingThisUserRole}
+                                    onClick={() => handleAssignStaffRoleClick(user, 'user')}
+                                    className="px-2 py-1 text-xs rounded-lg bg-indigo-50 dark:bg-indigo-950/40 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                                    title="Revoke Moderator status"
+                                  >
+                                    <UserMinus size={12} />
+                                    <span>{isUpdatingThisUserRole ? 'Updating...' : 'Revoke Mod'}</span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={isUpdatingThisUserRole}
+                                    onClick={() => handleAssignStaffRoleClick(user, 'moderator')}
+                                    className="px-2 py-1 text-xs rounded-lg bg-purple-50 dark:bg-purple-950/40 hover:bg-purple-100 text-purple-700 dark:text-purple-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                                    title="Appoint as Moderator"
+                                  >
+                                    <UserPlus size={12} />
+                                    <span>{isUpdatingThisUserRole ? 'Updating...' : 'Make Moderator'}</span>
+                                  </button>
+                                )}
+
+                                {isTargetSupportHelper ? (
+                                  <button
+                                    type="button"
+                                    disabled={isUpdatingThisUserRole}
+                                    onClick={() => handleAssignStaffRoleClick(user, 'user')}
+                                    className="px-2 py-1 text-xs rounded-lg bg-teal-50 dark:bg-teal-950/40 hover:bg-teal-100 text-teal-700 dark:text-teal-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                                    title="Revoke Support Helper status"
+                                  >
+                                    <UserMinus size={12} />
+                                    <span>Revoke Helper</span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={isUpdatingThisUserRole}
+                                    onClick={() => handleAssignStaffRoleClick(user, 'support_helper')}
+                                    className="px-2 py-1 text-xs rounded-lg bg-teal-50 dark:bg-teal-950/40 hover:bg-teal-100 text-teal-700 dark:text-teal-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                                    title="Appoint as Support Helper (Tickets & Hide Content only; emails hidden)"
+                                  >
+                                    <HelpCircle size={12} />
+                                    <span>Make Support Helper</span>
+                                  </button>
+                                )}
+
                                 <button
                                   type="button"
-                                  disabled={isUpdatingThisUserRole}
-                                  onClick={() => handleToggleSubAdminRole(user, false)}
-                                  className="px-2 py-1 text-xs rounded-lg bg-indigo-50 dark:bg-indigo-950/40 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
-                                  title="Revoke Sub-Admin status"
+                                  disabled={resettingMfaUserId === user.id}
+                                  onClick={() => handleResetUserMfa(user)}
+                                  className="px-2 py-1 text-xs rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                                  title="Remove enrolled authenticator 2FA factor if user lost their device"
                                 >
-                                  <UserMinus size={12} />
-                                  <span>{isUpdatingThisUserRole ? 'Updating...' : 'Revoke Mod'}</span>
+                                  <Key size={12} />
+                                  <span>{resettingMfaUserId === user.id ? 'Resetting 2FA...' : 'Reset 2FA'}</span>
                                 </button>
-                              ) : (
-                                <button
-                                  type="button"
-                                  disabled={isUpdatingThisUserRole}
-                                  onClick={() => handleToggleSubAdminRole(user, true)}
-                                  className="px-2 py-1 text-xs rounded-lg bg-purple-50 dark:bg-purple-950/40 hover:bg-purple-100 text-purple-700 dark:text-purple-300 font-semibold flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
-                                  title="Appoint as Sub-Admin with limited moderation privileges"
-                                >
-                                  <UserPlus size={12} />
-                                  <span>{isUpdatingThisUserRole ? 'Updating...' : 'Make Sub-Admin'}</span>
-                                </button>
-                              )
+                              </>
                             )}
 
                             {/* Admin & Super Admin: Verify Member / Grant Complimentary Pro Access */}

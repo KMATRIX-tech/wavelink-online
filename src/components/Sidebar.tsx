@@ -5,7 +5,6 @@ import { useAfricanRegion, KANGA_PATTERN_FRAMES } from '../utils/africanCultureC
 import { CrystalBadge } from './CrystalBadge';
 import { ActiveTab } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
-import { AdsterraAdBanner } from './AdsterraAdBanner';
 import {
   Waves,
   Rss,
@@ -28,7 +27,8 @@ import {
   ChevronRight,
   Trophy,
   Bell,
-  Palette
+  Palette,
+  HelpCircle
 } from 'lucide-react';
 import { useSimpleMode } from '../context/SimpleModeContext';
 import { useTheme, APPEARANCE_THEMES } from '../context/ThemeContext';
@@ -58,7 +58,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   unreadChatCount = 0,
   hasNewPosts = false
 }) => {
-  const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isProEffective, adminCheckFailedReason, signOut } = useAuth();
+  const { currentUser, userProfile, isAdmin, isSuperAdmin, isSubAdmin, isSupportHelper, isStaff, isProEffective, adminCheckFailedReason, signOut } = useAuth();
   const { t, language } = useLanguage();
   const { isSimpleMode } = useSimpleMode();
   const { appearanceTheme, setAppearanceTheme } = useTheme();
@@ -114,8 +114,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; badge?: string }[] = isSimpleMode
     ? [
         { id: 'feed', label: t('nav.home'), icon: <Rss size={22} /> },
-        { id: 'chat', label: language === 'sw' ? 'Ujumbe (Chat)' : 'Messages', icon: <MessageSquare size={22} /> },
-        { id: 'announcements', label: language === 'sw' ? 'Taarifa' : 'Notifications', icon: <Bell size={22} /> },
+        { id: 'chat', label: language === 'sw' ? 'Soga' : 'Chat', icon: <MessageSquare size={22} /> },
+        { id: 'announcements', label: language === 'sw' ? 'Matukio' : 'Events', icon: <Bell size={22} /> },
         { id: 'settings', label: t('nav.profile'), icon: <Settings size={22} /> },
       ]
     : [
@@ -128,15 +128,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
         { id: 'monetization', label: t('nav.monetization'), icon: <Coins size={18} />, badge: currency },
         { id: 'directory', label: t('nav.members'), icon: <Users size={18} /> },
         { id: 'analytics', label: t('nav.analytics'), icon: <BarChart3 size={18} />, badge: 'Private' },
-        // Restrict Admin / Moderator Desk to authorized admins (or owner session needing re-verification)
+        // Restrict Admin / Moderator / Support Desk to authorized staff (or owner session needing re-verification)
         ...(isAdmin ||
+        isStaff ||
         adminCheckFailedReason === 'owner sign-in not used' ||
         adminCheckFailedReason === 'session needs refresh'
           ? [{
               id: 'admin' as ActiveTab,
-              label: isSuperAdmin || !isSubAdmin ? t('nav.admin') : 'Moderator Desk',
+              label: isSuperAdmin
+                ? t('nav.admin')
+                : isSupportHelper
+                ? 'Support'
+                : 'Moderator',
               icon: <Shield size={18} />,
-              badge: isSuperAdmin || !isSubAdmin ? 'Owner' : 'Mod'
+              badge: isSuperAdmin ? 'Owner' : isSupportHelper ? 'Support' : 'Mod'
             }]
           : []),
         { id: 'settings', label: t('nav.profile'), icon: <Settings size={18} /> },
@@ -196,7 +201,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {isOpenMobile && (
           <button
             onClick={onCloseMobile}
-            className="p-1.5 text-[var(--text-primary)] hover:text-[var(--accent-primary)] rounded-xl lg:hidden"
+            aria-label="Close"
+            className="min-w-[2.75rem] min-h-[2.75rem] flex items-center justify-center text-[var(--text-primary)] hover:text-[var(--accent-primary)] rounded-xl lg:hidden cursor-pointer"
           >
             <X size={18} />
           </button>
@@ -427,7 +433,36 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
           {collapsedMode && (
             <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
-              Theme / Appearance
+              Theme
+            </div>
+          )}
+        </div>
+
+        {/* Help Quick Button (opens 5 short answers) */}
+        <div className="relative group/nav">
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent('wavelink:open-help'))}
+            title={language === 'sw' ? 'Msaada' : 'Help'}
+            aria-label={language === 'sw' ? 'Msaada' : 'Help'}
+            className={`w-full min-h-[44px] flex items-center rounded-2xl text-sm font-bold text-[var(--text-primary)] hover:border-[var(--accent-primary)] transition-all duration-150 mt-1 border border-[var(--border-hairline)] bg-[var(--bg-subtle)] cursor-pointer ${
+              collapsedMode ? 'justify-center px-0 py-2.5' : 'justify-between px-3.5 py-2.5'
+            }`}
+          >
+            <div className={`flex items-center ${collapsedMode ? 'justify-center' : 'gap-3 min-w-0'}`}>
+              <span className="text-[#0D9488] shrink-0">
+                <HelpCircle size={18} />
+              </span>
+              {!collapsedMode && (
+                <span className="truncate">
+                  {language === 'sw' ? 'Msaada' : 'Help'}
+                </span>
+              )}
+            </div>
+          </button>
+          {collapsedMode && (
+            <div className="pointer-events-none opacity-0 group-hover/nav:opacity-100 transition-opacity duration-150 fixed left-[76px] z-50 px-2.5 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold whitespace-nowrap shadow-lg -translate-y-9">
+              {language === 'sw' ? 'Msaada' : 'Help'}
             </div>
           )}
         </div>
@@ -486,12 +521,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </div>
               )}
 
-              {/* Adsterra Sidebar Sponsored Banner (Free Users Only - hidden if Pro, Blue Star, or Admin) */}
-              <AdsterraAdBanner
-                variant="sidebar"
-                onOpenUpgradeModal={() => handleSelectTab('monetization')}
-              />
-
               {/* PWA Install Button */}
               <div className="pt-2">
                 <PWAInstallButton variant="full" />
@@ -536,7 +565,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               onClick={signOut}
               title="Sign Out"
               aria-label="Sign Out"
-              className="p-1.5 text-[var(--text-secondary)] hover:text-rose-600 rounded-xl transition cursor-pointer"
+              className="min-w-[2.75rem] min-h-[2.75rem] flex items-center justify-center text-[var(--text-secondary)] hover:text-rose-600 rounded-xl transition cursor-pointer"
             >
               <LogOut size={15} />
             </button>
@@ -598,11 +627,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
             <div className="flex items-center gap-1 shrink-0">
               <button
+                type="button"
                 onClick={signOut}
-                title="Sign Out"
-                className="p-1.5 text-[var(--text-secondary)] hover:text-rose-600 rounded-xl transition cursor-pointer"
+                title="Log Out"
+                aria-label="Log Out"
+                className="min-h-[2.5rem] px-3 py-1.5 flex items-center justify-center gap-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border border-rose-500/25 rounded-xl text-xs font-extrabold transition active:scale-95 cursor-pointer"
               >
-                <LogOut size={15} />
+                <LogOut size={14} />
+                <span>Log Out</span>
               </button>
             </div>
           </div>

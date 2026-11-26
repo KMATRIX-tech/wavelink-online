@@ -63,15 +63,15 @@ import { VideoPlayer } from './VideoPlayer';
 import { PostBody } from './PostBody';
 import { Avatar } from './Avatar';
 import { SongPlayerCard } from './SongPlayerCard';
-import { SparkTray } from './SparkTray';
-import { AdsterraAdBanner } from './AdsterraAdBanner';
-import { shouldShowAds } from './AdsterraManager';
+import { SparkTray, WEEKLY_SPARK_THEMES } from './SparkTray';
+import { NotificationsPopover } from './NotificationsPopover';
 import { RichEventCard } from './RichEventCard';
 import { ImageLightboxModal, LightboxState } from './ImageLightboxModal';
 import { useBottomSheetLock } from '../utils/sheetLock';
 import { AddToHomeScreenHintCard } from './PWAInstallButton';
 import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
+import { checkClientSpam, checkWordFilter, formatCompactNumber } from '../utils/safetyFilters';
 import {
   ThumbsUp,
   Heart,
@@ -124,7 +124,13 @@ import {
   Lock,
   RefreshCw,
   Smile,
-  MoreHorizontal
+  MoreHorizontal,
+  Search,
+  ArrowUpRight,
+  Layers,
+  ChevronDown,
+  ChevronUp,
+  EyeOff
 } from 'lucide-react';
 import { sendWelinkChatMessage } from '../services/geminiService';
 import { getCachedWelinkResponse, setCachedWelinkResponse } from '../services/welinkCache';
@@ -241,6 +247,21 @@ const SPONSORED_ADS: Post[] = [
   }
 ];
 
+const FEED_CATEGORIES = [
+  { id: 'All', labelEn: 'All', labelSw: 'Zote', keywords: [] as string[] },
+  { id: 'Art', labelEn: 'Art', labelSw: 'Sanaa', keywords: ['art', 'design', 'paint', 'draw', 'creative', 'photo', 'craft', 'sanaa', 'gallery'] },
+  { id: 'Fashion', labelEn: 'Fashion', labelSw: 'Mitindo', keywords: ['fashion', 'style', 'outfit', 'kitenge', 'kanga', 'dress', 'wear', 'look', 'mitindo'] },
+  { id: 'Travel', labelEn: 'Travel', labelSw: 'Safari', keywords: ['travel', 'safari', 'zanzibar', 'beach', 'kilimanjaro', 'arusha', 'nairobi', 'trip', 'explore', 'sunset'] },
+  { id: 'Music', labelEn: 'Music', labelSw: 'Muziki', keywords: ['music', 'bongo', 'afrobeats', 'amapiano', 'song', 'beat', 'dance', 'muziki', 'audio', 'track'] },
+  { id: 'Sports', labelEn: 'Sports', labelSw: 'Michezo', keywords: ['sport', 'football', 'soccer', 'simba', 'yanga', 'run', 'fitness', 'gym', 'game', 'match', 'michezo'] },
+  { id: 'Food', labelEn: 'Food', labelSw: 'Chakula', keywords: ['food', 'cook', 'pilau', 'nyama', 'cafe', 'coffee', 'chai', 'taste', 'recipe', 'chakula', 'dinner'] },
+  { id: 'Comedy', labelEn: 'Comedy', labelSw: 'Vichekesho', keywords: ['comedy', 'funny', 'laugh', 'joke', 'meme', 'skit', 'vichekesho', 'lol', 'humor'] },
+  { id: 'Tech', labelEn: 'Tech', labelSw: 'Teknolojia', keywords: ['tech', 'ai', 'code', 'app', 'startup', 'mobile', 'gadget', 'crypto', 'digital', 'web', 'teknolojia'] },
+  { id: 'Local', labelEn: 'Local', labelSw: 'Karibu', keywords: ['tanzania', 'kenya', 'uganda', 'rwanda', 'dar', 'nairobi', 'kampala', 'kigali', 'local', 'eastafrica', 'nyumbani'] },
+] as const;
+
+type FeedCategoryId = (typeof FEED_CATEGORIES)[number]['id'];
+
 interface FeedViewProps {
   onNavigateTab?: (tab: string) => void;
   initialFilterTag?: string | null;
@@ -251,6 +272,8 @@ interface FeedViewProps {
   onStartChat?: (userId: string) => void;
   hasNewPosts?: boolean;
   onLoadNewPosts?: () => void;
+  hasUnreadNotifications?: boolean;
+  unreadNotificationCount?: number;
 }
 
 export const FeedView: React.FC<FeedViewProps> = ({
@@ -262,7 +285,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
   onOpenWelink,
   onStartChat,
   hasNewPosts = false,
-  onLoadNewPosts
+  onLoadNewPosts,
+  hasUnreadNotifications = false,
+  unreadNotificationCount = 0
 }) => {
   const {
     currentUser,
@@ -277,10 +302,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
     recordAdminAuditLog
   } = useAuth();
 
-  // Ads Rule: HIDE if user.isPro === true, user has Blue Star, or user is admin. SHOW only to regular free users.
-  const showAds = shouldShowAds(userProfile, isAdmin, isProEffective);
-  const isProUser = !showAds;
   const isProTier = Boolean(isProEffective || isAdmin);
+  const isProUser = Boolean(isProTier || userProfile?.hasBlueStar || userProfile?.isVerifiedByAdmin);
   const maxVideoSeconds = getMaxVideoDurationSeconds(isProTier);
   const { jobs: videoUploadJobs } = useVideoUploadQueue();
   const activeOrFailedVideoJobs = videoUploadJobs.filter(
@@ -305,7 +328,32 @@ export const FeedView: React.FC<FeedViewProps> = ({
     PAN_AFRICAN_LANGUAGES.find((l) => l.code === (userProfile?.panAfricanLanguage || panAfricanLang)) ||
     PAN_AFRICAN_LANGUAGES[0];
 
-  const [feedMode, setFeedMode] = useState<'all' | 'local' | 'following' | 'saved'>('all');
+  const [feedMode, setFeedMode] = useState<'all' | 'local' | 'following' | 'trending' | 'saved'>('all');
+  const [selectedCategory, setSelectedCategory] = useState<FeedCategoryId>('All');
+  const [feedSearchQuery, setFeedSearchQuery] = useState('');
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
+  const [isCheckInExpanded, setIsCheckInExpanded] = useState(false);
+  const [isSparkPromptExpanded, setIsSparkPromptExpanded] = useState(false);
+  const [trendingCreatorPost, setTrendingCreatorPost] = useState<Post | null>(null);
+  const [isLoadingTrendingCreator, setIsLoadingTrendingCreator] = useState(true);
+  const [gridPosts, setGridPosts] = useState<Post[]>([]);
+  const [lastGridDoc, setLastGridDoc] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [hasMoreGridPosts, setHasMoreGridPosts] = useState(true);
+  const [isLoadingGrid, setIsLoadingGrid] = useState(true);
+  const [isLoadingMoreGrid, setIsLoadingMoreGrid] = useState(false);
+  const [activeGridActionPostId, setActiveGridActionPostId] = useState<string | null>(null);
+  const [hiddenPostIds, setHiddenPostIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(`wavelink_hidden_posts_${currentUser?.uid || 'guest'}`);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+  const longPressTimerRef = useRef<number | null>(null);
+  const lastTapTimeRef = useRef<Record<string, number>>({});
+  const lastScrollYRef = useRef<number>(0);
+
   const [highlightedPostId, setHighlightedPostId] = useState<string | null>(null);
   const [showCountryPickerBar, setShowCountryPickerBar] = useState(false);
 
@@ -698,6 +746,90 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
+  // Trending Creator Loader: single limited query (limit(1)) ordered by likesCount desc
+  const loadTrendingCreatorPost = async () => {
+    setIsLoadingTrendingCreator(true);
+    try {
+      const trendingQuery = query(collection(db, 'posts'), orderBy('likesCount', 'desc'), limit(1));
+      const snap = await getDocs(trendingQuery);
+      if (!snap.empty) {
+        const d = snap.docs[0];
+        setTrendingCreatorPost({ id: d.id, ...d.data() } as Post);
+      }
+    } catch (error) {
+      if (isFirestoreQuotaError(error)) notifyQuotaExceeded(error);
+    } finally {
+      setIsLoadingTrendingCreator(false);
+    }
+  };
+
+  // Made For You Masonry Grid Loader: 12 cards at a time with pagination
+  const loadInitialGridPosts = async () => {
+    setIsLoadingGrid(true);
+    try {
+      const gridQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(12));
+      const snapshot = await getDocs(gridQuery);
+      const docs: Post[] = [];
+      snapshot.forEach((docSnap) => {
+        docs.push({ id: docSnap.id, ...docSnap.data() } as Post);
+      });
+      setGridPosts(docs);
+      setLastGridDoc(snapshot.docs[snapshot.docs.length - 1] || null);
+      setHasMoreGridPosts(snapshot.docs.length === 12);
+    } catch (error) {
+      if (isFirestoreQuotaError(error)) notifyQuotaExceeded(error);
+    } finally {
+      setIsLoadingGrid(false);
+    }
+  };
+
+  const loadMoreGridPosts = async () => {
+    if (isLoadingMoreGrid || !hasMoreGridPosts || !lastGridDoc) return;
+    setIsLoadingMoreGrid(true);
+    try {
+      const nextGridQuery = query(
+        collection(db, 'posts'),
+        orderBy('createdAt', 'desc'),
+        startAfter(lastGridDoc),
+        limit(12)
+      );
+      const snapshot = await getDocs(nextGridQuery);
+      if (!snapshot.empty) {
+        const newDocs: Post[] = [];
+        snapshot.forEach((docSnap) => {
+          newDocs.push({ id: docSnap.id, ...docSnap.data() } as Post);
+        });
+        setGridPosts((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          return [...prev, ...newDocs.filter((p) => !existingIds.has(p.id))];
+        });
+        setLastGridDoc(snapshot.docs[snapshot.docs.length - 1] || null);
+        setHasMoreGridPosts(snapshot.docs.length === 12);
+      } else {
+        setHasMoreGridPosts(false);
+      }
+    } catch (error) {
+      if (isFirestoreQuotaError(error)) notifyQuotaExceeded(error);
+    } finally {
+      setIsLoadingMoreGrid(false);
+    }
+  };
+
+  const handleHidePost = (postId: string) => {
+    const nextHidden = Array.from(new Set([...hiddenPostIds, postId]));
+    setHiddenPostIds(nextHidden);
+    try {
+      localStorage.setItem(
+        `wavelink_hidden_posts_${currentUser?.uid || 'guest'}`,
+        JSON.stringify(nextHidden)
+      );
+    } catch {
+      // ignore storage errors
+    }
+    setActiveGridActionPostId(null);
+    showToast(language === 'sw' ? 'Chapisho limefichwa' : 'Post hidden from your feed', 'success');
+  };
+
   // Primary Feed Loader: 10 posts at a time using getDocs (loaded once on mount/refresh)
   const loadInitialPosts = async (showRefreshSpinner = false) => {
     if (showRefreshSpinner) setIsRefreshing(true);
@@ -763,6 +895,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
   // Initial load on mount + deep-link support for shared ?post=ID URLs
   useEffect(() => {
     loadInitialPosts();
+    loadTrendingCreatorPost();
+    loadInitialGridPosts();
 
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
@@ -784,6 +918,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       const created = (ev as CustomEvent<Post>)?.detail;
       if (created && created.id) {
         setPosts((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
+        setGridPosts((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
       }
     };
     window.addEventListener('wavelink:video-post-created', handleVideoPostCreated);
@@ -1227,6 +1362,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const handleCreatePost = async () => {
     if (!currentUser || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)) return;
 
+    if (inlineContent.trim()) {
+      const spamRes = checkClientSpam('post', inlineContent.trim());
+      if (spamRes.isSpam) {
+        setPostNotice({ type: 'error', text: spamRes.reason || 'Please slow down before posting again.' });
+        return;
+      }
+      const wordRes = checkWordFilter(inlineContent.trim());
+      if (wordRes.flagged) {
+        setPostNotice({
+          type: 'error',
+          text:
+            language === 'sw'
+              ? 'Ujumbe wako una maneno yasiyoruhusiwa na Mwongozo wa Usalama wa WaveLink.'
+              : 'Your post contains words blocked by WaveLink Safety Filters. Please revise and try again.',
+        });
+        return;
+      }
+    }
+
     clearFailedVideoAndStudioDrafts();
     const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
     const safeAuthorPhotoURL = sanitizeAvatarUrlForFirestore(
@@ -1485,7 +1639,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
             }`}
           />
           <span className="font-mono tabular-nums">
-            {primaryHeartCount.toLocaleString()}
+            {formatCompactNumber(primaryHeartCount)}
           </span>
         </button>
 
@@ -1514,7 +1668,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 active.fire ? 'fill-orange-500 text-orange-500' : 'text-orange-500'
               }`}
             />
-            <span className="font-mono tabular-nums">{counts.fire}</span>
+            <span className="font-mono tabular-nums">{formatCompactNumber(counts.fire)}</span>
           </button>
         ) : null}
       </div>
@@ -1579,32 +1733,57 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   const blockedIds = userProfile?.blockedUserIds || [];
 
+  const matchesCategory = (p: Post, catId: FeedCategoryId): boolean => {
+    if (catId === 'All') return true;
+    if (catId === 'Local') {
+      return (
+        doesPostMatchCountry(p, activeCountryCode) ||
+        Boolean(p.locationTag) ||
+        FEED_CATEGORIES.find((c) => c.id === 'Local')!.keywords.some((kw) =>
+          (p.content || '').toLowerCase().includes(kw)
+        )
+      );
+    }
+    const cat = FEED_CATEGORIES.find((c) => c.id === catId);
+    if (!cat || cat.keywords.length === 0) return true;
+    const text = `${p.content || ''} ${p.songTitle || ''} ${p.songArtist || ''} ${p.locationTag || ''}`.toLowerCase();
+    if (catId === 'Music' && (p.songPreviewUrl || p.songTitle)) return true;
+    return cat.keywords.some((kw) => text.includes(kw));
+  };
+
+  const isPostVisibleToViewer = (p: Post): boolean => {
+    if (hiddenPostIds.includes(p.id)) return false;
+    if (blockedIds.includes(p.authorId)) return false;
+    const authorCached = p.authorId ? getCachedUserProfile(p.authorId) : null;
+    if (currentUser?.uid && (authorCached?.blockedUserIds || []).includes(currentUser.uid)) {
+      return false;
+    }
+    if (p.authorId !== currentUser?.uid && !isAdmin) {
+      const audience = p.audience || 'public';
+      if (audience === 'followers') {
+        const viewerFollowsAuthor =
+          followedIds.includes(p.authorId) ||
+          (userProfile?.followingIds || []).includes(p.authorId);
+        if (!viewerFollowsAuthor) return false;
+      } else if (audience === 'close_friends') {
+        const isCloseFriend =
+          Boolean(currentUser?.uid) &&
+          (authorCached?.closeFriendIds || []).includes(currentUser!.uid);
+        if (!isCloseFriend) return false;
+      }
+    }
+    if (p.isHidden && p.authorId !== currentUser?.uid && !isAdmin) {
+      return false;
+    }
+    return true;
+  };
+
   // Priority sorting:
-  // - If feedMode === 'local', show posts from the user's selected country first!
-  // - Boosted posts first, then Phase 3 interest-matched posts for recent waves, with plain chronological fallback
+  // - If feedMode === 'local', show posts from the user's selected country first
+  // - If feedMode === 'trending', sort by highest weekly engagement
+  // - Boosted posts first, then interest-matched posts for recent waves, with chronological fallback
   const sortedPosts = [...posts]
-    .filter((p) => {
-      if (blockedIds.includes(p.authorId)) return false;
-      const authorCached = p.authorId ? getCachedUserProfile(p.authorId) : null;
-      if (currentUser?.uid && (authorCached?.blockedUserIds || []).includes(currentUser.uid)) {
-        return false;
-      }
-      if (p.authorId !== currentUser?.uid && !isAdmin) {
-        const audience = p.audience || 'public';
-        if (audience === 'followers') {
-          const viewerFollowsAuthor =
-            followedIds.includes(p.authorId) ||
-            (userProfile?.followingIds || []).includes(p.authorId);
-          if (!viewerFollowsAuthor) return false;
-        } else if (audience === 'close_friends') {
-          const isCloseFriend =
-            Boolean(currentUser?.uid) &&
-            (authorCached?.closeFriendIds || []).includes(currentUser!.uid);
-          if (!isCloseFriend) return false;
-        }
-      }
-      return true;
-    })
+    .filter(isPostVisibleToViewer)
     .filter((p) => {
       if (feedMode === 'following') {
         return followedIds.includes(p.authorId) || p.authorId === currentUser?.uid;
@@ -1614,7 +1793,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
       }
       return true;
     })
+    .filter((p) => matchesCategory(p, selectedCategory))
     .sort((a, b) => {
+      if (feedMode === 'trending') {
+        const scoreA = (a.likesCount || 0) + (a.commentsCount || 0) * 2 + (a.sharesCount || 0) * 2;
+        const scoreB = (b.likesCount || 0) + (b.commentsCount || 0) * 2 + (b.sharesCount || 0) * 2;
+        if (scoreB !== scoreA) return scoreB - scoreA;
+      }
       if (feedMode === 'local') {
         const aLocal = doesPostMatchCountry(a, activeCountryCode);
         const bLocal = doesPostMatchCountry(b, activeCountryCode);
@@ -1626,7 +1811,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
       if (userInterests.length > 0) {
         const ageHoursA = (Date.now() - new Date(a.createdAt).getTime()) / (1000 * 60 * 60);
         const ageHoursB = (Date.now() - new Date(b.createdAt).getTime()) / (1000 * 60 * 60);
-        // Prioritize interest-matching posts published within the last 72 hours; plain chronological fallback otherwise
         if (ageHoursA <= 72 && ageHoursB <= 72) {
           const scoreA = scorePostByInterests(a, userInterests);
           const scoreB = scorePostByInterests(b, userInterests);
@@ -1636,19 +1820,68 @@ export const FeedView: React.FC<FeedViewProps> = ({
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
 
-  const activeFilter = internalFilterTag || initialFilterTag || null;
+  const activeFilter = (feedSearchQuery.trim() || internalFilterTag || initialFilterTag || null);
 
-  // If hashtag or mention filter active (from search or tapped in post body)
+  // If hashtag, mention, or search filter is active
   const filteredSortedPosts = activeFilter
     ? sortedPosts.filter((p) => {
-        const query = activeFilter.toLowerCase();
+        const q = activeFilter.toLowerCase();
         return (
-          p.content?.toLowerCase().includes(query) ||
-          p.authorUsername?.toLowerCase().includes(query) ||
-          p.authorName?.toLowerCase().includes(query)
+          p.content?.toLowerCase().includes(q) ||
+          p.authorUsername?.toLowerCase().includes(q) ||
+          p.authorName?.toLowerCase().includes(q) ||
+          p.locationTag?.toLowerCase().includes(q)
         );
       })
     : sortedPosts;
+
+  // Choose Trending Creator by highest engagement this week (from the single limit(1) query + loaded posts)
+  const bestTrendingCreatorPost: Post | null = (() => {
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const pool = [
+      ...(trendingCreatorPost ? [trendingCreatorPost] : []),
+      ...gridPosts,
+      ...posts,
+    ].filter((p) => p && !p.isSponsored && isPostVisibleToViewer(p));
+    if (pool.length === 0) return null;
+    const uniqueById = Array.from(new Map(pool.map((p) => [p.id, p])).values());
+    const weeklyPool = uniqueById.filter((p) => {
+      const ts = new Date(p.createdAt || 0).getTime();
+      return Number.isFinite(ts) && ts >= weekAgo;
+    });
+    const candidates = weeklyPool.length > 0 ? weeklyPool : uniqueById;
+    return [...candidates].sort((a, b) => {
+      const hasMediaA = Boolean(a.imageUrl || a.imageUrls?.length || a.videoUrl || a.thumbnailUrl) ? 1 : 0;
+      const hasMediaB = Boolean(b.imageUrl || b.imageUrls?.length || b.videoUrl || b.thumbnailUrl) ? 1 : 0;
+      if (hasMediaB !== hasMediaA) return hasMediaB - hasMediaA;
+      const engA = (a.likesCount || 0) + (a.commentsCount || 0) * 2 + (a.sharesCount || 0) * 2;
+      const engB = (b.likesCount || 0) + (b.commentsCount || 0) * 2 + (b.sharesCount || 0) * 2;
+      return engB - engA;
+    })[0] || null;
+  })();
+
+  // Made For You masonry grid items (filtered by active category, switcher tab, and search query)
+  const filteredGridPosts = (gridPosts.length > 0 ? gridPosts : posts)
+    .filter(isPostVisibleToViewer)
+    .filter((p) => {
+      if (feedMode === 'following') {
+        return followedIds.includes(p.authorId) || p.authorId === currentUser?.uid;
+      }
+      if (feedMode === 'saved') {
+        return (userProfile?.savedPostIds || []).includes(p.id);
+      }
+      return true;
+    })
+    .filter((p) => matchesCategory(p, selectedCategory))
+    .filter((p) => {
+      if (!activeFilter) return true;
+      const q = activeFilter.toLowerCase();
+      return (
+        p.content?.toLowerCase().includes(q) ||
+        p.authorUsername?.toLowerCase().includes(q) ||
+        p.authorName?.toLowerCase().includes(q)
+      );
+    });
 
   // Interleave subtle, non-intrusive sponsored posts every 8 scrolls/items
   // (Exempt: Admins, Verified members, and Pro users have an ad-free experience!)
@@ -1680,12 +1913,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
     preloadUpcomingFeedPosts(combinedFeed, 0, 3, handleMediaDimensionsReady);
   }, [combinedFeed.length, isLoading]);
 
-  // Track window scroll progress, how many feed posts have been viewed, and preload the next 3 upcoming items
+  // Track window scroll progress, dispatch scroll direction for bottom bar auto-hide, and preload next 3 posts
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
     const updateReadingProgress = () => {
       const scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
+      const delta = scrollTop - lastScrollYRef.current;
+      if (Math.abs(delta) > 10) {
+        const direction = scrollTop > 72 && delta > 0 ? 'down' : 'up';
+        window.dispatchEvent(
+          new CustomEvent('wavelink:feed-scroll-direction', { detail: { direction } })
+        );
+        lastScrollYRef.current = scrollTop;
+      } else if (scrollTop <= 16) {
+        window.dispatchEvent(
+          new CustomEvent('wavelink:feed-scroll-direction', { detail: { direction: 'up' } })
+        );
+      }
+
       const docHeight = Math.max(
         document.documentElement.scrollHeight,
         document.body.scrollHeight
@@ -1733,8 +1979,80 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
+  // Current weekly Spark of the Day prompt
+  const todaySparkPrompt = WEEKLY_SPARK_THEMES[new Date().getDay()] || WEEKLY_SPARK_THEMES[0] || '🔥 What is making you smile today?';
+
+  // Quick search suggestions for the header search pill
+  const searchMatchingCreators = (() => {
+    const q = feedSearchQuery.trim().toLowerCase();
+    if (!q) return [];
+    const map = new Map<string, { id: string; name: string; username: string; photoURL?: string }>();
+    [...posts, ...gridPosts].forEach((p) => {
+      if (!p.authorId || p.isSponsored) return;
+      if (
+        p.authorName?.toLowerCase().includes(q) ||
+        p.authorUsername?.toLowerCase().includes(q)
+      ) {
+        if (!map.has(p.authorId)) {
+          map.set(p.authorId, {
+            id: p.authorId,
+            name: p.authorName,
+            username: p.authorUsername || `@${p.authorName.toLowerCase().replace(/\s+/g, '')}`,
+            photoURL: p.authorPhotoURL
+          });
+        }
+      }
+    });
+    return Array.from(map.values()).slice(0, 4);
+  })();
+
+  const handleGridCardTouchStart = (postId: string) => {
+    if (longPressTimerRef.current) {
+      window.clearTimeout(longPressTimerRef.current);
+    }
+    longPressTimerRef.current = window.setTimeout(() => {
+      setActiveGridActionPostId(postId);
+    }, 480);
+  };
+
+  const handleGridCardTouchEnd = () => {
+    if (longPressTimerRef.current) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
+
+  const handleGridCardClick = (post: Post) => {
+    if (activeGridActionPostId === post.id) return;
+    const now = Date.now();
+    const lastTap = lastTapTimeRef.current[post.id] || 0;
+    if (now - lastTap < 300) {
+      // Double tap to like!
+      lastTapTimeRef.current[post.id] = 0;
+      void handleToggleReaction(post, 'heart');
+      return;
+    }
+    lastTapTimeRef.current[post.id] = now;
+    handleOpenPostDetail(post);
+  };
+
+  const getPostPrimaryThumbnail = (p: Post): string | null => {
+    if (p.thumbnailUrl && p.thumbnailUrl.startsWith('https://')) {
+      return getOptimizedImagePreviewUrl(p.thumbnailUrl, isDataSaverOn);
+    }
+    const rawImg =
+      (p.imageUrls && p.imageUrls.length > 0 ? p.imageUrls[0] : p.imageUrl) || null;
+    if (rawImg && rawImg.startsWith('https://')) {
+      return getOptimizedImagePreviewUrl(rawImg, isDataSaverOn);
+    }
+    return null;
+  };
+
   return (
     <div className="wavelink-feed-container relative">
+      {/* 1. Single-Layer Fixed Vivid Theme Gradient Backdrop (No stacked blur layers) */}
+      <div className="wavelink-feed-vivid-bg" aria-hidden="true" />
+
       {/* Top Viewport Visual Reading Progress Bar */}
       <div
         role="progressbar"
@@ -1745,13 +2063,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
         className="fixed top-0 left-0 right-0 z-40 h-1 bg-stone-200/40 pointer-events-none overflow-hidden"
       >
         <div
-          className="h-full bg-gradient-to-r from-[#2563EB] via-[#0D9488] to-[#10B981] transition-all duration-150 ease-out"
+          className="h-full bg-gradient-to-r from-[var(--accent-primary)] via-[var(--accent-secondary)] to-[var(--accent-highlight)] transition-all duration-150 ease-out"
           style={{ width: `${feedReadProgress}%` }}
         />
       </div>
 
-      <div className="wavelink-feed-row">
-        {/* Center Main Feed (Mobile < 768px: Full Width Single Column; Desktop >= 1024px: Centered max 660px) */}
+      <div className="wavelink-feed-row relative z-10">
+        {/* Center Main Feed (Mobile <= 767px: Full Width Single Column; Desktop >= 1024px: Centered max 680px) */}
         <div className="wavelink-feed-column overflow-hidden">
           {/* Floating "New posts" Pill (Tapping scrolls up and loads new posts without auto-inserting while reading) */}
           {hasNewPosts && (
@@ -1762,6 +2080,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                   onLoadNewPosts?.();
                   void loadInitialPosts(true);
+                  void loadInitialGridPosts();
+                  void loadTrendingCreatorPost();
                 }}
                 className="pointer-events-auto min-h-[44px] px-4 py-2 rounded-full bg-[#F43F5E] hover:bg-rose-600 text-white text-xs font-extrabold shadow-lg flex items-center gap-2 ring-2 ring-white/80 dark:ring-slate-900 transition active:scale-95 cursor-pointer"
               >
@@ -1771,25 +2091,257 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
+          {/* 2. HEADER: Large friendly heading + Glassy rounded search pill + Bell icon with red unread dot */}
+          <header className="wavelink-feed-hero-header pt-1 pb-1.5">
+            <div className="flex items-center justify-between gap-3 mb-2.5">
+              <div>
+                <h1 className="text-2xl sm:text-[28px] font-black tracking-tight text-[var(--text-primary)] leading-tight">
+                  {language === 'sw' ? 'Gundua wimbi lako jipya.' : 'Find your next wave.'}
+                </h1>
+              </div>
+              {/* Bell icon with red dot when there are unread alerts */}
+              <div className="shrink-0">
+                <NotificationsPopover
+                  onNavigateTab={onNavigateTab}
+                  onStartChat={onStartChat}
+                  hasUnreadNotifications={hasUnreadNotifications}
+                  unreadNotificationCount={unreadNotificationCount}
+                />
+              </div>
+            </div>
+
+            {/* Glassy rounded search pill with magnifier */}
+            <div className="relative">
+              <div className="wavelink-feed-search-pill flex items-center gap-2.5 min-h-[46px] px-4 py-2 rounded-full border border-[var(--border-hairline)] bg-[var(--bg-surface)] shadow-xs transition focus-within:ring-2 focus-within:ring-[var(--accent-primary)]">
+                <Search size={18} className="text-[var(--text-secondary)] shrink-0" />
+                <input
+                  type="search"
+                  value={feedSearchQuery}
+                  onFocus={() => setIsSearchFocused(true)}
+                  onBlur={() => window.setTimeout(() => setIsSearchFocused(false), 180)}
+                  onChange={(e) => setFeedSearchQuery(e.target.value)}
+                  placeholder={
+                    language === 'sw'
+                      ? 'Tafuta watu, mitindo na mawazo'
+                      : 'Search people, trends and ideas'
+                  }
+                  aria-label="Search people, trends and ideas"
+                  className="w-full bg-transparent text-sm sm:text-base font-semibold text-[var(--text-primary)] placeholder:text-[var(--text-secondary)]/75 focus:outline-none"
+                />
+                {feedSearchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setFeedSearchQuery('')}
+                    aria-label="Clear search"
+                    className="min-w-[32px] min-h-[32px] rounded-full flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+                  >
+                    <X size={16} />
+                  </button>
+                )}
+              </div>
+
+              {/* Quick dropdown suggestions when typing in the search pill */}
+              {isSearchFocused && feedSearchQuery.trim().length > 0 && (
+                <div className="mt-1.5 rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-2.5 shadow-xl space-y-2 z-30 relative">
+                  {searchMatchingCreators.length > 0 && (
+                    <div>
+                      <span className="px-2 text-[10px] font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
+                        {language === 'sw' ? 'Wabunifu' : 'Creators'}
+                      </span>
+                      <div className="mt-1 space-y-1">
+                        {searchMatchingCreators.map((c) => (
+                          <button
+                            key={c.id}
+                            type="button"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              setFeedSearchQuery(c.username);
+                              setIsSearchFocused(false);
+                            }}
+                            className="w-full min-h-[44px] px-2.5 py-1.5 rounded-xl hover:bg-[var(--bg-subtle)] flex items-center justify-between gap-2 text-left transition cursor-pointer"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <Avatar
+                                uid={c.id}
+                                src={resolveUserAvatarUrl(c.id, c.photoURL)}
+                                alt={c.name}
+                                fallbackName={c.name}
+                                size={32}
+                                showStatus={true}
+                              />
+                              <div className="min-w-0">
+                                <p className="text-xs font-extrabold text-[var(--text-primary)] truncate">
+                                  {c.name}
+                                </p>
+                                <p className="text-[11px] font-mono text-[var(--text-secondary)] truncate">
+                                  {c.username}
+                                </p>
+                              </div>
+                            </div>
+                            <span className="text-[11px] font-bold text-[var(--accent-primary)]">
+                              {language === 'sw' ? 'Tazama' : 'Filter'}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between px-2 pt-1 border-t border-[var(--border-hairline)] text-xs text-[var(--text-secondary)]">
+                    <span>
+                      {language === 'sw'
+                        ? `Inachuja machapisho kwa "${feedSearchQuery.trim()}"`
+                        : `Filtering feed for "${feedSearchQuery.trim()}"`}
+                    </span>
+                    <span className="font-mono font-bold text-[var(--accent-primary)]">
+                      {filteredSortedPosts.length}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </header>
+
+          {/* Compact Collapsed Cards for Check-In & Spark of the Day (Collapsed by default so stories stay high) */}
+          <div className="grid grid-cols-2 gap-2">
+            {/* Compact Collapsed Daily Check-In Card */}
+            <div className="rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-2 shadow-2xs">
+              <div className="flex items-center justify-between gap-1.5 min-h-[36px]">
+                <button
+                  type="button"
+                  onClick={() => setIsCheckInExpanded((prev) => !prev)}
+                  className="flex items-center gap-2 min-w-0 text-left flex-1 cursor-pointer"
+                >
+                  <span className="w-7 h-7 rounded-xl bg-amber-500/15 text-[#D97706] flex items-center justify-center shrink-0">
+                    <Flame size={15} />
+                  </span>
+                  <div className="min-w-0">
+                    <span className="text-xs font-extrabold text-[var(--text-primary)] block truncate">
+                      {checkInDoneToday
+                        ? language === 'sw'
+                          ? 'Umeingia Leo'
+                          : 'Checked In'
+                        : language === 'sw'
+                        ? 'Ingia Leo'
+                        : 'Daily Check-In'}
+                    </span>
+                    <span className="text-[10px] font-bold text-[#D97706] block truncate">
+                      🔥 {Math.max(1, userProfile?.loginStreak ?? 1)}d · +15 pts
+                    </span>
+                  </div>
+                </button>
+                {!checkInDoneToday ? (
+                  <button
+                    type="button"
+                    onClick={handleDailyCheckIn}
+                    className="min-h-[32px] px-2.5 py-1 rounded-xl bg-[var(--accent-secondary)] text-white text-[11px] font-extrabold shrink-0 active:scale-95 transition cursor-pointer"
+                  >
+                    +15
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setIsCheckInExpanded((prev) => !prev)}
+                    aria-label="Toggle check-in details"
+                    className="p-1 text-[var(--text-secondary)] cursor-pointer"
+                  >
+                    {isCheckInExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                  </button>
+                )}
+              </div>
+              {isCheckInExpanded && (
+                <div className="mt-2 pt-2 border-t border-[var(--border-hairline)] text-[11px] text-[var(--text-secondary)] flex items-center justify-between gap-2">
+                  <span>
+                    {checkInDoneToday
+                      ? `${t('feed.checkedInToday')} (${(userProfile?.wavePoints ?? 15).toLocaleString()} pts)`
+                      : t('feed.tapToCheckIn')}
+                  </span>
+                  {!checkInDoneToday && (
+                    <button
+                      type="button"
+                      onClick={handleDailyCheckIn}
+                      className="px-2.5 py-1 rounded-lg bg-[var(--accent-primary)] text-white font-bold text-[11px] cursor-pointer"
+                    >
+                      {t('feed.checkInBtn')}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Compact Collapsed Spark of the Day Card */}
+            <div className="rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-2 shadow-2xs">
+              <div className="flex items-center justify-between gap-1.5 min-h-[36px]">
+                <button
+                  type="button"
+                  onClick={() => setIsSparkPromptExpanded((prev) => !prev)}
+                  className="flex items-center gap-2 min-w-0 text-left flex-1 cursor-pointer"
+                >
+                  <span className="w-7 h-7 rounded-xl bg-pink-500/15 text-pink-600 dark:text-pink-400 flex items-center justify-center shrink-0">
+                    <Sparkles size={15} />
+                  </span>
+                  <div className="min-w-0">
+                    <span className="text-xs font-extrabold text-[var(--text-primary)] block truncate">
+                      {language === 'sw' ? 'Cheche ya Leo' : 'Spark of the Day'}
+                    </span>
+                    <span className="text-[10px] font-semibold text-[var(--text-secondary)] block truncate">
+                      {todaySparkPrompt}
+                    </span>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsSparkPromptExpanded((prev) => !prev)}
+                  aria-label="Toggle Spark of the Day prompt"
+                  className="p-1 text-[var(--text-secondary)] shrink-0 cursor-pointer"
+                >
+                  {isSparkPromptExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                </button>
+              </div>
+              {isSparkPromptExpanded && (
+                <div className="mt-2 pt-2 border-t border-[var(--border-hairline)] text-[11px] text-[var(--text-secondary)] space-y-2">
+                  <p className="font-semibold text-[var(--text-primary)] leading-snug">
+                    {todaySparkPrompt}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      window.dispatchEvent(new CustomEvent('wavelink:open-spark-poster'));
+                    }}
+                    className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-gradient-to-r from-[#A855F7] via-[#EC4899] to-[#F97316] text-white font-extrabold text-xs cursor-pointer"
+                  >
+                    {language === 'sw' ? '+ Shiriki Hadithi' : '+ Join Spark Story'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
           {/* Background Video Upload Progress Chip at the Top of the Feed */}
           <VideoUploadProgressChip variant="feed-inline" />
 
-          {/* Friendly Add to Home Screen Hint (Especially for iPhone Users) */}
+          {/* Friendly Add to Home Screen Hint */}
           <AddToHomeScreenHintCard compact />
+
+          {/* 3. FRESH STORIES: Horizontal scroll of round story avatars with gradient/grey ring & "+" first */}
+          <div className="w-full max-w-full overflow-hidden">
+            <SparkTray
+              externalPostsToShare={postsForSpark}
+              onClearExternalPosts={() => setPostsForSpark(null)}
+              onStartChat={onStartChat}
+            />
+          </div>
 
           {/* Active Hashtag or Mention Filter Banner */}
           {activeFilter && (
-            <div className="p-4 rounded-3xl bg-gradient-to-r from-[#3B82F6] to-[#10B981] text-white flex items-center justify-between gap-3 shadow-md animate-in fade-in">
+            <div className="p-3.5 rounded-2xl bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-secondary)] text-white flex items-center justify-between gap-3 shadow-sm animate-in fade-in">
               <div className="flex items-center gap-2.5 min-w-0">
-                <div className="p-2 rounded-2xl bg-white/20 text-white shrink-0">
-                  {activeFilter.startsWith('@') ? <AtSign size={18} /> : <Hash size={18} />}
+                <div className="p-2 rounded-xl bg-white/20 text-white shrink-0">
+                  {activeFilter.startsWith('@') ? <AtSign size={16} /> : <Hash size={16} />}
                 </div>
                 <div className="min-w-0">
-                  <span className="text-[10px] text-blue-100 font-bold uppercase tracking-wider block">
-                    {activeFilter.startsWith('@') ? 'Mention Discovery' : 'Hashtag Discovery'}
-                  </span>
-                  <h4 className="text-sm font-extrabold truncate">
-                    Filtered by <span className="text-emerald-200">{activeFilter}</span> ({filteredSortedPosts.length} waves)
+                  <h4 className="text-xs sm:text-sm font-extrabold truncate">
+                    {language === 'sw' ? 'Inachuja:' : 'Filtered by'}{' '}
+                    <span className="underline">{activeFilter}</span> ({filteredSortedPosts.length})
                   </h4>
                 </div>
               </div>
@@ -1797,26 +2349,28 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 type="button"
                 onClick={() => {
                   setInternalFilterTag(null);
+                  setFeedSearchQuery('');
                   if (onClearFilterTag) onClearFilterTag();
                 }}
-                className="min-h-[44px] px-3.5 py-1.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shrink-0 cursor-pointer"
+                className="min-h-[38px] px-3 py-1 rounded-xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1 transition active:scale-95 shrink-0 cursor-pointer"
               >
-                <span>Clear</span>
+                <span>{language === 'sw' ? 'Futa' : 'Clear'}</span>
                 <X size={13} />
               </button>
             </div>
           )}
 
-          {/* Clean Segmented Control for All, Local, Following, and Trending */}
-          <div className="w-full bg-stone-100 dark:bg-stone-800/80 p-1 rounded-2xl flex items-center justify-between gap-1 shadow-2xs">
-            <div className="flex items-center gap-1 flex-1 min-w-0">
+          {/* 4. SMALL SWITCHER (Following, Local, Trending) + HORIZONTAL CATEGORY CHIPS */}
+          <div className="space-y-2.5">
+            {/* Small switcher above the chips for All, Following, Local and Trending */}
+            <div className="w-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-1 rounded-2xl flex items-center justify-between gap-1 shadow-2xs">
               <button
                 type="button"
                 onClick={() => setFeedMode('all')}
-                className={`flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate ${
+                className={`flex-1 min-h-[38px] py-1.5 px-2.5 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate ${
                   feedMode === 'all'
-                    ? 'bg-white dark:bg-stone-700 text-[#1C1917] dark:text-stone-100 shadow-2xs'
-                    : 'text-stone-600 dark:text-stone-300 hover:text-stone-900'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                 }`}
               >
                 {t('feed.tabAll')}
@@ -1824,13 +2378,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
               <button
                 type="button"
-                onClick={() => setFeedMode('local')}
-                className={`flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate flex items-center justify-center gap-1.5 ${
-                  feedMode === 'local'
-                    ? 'bg-white dark:bg-stone-700 text-[#0D9488] shadow-2xs'
-                    : 'text-stone-600 dark:text-stone-300 hover:text-stone-900'
+                onClick={() => setFeedMode('following')}
+                className={`flex-1 min-h-[38px] py-1.5 px-2.5 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate ${
+                  feedMode === 'following'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                 }`}
-                title={t('feed.localBannerDesc')}
+              >
+                {t('feed.tabFollowing')}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setFeedMode('local')}
+                className={`flex-1 min-h-[38px] py-1.5 px-2.5 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate flex items-center justify-center gap-1 ${
+                  feedMode === 'local'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
               >
                 <span>{activeCountryMeta.flag}</span>
                 <span>{t('feed.tabLocal')}</span>
@@ -1838,84 +2403,464 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
               <button
                 type="button"
-                onClick={() => setFeedMode('following')}
-                className={`flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate ${
-                  feedMode === 'following'
-                    ? 'bg-white dark:bg-stone-700 text-[#1C1917] dark:text-stone-100 shadow-2xs'
-                    : 'text-stone-600 dark:text-stone-300 hover:text-stone-900'
+                onClick={() => setFeedMode('trending')}
+                className={`flex-1 min-h-[38px] py-1.5 px-2.5 rounded-xl font-extrabold text-xs transition cursor-pointer text-center truncate flex items-center justify-center gap-1 ${
+                  feedMode === 'trending'
+                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                 }`}
               >
-                {t('feed.tabFollowing')}
+                <Flame size={13} className={feedMode === 'trending' ? 'text-amber-200' : 'text-orange-500'} />
+                <span>{t('nav.trending_short')}</span>
               </button>
-
-              {onNavigateTab && (
-                <button
-                  type="button"
-                  onClick={() => onNavigateTab('trending')}
-                  className="flex-1 py-1.5 px-2.5 sm:px-3 rounded-xl font-extrabold text-xs text-stone-600 dark:text-stone-300 hover:text-[#2563EB] transition cursor-pointer text-center truncate"
-                >
-                  {t('nav.trending_short')}
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Slim Greeting Row with Daily Check-In Button inside */}
-          <div className="w-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl px-3.5 py-2 shadow-2xs flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded-xl bg-amber-50 dark:bg-amber-950/40 text-[#D97706] border border-amber-200/70 dark:border-amber-800/60 flex items-center justify-center shrink-0">
-                <Flame size={16} />
-              </div>
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <h2 className="text-xs sm:text-sm font-extrabold text-[#1C1917] dark:text-stone-100 truncate">
-                    {(() => {
-                      const hour = new Date().getHours();
-                      const name = userProfile?.displayName?.split(' ')[0] || currentUser?.displayName?.split(' ')[0] || 'Rafiki';
-                      const timeGreeting =
-                        hour < 12
-                          ? t('feed.greetingMorning')
-                          : hour < 18
-                          ? t('feed.greetingAfternoon')
-                          : t('feed.greetingEvening');
-                      return `${timeGreeting}, ${name} 👋`;
-                    })()}
-                  </h2>
-                  <span className="text-[10px] font-bold text-[#D97706] bg-amber-50 dark:bg-amber-950/40 px-1.5 py-0.2 rounded-md shrink-0">
-                    {Math.max(1, userProfile?.loginStreak ?? 1)}d
-                  </span>
-                </div>
-                <p className="text-[11px] text-[#78716C] dark:text-stone-400 truncate hidden xs:block">
-                  {checkInDoneToday
-                    ? `${t('feed.checkedInToday')} · ${(userProfile?.wavePoints ?? 15).toLocaleString()} pts`
-                    : `${t('feed.tapToCheckIn')} · +15 WavePoints`}
-                </p>
-              </div>
             </div>
 
-            <button
-              type="button"
-              onClick={handleDailyCheckIn}
-              disabled={checkInDoneToday}
-              className={`min-h-[34px] px-3 py-1 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer ${
-                checkInDoneToday
-                  ? 'bg-teal-50 dark:bg-teal-950/40 text-[#0D9488] border border-teal-200/80 dark:border-teal-800'
-                  : 'bg-[#0D9488] hover:bg-teal-700 text-white active:scale-95 shadow-2xs'
-              }`}
+            {/* Category chips: All, Art, Fashion, Travel, Music, Sports, Food, Comedy, Tech, Local */}
+            <div
+              role="tablist"
+              aria-label="Feed categories"
+              className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1 pt-0.5"
             >
-              {checkInDoneToday ? t('feed.checkedInBtn') : t('feed.checkInBtn')}
-            </button>
+              {FEED_CATEGORIES.map((cat) => {
+                const isSelected = selectedCategory === cat.id;
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSelected}
+                    onClick={() => {
+                      setSelectedCategory(cat.id);
+                      if (cat.id === 'Local') {
+                        setFeedMode('local');
+                      } else if (feedMode === 'local' && cat.id === 'All') {
+                        setFeedMode('all');
+                      }
+                    }}
+                    className={`min-h-[44px] px-4 py-2 rounded-full text-xs sm:text-sm font-extrabold whitespace-nowrap shrink-0 transition active:scale-95 cursor-pointer ${
+                      isSelected
+                        ? 'bg-[var(--accent-primary)] text-white shadow-sm'
+                        : 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)]/50'
+                    }`}
+                  >
+                    {language === 'sw' ? cat.labelSw : cat.labelEn}
+                  </button>
+                );
+              })}
+            </div>
           </div>
+
+          {/* 5. TRENDING CREATOR & 6. MADE FOR YOU MASONRY GRID */}
+          <section aria-label="Creator Spotlight and Made For You" className="space-y-4">
+            {/* Section 5: TRENDING CREATOR Featured Card */}
+            {isLoadingTrendingCreator && !bestTrendingCreatorPost ? (
+              <div className="w-full h-60 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] animate-pulse p-5 flex flex-col justify-end">
+                <div className="w-28 h-4 rounded-full bg-slate-300/60 dark:bg-slate-700 mb-2" />
+                <div className="w-3/4 h-6 rounded-xl bg-slate-300/60 dark:bg-slate-700 mb-2" />
+                <div className="w-40 h-4 rounded-full bg-slate-300/60 dark:bg-slate-700" />
+              </div>
+            ) : bestTrendingCreatorPost ? (
+              (() => {
+                const featuredThumb = getPostPrimaryThumbnail(bestTrendingCreatorPost);
+                const featuredReactions = getReactionData(bestTrendingCreatorPost);
+                const featuredLikes = Math.max(
+                  featuredReactions.counts.heart,
+                  featuredReactions.counts.total,
+                  bestTrendingCreatorPost.likesCount || 0
+                );
+                const rawTitle = (bestTrendingCreatorPost.content || '').replace(/#[a-zA-Z0-9_]+/g, '').trim();
+                const cleanTitle =
+                  rawTitle.length > 0
+                    ? rawTitle.slice(0, 88) + (rawTitle.length > 88 ? '…' : '')
+                    : language === 'sw'
+                    ? `Wimbi maarufu kutoka kwa ${bestTrendingCreatorPost.authorName}`
+                    : `Featured wave by ${bestTrendingCreatorPost.authorName}`;
+                const creatorHandle =
+                  bestTrendingCreatorPost.authorUsername?.startsWith('@')
+                    ? bestTrendingCreatorPost.authorUsername
+                    : `@${bestTrendingCreatorPost.authorUsername || bestTrendingCreatorPost.authorName.toLowerCase().replace(/\s+/g, '')}`;
+
+                return (
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => handleOpenPostDetail(bestTrendingCreatorPost)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        handleOpenPostDetail(bestTrendingCreatorPost);
+                      }
+                    }}
+                    className="wavelink-trending-creator-card group relative w-full rounded-[28px] overflow-hidden border border-[var(--border-hairline)] shadow-md cursor-pointer transition-transform duration-200 hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-[var(--accent-primary)]"
+                  >
+                    {/* Media Thumbnail or Vibrant Creator Gradient Fallback */}
+                    <div className="relative w-full h-64 sm:h-72 bg-gradient-to-br from-[#7C3AED] via-[#EC4899] to-[#F97316] overflow-hidden">
+                      {featuredThumb ? (
+                        <img
+                          src={featuredThumb}
+                          alt={cleanTitle}
+                          loading="lazy"
+                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center p-6 text-white/25">
+                          <Waves size={88} />
+                        </div>
+                      )}
+                      {/* Soft dark gradient overlay for crisp text legibility */}
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/35 to-black/10" />
+
+                      {/* Top row: TRENDING CREATOR pill + Media badge */}
+                      <div className="absolute top-3.5 left-3.5 right-3.5 flex items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/20 text-white text-[10px] font-black uppercase tracking-widest border border-white/30">
+                          <Sparkles size={11} className="text-amber-300" />
+                          <span>TRENDING CREATOR</span>
+                        </span>
+                        {(bestTrendingCreatorPost.videoUrl || bestTrendingCreatorPost.hasVideoChunks || bestTrendingCreatorPost.mediaType === 'video') && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/55 text-white text-[11px] font-bold">
+                            <Play size={11} className="fill-white" />
+                            <span>
+                              {bestTrendingCreatorPost.videoDurationSeconds
+                                ? `${Math.round(bestTrendingCreatorPost.videoDurationSeconds)}s`
+                                : 'Video'}
+                            </span>
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Bottom content: Bold title from caption, creator @handle + like count, and round arrow button */}
+                      <div className="absolute bottom-3.5 left-3.5 right-3.5 flex items-end justify-between gap-3">
+                        <div className="min-w-0 flex-1 space-y-1.5">
+                          <h2 className="text-lg sm:text-xl font-black text-white leading-snug line-clamp-2 drop-shadow-xs">
+                            {cleanTitle}
+                          </h2>
+                          <div className="flex items-center gap-2.5 text-xs font-bold text-white/90 flex-wrap">
+                            <div className="inline-flex items-center gap-1.5 min-w-0">
+                              <Avatar
+                                uid={bestTrendingCreatorPost.authorId}
+                                src={resolveUserAvatarUrl(
+                                  bestTrendingCreatorPost.authorId,
+                                  bestTrendingCreatorPost.authorPhotoURL
+                                )}
+                                alt={bestTrendingCreatorPost.authorName}
+                                fallbackName={bestTrendingCreatorPost.authorName}
+                                size={22}
+                                showStatus={false}
+                              />
+                              <span className="truncate font-mono">{creatorHandle}</span>
+                            </div>
+                            <span>•</span>
+                            <span className="inline-flex items-center gap-1 text-rose-300 font-mono">
+                              <Heart size={13} className="fill-rose-400 text-rose-400" />
+                              <span>{formatCompactNumber(featuredLikes)}</span>
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Round Arrow Button that opens the post */}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenPostDetail(bestTrendingCreatorPost);
+                          }}
+                          aria-label="Open trending creator post"
+                          className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full bg-white text-[#0F172A] hover:bg-[var(--accent-primary)] hover:text-white flex items-center justify-center shadow-lg transition-transform active:scale-95 shrink-0 cursor-pointer"
+                        >
+                          <ArrowUpRight size={20} strokeWidth={2.5} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()
+            ) : null}
+
+            {/* Section 6: MADE FOR YOU Masonry Grid (2-col on mobile <= 767px, 3-col on desktop >= 1024px) */}
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between px-1">
+                <div>
+                  <h2 className="text-base sm:text-lg font-extrabold text-[var(--text-primary)] tracking-tight">
+                    {language === 'sw' ? 'Imeundwa Kwa Ajili Yako' : 'Made for you'}
+                  </h2>
+                  <p className="text-[11px] text-[var(--text-secondary)]">
+                    {language === 'sw'
+                      ? 'Gusa mara mbili kupenda • Shikilia kwa chaguo za haraka'
+                      : 'Double tap to like • Long press for quick actions'}
+                  </p>
+                </div>
+                {selectedCategory !== 'All' && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCategory('All')}
+                    className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline cursor-pointer"
+                  >
+                    {language === 'sw' ? 'Onyesha zote' : 'Reset filter'}
+                  </button>
+                )}
+              </div>
+
+              {isLoadingGrid && filteredGridPosts.length === 0 ? (
+                <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                  {[0, 1, 2, 3, 4, 5].map((n) => (
+                    <div
+                      key={n}
+                      className={`rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] animate-pulse ${
+                        n % 2 === 0 ? 'h-56' : 'h-44'
+                      }`}
+                    />
+                  ))}
+                </div>
+              ) : filteredGridPosts.length > 0 ? (
+                <>
+                  <div className="wavelink-masonry-grid">
+                    {filteredGridPosts.map((gridPost, idx) => {
+                      const thumbUrl = getPostPrimaryThumbnail(gridPost);
+                      const isVideoPost = Boolean(
+                        gridPost.videoUrl || gridPost.hasVideoChunks || gridPost.mediaType === 'video'
+                      );
+                      const multiPhotoCount = gridPost.imageUrls?.length || 0;
+                      const reactionInfo = getReactionData(gridPost);
+                      const isHearted = reactionInfo.active.heart || reactionInfo.active.like;
+                      const heartCount = Math.max(
+                        reactionInfo.counts.heart,
+                        reactionInfo.counts.total,
+                        gridPost.likesCount || 0
+                      );
+                      const handle =
+                        gridPost.authorUsername?.startsWith('@')
+                          ? gridPost.authorUsername
+                          : `@${gridPost.authorUsername || gridPost.authorName.toLowerCase().replace(/\s+/g, '')}`;
+                      const shortCaption =
+                        (gridPost.content || '').trim() ||
+                        (gridPost.songTitle ? `🎵 ${gridPost.songTitle}` : gridPost.authorName);
+                      const isTallCard = idx % 3 === 0 || idx % 5 === 0;
+                      const isSaved = (userProfile?.savedPostIds || []).includes(gridPost.id);
+                      const isQuickMenuOpen = activeGridActionPostId === gridPost.id;
+
+                      return (
+                        <div
+                          key={gridPost.id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => handleGridCardClick(gridPost)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              handleOpenPostDetail(gridPost);
+                            }
+                          }}
+                          onTouchStart={() => handleGridCardTouchStart(gridPost.id)}
+                          onTouchEnd={handleGridCardTouchEnd}
+                          onTouchCancel={handleGridCardTouchEnd}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setActiveGridActionPostId(gridPost.id);
+                          }}
+                          className={`wavelink-masonry-card group relative rounded-[24px] overflow-hidden border border-[var(--border-hairline)] bg-[var(--bg-surface)] shadow-xs cursor-pointer select-none transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md focus-visible:ring-2 focus-visible:ring-[var(--accent-primary)] ${
+                            isTallCard ? 'wavelink-masonry-card--tall' : 'wavelink-masonry-card--medium'
+                          }`}
+                        >
+                          {/* Media or Rich Themed Gradient */}
+                          <div className="relative w-full h-full overflow-hidden bg-gradient-to-br from-[#2563EB] via-[#7C3AED] to-[#EC4899]">
+                            {thumbUrl ? (
+                              <img
+                                src={thumbUrl}
+                                alt={shortCaption.slice(0, 60)}
+                                loading="lazy"
+                                className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+                              />
+                            ) : (
+                              <div className="w-full h-full p-4 flex flex-col justify-center items-center text-center text-white">
+                                <p className="text-xs sm:text-sm font-extrabold line-clamp-4 leading-snug">
+                                  {shortCaption}
+                                </p>
+                              </div>
+                            )}
+
+                            {/* Soft dark gradient at the bottom */}
+                            <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-transparent pointer-events-none" />
+
+                            {/* Top-left badge: Small play icon + duration for videos, or stack icon for multi-photo posts */}
+                            <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5">
+                              {isVideoPost ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-black/60 text-white text-[10px] font-bold">
+                                  <Play size={10} className="fill-white" />
+                                  <span>
+                                    {gridPost.videoDurationSeconds
+                                      ? `${Math.floor(gridPost.videoDurationSeconds / 60)}:${String(
+                                          Math.round(gridPost.videoDurationSeconds % 60)
+                                        ).padStart(2, '0')}`
+                                      : '0:15'}
+                                  </span>
+                                </span>
+                              ) : multiPhotoCount > 1 ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-black/60 text-white text-[10px] font-bold">
+                                  <Layers size={11} />
+                                  <span>{multiPhotoCount}</span>
+                                </span>
+                              ) : null}
+                            </div>
+
+                            {/* Top-right Heart button in the corner (>= 44px touch target) */}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleToggleReaction(gridPost, 'heart');
+                              }}
+                              aria-label={`Like post by ${handle}`}
+                              className="absolute top-1.5 right-1.5 w-11 h-11 min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-white transition active:scale-90 cursor-pointer"
+                            >
+                              <span className="w-8 h-8 rounded-full bg-black/45 hover:bg-black/65 flex items-center justify-center">
+                                <Heart
+                                  size={15}
+                                  className={
+                                    isHearted
+                                      ? 'fill-[#F43F5E] text-[#F43F5E]'
+                                      : 'text-white'
+                                  }
+                                />
+                              </span>
+                            </button>
+
+                            {/* Bottom overlay: Short caption + @handle + like count + quick action trigger */}
+                            <div className="absolute bottom-2.5 left-2.5 right-2.5 flex items-end justify-between gap-1.5">
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-extrabold text-white line-clamp-2 leading-tight drop-shadow-xs">
+                                  {shortCaption}
+                                </p>
+                                <div className="flex items-center gap-1.5 mt-1 text-[11px] font-semibold text-white/85">
+                                  <span className="truncate font-mono">{handle}</span>
+                                  {heartCount > 0 && (
+                                    <>
+                                      <span>·</span>
+                                      <span className="font-mono">{formatCompactNumber(heartCount)}</span>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActiveGridActionPostId(
+                                    isQuickMenuOpen ? null : gridPost.id
+                                  );
+                                }}
+                                aria-label="Quick actions"
+                                className="w-7 h-7 rounded-full bg-black/45 hover:bg-black/70 text-white flex items-center justify-center shrink-0 cursor-pointer"
+                              >
+                                <MoreHorizontal size={14} />
+                              </button>
+                            </div>
+
+                            {/* Long-Press Quick Actions Overlay (Save, Share, Hide, Report) */}
+                            {isQuickMenuOpen && (
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="absolute inset-0 bg-slate-950/85 p-3 flex flex-col justify-center gap-1.5 z-20 animate-in fade-in"
+                              >
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="text-[10px] font-black uppercase tracking-wider text-white/70">
+                                    {language === 'sw' ? 'Chaguo za Haraka' : 'Quick Actions'}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setActiveGridActionPostId(null)}
+                                    aria-label="Close quick actions"
+                                    className="w-7 h-7 rounded-full bg-white/15 text-white flex items-center justify-center cursor-pointer"
+                                  >
+                                    <X size={14} />
+                                  </button>
+                                </div>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    void handleToggleSave(gridPost.id);
+                                    setActiveGridActionPostId(null);
+                                  }}
+                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-extrabold flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Bookmark size={14} className={isSaved ? 'fill-amber-400 text-amber-400' : ''} />
+                                  <span>{isSaved ? (language === 'sw' ? 'Imeondolewa' : 'Unsave') : (language === 'sw' ? 'Hifadhi' : 'Save')}</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActiveGridActionPostId(null);
+                                    handleSharePost(gridPost);
+                                  }}
+                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-extrabold flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Share2 size={14} />
+                                  <span>{language === 'sw' ? 'Shiriki' : 'Share'}</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => handleHidePost(gridPost.id)}
+                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-extrabold flex items-center gap-2 cursor-pointer"
+                                >
+                                  <EyeOff size={14} />
+                                  <span>{language === 'sw' ? 'Ficha' : 'Hide'}</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActiveGridActionPostId(null);
+                                    setReportingPost(gridPost);
+                                  }}
+                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-rose-500/25 hover:bg-rose-500/40 text-rose-200 text-xs font-extrabold flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Flag size={14} />
+                                  <span>{language === 'sw' ? 'Ripoti' : 'Report'}</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Pagination button for Made for you grid (loads 12 cards at a time) */}
+                  {hasMoreGridPosts && (
+                    <div className="flex justify-center pt-1">
+                      <button
+                        type="button"
+                        onClick={() => void loadMoreGridPosts()}
+                        disabled={isLoadingMoreGrid}
+                        className="min-h-[44px] px-5 py-2 rounded-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] shadow-2xs transition active:scale-95 cursor-pointer disabled:opacity-50"
+                      >
+                        {isLoadingMoreGrid
+                          ? language === 'sw'
+                            ? 'Inapakia...'
+                            : 'Loading more...'
+                          : language === 'sw'
+                          ? 'Onyesha zaidi (12)'
+                          : 'Explore more waves'}
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : null}
+            </div>
+          </section>
 
           {/* Compact First-Time Welcome Strip if active */}
           {showWelcomeFlow && (
-            <div className="bg-gradient-to-r from-teal-50/70 via-blue-50/60 to-amber-50/50 dark:from-stone-900 dark:to-stone-900 border border-teal-200/80 dark:border-stone-800 rounded-2xl p-3 shadow-2xs flex items-center justify-between gap-3 animate-in fade-in">
+            <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-2xl p-3 shadow-2xs flex items-center justify-between gap-3 animate-in fade-in">
               <div className="min-w-0">
-                <span className="text-xs font-bold text-stone-900 dark:text-stone-100 block truncate">
+                <span className="text-xs font-bold text-[var(--text-primary)] block truncate">
                   Karibu WaveLink • Welcome! 🌿
                 </span>
-                <span className="text-[11px] text-stone-500 dark:text-stone-400 block truncate">
-                  Personalize your feed with East African creators and culture.
+                <span className="text-[11px] text-[var(--text-secondary)] block truncate">
+                  Personalize your feed with creators and categories you love.
                 </span>
               </div>
               <div className="flex items-center gap-1.5 shrink-0">
@@ -1925,14 +2870,14 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     handleDismissWelcome();
                     window.dispatchEvent(new CustomEvent('wavelink:open-interest-picker'));
                   }}
-                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white text-xs font-bold hover:bg-blue-700 transition cursor-pointer"
+                  className="min-h-[38px] px-3 py-1 rounded-xl bg-[var(--accent-primary)] text-white text-xs font-bold hover:opacity-95 transition cursor-pointer"
                 >
                   Pick Topics
                 </button>
                 <button
                   type="button"
                   onClick={handleDismissWelcome}
-                  className="p-1 text-stone-400 hover:text-stone-600 transition cursor-pointer"
+                  className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition cursor-pointer"
                   title="Dismiss"
                 >
                   <X size={14} />
@@ -1940,15 +2885,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
               </div>
             </div>
           )}
-
-          {/* Slim Sparks Row */}
-          <div className="w-full max-w-full overflow-hidden">
-            <SparkTray
-              externalPostsToShare={postsForSpark}
-              onClearExternalPosts={() => setPostsForSpark(null)}
-              onStartChat={onStartChat}
-            />
-          </div>
 
           {/* One Compact Pinned Notice Card with a single small badge */}
           {isLoadingAnnouncements ? (
@@ -1965,13 +2901,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
             )
           )}
 
-          {/* Large Friendly Composer Box for First-Time & Non-Technical Users */}
-          <div className="w-full max-w-full overflow-hidden bg-[#FFFFFF] border-2 border-stone-200/90 rounded-3xl p-4 sm:p-5 shadow-sm transition">
+          {/* Quick Inline Composer Box */}
+          <div className="wavelink-glass-post-card w-full max-w-full overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-5 shadow-xs transition">
             {/* Friendly Greeting Header */}
-            <div className="flex items-center justify-between mb-3.5 pb-2 border-b border-stone-100 flex-wrap gap-2">
+            <div className="flex items-center justify-between mb-3.5 pb-2 border-b border-[var(--border-hairline)] flex-wrap gap-2">
               <div className="flex items-center gap-2">
                 <span className="text-xl">🌿</span>
-                <h3 className="text-sm sm:text-base font-black text-stone-900 tracking-tight">
+                <h3 className="text-sm sm:text-base font-black text-[var(--text-primary)] tracking-tight">
                   {language === 'sw'
                     ? 'Shiriki kitu na marafiki zako'
                     : 'Share something with your friends'}
@@ -2007,7 +2943,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 showStatus={true}
                 onlyWhenVisible={false}
                 targetProfile={userProfile}
-                ringClassName="ring-2 ring-[#2563EB]/20"
+                ringClassName="ring-2 ring-[var(--accent-primary)]/20"
                 className="mt-0.5"
               />
               <div className="flex-1 min-w-0">
@@ -2020,13 +2956,13 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       : 'Share something with your friends... what is on your mind?'
                   }
                   rows={inlineContent || inlineMediaPreview ? 3 : 2}
-                  className="w-full max-w-full bg-[#FAF7F2] rounded-2xl p-4 border border-[#EFECE6] resize-none text-base text-[#1C1917] placeholder-stone-500 focus:outline-none focus:bg-white focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/10 break-words leading-relaxed transition font-medium"
+                  className="w-full max-w-full bg-[var(--bg-subtle)]/70 rounded-2xl p-4 border border-[var(--border-hairline)] resize-none text-base text-[var(--text-primary)] placeholder-[var(--text-secondary)]/70 focus:outline-none focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:ring-2 focus:ring-[var(--accent-primary)]/15 break-words leading-relaxed transition font-medium"
                 />
 
-                {/* Phase 3: Suggested Hashtags based on picked interests */}
+                {/* Suggested Hashtags based on picked interests */}
                 {suggestedHashtags.length > 0 && (
                   <div className="flex items-center gap-1.5 flex-wrap mt-2">
-                    <span className="text-[10px] font-bold text-[#78716C] uppercase tracking-wider">
+                    <span className="text-[10px] font-bold text-[var(--text-secondary)] uppercase tracking-wider">
                       {t('interests.suggestedHashtags')}:
                     </span>
                     {suggestedHashtags.slice(0, 6).map((tag) => (
@@ -2038,7 +2974,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                             prev.includes(tag) ? prev : `${prev.trim() ? `${prev.trim()} ` : ''}${tag} `
                           );
                         }}
-                        className="px-2 py-0.5 rounded-lg bg-[#FAF7F2] hover:bg-blue-50 text-[#2563EB] border border-[#EFECE6] text-[11px] font-bold transition cursor-pointer"
+                        className="px-2 py-0.5 rounded-lg bg-[var(--bg-subtle)] hover:opacity-90 text-[var(--accent-primary)] border border-[var(--border-hairline)] text-[11px] font-bold transition cursor-pointer"
                       >
                         {tag}
                       </button>
@@ -2047,25 +2983,15 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 )}
 
                 {inlineMediaPreview && (
-                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[#EFECE6] bg-[#0C0A09] flex items-center justify-center">
+                  <div className="relative rounded-2xl overflow-hidden my-3 border border-[var(--border-hairline)] bg-[#0C0A09] flex items-center justify-center">
                     {inlineMediaType === 'video' ? (
                       <video src={inlineMediaPreview} controls className="relative z-10 w-full h-auto max-h-72 object-contain" />
                     ) : (
-                      <>
-                        <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
-                          <img
-                            src={inlineMediaPreview}
-                            alt=""
-                            className="w-full h-full object-cover scale-110 blur-2xl opacity-60 brightness-50"
-                          />
-                          <div className="absolute inset-0 bg-black/30" />
-                        </div>
-                        <img
-                          src={inlineMediaPreview}
-                          alt="Preview"
-                          className="relative z-10 w-full h-auto max-h-72 object-contain"
-                        />
-                      </>
+                      <img
+                        src={inlineMediaPreview}
+                        alt="Preview"
+                        className="relative z-10 w-full h-auto max-h-72 object-contain"
+                      />
                     )}
                     <button
                       type="button"
@@ -2074,7 +3000,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         setInlineMediaPreview(null);
                         setInlineVideoNeedsTrim(false);
                       }}
-                      className="absolute top-2.5 right-2.5 min-w-[36px] min-h-[36px] p-2 rounded-full bg-stone-900/80 text-white hover:bg-stone-900 flex items-center justify-center transition"
+                      className="absolute top-2.5 right-2.5 min-w-[44px] min-h-[44px] p-2 rounded-full bg-stone-900/80 text-white hover:bg-stone-900 flex items-center justify-center transition"
                       title="Remove attachment"
                     >
                       <X size={16} />
@@ -2100,7 +3026,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                                   text: `Trimmed to first ${maxVideoSeconds} seconds — ready to upload!`,
                                 });
                               }}
-                              className="px-3 py-1 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white font-bold text-xs transition"
+                              className="px-3 py-1 rounded-xl bg-[var(--accent-primary)] text-white font-bold text-xs transition"
                             >
                               Trim to {maxVideoSeconds}s
                             </button>
@@ -2159,12 +3085,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 {isSubmittingPost && uploadProgress > 0 && (
                   <div className="my-3 p-3 rounded-2xl bg-blue-50/70 border border-blue-200/80">
                     <div className="flex items-center justify-between text-xs font-bold text-[#1C1917] mb-1.5">
-                      <span>Uploading to Cloudinary & publishing...</span>
-                      <span className="font-mono text-[#2563EB]">{uploadProgress}%</span>
+                      <span>Uploading & publishing...</span>
+                      <span className="font-mono text-[var(--accent-primary)]">{uploadProgress}%</span>
                     </div>
                     <div className="w-full h-2 rounded-full bg-blue-100 overflow-hidden">
                       <div
-                        className="h-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] transition-all duration-300"
+                        className="h-full bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-secondary)] transition-all duration-300"
                         style={{ width: `${uploadProgress}%` }}
                       />
                     </div>
@@ -2213,7 +3139,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   </div>
                 )}
 
-                <div className="flex items-center justify-between pt-3.5 mt-2.5 border-t border-[#EFECE6] flex-wrap gap-2.5">
+                <div className="flex items-center justify-between pt-3.5 mt-2.5 border-t border-[var(--border-hairline)] flex-wrap gap-2.5">
                   <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
                     <input
                       type="file"
@@ -2230,45 +3156,45 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       onChange={handleMediaSelect}
                     />
 
-                    {/* Big Photo Button */}
+                    {/* Photo Button */}
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
-                      className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-blue-50/90 hover:bg-blue-100 text-[#2563EB] border border-blue-200/90 text-xs sm:text-sm font-extrabold flex items-center gap-2 transition active:scale-95 cursor-pointer shadow-2xs"
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:opacity-90 text-[var(--accent-primary)] border border-[var(--border-hairline)] text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95 cursor-pointer"
                     >
-                      <ImageIcon size={18} className="text-[#2563EB]" />
+                      <ImageIcon size={17} />
                       <span>{language === 'sw' ? 'Picha' : 'Photo'}</span>
                     </button>
 
-                    {/* Big Video Button */}
+                    {/* Video Button */}
                     <button
                       type="button"
                       onClick={() => videoInputRef.current?.click()}
                       title={`Upload video up to ${maxVideoSeconds}s (${MAX_VIDEO_RAW_MB} MB max)`}
-                      className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-teal-50/90 hover:bg-teal-100 text-[#0D9488] border border-teal-200/90 text-xs sm:text-sm font-extrabold flex items-center gap-2 transition active:scale-95 cursor-pointer shadow-2xs"
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:opacity-90 text-[var(--accent-secondary)] border border-[var(--border-hairline)] text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95 cursor-pointer"
                     >
-                      <VideoIcon size={18} className="text-[#0D9488]" />
+                      <VideoIcon size={17} />
                       <span>{language === 'sw' ? 'Video' : 'Video'}</span>
                     </button>
 
-                    {/* Big Feeling Button */}
+                    {/* Feeling Button */}
                     <button
                       type="button"
                       onClick={() => setIsFeelingPickerOpen(true)}
-                      className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-amber-50/90 hover:bg-amber-100 text-[#D97706] border border-amber-200/90 text-xs sm:text-sm font-extrabold flex items-center gap-2 transition active:scale-95 cursor-pointer shadow-2xs"
+                      className="min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] hover:opacity-90 text-[#D97706] border border-[var(--border-hairline)] text-xs font-extrabold flex items-center gap-1.5 transition active:scale-95 cursor-pointer"
                     >
-                      <Smile size={18} className="text-[#D97706]" />
+                      <Smile size={17} />
                       <span>{language === 'sw' ? 'Hisia' : 'Feeling'}</span>
                     </button>
 
                     {/* Audience Selector */}
-                    <div className="min-h-[46px] px-3 py-1.5 rounded-2xl bg-stone-50/90 border border-stone-200/90 text-[#44403C] text-xs font-extrabold flex items-center gap-1.5 shadow-2xs">
+                    <div className="min-h-[44px] px-3 py-1.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-extrabold flex items-center gap-1.5">
                       {postAudience === 'public' ? (
-                        <Globe size={15} className="text-[#2563EB] shrink-0" />
+                        <Globe size={14} className="text-[var(--accent-primary)] shrink-0" />
                       ) : postAudience === 'followers' ? (
-                        <Users size={15} className="text-[#0D9488] shrink-0" />
+                        <Users size={14} className="text-[var(--accent-secondary)] shrink-0" />
                       ) : (
-                        <Lock size={15} className="text-amber-600 shrink-0" />
+                        <Lock size={14} className="text-amber-600 shrink-0" />
                       )}
                       <select
                         aria-label="Post audience"
@@ -2276,7 +3202,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         onChange={(e) =>
                           setPostAudience(e.target.value as 'public' | 'followers' | 'close_friends')
                         }
-                        className="bg-transparent text-xs font-extrabold text-[#1C1917] focus:outline-none cursor-pointer pr-1"
+                        className="bg-transparent text-xs font-extrabold text-[var(--text-primary)] focus:outline-none cursor-pointer pr-1"
                       >
                         <option value="public">{language === 'sw' ? 'Kila mtu' : 'Public'}</option>
                         <option value="followers">{language === 'sw' ? 'Wafuasi tu' : 'Followers'}</option>
@@ -2285,18 +3211,17 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     </div>
                   </div>
 
-                  {/* ONE MAIN BUTTON ON SCREEN */}
                   <button
                     type="button"
                     onClick={handleCreatePost}
                     disabled={isSubmittingPost || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)}
-                    className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-md shadow-blue-500/20 active:scale-95 transition cursor-pointer"
+                    className="min-h-[44px] px-5 py-2.5 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 disabled:opacity-40 disabled:pointer-events-none text-white font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-sm active:scale-95 transition cursor-pointer"
                   >
                     {isSubmittingPost ? (
                       <span>{t('feed.sharing')}</span>
                     ) : (
                       <>
-                        <Send size={16} />
+                        <Send size={15} />
                         <span>{language === 'sw' ? 'Chapisha' : 'Post Wave'}</span>
                       </>
                     )}
@@ -2312,20 +3237,20 @@ export const FeedView: React.FC<FeedViewProps> = ({
               role="dialog"
               aria-modal="true"
               aria-label="How are you feeling?"
-              className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/50 backdrop-blur-xs animate-in fade-in"
+              className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/50 animate-in fade-in"
             >
-              <div className="w-full max-w-sm bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-3xl p-5 shadow-2xl relative space-y-4">
-                <div className="flex items-center justify-between pb-3 border-b border-stone-100 dark:border-stone-800">
+              <div className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-2xl relative space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-[var(--border-hairline)]">
                   <div className="flex items-center gap-2">
                     <Smile size={20} className="text-[#D97706]" />
-                    <h3 className="font-extrabold text-base text-stone-900 dark:text-stone-100">
+                    <h3 className="font-extrabold text-base text-[var(--text-primary)]">
                       {language === 'sw' ? 'Unajisikiaje sasa hivi?' : 'How are you feeling?'}
                     </h3>
                   </div>
                   <button
                     type="button"
                     onClick={() => setIsFeelingPickerOpen(false)}
-                    className="p-1 rounded-lg text-stone-400 hover:text-stone-700 cursor-pointer"
+                    className="p-1 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
                   >
                     <X size={18} />
                   </button>
@@ -2340,10 +3265,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         setSelectedFeeling(f);
                         setIsFeelingPickerOpen(false);
                       }}
-                      className="min-h-[48px] p-3 rounded-2xl bg-stone-50 hover:bg-amber-50 dark:bg-stone-800 dark:hover:bg-amber-950/40 border border-stone-200/80 dark:border-stone-700 text-left flex items-center gap-2.5 transition active:scale-95 cursor-pointer"
+                      className="min-h-[48px] p-3 rounded-2xl bg-[var(--bg-subtle)] hover:opacity-90 border border-[var(--border-hairline)] text-left flex items-center gap-2.5 transition active:scale-95 cursor-pointer"
                     >
                       <span className="text-2xl">{f.emoji}</span>
-                      <span className="text-xs font-bold text-stone-800 dark:text-stone-200">
+                      <span className="text-xs font-bold text-[var(--text-primary)]">
                         {language === 'sw' ? f.labelSw : f.labelEn}
                       </span>
                     </button>
@@ -2353,67 +3278,28 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Feed Reading Progress Strip above Posts Stream */}
-          {!isLoading && combinedFeed.length > 0 && (
-            <div className="sticky top-2 md:top-18 z-10 bg-[var(--bg-surface)]/95 backdrop-blur-md border border-[var(--border-hairline)] rounded-2xl px-4 py-2.5 shadow-2xs transition-all">
-              <div className="flex items-center justify-between gap-3 text-xs">
-                <div className="flex items-center gap-2 min-w-0">
-                  <Eye size={14} className="text-[#0D9488] shrink-0" />
-                  <span className="font-bold text-[#1C1917] truncate">
-                    {feedReadProgress >= 95
-                      ? 'All caught up on this feed!'
-                      : `Reading progress • ${Math.max(1, consumedPostsCount)} of ${combinedFeed.length} waves`}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2.5 shrink-0">
-                  <span className="font-mono font-bold text-[11px] text-[#2563EB] tabular-nums">
-                    {feedReadProgress}%
-                  </span>
-                  {feedReadProgress > 20 && (
-                    <button
-                      type="button"
-                      onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
-                      className="text-[11px] font-semibold text-[#78716C] hover:text-[#1C1917] underline cursor-pointer"
-                    >
-                      Top ↑
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className="w-full h-1.5 bg-[#FAF7F2] rounded-full overflow-hidden mt-1.5 border border-[#EFECE6]">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-[#2563EB] to-[#0D9488] transition-all duration-200 ease-out"
-                  style={{
-                    width: `${Math.max(
-                      feedReadProgress,
-                      combinedFeed.length > 0
-                        ? Math.round((Math.max(1, consumedPostsCount) / combinedFeed.length) * 100)
-                        : 0
-                    )}%`
-                  }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Posts Stream: Show active/failed uploading video post cards at the top of the feed */}
+          {/* Full Posts Feed Below the Masonry Grid (10 posts at a time with infinite scroll) */}
           <div className="space-y-5">
-            {/* Friendly Quota Exceeded Notice (Graceful cached offline mode) */}
+            {/* Friendly Quota Exceeded Notice */}
             <QuotaExceededBanner onRetry={() => loadInitialPosts(true)} />
 
-            {/* Quick Refresh bar */}
+            {/* Full Feed Section Header & Quick Refresh button */}
             <div className="flex items-center justify-between pb-1 px-1">
-              <span className="text-xs font-bold text-stone-600">
-                {language === 'sw' ? 'Machapisho ya Hivi Karibuni' : 'Recent Waves'}
+              <span className="text-sm font-extrabold text-[var(--text-primary)]">
+                {language === 'sw' ? 'Mlisho Kamili wa Machapisho' : 'Latest Full Posts'}
               </span>
               <button
                 type="button"
-                onClick={() => loadInitialPosts(true)}
+                onClick={() => {
+                  void loadInitialPosts(true);
+                  void loadInitialGridPosts();
+                  void loadTrendingCreatorPost();
+                }}
                 disabled={isRefreshing || isLoading}
-                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition active:scale-95 cursor-pointer disabled:opacity-50"
+                className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-bold transition active:scale-95 cursor-pointer disabled:opacity-50"
                 title={language === 'sw' ? 'Onyesha upya mlisho' : 'Refresh feed'}
               >
-                <RefreshCw size={12} className={isRefreshing ? 'animate-spin text-teal-600' : ''} />
+                <RefreshCw size={12} className={isRefreshing ? 'animate-spin text-[var(--accent-secondary)]' : ''} />
                 <span>
                   {isRefreshing
                     ? language === 'sw'
@@ -2430,25 +3316,29 @@ export const FeedView: React.FC<FeedViewProps> = ({
             {isLoading ? (
               <PostSkeleton count={4} />
             ) : combinedFeed.length === 0 && activeOrFailedVideoJobs.length === 0 ? (
-              <div className="text-center py-16 px-6 bg-white border border-slate-200/90 rounded-3xl shadow-xs">
-                <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[#3B82F6] to-[#10B981] text-white mx-auto flex items-center justify-center mb-4 shadow-md shadow-blue-500/20">
+              <div className="wavelink-glass-post-card text-center py-14 px-6 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-xs">
+                <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[var(--accent-primary)] to-[var(--accent-secondary)] text-white mx-auto flex items-center justify-center mb-4 shadow-md">
                   <Waves size={32} />
                 </div>
-                <h3 className="text-xl font-extrabold text-[#0F172A] mb-1">
-                  Feed Is Clear & Ready!
-                </h3>
-                <p className="text-xs sm:text-sm text-slate-500 max-w-sm mx-auto mb-6 leading-relaxed">
-                  WaveLink operates with strict zero mock data. Share a photo or video above or open the Media Studio to post the first wave!
+                <p className="text-base font-extrabold text-[var(--text-primary)] max-w-sm mx-auto mb-5 leading-snug">
+                  {language === 'sw'
+                    ? 'Hakuna kitu hapa bado, kuwa wa kwanza kuchapisha'
+                    : 'Nothing here yet, be the first to post'}
                 </p>
-                {onNavigateTab && (
-                  <button
-                    onClick={() => onNavigateTab('studio')}
-                    className="px-6 py-3 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-bold text-xs sm:text-sm shadow-sm shadow-blue-500/20 active:scale-95 transition inline-flex items-center gap-2"
-                  >
-                    <Wand2 size={16} />
-                    <span>Open Media Studio</span>
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onNavigateTab) {
+                      onNavigateTab('studio');
+                    } else {
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                  className="min-h-[48px] px-7 py-3 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white font-extrabold text-base shadow-md active:scale-95 transition inline-flex items-center gap-2 cursor-pointer"
+                >
+                  <Wand2 size={18} />
+                  <span>{language === 'sw' ? '+ Chapisha Sasa' : '+ Create Post'}</span>
+                </button>
               </div>
             ) : (
               combinedFeed.map((post) => {

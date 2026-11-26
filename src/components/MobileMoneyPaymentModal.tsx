@@ -12,6 +12,7 @@ import {
 } from '../services/paymentService';
 import { submitPaymentRequest } from '../services/verificationService';
 import { formatLocalPrice, useAfricanRegion } from '../utils/africanCultureConfig';
+import { sanitizeUserFacingError } from '../utils/safetyFilters';
 import { useBottomSheetLock } from '../utils/sheetLock';
 import {
   X,
@@ -173,7 +174,12 @@ export const MobileMoneyPaymentModal: React.FC<MobileMoneyPaymentModalProps> = (
         }, 2200);
       }
     } catch (err: any) {
-      setError(err.message || 'Could not complete payment request. Please try again.');
+      setError(
+        sanitizeUserFacingError(
+          err,
+          'Could not finish your payment right now. Check your phone and tap Try again.'
+        )
+      );
     } finally {
       setIsSubmitting(false);
     }

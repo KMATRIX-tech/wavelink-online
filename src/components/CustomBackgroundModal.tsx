@@ -695,10 +695,10 @@ export const CustomBackgroundModal: React.FC<CustomBackgroundModalProps> = ({
                 type="button"
                 disabled={isSaving}
                 onClick={handleSave}
-                className="min-h-[44px] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+                className="min-h-[2.75rem] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer shrink-0"
               >
                 <RotateCcw size={13} />
-                <span>{language === 'sw' ? 'Jaribu Tena' : 'Retry'}</span>
+                <span>{language === 'sw' ? 'Jaribu tena' : 'Try again'}</span>
               </button>
             </div>
           )}

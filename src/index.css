@@ -515,7 +515,7 @@ html[data-bottom-sheet-open="true"] .wavelink-floating-upload-chip {
   transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease !important;
 }
 
-@media (max-width: 1023px) {
+@media (max-width: 767px) {
   html[data-bottom-sheet-open="true"] .wavelink-mobile-bottom-nav {
     transform: translate3d(0, 7rem, 0) !important;
     opacity: 0 !important;
@@ -2031,8 +2031,8 @@ html[data-keyboard-open="true"] .wavelink-chat-input-bar {
   }
 
   .wavelink-incoming-call-reply-btn {
-    min-height: 40px;
-    padding: 0.45rem 0.9rem;
+    min-height: 2.75rem;
+    padding: 0.5rem 0.95rem;
     border-radius: 9999px;
     background: rgba(255, 255, 255, 0.12);
     border: 1px solid rgba(255, 255, 255, 0.22);
@@ -3794,11 +3794,21 @@ html[data-battery-saver="true"] .wavelink-presence-pulse {
       inset 0 1px 0 0 rgba(255, 255, 255, 0.14);
   }
 
+  .wavelink-mobile-conversation-screen .wavelink-mobile-convo-call-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.1875rem;
+    border-radius: 9999px;
+    background: color-mix(in srgb, var(--bg-subtle) 92%, var(--bg-surface));
+    border: 1px solid var(--border-hairline);
+  }
+
   .wavelink-mobile-conversation-screen .wavelink-mobile-convo-header-btn {
-    width: 42px;
-    height: 42px;
-    min-width: 42px;
-    min-height: 42px;
+    width: 2.75rem;
+    height: 2.75rem;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
     border-radius: 9999px;
     display: inline-flex;
     align-items: center;
@@ -4554,9 +4564,18 @@ html[data-has-theme-mix="true"][data-chat-bubble-style="glass"] .wavelink-convo-
   html[data-has-theme-mix="true"][data-nav-style="bordered"] .wavelink-mobile-bottom-nav nav {
     border-top: 2px solid var(--accent-primary) !important;
   }
+
+  /* Eliminate glitchy stacked blur effects on mobile in Settings & Security Center */
+  .wavelink-profile-shell,
+  .wavelink-profile-shell *,
+  .wavelink-security-center-panel,
+  .wavelink-security-center-panel * {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
 }
 
-/* Desktop-only (>= 1024px) Mix Your Own Theme styles */
+/* Desktop-only (>= 1024px) Mix Your Own Theme & Keyboard Focus styles */
 @media (min-width: 1024px) {
   html[data-has-theme-mix="true"][data-nav-style="solid"] .wavelink-desktop-sidebar > div {
     background: var(--bg-surface) !important;
@@ -4572,7 +4591,232 @@ html[data-has-theme-mix="true"][data-chat-bubble-style="glass"] .wavelink-convo-
   html[data-has-theme-mix="true"][data-nav-style="bordered"] .wavelink-desktop-sidebar > div {
     border: 2px solid color-mix(in srgb, var(--accent-primary) 50%, var(--border-hairline)) !important;
   }
+
+  /* Clear keyboard focus rings & hover elevation on desktop */
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  [role="button"]:focus-visible,
+  [role="tab"]:focus-visible {
+    outline: 2px solid var(--accent-primary) !important;
+    outline-offset: 2px !important;
+  }
 }
 
+/* Mobile (< 768px): 16px readable text minimum, generous card radius, and NEVER stack multiple blur layers */
+@media (max-width: 767px) {
+  html,
+  body {
+    font-size: 16px !important;
+    overflow-x: hidden !important;
+    max-width: 100vw !important;
+  }
 
+  .wavelink-glass-post-card p,
+  .wavelink-convo-bubble-text,
+  input,
+  textarea,
+  select {
+    font-size: 1rem !important;
+  }
+
+  /* Never stack multiple blur layers inside cards, modals, or bottom sheets on mobile */
+  .wavelink-glass-post-card *,
+  [role="dialog"] > div *,
+  .wavelink-comments-sheet * {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
+/* Low-Effects Mode (auto-enabled on slow phones or toggled manually): turns off all blur & animations */
+html[data-low-effects="true"] *,
+html[data-lite-mode="true"] *,
+html[data-battery-saver="true"] * {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+html[data-low-effects="true"] .wavelink-app-shell,
+html[data-lite-mode="true"] .wavelink-app-shell {
+  animation: none !important;
+}
+
+/* ============================================================================
+   WAVELINK HOME FEED REDESIGN — VIVID SINGLE-LAYER BACKDROP & MASONRY GRID
+   Mobile styles strictly inside @media (max-width: 767px)
+   Desktop styles strictly inside @media (min-width: 1024px)
+   ============================================================================ */
+
+/* Single fixed gradient layer behind the Home Feed using active theme variables
+   (purple, pink and warm orange blended with active theme accents by default) */
+.wavelink-feed-vivid-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    radial-gradient(
+      circle at 12% 10%,
+      color-mix(in srgb, var(--accent-primary) 24%, rgba(168, 85, 247, 0.28)) 0%,
+      transparent 52%
+    ),
+    radial-gradient(
+      circle at 88% 16%,
+      color-mix(in srgb, var(--accent-secondary) 22%, rgba(236, 72, 153, 0.26)) 0%,
+      transparent 50%
+    ),
+    radial-gradient(
+      circle at 50% 82%,
+      color-mix(in srgb, var(--accent-highlight) 24%, rgba(249, 115, 22, 0.24)) 0%,
+      transparent 58%
+    ),
+    linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--bg-canvas) 84%, #A855F7 16%) 0%,
+      color-mix(in srgb, var(--bg-canvas) 86%, #EC4899 14%) 48%,
+      color-mix(in srgb, var(--bg-canvas) 86%, #F97316 14%) 100%
+    );
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* When user has uploaded a custom Pro background image, let their background shine through */
+html[data-has-custom-bg="true"] .wavelink-feed-vivid-bg {
+  opacity: 0.22;
+}
+
+/* Base Masonry Grid fallback for tablet (768px - 1023px) */
+.wavelink-masonry-grid {
+  column-count: 2;
+  column-gap: 0.75rem;
+  width: 100%;
+}
+
+.wavelink-masonry-card {
+  break-inside: avoid;
+  margin-bottom: 0.75rem;
+  width: 100%;
+  display: inline-block;
+}
+
+.wavelink-masonry-card--tall {
+  height: 15.5rem;
+}
+
+.wavelink-masonry-card--medium {
+  height: 12.25rem;
+}
+
+/* MOBILE FEED LAYOUT (strictly inside @media (max-width: 767px)) */
+@media (max-width: 767px) {
+  .wavelink-feed-container {
+    width: 100%;
+    max-width: 100vw;
+    overflow-x: hidden;
+    padding-bottom: calc(5.75rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .wavelink-feed-column {
+    width: 100%;
+    max-width: 100%;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.875rem;
+  }
+
+  .wavelink-feed-search-pill {
+    background: var(--bg-surface);
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  /* Two-column masonry grid of rounded cards with different heights on mobile */
+  .wavelink-masonry-grid {
+    column-count: 2;
+    column-gap: 0.65rem;
+  }
+
+  .wavelink-masonry-card {
+    margin-bottom: 0.65rem;
+    border-radius: 1.35rem;
+  }
+
+  .wavelink-masonry-card--tall {
+    height: 14.5rem;
+  }
+
+  .wavelink-masonry-card--medium {
+    height: 11.25rem;
+  }
+
+  /* Ensure no stacked blur layers inside mobile feed cards */
+  .wavelink-trending-creator-card *,
+  .wavelink-masonry-card * {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
+/* DESKTOP FEED LAYOUT (strictly inside @media (min-width: 1024px)) */
+@media (min-width: 1024px) {
+  .wavelink-feed-column {
+    width: 100%;
+    max-width: 42.5rem; /* 680px centered column */
+    margin-left: auto;
+    margin-right: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  /* Three-column masonry grid in the center column on desktop */
+  .wavelink-masonry-grid {
+    column-count: 3;
+    column-gap: 0.875rem;
+  }
+
+  .wavelink-masonry-card {
+    margin-bottom: 0.875rem;
+    border-radius: 1.5rem;
+  }
+
+  .wavelink-masonry-card--tall {
+    height: 16.5rem;
+  }
+
+  .wavelink-masonry-card--medium {
+    height: 13rem;
+  }
+
+  .wavelink-masonry-card:hover,
+  .wavelink-trending-creator-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 18px 34px -12px rgba(15, 23, 42, 0.22);
+  }
+
+  .wavelink-masonry-card:focus-visible,
+  .wavelink-trending-creator-card:focus-visible {
+    outline: 2px solid var(--accent-primary) !important;
+    outline-offset: 2px !important;
+  }
+}
+
+/* Respect prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  .wavelink-trending-creator-card,
+  .wavelink-trending-creator-card img,
+  .wavelink-masonry-card,
+  .wavelink-masonry-card img,
+  .wavelink-mobile-bottom-nav nav,
+  .wavelink-mobile-bottom-nav button {
+    transition: none !important;
+    animation: none !important;
+    transform: none !important;
+  }
+}
 

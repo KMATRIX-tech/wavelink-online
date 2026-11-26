@@ -6,7 +6,14 @@ import {
   deleteDoc,
   serverTimestamp
 } from 'firebase/firestore';
-import { db, cleanFirestoreData, handleFirestoreError, OperationType, ADMIN_EMAIL } from '../firebase';
+import {
+  db,
+  cleanFirestoreData,
+  handleFirestoreError,
+  OperationType,
+  ADMIN_EMAIL,
+  getAuthHeaders
+} from '../firebase';
 import { PendingVerification, PaymentRequest, SystemDomain } from '../types';
 import { sendNotification } from './notificationService';
 
@@ -52,9 +59,8 @@ export async function submitManualVerification(
     await setDoc(doc(db, 'pending_verifications', id), cleanFirestoreData(record));
 
     // Also notify platform owner / admin about this pending transaction
-    // Send a system alert notification
     sendNotification({
-      recipientId: 'keylan_admin', // generic admin identifier or will be picked up by admin query
+      recipientId: 'keylan_admin',
       actorId: params.userId,
       actorName: params.userName,
       actorAvatar: params.userPhotoURL,
@@ -63,9 +69,7 @@ export async function submitManualVerification(
       body: `${params.userName} submitted ${params.carrier.toUpperCase()} Txn: ${params.transactionId} (TZS ${params.amountTZS.toLocaleString()})`,
       entityId: id,
       actionUrl: 'admin'
-    }).catch(() => {
-      // Notification is non-blocking
-    });
+    }).catch(() => {});
 
     return record;
   } catch (err) {
@@ -75,41 +79,38 @@ export async function submitManualVerification(
 }
 
 /**
- * Admin approves a pending verification:
- * 1. Marks verification as approved
- * 2. Sets user.isPro = true, awards Verified Blue Star badge, sets expiry
- * 3. Sends notification to the user
+ * Admin approves a pending verification via Server Function
+ * (Pro status and roles can ONLY be changed by a server function)
  */
 export async function approveVerification(
   verification: PendingVerification,
   approvedByEmail: string
 ): Promise<void> {
   const now = new Date();
-  let daysToAdd = 30;
-  if (verification.tierId === 'weekly') daysToAdd = 7;
-  if (verification.tierId === 'annual') daysToAdd = 365;
-
-  const expiresAt = new Date(now.getTime() + daysToAdd * 24 * 60 * 60 * 1000).toISOString();
-
   try {
     // 1. Mark verification document as approved
     await updateDoc(doc(db, 'pending_verifications', verification.id), {
       status: 'approved',
       approvedAt: now.toISOString(),
       approvedBy: approvedByEmail
-    });
+    }).catch(() => {});
 
-    // 2. Set user.isPro = true and grant full perks
-    await updateDoc(doc(db, 'users', verification.userId), {
-      isPro: true,
-      hasBlueStar: true,
-      proPlan: verification.tierId,
-      proExpiresAt: expiresAt,
-      proBadge: 'verified',
-      proBorderEffect: 'neon-pulse',
-      proAccentColor: 'purple',
-      updatedAt: now.toISOString()
+    // 2. Call server function to set user.isPro = true and grant full perks via Admin SDK
+    const headers = await getAuthHeaders();
+    const resp = await fetch('/api/admin/approve-verification', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        requestId: verification.id,
+        userId: verification.userId,
+        planType: verification.tierId || 'monthly',
+        collectionName: 'pending_verifications'
+      })
     });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.error || 'Server could not approve Pro verification.');
+    }
 
     // 3. Dispatch celebration notification to the user
     sendNotification({
@@ -172,7 +173,6 @@ export interface SubmitPaymentRequestParams {
 
 /**
  * Submit manual payment notification into 'payment_requests' collection
- * Exactly storing { userId, userPhone, plan, transactionId, status: 'pending', timestamp: serverTimestamp() }
  */
 export async function submitPaymentRequest(
   params: SubmitPaymentRequestParams
@@ -199,7 +199,6 @@ export async function submitPaymentRequest(
   try {
     await setDoc(doc(db, 'payment_requests', id), cleanFirestoreData(record));
 
-    // Notify admin
     sendNotification({
       recipientId: 'keylan_admin',
       actorId: params.userId,
@@ -220,37 +219,38 @@ export async function submitPaymentRequest(
 }
 
 /**
- * Admin 1-Click Approve for PaymentRequest:
- * 1. Sets status: 'approved' in payment_requests
- * 2. Updates user.isPro = true, removes ads, sets Verified Pro badge
+ * Admin 1-Click Approve for PaymentRequest via Server Function
+ * (Pro status and roles can ONLY be changed by a server function)
  */
 export async function approvePaymentRequest(
   request: PaymentRequest,
   approvedByEmail: string
 ): Promise<void> {
   const now = new Date();
-  const daysToAdd = request.plan === 'harvest' ? 365 : 30;
-  const expiresAt = new Date(now.getTime() + daysToAdd * 24 * 60 * 60 * 1000).toISOString();
-
   try {
     // 1. Mark request as approved
     await updateDoc(doc(db, 'payment_requests', request.id), {
       status: 'approved',
       approvedAt: now.toISOString(),
       approvedBy: approvedByEmail
-    });
+    }).catch(() => {});
 
-    // 2. Set user.isPro = true and grant full perks
-    await updateDoc(doc(db, 'users', request.userId), {
-      isPro: true,
-      hasBlueStar: true,
-      proPlan: request.plan === 'harvest' ? 'annual' : 'monthly',
-      proExpiresAt: expiresAt,
-      proBadge: 'verified',
-      proBorderEffect: 'neon-pulse',
-      proAccentColor: 'emerald',
-      updatedAt: now.toISOString()
+    // 2. Call server function to set user.isPro = true and grant full perks via Admin SDK
+    const headers = await getAuthHeaders();
+    const resp = await fetch('/api/admin/approve-verification', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        requestId: request.id,
+        userId: request.userId,
+        planType: request.plan === 'harvest' ? 'annual' : 'monthly',
+        collectionName: 'payment_requests'
+      })
     });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.error || 'Server could not approve Pro payment request.');
+    }
 
     // 3. Dispatch celebration notification to the user
     sendNotification({

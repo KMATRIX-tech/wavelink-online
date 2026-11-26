@@ -1,7 +1,7 @@
 /* eslint-disable no-undef */
 // Unified WaveLink Progressive Web App + Firebase Cloud Messaging Service Worker
 
-const CACHE_NAME = 'wavelink-pwa-v5';
+const CACHE_NAME = 'wavelink-pwa-v6';
 const ASSETS_TO_CACHE = [
   '/',
   '/index.html',

@@ -14,6 +14,7 @@ import {
 import { useAuth } from './AuthContext';
 import { useDataSaver } from '../services/dataSaverService';
 import { computeEffectiveTextMode } from '../utils/mediaStorage';
+import { sanitizeUserFacingError } from '../utils/safetyFilters';
 
 export const THEME_MIX_ACCENT_PRESETS: Array<{ hex: string; label: string }> = [
   { hex: '#2563EB', label: 'Ocean Blue' },
@@ -477,6 +478,7 @@ interface ThemeContextType {
   setBatterySaver: (enabled: boolean) => void;
   toggleBatterySaver: () => void;
   isLiteMode: boolean;
+  isAutoLowEffectsDetected: boolean;
   setLiteMode: (enabled: boolean) => void;
   toggleLiteMode: () => void;
   // Custom app background (Pro only)
@@ -513,6 +515,32 @@ interface ThemeContextType {
   dismissSharedThemeMixCandidate: () => void;
 }
 
+export function detectSlowPhoneForLowEffects(): boolean {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
+  try {
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      return true;
+    }
+    const nav = navigator as any;
+    if (typeof nav.deviceMemory === 'number' && nav.deviceMemory <= 2) {
+      return true;
+    }
+    if (typeof nav.hardwareConcurrency === 'number' && nav.hardwareConcurrency > 0 && nav.hardwareConcurrency <= 4) {
+      return true;
+    }
+    const conn = nav.connection || nav.mozConnection || nav.webkitConnection;
+    if (conn) {
+      if (conn.saveData === true) return true;
+      if (typeof conn.effectiveType === 'string' && ['slow-2g', '2g'].includes(conn.effectiveType)) {
+        return true;
+      }
+    }
+  } catch {
+    // ignore hardware inspection errors
+  }
+  return false;
+}
+
 const ThemeContext = createContext<ThemeContextType>({
   theme: 'light',
   appearanceTheme: 'ocean',
@@ -531,6 +559,7 @@ const ThemeContext = createContext<ThemeContextType>({
   setBatterySaver: () => {},
   toggleBatterySaver: () => {},
   isLiteMode: false,
+  isAutoLowEffectsDetected: false,
   setLiteMode: () => {},
   toggleLiteMode: () => {},
   customBackground: null,
@@ -654,12 +683,20 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     savedAt: number;
   } | null>(null);
 
+  const [isAutoLowEffectsDetected] = useState<boolean>(() => detectSlowPhoneForLowEffects());
+
   const [isBatterySaver, setIsBatterySaverState] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
-      return (
-        localStorage.getItem('wavelink_lite_mode') === 'true' ||
-        localStorage.getItem('wavelink_battery_saver') === 'true'
-      );
+      const manualOverride = localStorage.getItem('wavelink_lite_mode_manual');
+      if (manualOverride === 'true' || manualOverride === 'false') {
+        return manualOverride === 'true';
+      }
+      const savedLite = localStorage.getItem('wavelink_lite_mode');
+      const savedBattery = localStorage.getItem('wavelink_battery_saver');
+      if (savedLite === 'true' || savedBattery === 'true') {
+        return true;
+      }
+      return detectSlowPhoneForLowEffects();
     }
     return false;
   });
@@ -893,12 +930,18 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     if (isBatterySaver) {
       root.setAttribute('data-battery-saver', 'true');
       root.setAttribute('data-lite-mode', 'true');
+      root.setAttribute('data-low-effects', 'true');
     } else {
       root.removeAttribute('data-battery-saver');
       root.removeAttribute('data-lite-mode');
+      root.removeAttribute('data-low-effects');
     }
-    localStorage.setItem('wavelink_battery_saver', isBatterySaver ? 'true' : 'false');
-    localStorage.setItem('wavelink_lite_mode', isBatterySaver ? 'true' : 'false');
+    try {
+      localStorage.setItem('wavelink_battery_saver', isBatterySaver ? 'true' : 'false');
+      localStorage.setItem('wavelink_lite_mode', isBatterySaver ? 'true' : 'false');
+    } catch {
+      // ignore storage errors
+    }
   }, [isBatterySaver]);
 
   const setAppearanceTheme = useCallback((nextTheme: AppearanceTheme) => {
@@ -953,16 +996,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
         return { success: true };
       } catch (err: any) {
-        const rawMsg =
-          err instanceof Error
-            ? err.message
-            : typeof err?.code === 'string'
-            ? err.code
-            : 'Failed to save theme to your profile.';
-        const friendlyMsg =
-          rawMsg.toLowerCase().includes('permission')
-            ? `Theme save blocked (${rawMsg}). Check Firestore rules for users/${currentUser.uid} and tap Retry.`
-            : `Could not save theme (${rawMsg}). Tap Retry to sync to your account.`;
+        const friendlyMsg = sanitizeUserFacingError(
+          err,
+          'Could not save your theme right now. Check your internet and tap Try again.'
+        );
         console.error('[WaveLink Theme] Failed to save appearanceTheme to Firestore:', err);
         if (pendingSaveRef.current && pendingSaveRef.current.theme === normalized) {
           pendingSaveRef.current.inFlight = false;
@@ -1000,10 +1037,23 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const setBatterySaver = (enabled: boolean) => {
     setIsBatterySaverState(enabled);
+    try {
+      localStorage.setItem('wavelink_lite_mode_manual', enabled ? 'true' : 'false');
+    } catch {
+      // ignore
+    }
   };
 
   const toggleBatterySaver = () => {
-    setIsBatterySaverState((prev) => !prev);
+    setIsBatterySaverState((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('wavelink_lite_mode_manual', next ? 'true' : 'false');
+      } catch {
+        // ignore
+      }
+      return next;
+    });
   };
 
   const saveCustomBackground = useCallback(
@@ -1076,8 +1126,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
         return { success: true };
       } catch (err: any) {
-        const msg =
-          err instanceof Error ? err.message : 'Could not save custom background to your profile.';
+        const msg = sanitizeUserFacingError(
+          err,
+          'Could not save your custom background. Check your internet and tap Try again.'
+        );
         if (pendingCustomBgSaveRef.current?.updatedAt === nowIso) {
           pendingCustomBgSaveRef.current = null;
         }
@@ -1138,7 +1190,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
       return { success: true };
     } catch (err: any) {
-      const msg = err instanceof Error ? err.message : 'Could not remove custom background.';
+      const msg = sanitizeUserFacingError(
+        err,
+        'Could not remove your custom background. Check your internet and tap Try again.'
+      );
       if (pendingCustomBgSaveRef.current?.updatedAt === nowIso) {
         pendingCustomBgSaveRef.current = null;
       }
@@ -1207,7 +1262,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
         return { success: true };
       } catch (err: any) {
-        const msg = err instanceof Error ? err.message : 'Failed to save custom theme mix.';
+        const msg = sanitizeUserFacingError(
+          err,
+          'Could not save your custom theme. Check your internet and tap Try again.'
+        );
         setThemeSaveError(msg);
         return { success: false, error: msg };
       } finally {
@@ -1242,7 +1300,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
       return { success: true };
     } catch (err: any) {
-      const msg = err instanceof Error ? err.message : 'Failed to reset custom theme mix.';
+      const msg = sanitizeUserFacingError(
+        err,
+        'Could not reset your theme. Check your internet and tap Try again.'
+      );
       return { success: false, error: msg };
     } finally {
       setIsSavingThemeMix(false);
@@ -1304,7 +1365,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
         return { success: true };
       } catch (err: any) {
-        const msg = err instanceof Error ? err.message : 'Failed to save new theme preset.';
+        const msg = sanitizeUserFacingError(
+          err,
+          'Could not save your theme preset. Check your internet and tap Try again.'
+        );
         return { success: false, error: msg };
       } finally {
         setIsSavingThemeMix(false);
@@ -1336,7 +1400,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
         return { success: true };
       } catch (err: any) {
-        const msg = err instanceof Error ? err.message : 'Failed to delete saved theme.';
+        const msg = sanitizeUserFacingError(
+          err,
+          'Could not delete your saved theme. Check your internet and tap Try again.'
+        );
         return { success: false, error: msg };
       } finally {
         setIsSavingThemeMix(false);
@@ -1365,6 +1432,7 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setBatterySaver,
         toggleBatterySaver,
         isLiteMode: isBatterySaver,
+        isAutoLowEffectsDetected,
         setLiteMode: setBatterySaver,
         toggleLiteMode: toggleBatterySaver,
         customBackground,

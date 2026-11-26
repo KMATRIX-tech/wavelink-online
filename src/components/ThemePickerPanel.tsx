@@ -66,6 +66,7 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
     retrySaveTheme,
     clearThemeSaveError,
     isLiteMode,
+    isAutoLowEffectsDetected,
     toggleLiteMode,
     customBackground,
     customBackgroundHistory,
@@ -318,7 +319,7 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
         )}
       </div>
 
-      {/* Lite Mode Toggle in Settings > Appearance (Disables glass blur and animations for low-end Android phones) */}
+      {/* Low-Effects Mode Toggle in Settings > Appearance (Disables glass blur & animations, auto-on for slow phones) */}
       <div className="wavelink-glass-post-card rounded-3xl p-4 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
           <div className="w-10 h-10 rounded-2xl bg-teal-500/15 text-[#0D9488] flex items-center justify-center shrink-0">
@@ -326,19 +327,25 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs sm:text-sm font-extrabold text-[var(--text-primary)]">
-                {language === 'sw' ? 'Lite mode (Simu nyepesi)' : 'Lite mode'}
+              <span className="text-sm font-extrabold text-[var(--text-primary)]">
+                {language === 'sw' ? 'Athari ndogo' : 'Low-effects mode'}
               </span>
               {isLiteMode && (
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-[#0D9488] text-white">
-                  {language === 'sw' ? 'Imewashwa' : 'On'}
+                  {isAutoLowEffectsDetected
+                    ? language === 'sw'
+                      ? ' Otomatiki'
+                      : 'Auto-On'
+                    : language === 'sw'
+                    ? 'Imewashwa'
+                    : 'On'}
                 </span>
               )}
             </div>
             <p className="text-xs text-[var(--text-secondary)] mt-0.5">
               {language === 'sw'
-                ? 'Huzima blur ya kioo na miondoko ili kuokoa betri na kuongeza kasi kwenye simu za kawaida.'
-                : 'Disables glass blur and animations for faster scrolling on low-end phones.'}
+                ? 'Huzima blur na miondoko. Huwaka yenyewe kwenye simu za taratibu.'
+                : 'Turns off blur and animations. Switches on automatically on slow phones.'}
             </p>
           </div>
         </div>
@@ -347,18 +354,18 @@ export const ThemePickerPanel: React.FC<ThemePickerPanelProps> = ({
           type="button"
           role="switch"
           aria-checked={isLiteMode}
-          aria-label="Toggle Lite mode"
+          aria-label="Toggle Low-effects mode"
           onClick={() => {
             toggleLiteMode();
             const nextState = !isLiteMode;
             showGlobalToast?.(
               nextState
                 ? language === 'sw'
-                  ? 'Lite mode imewashwa ⚡'
-                  : 'Lite mode enabled — blur & animations turned off ⚡'
+                  ? 'Athari ndogo imewashwa ⚡'
+                  : 'Low-effects mode on ⚡'
                 : language === 'sw'
-                ? 'Lite mode imezimwa ✨'
-                : 'Lite mode disabled — glass blur & animations restored ✨'
+                ? 'Athari ndogo imezimwa ✨'
+                : 'Low-effects mode off ✨'
             );
           }}
           className={`relative w-13 h-7 min-w-[52px] rounded-full transition-colors cursor-pointer shrink-0 p-0.5 ${
