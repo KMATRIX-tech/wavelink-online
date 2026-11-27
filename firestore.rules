@@ -73,9 +73,20 @@ service cloud.firestore {
         : request.auth.token.get('role', 'user');
     }
 
+    function hasRoleDoc() {
+      return isSignedIn() && exists(/databases/$(database)/documents/roles/$(request.auth.uid));
+    }
+
+    function getRoleDocValue() {
+      return hasRoleDoc()
+        ? get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.get('role', 'user')
+        : 'user';
+    }
+
     function isSuperAdmin() {
       return isSignedIn() && (
         hasAdminCustomClaim() ||
+        getRoleDocValue() == 'admin' ||
         getUserRole() in ['admin', 'super_admin'] ||
         (hasUserDoc() && getUserDoc().data.get('isOwner', false) == true) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
@@ -84,8 +95,9 @@ service cloud.firestore {
 
     function isSubAdmin() {
       return isSignedIn() && (
-        request.auth.token.get('role', '') in ['sub_admin', 'moderator'] ||
-        getUserRole() in ['sub_admin', 'moderator'] ||
+        getRoleDocValue() in ['subadmin', 'sub_admin'] ||
+        request.auth.token.get('role', '') in ['sub_admin', 'subadmin', 'moderator'] ||
+        getUserRole() in ['sub_admin', 'subadmin', 'moderator'] ||
         (hasUserDoc() &&
          (getUserDoc().data.get('isSubAdmin', false) == true || getUserDoc().data.get('isModerator', false) == true) &&
          getUserDoc().data.get('isBot', false) != true)
@@ -114,10 +126,17 @@ service cloud.firestore {
       return isAdmin() || isSupportHelper();
     }
 
+    function isNotRestrictedTimestamp(data, field) {
+      return !(field in data) || data[field] == null || !(data[field] is number) || data[field] <= request.time.toMillis();
+    }
+
     function isNotBanned() {
       return isSignedIn() && (
-        !hasUserDoc() ||
-        getUserDoc().data.get('isBanned', false) != true
+        !hasUserDoc() || (
+          getUserDoc().data.get('isBanned', false) != true &&
+          isNotRestrictedTimestamp(getUserDoc().data, 'suspendedUntilMs') &&
+          isNotRestrictedTimestamp(getUserDoc().data, 'mutedUntilMs')
+        )
       );
     }
 
@@ -237,7 +256,18 @@ service cloud.firestore {
         (!('showLastSeen' in p) || p.showLastSeen == null || p.showLastSeen is bool) &&
         (!('showOnlineStatus' in p) || p.showOnlineStatus == null || p.showOnlineStatus is bool) &&
         (!('showReadReceipts' in p) || p.showReadReceipts == null || p.showReadReceipts is bool) &&
-        (!('showTypingIndicator' in p) || p.showTypingIndicator == null || p.showTypingIndicator is bool)
+        (!('showTypingIndicator' in p) || p.showTypingIndicator == null || p.showTypingIndicator is bool) &&
+        (!('showAchievementsAndChallenges' in p) || p.showAchievementsAndChallenges == null || p.showAchievementsAndChallenges is bool) &&
+        (!('isTeenAccount' in p) || p.isTeenAccount == null || p.isTeenAccount is bool)
+      );
+    }
+
+    function isValidChatNote(note) {
+      return note == null || (
+        note is map &&
+        ('text' in note) && note.text is string && note.text.size() >= 1 && note.text.size() <= 60 &&
+        (!('createdAt' in note) || note.createdAt == null || (note.createdAt is string && note.createdAt.size() <= 64)) &&
+        (!('expiresAt' in note) || note.expiresAt == null || (note.expiresAt is string && note.expiresAt.size() <= 64))
       );
     }
 
@@ -263,13 +293,36 @@ service cloud.firestore {
         isValidOptionalString(data, 'proBorderEffect', 32) &&
         isValidOptionalString(data, 'proAccentColor', 32) &&
         isValidOptionalString(data, 'proBadge', 32) &&
+        isValidOptionalString(data, 'invitedByUid', 128) &&
+        isValidOptionalString(data, 'lastSeenUpdateAt', 64) &&
         (!('chatThemes' in data) || data.chatThemes == null || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
         (!('fcmTokens' in data) || isValidFcmTokensArray(data.fcmTokens)) &&
         isValidStringList(data, 'mutedChannelIds', 200) &&
         isValidStringList(data, 'followingIds', 500) &&
+        isValidStringList(data, 'contactIds', 500) &&
+        isValidStringList(data, 'pinnedChannelIds', 100) &&
+        isValidStringList(data, 'archivedChannelIds', 200) &&
         isValidStringList(data, 'blockedUserIds', 500) &&
+        isValidStringList(data, 'mutedUserIds', 500) &&
         isValidStringList(data, 'closeFriendIds', 500) &&
         isValidStringList(data, 'savedPostIds', 500) &&
+        isValidStringList(data, 'interests', 30) &&
+        isValidStringList(data, 'highlightedBadges', 3) &&
+        isValidOptionalString(data, 'highlightedBadgeId', 80) &&
+        (!('chatNote' in data) || isValidChatNote(data.chatNote)) &&
+        (!('showChatNotes' in data) || data.showChatNotes == null || data.showChatNotes is bool) &&
+        (!('chatUnreadFirst' in data) || data.chatUnreadFirst == null || data.chatUnreadFirst is bool) &&
+        (!('interestsCompleted' in data) || data.interestsCompleted == null || data.interestsCompleted is bool) &&
+        (!('hideAiGenerated' in data) || data.hideAiGenerated == null || data.hideAiGenerated is bool) &&
+        (!('sensitiveContentFilter' in data) || data.sensitiveContentFilter == null || data.sensitiveContentFilter is bool) &&
+        (!('isUnder18' in data) || data.isUnder18 == null || data.isUnder18 is bool) &&
+        (!('birthYear' in data) || data.birthYear == null || (data.birthYear is number && data.birthYear >= 1900 && data.birthYear <= 2100)) &&
+        (!('birthMonth' in data) || data.birthMonth == null || (data.birthMonth is number && data.birthMonth >= 1 && data.birthMonth <= 12)) &&
+        isValidOptionalString(data, 'turns18At', 16) &&
+        (!('parentalStatus' in data) || data.parentalStatus == null || data.parentalStatus in ['none', 'unverified_teen']) &&
+        isValidOptionalString(data, 'guidelinesAcceptedAt', 64) &&
+        isValidOptionalString(data, 'guidelinesVersion', 32) &&
+        (!('termsAgreement' in data) || data.termsAgreement == null || data.termsAgreement is map) &&
         (!('notificationSettings' in data) || data.notificationSettings == null || data.notificationSettings is map) &&
         (!('privacySettings' in data) || isValidPrivacySettings(data.privacySettings)) &&
         (!('customThemeMix' in data) || data.customThemeMix == null || (data.customThemeMix is map && data.customThemeMix.size() <= 16)) &&
@@ -305,13 +358,32 @@ service cloud.firestore {
         (!changed.hasAny(['proBorderEffect']) || isValidOptionalString(data, 'proBorderEffect', 32)) &&
         (!changed.hasAny(['proAccentColor']) || isValidOptionalString(data, 'proAccentColor', 32)) &&
         (!changed.hasAny(['proBadge']) || isValidOptionalString(data, 'proBadge', 32)) &&
+        (!changed.hasAny(['invitedByUid']) || isValidOptionalString(data, 'invitedByUid', 128)) &&
+        (!changed.hasAny(['lastSeenUpdateAt']) || isValidOptionalString(data, 'lastSeenUpdateAt', 64)) &&
         (!changed.hasAny(['chatThemes']) || !('chatThemes' in data) || data.chatThemes == null || (data.chatThemes is map && data.chatThemes.size() <= 200)) &&
         (!changed.hasAny(['fcmTokens']) || !('fcmTokens' in data) || isValidFcmTokensArray(data.fcmTokens)) &&
         (!changed.hasAny(['mutedChannelIds']) || isValidStringList(data, 'mutedChannelIds', 200)) &&
         (!changed.hasAny(['followingIds']) || isValidStringList(data, 'followingIds', 500)) &&
+        (!changed.hasAny(['contactIds']) || isValidStringList(data, 'contactIds', 500)) &&
+        (!changed.hasAny(['pinnedChannelIds']) || isValidStringList(data, 'pinnedChannelIds', 100)) &&
+        (!changed.hasAny(['archivedChannelIds']) || isValidStringList(data, 'archivedChannelIds', 200)) &&
         (!changed.hasAny(['blockedUserIds']) || isValidStringList(data, 'blockedUserIds', 500)) &&
+        (!changed.hasAny(['mutedUserIds']) || isValidStringList(data, 'mutedUserIds', 500)) &&
         (!changed.hasAny(['closeFriendIds']) || isValidStringList(data, 'closeFriendIds', 500)) &&
         (!changed.hasAny(['savedPostIds']) || isValidStringList(data, 'savedPostIds', 500)) &&
+        (!changed.hasAny(['interests']) || isValidStringList(data, 'interests', 30)) &&
+        (!changed.hasAny(['highlightedBadges']) || isValidStringList(data, 'highlightedBadges', 3)) &&
+        (!changed.hasAny(['highlightedBadgeId']) || isValidOptionalString(data, 'highlightedBadgeId', 80)) &&
+        (!changed.hasAny(['chatNote']) || !('chatNote' in data) || isValidChatNote(data.chatNote)) &&
+        (!changed.hasAny(['showChatNotes']) || !('showChatNotes' in data) || data.showChatNotes == null || data.showChatNotes is bool) &&
+        (!changed.hasAny(['chatUnreadFirst']) || !('chatUnreadFirst' in data) || data.chatUnreadFirst == null || data.chatUnreadFirst is bool) &&
+        (!changed.hasAny(['interestsCompleted']) || !('interestsCompleted' in data) || data.interestsCompleted == null || data.interestsCompleted is bool) &&
+        (!changed.hasAny(['hideAiGenerated']) || !('hideAiGenerated' in data) || data.hideAiGenerated == null || data.hideAiGenerated is bool) &&
+        (!changed.hasAny(['sensitiveContentFilter']) || !('sensitiveContentFilter' in data) || data.sensitiveContentFilter == null || data.sensitiveContentFilter is bool) &&
+        (!changed.hasAny(['isUnder18']) || !('isUnder18' in data) || data.isUnder18 == null || data.isUnder18 is bool) &&
+        (!changed.hasAny(['guidelinesAcceptedAt']) || isValidOptionalString(data, 'guidelinesAcceptedAt', 64)) &&
+        (!changed.hasAny(['guidelinesVersion']) || isValidOptionalString(data, 'guidelinesVersion', 32)) &&
+        (!changed.hasAny(['termsAgreement']) || !('termsAgreement' in data) || data.termsAgreement == null || data.termsAgreement is map) &&
         (!changed.hasAny(['notificationSettings']) || !('notificationSettings' in data) || data.notificationSettings == null || data.notificationSettings is map) &&
         (!changed.hasAny(['privacySettings']) || !('privacySettings' in data) || isValidPrivacySettings(data.privacySettings)) &&
         (!changed.hasAny(['customThemeMix']) || !('customThemeMix' in data) || data.customThemeMix == null || (data.customThemeMix is map && data.customThemeMix.size() <= 16)) &&
@@ -355,6 +427,22 @@ service cloud.firestore {
         (!('isSupportHelper' in data) || data.isSupportHelper == false) &&
         (!('isBot' in data) || data.isBot == false) &&
         (!('isBanned' in data) || data.isBanned == false) &&
+        (!('strikesCount' in data) || data.strikesCount == 0) &&
+        (!('strikeLevel' in data) || data.strikeLevel == 'none') &&
+        (!('mutedUntilMs' in data) || data.mutedUntilMs == null || data.mutedUntilMs == 0) &&
+        (!('suspendedUntilMs' in data) || data.suspendedUntilMs == null || data.suspendedUntilMs == 0) &&
+        (!('strikeHistory' in data)) &&
+        (
+          !(data.get('isUnder18', false) == true || data.get('privacySettings', {}).get('isTeenAccount', false) == true) ||
+          (
+            data.get('sensitiveContentFilter', true) == true &&
+            data.get('parentalStatus', 'unverified_teen') == 'unverified_teen'
+          )
+        ) &&
+        (!('parentalLinkId' in data) || data.parentalLinkId == null) &&
+        (!('parentEmailMasked' in data) || data.parentEmailMasked == null) &&
+        (!('parentalSettings' in data) || data.parentalSettings == null) &&
+        (!('hasLinkedTeens' in data) || data.hasLinkedTeens == false) &&
         (!('isPro' in data) || data.isPro == false) &&
         (!('hasBlueStar' in data) || data.hasBlueStar == false) &&
         (!('isVerifiedByAdmin' in data) || data.isVerifiedByAdmin == false) &&
@@ -369,7 +457,14 @@ service cloud.firestore {
         (!('phoneVerified' in data) || data.phoneVerified == false) &&
         (!('isContactVerified' in data) || data.isContactVerified == isEmailVerified()) &&
         (!('points' in data) || (data.points is number && data.points >= 0 && data.points <= 50)) &&
-        (!('wavePoints' in data) || (data.wavePoints is number && data.wavePoints >= 0 && data.wavePoints <= 50));
+        (!('wavePoints' in data) || (data.wavePoints is number && data.wavePoints >= 0 && data.wavePoints <= 50)) &&
+        (!('xp' in data) || (data.xp is number && data.xp == 0)) &&
+        (!('level' in data) || (data.level is number && data.level == 1)) &&
+        (!('streak' in data) || (data.streak is number && data.streak >= 0 && data.streak <= 1)) &&
+        (!('longestStreak' in data) || (data.longestStreak is number && data.longestStreak >= 0 && data.longestStreak <= 1)) &&
+        (!('badges' in data) || (data.badges is list && data.badges.size() == 0)) &&
+        (!('challengeStats' in data)) &&
+        (!('recentChallenges' in data));
     }
 
     // Users can update ONLY their own safe profile fields (photo, cover, bio, displayName, username, theme, language, settings),
@@ -397,6 +492,18 @@ service cloud.firestore {
             (!('proBadge' in incoming) || incoming.proBadge == null || incoming.proBadge != 'founder' || isSuperAdmin())
           )
         ) &&
+        (
+          !(
+            existing.get('isUnder18', false) == true ||
+            incoming.get('isUnder18', false) == true ||
+            existing.get('privacySettings', {}).get('isTeenAccount', false) == true ||
+            incoming.get('privacySettings', {}).get('isTeenAccount', false) == true
+          ) ||
+          incoming.get('sensitiveContentFilter', true) == true
+        ) &&
+        (!existing.get('isUnder18', false) || incoming.get('isUnder18', true) == true) &&
+        // Owner may only dismiss (clear to null) pendingWinnerCelebration, never forge one
+        (!changed.hasAny(['pendingWinnerCelebration']) || (('pendingWinnerCelebration' in incoming) && incoming.pendingWinnerCelebration == null)) &&
         !changed.hasAny([
           'role',
           'admin',
@@ -413,18 +520,47 @@ service cloud.firestore {
           'followingCount',
           'followerIds',
           'isBanned',
+          'strikesCount',
+          'strikeLevel',
+          'mutedUntilMs',
+          'suspendedUntilMs',
+          'strikeHistory',
+          'warnings',
+          'warningMessage',
+          'lastWarningAt',
+          'banReason',
+          'bannedAt',
           'points',
           'wavePoints',
+          'xp',
+          'level',
+          'streak',
+          'longestStreak',
+          'daysActive',
+          'totalLikesReceived',
+          'badges',
+          'weeklyWinnerUntil',
+          'challengeStats',
+          'recentChallenges',
+          'xpDailyTracker',
           'isBot',
           '_serverGrantKey',
           'emailVerified',
           'phoneVerified',
-          'isContactVerified'
+          'isContactVerified',
+          'birthYear',
+          'birthMonth',
+          'turns18At',
+          'parentalLinkId',
+          'parentalStatus',
+          'parentEmailMasked',
+          'parentalSettings',
+          'hasLinkedTeens'
         ]);
     }
 
-    // Admins can moderate user accounts (warnings, ban status), but CANNOT mutate role or isPro from the client SDK
-    // because Pro status and roles can ONLY be changed by a server function.
+    // Admins can moderate user accounts (warnings, strikes, mutes, suspensions, ban status),
+    // but CANNOT mutate role or isPro from the client SDK.
     function isAdminModerationUserUpdate() {
       let changed = request.resource.data.diff(resource.data).affectedKeys();
       return isAdmin() &&
@@ -436,6 +572,11 @@ service cloud.firestore {
           'warnings',
           'warningMessage',
           'lastWarningAt',
+          'strikesCount',
+          'strikeLevel',
+          'mutedUntilMs',
+          'suspendedUntilMs',
+          'strikeHistory',
           'isDuplicateDisabled',
           'mergedIntoUid',
           'disabledAt',
@@ -480,6 +621,16 @@ service cloud.firestore {
         isValidOptionalString(data, 'content', 4000) &&
         isValidOptionalString(data, 'authorName', 100) &&
         isValidOptionalString(data, 'authorUsername', 60) &&
+        isValidOptionalString(data, 'authorHighlightedBadgeId', 80) &&
+        isValidOptionalString(data, 'challengeId', 160) &&
+        isValidOptionalString(data, 'challengeHashtag', 80) &&
+        isValidOptionalString(data, 'category', 40) &&
+        isValidOptionalString(data, 'language', 24) &&
+        isValidOptionalString(data, 'taggedAt', 64) &&
+        isValidStringList(data, 'keywords', 20) &&
+        (!('aiGenerated' in data) || data.aiGenerated == null || data.aiGenerated is bool) &&
+        (!('aiConfidence' in data) || data.aiConfidence == null || (data.aiConfidence is number && data.aiConfidence >= 0 && data.aiConfidence <= 1)) &&
+        (!('mediaSafety' in data) || data.mediaSafety == null || data.mediaSafety in ['safe', 'borderline']) &&
         (!('audience' in data) || data.audience in ['public', 'followers', 'close_friends']) &&
         (!('videoUrl' in data) || !(data.videoUrl is string) || !data.videoUrl.matches('^data:video/.*')) &&
         (!('likesCount' in data) || (data.likesCount is number && data.likesCount >= 0)) &&
@@ -487,12 +638,12 @@ service cloud.firestore {
         (!('duration' in data) || (
           data.duration is number &&
           data.duration >= 0 &&
-          (isUserProOrAdmin() ? data.duration <= 90.5 : data.duration <= 60.5)
+          data.duration <= 90.5
         )) &&
         (!('videoDurationSeconds' in data) || (
           data.videoDurationSeconds is number &&
           data.videoDurationSeconds >= 0 &&
-          (isUserProOrAdmin() ? data.videoDurationSeconds <= 90.5 : data.videoDurationSeconds <= 60.5)
+          data.videoDurationSeconds <= 90.5
         ));
     }
 
@@ -500,7 +651,34 @@ service cloud.firestore {
     function isValidCommentPayload(data) {
       return ('authorId' in data) && data.authorId is string && data.authorId.size() >= 1 && data.authorId.size() <= 128 &&
         ('content' in data) && data.content is string && data.content.size() >= 1 && data.content.size() <= 2000 &&
-        isValidOptionalString(data, 'authorName', 100);
+        isValidOptionalString(data, 'authorName', 100) &&
+        isValidOptionalString(data, 'authorHighlightedBadgeId', 80);
+    }
+
+    // Validate Weekly Challenge payload (Admin / Sub-Admin only)
+    function isValidChallengePayload(data) {
+      return isValidOptionalString(data, 'title', 120) &&
+        ('theme' in data) && data.theme is string && data.theme.size() >= 2 && data.theme.size() <= 120 &&
+        ('hashtag' in data) && data.hashtag is string && data.hashtag.size() >= 2 && data.hashtag.size() <= 60 &&
+        ('description' in data) && data.description is string && data.description.size() >= 2 && data.description.size() <= 2000 &&
+        isValidOptionalString(data, 'rules', 2000) &&
+        (!('type' in data) || data.type == null || data.type in ['photo', 'video', 'text', 'any']) &&
+        isValidOptionalString(data, 'coverImageUrl', 2048) &&
+        (!('coverImageUrl' in data) || !(data.coverImageUrl is string) || !data.coverImageUrl.matches('^data:.*')) &&
+        isValidOptionalString(data, 'badgeId', 80) &&
+        (!('status' in data) || data.status in ['active', 'completed']) &&
+        (!('maxEntriesPerUser' in data) || data.maxEntriesPerUser == null || (data.maxEntriesPerUser is number && data.maxEntriesPerUser >= 1 && data.maxEntriesPerUser <= 20));
+    }
+
+    // Validate Custom Badge payload (Admin / Sub-Admin only)
+    function isValidBadgePayload(data) {
+      return ('name' in data) && data.name is string && data.name.size() >= 2 && data.name.size() <= 60 &&
+        isValidOptionalString(data, 'description', 240) &&
+        isValidOptionalString(data, 'color', 32) &&
+        isValidOptionalString(data, 'iconName', 48) &&
+        isValidOptionalString(data, 'imageUrl', 2048) &&
+        (!('imageUrl' in data) || !(data.imageUrl is string) || !data.imageUrl.matches('^data:.*')) &&
+        isValidOptionalString(data, 'challengeId', 160);
     }
 
     // Default catch-all deny rule for zero-trust baseline
@@ -581,10 +759,43 @@ service cloud.firestore {
       allow read, write: if isOwner(userId);
     }
 
-    // Weekly Creator Challenges — readable by signed-in users, managed by Admins
+    // Weekly Creator Challenges — readable by signed-in users, managed by Admins & Sub-Admins
     match /challenges/{challengeId} {
       allow read: if isSignedIn();
-      allow create, update, delete: if isAdmin();
+      allow create, update: if isAdmin() && isValidChallengePayload(request.resource.data);
+      allow delete: if isAdmin();
+
+      // Entries inside a challenge (one entry per postId; strictly blocked after challenge endDateMs)
+      match /entries/{postId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && isNotBanned() &&
+          request.resource.data.uid == request.auth.uid &&
+          request.resource.data.postId == postId &&
+          request.resource.data.challengeId == challengeId &&
+          request.resource.data.get('moderationChecked', false) == true &&
+          request.resource.data.get('likesCount', 0) == 0 &&
+          exists(/databases/$(database)/documents/challenges/$(challengeId)) &&
+          get(/databases/$(database)/documents/challenges/$(challengeId)).data.get('status', 'active') == 'active' &&
+          (
+            !('endDateMs' in get(/databases/$(database)/documents/challenges/$(challengeId)).data) ||
+            request.time.toMillis() <= get(/databases/$(database)/documents/challenges/$(challengeId)).data.endDateMs
+          );
+        allow update: if isAdmin();
+        allow delete: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      }
+
+      // Per-user participant counters & anti-cheat metadata — server-authoritative writes only (prevents like/count spoofing)
+      match /participants/{participantUid} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // Custom Badges — readable by signed-in users, created/managed by Admins & Sub-Admins
+    match /badges/{badgeId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin() && isValidBadgePayload(request.resource.data);
+      allow delete: if isAdmin();
     }
 
     // Creator Spotlight of the Week — readable by signed-in users, managed by Admins
@@ -604,6 +815,8 @@ service cloud.firestore {
     match /posts/{postId} {
       allow get, list: if isSignedIn() && canReadPostDoc(resource.data);
       allow create: if isSignedIn() && isNotBanned() && isValidPostPayload(request.resource.data) && (
+        isAdmin() || request.resource.data.get('moderationChecked', false) == true
+      ) && (
         request.resource.data.authorId == request.auth.uid ||
         (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
       ) && (
@@ -613,6 +826,21 @@ service cloud.firestore {
           !('boostTier' in request.resource.data) &&
           request.resource.data.get('tipsTotalTZS', 0) == 0 &&
           request.resource.data.get('tipsCount', 0) == 0
+        )
+      ) && (
+        // Teen account posting safeguards: no location sharing, and no public posts unless parent verified & allowed
+        !hasUserDoc() ||
+        getUserDoc().data.get('isUnder18', false) != true ||
+        (
+          (!('locationTag' in request.resource.data) || request.resource.data.locationTag == null || request.resource.data.locationTag == '') &&
+          (
+            request.resource.data.get('audience', 'followers') != 'public' ||
+            (
+              getUserDoc().data.get('parentalStatus', 'unverified_teen') == 'linked' &&
+              getUserDoc().data.get('parentalSettings', {}).get('profileVisibility', 'private') == 'public' &&
+              getUserDoc().data.get('parentalSettings', {}).get('isPaused', false) != true
+            )
+          )
         )
       );
       allow update: if isSignedIn() && isValidPostPayload(request.resource.data) && (
@@ -629,7 +857,7 @@ service cloud.firestore {
         ) ||
         (
           resource.data.authorId == request.auth.uid &&
-          areImmutableFieldsUnchanged(['authorId', 'createdAt', 'isBoosted', 'boostedUntil', 'boostTier', 'tipsTotalTZS', 'tipsCount'])
+          areImmutableFieldsUnchanged(['authorId', 'createdAt', 'challengeId', 'isBoosted', 'boostedUntil', 'boostTier', 'tipsTotalTZS', 'tipsCount'])
         ) ||
         (
           !isBlockedMutual(resource.data.get('authorId', '')) &&
@@ -670,6 +898,7 @@ service cloud.firestore {
         allow read: if isSignedIn();
         allow create: if isSignedIn() && isNotBanned() &&
           isValidCommentPayload(request.resource.data) &&
+          (isAdmin() || request.resource.data.get('moderationChecked', false) == true) &&
           request.resource.data.authorId == request.auth.uid &&
           (!exists(/databases/$(database)/documents/posts/$(postId)) ||
            !isBlockedMutual(get(/databases/$(database)/documents/posts/$(postId)).data.get('authorId', '')));
@@ -718,11 +947,12 @@ service cloud.firestore {
       return ('authorId' in data) && data.authorId is string && data.authorId.size() <= 128 &&
         isValidOptionalString(data, 'caption', 600) &&
         isValidOptionalString(data, 'legendaryTag', 80) &&
+        (!('mediaSafety' in data) || data.mediaSafety == null || data.mediaSafety in ['safe', 'borderline']) &&
         (!('mediaUrl' in data) || !(data.mediaUrl is string) || !data.mediaUrl.matches('^data:video/.*')) &&
         (!('videoDurationSeconds' in data) || (
           data.videoDurationSeconds is number &&
           data.videoDurationSeconds >= 0 &&
-          (isUserProOrAdmin() ? data.videoDurationSeconds <= 90.5 : data.videoDurationSeconds <= 60.5)
+          data.videoDurationSeconds <= 90.5
         )) &&
         (!('videoFileSize' in data) || (data.videoFileSize is number && data.videoFileSize <= 80 * 1024 * 1024));
     }
@@ -731,6 +961,8 @@ service cloud.firestore {
     match /sparks/{sparkId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn() && isNotBanned() && isValidSparkPayload() && (
+        isAdmin() || request.resource.data.get('moderationChecked', false) == true
+      ) && (
         request.resource.data.authorId == request.auth.uid ||
         (request.resource.data.authorId == 'wavelink_support_bot' && isAdmin())
       );
@@ -929,6 +1161,11 @@ service cloud.firestore {
         allow read: if isGroupMember(groupId);
         allow create: if isGroupMember(groupId) && isNotBanned() &&
           request.resource.data.senderId == request.auth.uid &&
+          (
+            isAdmin() ||
+            request.resource.data.get('isSystem', false) == true ||
+            request.resource.data.get('moderationChecked', false) == true
+          ) &&
           isValidOptionalString(request.resource.data, 'text', 4000) &&
           isValidOptionalString(request.resource.data, 'expiresAt', 64);
         allow update: if isGroupMember(groupId) && (
@@ -943,19 +1180,78 @@ service cloud.firestore {
       }
     }
 
+    // Server-side DM privacy & mutual-block validator:
+    // Rejects starting or sending messages in a conversation if:
+    //  1. Either user has blocked the other (isBlockedMutual(otherUid)).
+    //  2. The recipient has privacySettings.allowDirectMessages == 'followers' ("Only people I follow / friends")
+    //     and does NOT follow or have the sender in their contactIds/closeFriendIds (unless already accepted).
+    //  3. The recipient has privacySettings.allowDirectMessages == 'none' (unless already accepted or sender is admin).
+    function canMessageRecipient(otherUid, channelId) {
+      return isAdmin() ||
+        otherUid == '' ||
+        otherUid == request.auth.uid ||
+        otherUid == 'wavelink_support_bot' ||
+        (
+          !isBlockedMutual(otherUid) && (
+            !exists(/databases/$(database)/documents/users/$(otherUid)) ||
+            (
+              get(/databases/$(database)/documents/users/$(otherUid)).data.get('privacySettings', {}).get('allowDirectMessages', 'everyone') == 'everyone'
+            ) ||
+            (
+              get(/databases/$(database)/documents/users/$(otherUid)).data.get('privacySettings', {}).get('allowDirectMessages', 'everyone') == 'followers' && (
+                request.auth.uid in get(/databases/$(database)/documents/users/$(otherUid)).data.get('followingIds', []) ||
+                request.auth.uid in get(/databases/$(database)/documents/users/$(otherUid)).data.get('contactIds', []) ||
+                request.auth.uid in get(/databases/$(database)/documents/users/$(otherUid)).data.get('closeFriendIds', []) ||
+                exists(/databases/$(database)/documents/follows/$(otherUid + '_' + request.auth.uid)) ||
+                (
+                  exists(/databases/$(database)/documents/channels/$(channelId)) && (
+                    otherUid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('acceptedBy', []) ||
+                    get(/databases/$(database)/documents/channels/$(channelId)).data.get('lastMessageSenderId', '') == otherUid
+                  )
+                )
+              )
+            ) ||
+            (
+              exists(/databases/$(database)/documents/channels/$(channelId)) &&
+              otherUid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('acceptedBy', [])
+            )
+          )
+        );
+    }
+
+    function canWriteDmChannelParticipants(participants, channelId) {
+      return participants is list &&
+        participants.size() >= 1 &&
+        participants.size() <= 2 &&
+        request.auth.uid in participants && (
+          participants.size() == 1 ||
+          (participants[0] == request.auth.uid ? canMessageRecipient(participants[1], channelId) : canMessageRecipient(participants[0], channelId))
+        );
+    }
+
     // Real-Time Direct Messages & Official Updates Channel (Strictly participant-scoped, immutable participant list)
     match /channels/{channelId} {
       allow get: if isDmMember(channelId);
       allow list: if isSignedIn() && (request.auth.uid in resource.data.get('participants', []) || isAdmin());
       allow create: if channelId == 'official_updates' ? isAdmin() : (
         isSignedIn() && isNotBanned() &&
-        request.auth.uid in request.resource.data.get('participants', []) &&
-        request.resource.data.get('participants', []).size() <= 2 &&
+        canWriteDmChannelParticipants(request.resource.data.get('participants', []), channelId) &&
+        (!('senderMessageCount' in request.resource.data) || request.resource.data.senderMessageCount <= 2 || request.resource.data.get('requestStatus', 'accepted') == 'accepted') &&
         (!('disappearingHours' in request.resource.data) || request.resource.data.disappearingHours in [0, 24, 168, 720])
       );
       allow update: if channelId == 'official_updates' ? isAdmin() : (
         isDmMember(channelId) &&
         areImmutableFieldsUnchanged(['participants', 'createdAt']) &&
+        (
+          !('participants' in request.resource.data) ||
+          canWriteDmChannelParticipants(request.resource.data.get('participants', []), channelId)
+        ) &&
+        (
+          request.resource.data.get('requestStatus', 'accepted') != 'pending' ||
+          request.resource.data.get('initiatedBy', '') != request.auth.uid ||
+          !('senderMessageCount' in request.resource.data) ||
+          request.resource.data.senderMessageCount <= 2
+        ) &&
         (!('disappearingHours' in request.resource.data) || request.resource.data.disappearingHours in [0, 24, 168, 720])
       );
       allow delete: if isAdmin();
@@ -975,8 +1271,13 @@ service cloud.firestore {
         ) && (
           (request.resource.data.senderId == request.auth.uid && (channelId != 'official_updates' || isAdmin())) ||
           (request.resource.data.senderId == 'wavelink_support_bot' && channelId.matches('.*wavelink_support_bot.*'))
+        ) && (
+          isAdmin() ||
+          request.resource.data.get('senderId', '') == 'wavelink_support_bot' ||
+          request.resource.data.get('isSystem', false) == true ||
+          request.resource.data.get('moderationChecked', false) == true
         ) &&
-        (!('receiverId' in request.resource.data) || !isBlockedMutual(request.resource.data.get('receiverId', ''))) &&
+        (!('receiverId' in request.resource.data) || canMessageRecipient(request.resource.data.get('receiverId', ''), channelId)) &&
         isValidOptionalString(request.resource.data, 'text', 4000) &&
         isValidOptionalString(request.resource.data, 'expiresAt', 64);
         allow update: if isDmMember(channelId) && (
@@ -993,7 +1294,7 @@ service cloud.firestore {
         isSignedIn() && resource != null && request.auth.uid in resource.data.get('participants', [])
       );
       allow create: if isSignedIn() && isNotBanned() &&
-        request.auth.uid in request.resource.data.get('participants', []) &&
+        canWriteDmChannelParticipants(request.resource.data.get('participants', []), conversationId) &&
         (!('disappearingHours' in request.resource.data) || request.resource.data.disappearingHours in [0, 24, 168, 720]);
       allow update: if (isDmMember(conversationId) || (
         isSignedIn() && resource != null && request.auth.uid in resource.data.get('participants', [])
@@ -1015,6 +1316,7 @@ service cloud.firestore {
           (isSignedIn() && request.auth.uid in request.resource.data.get('participants', []))
         ) &&
         request.resource.data.senderId == request.auth.uid &&
+        (!('receiverId' in request.resource.data) || canMessageRecipient(request.resource.data.get('receiverId', ''), conversationId)) &&
         isValidOptionalString(request.resource.data, 'text', 4000) &&
         isValidOptionalString(request.resource.data, 'expiresAt', 64);
         allow update: if isDmMember(conversationId) && (
@@ -1171,7 +1473,17 @@ service cloud.firestore {
            request.resource.data.get('receiver', '').size() > 0 &&
            request.resource.data.get('receiver', '') != request.auth.uid &&
            !isBlockedMutual(request.resource.data.get('receiver', ''))))) &&
-        !request.resource.data.keys().hasAny(['callerPhotoURL', 'receiverPhotoURL', 'calleePhotoURL']);
+        !request.resource.data.keys().hasAny(['callerPhotoURL', 'receiverPhotoURL', 'calleePhotoURL']) &&
+        (
+          // Teen accounts cannot initiate calls unless parent verified & explicitly enabled allowCalls
+          !hasUserDoc() ||
+          getUserDoc().data.get('isUnder18', false) != true ||
+          (
+            getUserDoc().data.get('parentalStatus', 'unverified_teen') == 'linked' &&
+            getUserDoc().data.get('parentalSettings', {}).get('allowCalls', false) == true &&
+            getUserDoc().data.get('parentalSettings', {}).get('isPaused', false) != true
+          )
+        );
       allow update: if isSignedIn() &&
         isValidId(callId) &&
         isValidCallPayload(request.resource.data) &&
@@ -1201,5 +1513,121 @@ service cloud.firestore {
         allow delete: if isValidId(candidateId) && isCallParticipant(callId);
       }
     }
+
+    // ===============================================================
+    // ROLES (/roles/{uid}) — Only main "admin" (isSuperAdmin) can write
+    // ===============================================================
+    function isValidRoleDocPayload(data, targetUid) {
+      return data.keys().hasAll(['uid', 'role', 'updatedAt']) &&
+        data.uid == targetUid &&
+        data.role in ['admin', 'subadmin'] &&
+        data.updatedAt is string && data.updatedAt.size() <= 64 &&
+        isValidOptionalString(data, 'username', 60) &&
+        isValidOptionalString(data, 'displayName', 100) &&
+        isValidOptionalString(data, 'email', 160) &&
+        isValidOptionalString(data, 'photoURL', 2048) &&
+        isValidOptionalString(data, 'assignedBy', 128);
+    }
+
+    match /roles/{roleUid} {
+      allow get, list: if isSignedIn();
+      allow create, update: if isValidId(roleUid) &&
+        isSuperAdmin() &&
+        isValidRoleDocPayload(request.resource.data, roleUid);
+      allow delete: if isValidId(roleUid) && isSuperAdmin();
+    }
+
+    // ===============================================================
+    // ADMIN UPDATES (/adminUpdates/{updateId})
+    // ===============================================================
+    function isValidAdminUpdatePayload(data) {
+      return data.keys().hasAll(['title', 'message', 'type', 'authorUid', 'authorName', 'role', 'createdAt', 'deleted']) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 60 &&
+        data.message is string && data.message.size() >= 1 && data.message.size() <= 3000 &&
+        isValidOptionalString(data, 'messageSw', 3000) &&
+        data.type in ['new_feature', 'improvement', 'bug_fix', 'maintenance', 'announcement'] &&
+        isValidOptionalString(data, 'imageUrl', 2048) &&
+        (!('imageUrl' in data) || !(data.imageUrl is string) || !data.imageUrl.matches('^data:.*')) &&
+        data.authorUid is string && data.authorUid.size() >= 1 && data.authorUid.size() <= 128 &&
+        data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 100 &&
+        data.role in ['admin', 'subadmin'] &&
+        data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 64 &&
+        isValidOptionalString(data, 'updatedAt', 64) &&
+        (!('pinned' in data) || data.pinned == null || data.pinned is bool) &&
+        (!('alsoSendPush' in data) || data.alsoSendPush == null || data.alsoSendPush is bool) &&
+        data.deleted is bool;
+    }
+
+    match /adminUpdates/{updateId} {
+      allow get, list: if isSignedIn();
+      allow create: if isValidId(updateId) &&
+        isNotBanned() &&
+        isAdmin() &&
+        isValidAdminUpdatePayload(request.resource.data) &&
+        request.resource.data.authorUid == request.auth.uid &&
+        (isSuperAdmin() ? request.resource.data.role == 'admin' : request.resource.data.role == 'subadmin');
+      allow update: if isValidId(updateId) &&
+        isNotBanned() &&
+        isValidAdminUpdatePayload(request.resource.data) &&
+        areImmutableFieldsUnchanged(['authorUid', 'createdAt']) &&
+        (
+          isSuperAdmin() ||
+          (isSubAdmin() &&
+           resource.data.authorUid == request.auth.uid &&
+           request.resource.data.role == 'subadmin')
+        );
+      allow delete: if isValidId(updateId) &&
+        isNotBanned() &&
+        (
+          isSuperAdmin() ||
+          (isSubAdmin() && resource.data.authorUid == request.auth.uid)
+        );
+    }
+
+    // ===============================================================
+    // PARENTAL CONTROLS — Strictly private to linked parent & teen.
+    // All writes are server-authoritative (Admin SDK only) so teens
+    // can NEVER tamper with verification codes, limits, or pause state.
+    // ===============================================================
+    function isParentOrTeenParticipant(data) {
+      return isSignedIn() && (
+        data.get('teenUid', '') == request.auth.uid ||
+        data.get('parentUid', '') == request.auth.uid ||
+        (
+          isEmailVerified() &&
+          request.auth.token.email is string &&
+          data.get('parentEmailLower', '') == request.auth.token.email.lower()
+        )
+      );
+    }
+
+    match /parentalLinks/{linkId} {
+      allow get: if isValidId(linkId) && isParentOrTeenParticipant(resource.data);
+      allow list: if isParentOrTeenParticipant(resource.data);
+      allow create, update, delete: if false;
+    }
+
+    match /parentalAlerts/{alertId} {
+      allow get: if isValidId(alertId) && isParentOrTeenParticipant(resource.data);
+      allow list: if isParentOrTeenParticipant(resource.data);
+      allow create, update, delete: if false;
+    }
+
+    match /parentalFollowRequests/{reqId} {
+      allow get: if isValidId(reqId) && (
+        isParentOrTeenParticipant(resource.data) ||
+        (isSignedIn() && resource.data.get('requesterUid', '') == request.auth.uid)
+      );
+      allow list: if isParentOrTeenParticipant(resource.data) ||
+        (isSignedIn() && resource.data.get('requesterUid', '') == request.auth.uid);
+      allow create, update, delete: if false;
+    }
+
+    match /parentalDeletionRequests/{reqId} {
+      allow get: if isValidId(reqId) && (isSuperAdmin() || isParentOrTeenParticipant(resource.data));
+      allow list: if isSuperAdmin() || isParentOrTeenParticipant(resource.data);
+      allow create, update, delete: if false;
+    }
   }
 }
+

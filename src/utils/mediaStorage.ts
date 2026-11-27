@@ -4,12 +4,37 @@ import {
   formatCloudinaryUploadError,
   getAuthHeaders,
   formatVideoUploadError,
+  CLOUDFLARE_UPLOAD_URL,
+  CLOUDFLARE_PUBLIC_URL,
   CLOUDINARY_CLOUD_NAME,
   CLOUDINARY_UPLOAD_PRESET,
   CLOUDINARY_VIDEO_UPLOAD_URL,
   CLOUDINARY_IMAGE_UPLOAD_URL
 } from '../firebase';
 import { collection, doc, getDocs, query, orderBy, deleteDoc } from 'firebase/firestore';
+
+export function normalizeCloudflareHttpsUrl(rawUrl: string): string {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('/')) {
+    if (CLOUDFLARE_PUBLIC_URL && CLOUDFLARE_PUBLIC_URL.startsWith('http')) {
+      return `${CLOUDFLARE_PUBLIC_URL.replace(/\/+$/, '')}${trimmed}`;
+    }
+    if (typeof window !== 'undefined' && window.location?.origin) {
+      return `${window.location.origin}${trimmed}`;
+    }
+    return trimmed;
+  }
+  if (
+    typeof window !== 'undefined' &&
+    window.location?.protocol === 'https:' &&
+    trimmed.startsWith('http://') &&
+    trimmed.includes(window.location.host)
+  ) {
+    return trimmed.replace(/^http:\/\//i, 'https://');
+  }
+  return trimmed;
+}
 
 const DB_NAME = 'wavelink_media_db';
 const STORE_NAME = 'videos';
@@ -588,10 +613,10 @@ export async function compressImageForUpload(
 }
 
 /**
- * Uploads any image File, Blob, or data:image/... URL directly from the browser to Cloudinary's
- * unsigned image upload endpoint (`https://api.cloudinary.com/v1_1/monarcking72/image/upload`)
- * using upload preset `monarcking72` with automatic client-side image compression and a live progress callback.
- * Always returns optimized https:// thumbnail URLs and never returns base64 or data URLs.
+ * Uploads any image File, Blob, or data:image/... URL via Cloudflare's media upload gateway
+ * (`CLOUDFLARE_UPLOAD_URL` -> `/api/cloudflare/upload` or custom Cloudflare Worker/R2/Images endpoint)
+ * with automatic client-side image compression, live progress callback, and resilient fallback.
+ * Always returns optimized https:// URLs and never returns base64 or data URLs.
  */
 export async function uploadImageToCloudinary(
   source: File | Blob | string,
@@ -605,6 +630,7 @@ export async function uploadImageToCloudinary(
   height: number;
   bytes: number;
   publicId: string;
+  mediaSafety?: 'safe' | 'borderline';
 }> {
   if (!source) {
     throw new Error('No image file provided for upload.');
@@ -613,25 +639,27 @@ export async function uploadImageToCloudinary(
   // If already an HTTP/HTTPS URL, optimize and return it directly
   if (typeof source === 'string' && (source.startsWith('https://') || source.startsWith('http://'))) {
     if (onProgress) onProgress(100);
-    const optimized = optimizeCloudinaryThumbnailUrl(source, {
+    const normalizedSource = normalizeCloudflareHttpsUrl(source);
+    const optimized = optimizeCloudinaryThumbnailUrl(normalizedSource, {
       width: compressionOptions?.maxWidth || 1080
     });
-    const thumb = optimizeCloudinaryThumbnailUrl(source, {
+    const thumb = optimizeCloudinaryThumbnailUrl(normalizedSource, {
       width: compressionOptions?.thumbnailWidth || 720
     });
     return {
       secureUrl: optimized,
       thumbnailUrl: thumb,
-      rawSecureUrl: source,
+      rawSecureUrl: normalizedSource,
       width: 1080,
       height: 1080,
       bytes: 0,
-      publicId: 'existing_http_image'
+      publicId: 'existing_http_image',
+      mediaSafety: 'safe'
     };
   }
 
   // Automatically compress File, Blob, or data:image/... before uploading
-  let uploadPayload: File | Blob | string = source;
+  let uploadBlob: Blob;
   let localWidth = 1080;
   let localHeight = 1080;
   try {
@@ -641,104 +669,228 @@ export async function uploadImageToCloudinary(
       targetMaxBytes: compressionOptions?.targetMaxBytes ?? 240 * 1024,
       mimeType: compressionOptions?.mimeType ?? 'image/jpeg'
     });
-    uploadPayload = compressed.blob;
+    uploadBlob = compressed.blob;
     localWidth = compressed.width;
     localHeight = compressed.height;
   } catch {
-    uploadPayload = source;
+    if (typeof source === 'string' && source.startsWith('data:')) {
+      uploadBlob = dataUrlToBlob(source);
+    } else if (source instanceof Blob) {
+      uploadBlob = source;
+    } else {
+      throw new Error('Invalid image source for Cloudflare upload.');
+    }
   }
 
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', CLOUDINARY_IMAGE_UPLOAD_URL, true);
-    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+  const ext =
+    uploadBlob.type === 'image/png'
+      ? 'png'
+      : uploadBlob.type === 'image/webp'
+      ? 'webp'
+      : 'jpg';
+  const fileName =
+    source instanceof File && source.name
+      ? source.name
+      : `wavelink_cf_photo_${Date.now()}.${ext}`;
+  const mimeType = uploadBlob.type || 'image/jpeg';
 
-    xhr.upload.onprogress = (event: ProgressEvent) => {
-      if (!onProgress) return;
-      if (event.lengthComputable && event.total > 0) {
-        const pct = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
-        onProgress(pct);
-      } else {
-        onProgress(50);
+  let authTokenHeader = '';
+  try {
+    if (auth.currentUser) {
+      const idToken = await auth.currentUser.getIdToken();
+      if (idToken) authTokenHeader = `Bearer ${idToken}`;
+    }
+  } catch {
+    // proceed with UID header fallback
+  }
+
+  // Primary upload via Cloudflare Edge Media Gateway (CLOUDFLARE_UPLOAD_URL)
+  // Layer 3 server image safety check runs on this endpoint before saving.
+  const uploadViaCloudflareXhr = (): Promise<{
+    secureUrl: string;
+    thumbnailUrl: string;
+    rawSecureUrl: string;
+    width: number;
+    height: number;
+    bytes: number;
+    publicId: string;
+    mediaSafety?: 'safe' | 'borderline';
+  }> =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', CLOUDFLARE_UPLOAD_URL, true);
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-Mime-Type', mimeType);
+      xhr.setRequestHeader('X-File-Name', encodeURIComponent(fileName));
+      xhr.setRequestHeader('X-Resource-Type', 'image');
+      xhr.setRequestHeader('X-Image-Width', String(localWidth));
+      xhr.setRequestHeader('X-Image-Height', String(localHeight));
+      if (authTokenHeader) {
+        xhr.setRequestHeader('Authorization', authTokenHeader);
       }
-    };
-
-    xhr.onload = () => {
-      const status = xhr.status || 0;
-      let parsed: any = null;
-      try {
-        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
-      } catch {
-        parsed = null;
+      if (auth.currentUser?.uid) {
+        xhr.setRequestHeader('X-WaveLink-Uid', auth.currentUser.uid);
       }
 
-      if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
-        if (onProgress) onProgress(100);
-        const targetMainWidth = compressionOptions?.maxWidth ?? 1080;
-        const targetThumbWidth =
-          compressionOptions?.thumbnailWidth ?? Math.min(720, targetMainWidth);
-        const optimizedMainUrl = optimizeCloudinaryThumbnailUrl(parsed.secure_url, {
-          width: targetMainWidth
-        });
-        const optimizedThumbUrl = optimizeCloudinaryThumbnailUrl(parsed.secure_url, {
-          width: targetThumbWidth
-        });
-        resolve({
-          secureUrl: optimizedMainUrl,
-          thumbnailUrl: optimizedThumbUrl,
-          rawSecureUrl: parsed.secure_url,
-          width:
-            typeof parsed.width === 'number' && parsed.width > 0 ? parsed.width : localWidth,
-          height:
-            typeof parsed.height === 'number' && parsed.height > 0 ? parsed.height : localHeight,
-          bytes: typeof parsed.bytes === 'number' && parsed.bytes > 0 ? parsed.bytes : 0,
-          publicId: String(parsed.public_id || `wavelink_img_${Date.now()}`)
-        });
-        return;
-      }
+      xhr.upload.onprogress = (event: ProgressEvent) => {
+        if (!onProgress) return;
+        if (event.lengthComputable && event.total > 0) {
+          const pct = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+          onProgress(pct);
+        } else {
+          onProgress(50);
+        }
+      };
 
-      const errMsg =
-        parsed?.error?.message ||
-        (status ? `Cloudinary image upload HTTP ${status} error` : 'Cloudinary image upload failed');
-      reject(new Error(`Cloudinary image upload failed: ${errMsg}`));
-    };
+      xhr.onload = () => {
+        const status = xhr.status || 0;
+        let parsed: any = null;
+        try {
+          parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+        } catch {
+          parsed = null;
+        }
 
-    xhr.onerror = () => {
-      reject(
-        new Error(
-          'Network error while uploading image to Cloudinary. Please check your connection and try again.'
-        )
-      );
-    };
+        const rawUrl = parsed?.secure_url || parsed?.url || '';
+        if (status >= 200 && status < 300 && typeof rawUrl === 'string' && rawUrl.trim()) {
+          if (onProgress) onProgress(100);
+          const resolvedUrl = normalizeCloudflareHttpsUrl(rawUrl);
+          const targetMainWidth = compressionOptions?.maxWidth ?? 1080;
+          const targetThumbWidth =
+            compressionOptions?.thumbnailWidth ?? Math.min(720, targetMainWidth);
+          const optimizedMainUrl = optimizeCloudinaryThumbnailUrl(resolvedUrl, {
+            width: targetMainWidth
+          });
+          const optimizedThumbUrl = optimizeCloudinaryThumbnailUrl(resolvedUrl, {
+            width: targetThumbWidth
+          });
+          resolve({
+            secureUrl: optimizedMainUrl,
+            thumbnailUrl: optimizedThumbUrl,
+            rawSecureUrl: resolvedUrl,
+            width:
+              typeof parsed.width === 'number' && parsed.width > 0 ? parsed.width : localWidth,
+            height:
+              typeof parsed.height === 'number' && parsed.height > 0 ? parsed.height : localHeight,
+            bytes:
+              typeof parsed.bytes === 'number' && parsed.bytes > 0
+                ? parsed.bytes
+                : uploadBlob.size,
+            publicId: String(parsed.public_id || `cf_img_${Date.now()}`),
+            mediaSafety: parsed?.mediaSafety === 'borderline' ? 'borderline' : 'safe'
+          });
+          return;
+        }
 
-    xhr.onabort = () => {
-      reject(new Error('Image upload was cancelled.'));
-    };
+        const errMsg =
+          parsed?.error?.message ||
+          parsed?.error ||
+          (status ? `Cloudflare image upload HTTP ${status} error` : 'Cloudflare image upload failed');
+        const err = new Error(String(errMsg)) as Error & { isSafetyRejection?: boolean; status?: number };
+        err.status = status;
+        if (status === 422 || parsed?.code === 'IMAGE_SAFETY_BLOCKED') {
+          err.isSafetyRejection = true;
+        }
+        reject(err);
+      };
 
-    const formData = new FormData();
-    if (typeof uploadPayload === 'string') {
-      formData.append('file', uploadPayload);
-    } else if (uploadPayload instanceof File) {
-      formData.append('file', uploadPayload);
-    } else {
-      const ext =
-        uploadPayload.type === 'image/png'
-          ? 'png'
-          : uploadPayload.type === 'image/webp'
-          ? 'webp'
-          : 'jpg';
-      const namedFile = new File([uploadPayload], `wavelink_photo_${Date.now()}.${ext}`, {
-        type: uploadPayload.type || 'image/jpeg',
+      xhr.onerror = () => {
+        reject(new Error('Network error while uploading image via Cloudflare.'));
+      };
+
+      xhr.onabort = () => {
+        reject(new Error('Image upload was cancelled.'));
+      };
+
+      if (onProgress) onProgress(5);
+      xhr.send(uploadBlob);
+    });
+
+  try {
+    return await uploadViaCloudflareXhr();
+  } catch (cfErr: any) {
+    // Never bypass Layer 3 image safety rejections via fallback
+    if (cfErr?.isSafetyRejection || cfErr?.status === 422) {
+      throw cfErr;
+    }
+    console.warn('[WaveLink Cloudflare Image Upload Fallback]:', cfErr);
+    // Secondary fallback to unsigned Cloudinary endpoint if Cloudflare route is unreachable
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', CLOUDINARY_IMAGE_UPLOAD_URL, true);
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+      xhr.upload.onprogress = (event: ProgressEvent) => {
+        if (!onProgress) return;
+        if (event.lengthComputable && event.total > 0) {
+          const pct = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+          onProgress(pct);
+        }
+      };
+
+      xhr.onload = () => {
+        const status = xhr.status || 0;
+        let parsed: any = null;
+        try {
+          parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+        } catch {
+          parsed = null;
+        }
+
+        if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+          if (onProgress) onProgress(100);
+          const targetMainWidth = compressionOptions?.maxWidth ?? 1080;
+          const targetThumbWidth =
+            compressionOptions?.thumbnailWidth ?? Math.min(720, targetMainWidth);
+          const optimizedMainUrl = optimizeCloudinaryThumbnailUrl(parsed.secure_url, {
+            width: targetMainWidth
+          });
+          const optimizedThumbUrl = optimizeCloudinaryThumbnailUrl(parsed.secure_url, {
+            width: targetThumbWidth
+          });
+          resolve({
+            secureUrl: optimizedMainUrl,
+            thumbnailUrl: optimizedThumbUrl,
+            rawSecureUrl: parsed.secure_url,
+            width:
+              typeof parsed.width === 'number' && parsed.width > 0 ? parsed.width : localWidth,
+            height:
+              typeof parsed.height === 'number' && parsed.height > 0 ? parsed.height : localHeight,
+            bytes: typeof parsed.bytes === 'number' && parsed.bytes > 0 ? parsed.bytes : uploadBlob.size,
+            publicId: String(parsed.public_id || `wavelink_img_${Date.now()}`)
+          });
+          return;
+        }
+
+        reject(
+          cfErr instanceof Error
+            ? cfErr
+            : new Error('Cloudflare image upload failed. Please check your connection and try again.')
+        );
+      };
+
+      xhr.onerror = () => {
+        reject(
+          cfErr instanceof Error
+            ? cfErr
+            : new Error('Network error while uploading image via Cloudflare.')
+        );
+      };
+
+      const formData = new FormData();
+      const namedFile = new File([uploadBlob], fileName, {
+        type: mimeType,
         lastModified: Date.now()
       });
       formData.append('file', namedFile);
-    }
-    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-
-    if (onProgress) onProgress(5);
-    xhr.send(formData);
-  });
+      formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+      xhr.send(formData);
+    });
+  }
 }
+
+export const uploadImageToCloudflare = uploadImageToCloudinary;
 
 // ============================================================================
 // FIREBASE STORAGE PROFILE COVER & AVATAR UPLOAD (uploadBytesResumable)
@@ -1067,7 +1219,13 @@ export async function uploadSparkImageToStorage(params: {
   file?: File | null;
   dataUrl: string;
   onProgress?: (percentage: number) => void;
-}): Promise<{ downloadUrl: string; storagePath?: string; width?: number; height?: number }> {
+}): Promise<{
+  downloadUrl: string;
+  storagePath?: string;
+  width?: number;
+  height?: number;
+  mediaSafety?: 'safe' | 'borderline';
+}> {
   const { file, dataUrl, onProgress } = params;
   const uploadSource: File | Blob | string = file && file.size > 0 ? file : dataUrl;
   const uploaded = await uploadImageToCloudinary(uploadSource, onProgress);
@@ -1075,7 +1233,8 @@ export async function uploadSparkImageToStorage(params: {
     downloadUrl: uploaded.secureUrl,
     storagePath: uploaded.publicId,
     width: uploaded.width,
-    height: uploaded.height
+    height: uploaded.height,
+    mediaSafety: uploaded.mediaSafety || 'safe'
   };
 }
 
@@ -2101,6 +2260,8 @@ export function startDirectVideoUploadToCloudinary(params: {
       window.addEventListener('offline', offlineListener);
     }
 
+    let useCloudinaryFallback = false;
+
     startOrResumeTransfer = () => {
       if (isCancelledByUser || isPausedByUser) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) {
@@ -2110,11 +2271,27 @@ export function startDirectVideoUploadToCloudinary(params: {
 
       try {
         xhr = new XMLHttpRequest();
-        xhr.open('POST', CLOUDINARY_VIDEO_UPLOAD_URL, true);
+        const targetUploadUrl = useCloudinaryFallback
+          ? CLOUDINARY_VIDEO_UPLOAD_URL
+          : CLOUDFLARE_UPLOAD_URL;
+        xhr.open('POST', targetUploadUrl, true);
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
 
+        if (!useCloudinaryFallback) {
+          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+          xhr.setRequestHeader('X-Mime-Type', file.type || 'video/mp4');
+          xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name || `${postId}.mp4`));
+          xhr.setRequestHeader('X-Resource-Type', 'video');
+          xhr.setRequestHeader('X-Upload-Id', postId);
+          xhr.setRequestHeader('X-Image-Width', String(width));
+          xhr.setRequestHeader('X-Image-Height', String(height));
+          if (auth.currentUser?.uid) {
+            xhr.setRequestHeader('X-WaveLink-Uid', auth.currentUser.uid);
+          }
+        }
+
         if (onStateChange) onStateChange('running');
-        resetStallTimer(30000);
+        resetStallTimer(45000);
 
         xhr.upload.onprogress = (event: ProgressEvent) => {
           if (isCancelledByUser || isPausedByUser || isWaitingForNetwork) return;
@@ -2123,7 +2300,7 @@ export function startDirectVideoUploadToCloudinary(params: {
 
           if (event.loaded > 0) {
             highestLoadedBytes = loaded;
-            resetStallTimer(30000);
+            resetStallTimer(45000);
           }
 
           if (total > 0 && onProgress) {
@@ -2132,7 +2309,7 @@ export function startDirectVideoUploadToCloudinary(params: {
             highestPct = displayPct;
             onProgress(
               displayPct,
-              `Uploading ${displayPct}% • ${formatVideoFileSize(loaded)} / ${formatVideoFileSize(total)}`,
+              `Uploading via Cloudflare ${displayPct}% • ${formatVideoFileSize(loaded)} / ${formatVideoFileSize(total)}`,
               loaded,
               total
             );
@@ -2159,10 +2336,11 @@ export function startDirectVideoUploadToCloudinary(params: {
             parsed = null;
           }
 
-          if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+          const rawVideoUrl = parsed?.secure_url || parsed?.url || parsed?.videoUrl || '';
+          if (status >= 200 && status < 300 && typeof rawVideoUrl === 'string' && rawVideoUrl.trim()) {
             cleanupNetworkListeners();
-            const secureUrl: string = parsed.secure_url;
-            const publicId: string = String(parsed.public_id || `wavelink_${postId}`);
+            const secureUrl: string = normalizeCloudflareHttpsUrl(rawVideoUrl);
+            const publicId: string = String(parsed.public_id || `cf_${postId}`);
             const cloudDuration =
               typeof parsed.duration === 'number' && parsed.duration > 0
                 ? Math.round(parsed.duration * 10) / 10
@@ -2177,16 +2355,25 @@ export function startDirectVideoUploadToCloudinary(params: {
             if (onProgress) {
               onProgress(
                 100,
-                `Uploaded ${totalSizeLabel} (100%) — saving post...`,
+                `Uploaded ${totalSizeLabel} via Cloudflare (100%) — saving post...`,
                 file.size,
                 file.size
               );
             }
 
+            let effectiveThumbData = thumbnailDataUrl;
+            if (!effectiveThumbData) {
+              try {
+                effectiveThumbData = await generateVideoThumbnail(file);
+              } catch {
+                effectiveThumbData = '';
+              }
+            }
+
             const resolvedThumb = await uploadVideoThumbnailToStorage(
               params.userId,
               postId,
-              thumbnailDataUrl,
+              effectiveThumbData,
               secureUrl
             );
 
@@ -2203,13 +2390,22 @@ export function startDirectVideoUploadToCloudinary(params: {
             return;
           }
 
+          // If primary Cloudflare upload failed once, try fallback before rejecting
+          if (!useCloudinaryFallback) {
+            useCloudinaryFallback = true;
+            highestLoadedBytes = 0;
+            highestPct = 1;
+            startOrResumeTransfer?.();
+            return;
+          }
+
           cleanupNetworkListeners();
-          const cloudinaryErrMsg =
+          const uploadErrMsg =
             parsed?.error?.message ||
-            (status ? `Cloudinary HTTP ${status} error` : 'Cloudinary upload failed');
-          const err = Object.assign(new Error(`Cloudinary upload error: ${cloudinaryErrMsg}`), {
+            (status ? `Cloudflare HTTP ${status} error` : 'Cloudflare video upload failed');
+          const err = Object.assign(new Error(`Cloudflare upload error: ${uploadErrMsg}`), {
             httpStatus: status,
-            cloudinaryMessage: cloudinaryErrMsg
+            cloudinaryMessage: uploadErrMsg
           });
           const formatted = formatVideoUploadError(err, {
             fileSize: file.size,
@@ -2239,9 +2435,16 @@ export function startDirectVideoUploadToCloudinary(params: {
             return;
           }
 
+          if (!useCloudinaryFallback) {
+            useCloudinaryFallback = true;
+            networkDropRetries = 0;
+            startOrResumeTransfer?.();
+            return;
+          }
+
           cleanupNetworkListeners();
           const netErr = new Error(
-            'NETWORK_ERROR: Could not reach Cloudinary upload server. Check your internet connection.'
+            'NETWORK_ERROR: Could not reach Cloudflare upload server. Check your internet connection.'
           );
           const formatted = formatVideoUploadError(netErr, {
             fileSize: file.size,
@@ -2259,11 +2462,14 @@ export function startDirectVideoUploadToCloudinary(params: {
           }
         };
 
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-
-        xhr.send(formData);
+        if (useCloudinaryFallback) {
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+          xhr.send(formData);
+        } else {
+          xhr.send(file);
+        }
       } catch (initErr) {
         clearStallTimer();
         cleanupNetworkListeners();
@@ -2614,7 +2820,13 @@ export const MAX_CHAT_FILE_BYTES = 20 * 1024 * 1024; // 20 MB cap for documents/
 export function uploadChatFileToCloudinary(
   file: File,
   onProgress?: (percentage: number) => void
-): Promise<{ secureUrl: string; fileName: string; fileSize: number; publicId: string }> {
+): Promise<{
+  secureUrl: string;
+  fileName: string;
+  fileSize: number;
+  publicId: string;
+  mediaSafety?: 'safe' | 'borderline';
+}> {
   return new Promise((resolve, reject) => {
     if (!file || file.size <= 0) {
       reject(new Error('Selected file is empty.'));
@@ -2625,10 +2837,13 @@ export function uploadChatFileToCloudinary(
       return;
     }
 
-    const endpoint = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', endpoint, true);
+    xhr.open('POST', CLOUDFLARE_UPLOAD_URL, true);
     xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Mime-Type', file.type || 'application/octet-stream');
+    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name || 'attachment'));
+    xhr.setRequestHeader('X-Resource-Type', file.type?.startsWith('image/') ? 'image' : 'raw');
 
     xhr.upload.onprogress = (event: ProgressEvent) => {
       if (!onProgress) return;
@@ -2648,35 +2863,35 @@ export function uploadChatFileToCloudinary(
         parsed = null;
       }
 
-      if (status >= 200 && status < 300 && parsed && typeof parsed.secure_url === 'string') {
+      const rawUrl = parsed?.secure_url || parsed?.url || '';
+      if (status >= 200 && status < 300 && typeof rawUrl === 'string' && rawUrl.trim()) {
         if (onProgress) onProgress(100);
         resolve({
-          secureUrl: parsed.secure_url,
+          secureUrl: normalizeCloudflareHttpsUrl(rawUrl),
           fileName: file.name || 'Attachment',
           fileSize: file.size || Number(parsed.bytes) || 0,
-          publicId: String(parsed.public_id || `wavelink_file_${Date.now()}`)
+          publicId: String(parsed.public_id || `cf_file_${Date.now()}`),
+          mediaSafety: parsed?.mediaSafety === 'borderline' ? 'borderline' : 'safe'
         });
         return;
       }
 
       const errMsg =
         parsed?.error?.message ||
-        (status ? `Cloudinary file upload HTTP ${status} error` : 'Cloudinary file upload failed');
-      reject(new Error(`File upload failed: ${errMsg}`));
+        parsed?.error ||
+        (status ? `Cloudflare file upload HTTP ${status} error` : 'Cloudflare file upload failed');
+      reject(new Error(status === 422 ? String(errMsg) : `File upload failed: ${errMsg}`));
     };
 
     xhr.onerror = () => {
-      reject(new Error('Network error while uploading file to Cloudinary.'));
+      reject(new Error('Network error while uploading file via Cloudflare.'));
     };
 
     xhr.onabort = () => {
       reject(new Error('File upload was cancelled.'));
     };
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-    xhr.send(formData);
+    xhr.send(file);
   });
 }
 

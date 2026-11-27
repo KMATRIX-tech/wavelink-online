@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { createServer as createViteServer } from 'vite';
 import { createServer as createHttpServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { GoogleGenAI, Modality, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, Modality, ThinkingLevel, Type } from '@google/genai';
 import {
   initializeApp as initializeAdminApp,
   getApps as getAdminApps,
@@ -13,22 +13,91 @@ import {
   cert
 } from 'firebase-admin/app';
 import { getMessaging as getAdminMessaging } from 'firebase-admin/messaging';
-import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
+import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
 import { getAppCheck as getAdminAppCheck } from 'firebase-admin/app-check';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import {
+  XP_ACTIONS_CONFIG,
+  BADGE_BY_ID,
+  getLevelProgress,
+  evaluateEligibleBadgeIds,
+  type XpActionType,
+  type UserEarnedBadge,
+  type UserRecentChallenge
+} from './src/config/progressionConfig.js';
+import {
+  checkTextModerationLocal,
+  sanitizeAiCaptionText,
+  MODERATION_FRIENDLY_BLOCK_MESSAGE,
+  getUserRestrictionStatus
+} from './src/utils/contentModeration.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIDEO_STORAGE_DIR = '/tmp/wavelink_videos';
+let CLOUDFLARE_MEDIA_DIR = path.join(__dirname, 'uploads', 'cloudflare_media');
 try {
   if (!fs.existsSync(VIDEO_STORAGE_DIR)) {
     fs.mkdirSync(VIDEO_STORAGE_DIR, { recursive: true });
   }
 } catch {
   // ignore directory init warning
+}
+try {
+  if (!fs.existsSync(CLOUDFLARE_MEDIA_DIR)) {
+    fs.mkdirSync(CLOUDFLARE_MEDIA_DIR, { recursive: true });
+  }
+} catch {
+  CLOUDFLARE_MEDIA_DIR = '/tmp/wavelink_cloudflare_media';
+  try {
+    if (!fs.existsSync(CLOUDFLARE_MEDIA_DIR)) {
+      fs.mkdirSync(CLOUDFLARE_MEDIA_DIR, { recursive: true });
+    }
+  } catch {
+    // ignore fallback init warning
+  }
+}
+
+interface CloudflareStoredMediaMeta {
+  mimeType: string;
+  fileName: string;
+  bytes: number;
+  width?: number;
+  height?: number;
+  resourceType: 'image' | 'video' | 'raw';
+  createdAt: string;
+}
+
+const CLOUDFLARE_META_FILE = path.join(CLOUDFLARE_MEDIA_DIR, '_meta.json');
+const cloudflareMediaMetaMap = new Map<string, CloudflareStoredMediaMeta>();
+try {
+  if (fs.existsSync(CLOUDFLARE_META_FILE)) {
+    const parsedMeta = JSON.parse(fs.readFileSync(CLOUDFLARE_META_FILE, 'utf-8'));
+    if (parsedMeta && typeof parsedMeta === 'object') {
+      for (const [k, v] of Object.entries(parsedMeta)) {
+        if (v && typeof v === 'object') {
+          cloudflareMediaMetaMap.set(k, v as CloudflareStoredMediaMeta);
+        }
+      }
+    }
+  }
+} catch {
+  // ignore metadata cache read error
+}
+
+function saveCloudflareMediaMeta(): void {
+  try {
+    const obj: Record<string, CloudflareStoredMediaMeta> = {};
+    cloudflareMediaMetaMap.forEach((v, k) => {
+      obj[k] = v;
+    });
+    fs.writeFileSync(CLOUDFLARE_META_FILE, JSON.stringify(obj), 'utf-8');
+  } catch {
+    // ignore metadata cache write error
+  }
 }
 
 // Load .env / .env.production / .env.local files into process.env in production if present
@@ -1787,12 +1856,13 @@ async function resolveServerUserPrivileges(req: express.Request): Promise<{
     role = 'support_helper';
   }
 
-  // Check Firestore /users/{uid}, /admins/{uid}, and /staff_roles/{uid} for authoritative role, revocation & isPro
+  // Check Firestore /users/{uid}, /roles/{uid}, /admins/{uid}, and /staff_roles/{uid} for authoritative role, revocation & isPro
   try {
     const { projectId, firestoreDatabaseId } = getServerFirebaseConfig();
     let userData: Record<string, any> | null = null;
     let isAdminDoc = false;
     let staffRoleDocVal = '';
+    let roleDocVal = '';
 
     if (ensureFirebaseAdminInitialized() && getAdminApps().length > 0) {
       try {
@@ -1800,10 +1870,11 @@ async function resolveServerUserPrivileges(req: express.Request): Promise<{
           firestoreDatabaseId && firestoreDatabaseId !== '(default)'
             ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
             : getAdminFirestore(getAdminApp());
-        const [uSnap, aSnap, sSnap] = await Promise.all([
+        const [uSnap, aSnap, sSnap, rSnap] = await Promise.all([
           adminDb.collection('users').doc(uid).get(),
           adminDb.collection('admins').doc(uid).get(),
           adminDb.collection('staff_roles').doc(uid).get(),
+          adminDb.collection('roles').doc(uid).get(),
         ]);
         if (uSnap.exists) userData = uSnap.data() || null;
         if (aSnap.exists) {
@@ -1812,6 +1883,10 @@ async function resolveServerUserPrivileges(req: express.Request): Promise<{
         }
         if (sSnap.exists) {
           staffRoleDocVal = String(sSnap.data()?.role || '');
+        }
+        if (rSnap.exists) {
+          roleDocVal = String(rSnap.data()?.role || '').trim().toLowerCase();
+          if (roleDocVal === 'admin' || roleDocVal === 'super_admin') isAdminDoc = true;
         }
       } catch {
         // fall through to REST
@@ -1823,7 +1898,10 @@ async function resolveServerUserPrivileges(req: express.Request): Promise<{
         projectId
       )}/databases/${encodeURIComponent(firestoreDatabaseId || '(default)')}/documents`;
       const headers = { Authorization: `Bearer ${verified.rawIdToken}` };
-      const uResp = await fetch(`${dbPath}/users/${encodeURIComponent(uid)}`, { headers }).catch(() => null);
+      const [uResp, rResp] = await Promise.all([
+        fetch(`${dbPath}/users/${encodeURIComponent(uid)}`, { headers }).catch(() => null),
+        fetch(`${dbPath}/roles/${encodeURIComponent(uid)}`, { headers }).catch(() => null),
+      ]);
       if (uResp && uResp.ok) {
         const docJson = await uResp.json().catch(() => null);
         const f = docJson?.fields || {};
@@ -1841,7 +1919,12 @@ async function resolveServerUserPrivileges(req: express.Request): Promise<{
           sessionsRevokedKeepDeviceId: f.sessionsRevokedKeepDeviceId?.stringValue || '',
         };
       }
-      if (!isAdminDoc && role === 'user') {
+      if (rResp && rResp.ok) {
+        const rJson = await rResp.json().catch(() => null);
+        roleDocVal = String(rJson?.fields?.role?.stringValue || '').trim().toLowerCase();
+        if (roleDocVal === 'admin' || roleDocVal === 'super_admin') isAdminDoc = true;
+      }
+      if (!isAdminDoc && role === 'user' && roleDocVal !== 'subadmin' && roleDocVal !== 'sub_admin') {
         const aResp = await fetch(`${dbPath}/admins/${encodeURIComponent(uid)}`, { headers }).catch(() => null);
         if (aResp && aResp.ok) {
           const aJson = await aResp.json().catch(() => null);
@@ -1876,17 +1959,26 @@ async function resolveServerUserPrivileges(req: express.Request): Promise<{
       }
     }
 
-    if (isAdminDoc || userData?.role === 'admin' || userData?.role === 'super_admin' || userData?.isOwner === true) {
+    if (
+      isAdminDoc ||
+      roleDocVal === 'admin' ||
+      userData?.role === 'admin' ||
+      userData?.role === 'super_admin' ||
+      userData?.isOwner === true
+    ) {
       role = 'super_admin';
       isPro = true;
       persistOwnerUidOnServer(uid);
     } else if (
       role === 'user' &&
       !userData?.isBot &&
-      (staffRoleDocVal === 'moderator' ||
+      (roleDocVal === 'subadmin' ||
+        roleDocVal === 'sub_admin' ||
+        staffRoleDocVal === 'moderator' ||
         staffRoleDocVal === 'sub_admin' ||
         userData?.role === 'moderator' ||
         userData?.role === 'sub_admin' ||
+        userData?.role === 'subadmin' ||
         userData?.isModerator === true ||
         userData?.isSubAdmin === true)
     ) {
@@ -2260,11 +2352,21 @@ async function startServer() {
       allowedHeaders: [
         'Content-Type',
         'Authorization',
+        'X-Requested-With',
         'X-Firebase-AppCheck',
         'X-WaveLink-Uid',
         'X-WaveLink-Email',
         'X-WaveLink-Device-Id',
         'X-WaveLink-Owner-Token',
+        'X-File-Name',
+        'X-Mime-Type',
+        'X-Resource-Type',
+        'X-Image-Width',
+        'X-Image-Height',
+        'X-Video-Duration',
+        'X-Upload-Id',
+        'X-Chunk-Index',
+        'X-Total-Chunks',
       ],
       credentials: true,
     })
@@ -2279,6 +2381,8 @@ async function startServer() {
       // Do not corrupt base64 media chunks or cryptographic JWT/SDP payloads
       if (
         keyName === 'chunkData' ||
+        keyName === 'dataBase64' ||
+        keyName === 'fileBase64' ||
         keyName === 'imageBase64' ||
         keyName === 'audioBase64' ||
         keyName === 'idToken' ||
@@ -2658,6 +2762,16 @@ async function startServer() {
 
     const { mode, text, mediaType, tone } = parsed.data;
     const cleanDraft = sanitizeServerString(text || '', 2000);
+    if (cleanDraft) {
+      const draftCheck = checkTextModerationLocal(cleanDraft);
+      if (draftCheck.flagged) {
+        return res.status(422).json({
+          success: false,
+          flagged: true,
+          error: MODERATION_FRIENDLY_BLOCK_MESSAGE,
+        });
+      }
+    }
     const quota = checkAndIncrementUserAiQuota(`uid:${caller.uid}`, 'chat', caller.isPro);
     if (!quota.allowed) {
       return res.status(429).json({
@@ -2727,12 +2841,13 @@ async function startServer() {
           ? `Generate 3 distinct, engaging social media captions (with 2-3 relevant hashtags each) for a WaveLink ${mediaType} post.
 Tone: ${tone}.
 User context/draft: "${cleanDraft || 'Sharing a great moment on WaveLink'}".
+Keep every caption strictly family-friendly with zero profanity, slurs, or sexual language.
 Return ONLY a JSON array of 3 strings, e.g. ["caption 1", "caption 2", "caption 3"].`
-          : `Improve and polish this social media post draft for WaveLink while preserving the author's original meaning and voice. Make it clear, engaging (${tone} tone), well-formatted, and add 2-3 relevant hashtags if none are present.
+          : `Improve and polish this social media post draft for WaveLink while preserving the author's original meaning and voice. Make it clear, engaging (${tone} tone), strictly family-friendly with zero profanity or abuse, well-formatted, and add 2-3 relevant hashtags if none are present.
 Original draft: "${cleanDraft}"
 Return ONLY the improved post text without surrounding quotes or markdown explanation.`;
 
-      const candidateModels = getCandidateTextModels('gemini-3.8-flash');
+      const candidateModels = getCandidateTextModels('gemini-3.1-flash-lite');
       for (const modelName of candidateModels) {
         try {
           const reply = await generateFastGeminiReply(
@@ -2749,17 +2864,23 @@ Return ONLY the improved post text without surrounding quotes or markdown explan
               if (jsonMatch) {
                 const parsedArr = JSON.parse(jsonMatch[0]);
                 if (Array.isArray(parsedArr) && parsedArr.length > 0) {
-                  return res.json({
-                    success: true,
-                    mode,
-                    suggestions: parsedArr.map((s) => sanitizeServerString(String(s), 600)).filter(Boolean).slice(0, 3),
-                  });
+                  const safeSuggestions = parsedArr
+                    .map((s) => sanitizeAiCaptionText(sanitizeServerString(String(s), 600)))
+                    .filter((s) => s.length > 0 && !checkTextModerationLocal(s).flagged)
+                    .slice(0, 3);
+                  if (safeSuggestions.length > 0) {
+                    return res.json({
+                      success: true,
+                      mode,
+                      suggestions: safeSuggestions,
+                    });
+                  }
                 }
               }
               const lines = reply
                 .split('\n')
-                .map((l) => l.replace(/^(\d+[.)]|[-*])\s*/, '').trim())
-                .filter((l) => l.length > 10)
+                .map((l) => sanitizeAiCaptionText(l.replace(/^(\d+[.)]|[-*])\s*/, '').trim()))
+                .filter((l) => l.length > 10 && !checkTextModerationLocal(l).flagged)
                 .slice(0, 3);
               if (lines.length > 0) {
                 return res.json({
@@ -2769,11 +2890,14 @@ Return ONLY the improved post text without surrounding quotes or markdown explan
                 });
               }
             } else {
-              return res.json({
-                success: true,
-                mode,
-                improvedText: reply.replace(/^["']|["']$/g, '').trim(),
-              });
+              const cleanedReply = sanitizeAiCaptionText(reply.replace(/^["']|["']$/g, '').trim());
+              if (cleanedReply && !checkTextModerationLocal(cleanedReply).flagged) {
+                return res.json({
+                  success: true,
+                  mode,
+                  improvedText: cleanedReply,
+                });
+              }
             }
           }
         } catch {
@@ -2798,12 +2922,386 @@ Return ONLY the improved post text without surrounding quotes or markdown explan
     });
   });
 
+  // ============================================================================
+  // LAYER 2 (SERVER TEXT CHECK + SELECTIVE GEMINI) & LAYER 3 (IMAGE MODERATION)
+  // Honest note: No automated filter catches 100% of slang/context in every language.
+  // We combine fast local+server multilingual normalization, selective Gemini AI checks
+  // with daily cost caps, one-time upload image screening, and community reports/appeals.
+  // ============================================================================
+  const moderationMinuteRateMap = new Map<string, { count: number; resetAt: number }>();
+  const moderationAiDailyUserMap = new Map<string, { day: string; count: number }>();
+  let moderationAiDailyGlobal = { day: '', count: 0 };
+  const imageModDailyUserMap = new Map<string, { day: string; count: number }>();
+  let imageModDailyGlobal = { day: '', count: 0 };
+  const userRestrictionCache = new Map<string, { expiresAt: number; restricted: boolean; message: string }>();
+
+  const MODERATION_TEXT_PER_MIN_LIMIT = 25;
+  const MODERATION_AI_DAILY_PER_USER = 25;
+  const MODERATION_AI_DAILY_GLOBAL = 350;
+  const IMAGE_MOD_DAILY_PER_USER = 30;
+  const IMAGE_MOD_DAILY_GLOBAL = 300;
+
+  async function checkUserActiveRestrictionServer(uid: string): Promise<{ restricted: boolean; message: string }> {
+    const now = Date.now();
+    const cached = userRestrictionCache.get(uid);
+    if (cached && cached.expiresAt > now) {
+      return { restricted: cached.restricted, message: cached.message };
+    }
+    const adminDb = getServerFirestore();
+    if (!adminDb) return { restricted: false, message: '' };
+    try {
+      const snap = await adminDb.collection('users').doc(uid).get();
+      if (snap.exists) {
+        const status = getUserRestrictionStatus(snap.data() as any, now);
+        const result = { restricted: status.restricted, message: status.message || '' };
+        userRestrictionCache.set(uid, { ...result, expiresAt: now + 30_000 });
+        return result;
+      }
+    } catch {
+      // fail open on transient read issue
+    }
+    return { restricted: false, message: '' };
+  }
+
+  function consumeModerationMinuteQuota(uid: string): boolean {
+    const now = Date.now();
+    const b = moderationMinuteRateMap.get(uid);
+    if (!b || now > b.resetAt) {
+      moderationMinuteRateMap.set(uid, { count: 1, resetAt: now + 60_000 });
+      return true;
+    }
+    if (b.count >= MODERATION_TEXT_PER_MIN_LIMIT) return false;
+    b.count += 1;
+    return true;
+  }
+
+  function consumeAiModerationDailyBudget(uid: string): boolean {
+    const today = new Date().toISOString().slice(0, 10);
+    if (moderationAiDailyGlobal.day !== today) {
+      moderationAiDailyGlobal = { day: today, count: 0 };
+    }
+    if (moderationAiDailyGlobal.count >= MODERATION_AI_DAILY_GLOBAL) return false;
+    const u = moderationAiDailyUserMap.get(uid);
+    const uCount = u && u.day === today ? u.count : 0;
+    if (uCount >= MODERATION_AI_DAILY_PER_USER) return false;
+    moderationAiDailyGlobal.count += 1;
+    moderationAiDailyUserMap.set(uid, { day: today, count: uCount + 1 });
+    return true;
+  }
+
+  function consumeImageModDailyBudget(uid: string): boolean {
+    const today = new Date().toISOString().slice(0, 10);
+    if (imageModDailyGlobal.day !== today) {
+      imageModDailyGlobal = { day: today, count: 0 };
+    }
+    if (imageModDailyGlobal.count >= IMAGE_MOD_DAILY_GLOBAL) return false;
+    const u = imageModDailyUserMap.get(uid);
+    const uCount = u && u.day === today ? u.count : 0;
+    if (uCount >= IMAGE_MOD_DAILY_PER_USER) return false;
+    imageModDailyGlobal.count += 1;
+    imageModDailyUserMap.set(uid, { day: today, count: uCount + 1 });
+    return true;
+  }
+
+  async function runServerTextModeration(
+    rawText: string,
+    uid: string,
+    context: string = 'post',
+    forceDeepCheck: boolean = false
+  ): Promise<{
+    allowed: boolean;
+    flagged: boolean;
+    rateLimited?: boolean;
+    restricted?: boolean;
+    category: string;
+    friendlyMessage: string;
+    moderationChecked: boolean;
+    moderationCheckedAt: string;
+    usedAi: boolean;
+  }> {
+    const nowIso = new Date().toISOString();
+    const cleanText = sanitizeServerString(rawText || '', 4000);
+
+    // 1. Check active mute / suspension / ban status on user profile
+    const restriction = await checkUserActiveRestrictionServer(uid);
+    if (restriction.restricted) {
+      return {
+        allowed: false,
+        flagged: true,
+        restricted: true,
+        category: 'account_restricted',
+        friendlyMessage: restriction.message || 'Your account is temporarily restricted from posting.',
+        moderationChecked: false,
+        moderationCheckedAt: nowIso,
+        usedAi: false,
+      };
+    }
+
+    // 2. Per-user minute rate limit (cost & abuse guard)
+    if (!consumeModerationMinuteQuota(uid)) {
+      return {
+        allowed: false,
+        flagged: false,
+        rateLimited: true,
+        category: 'rate_limit',
+        friendlyMessage: 'You are posting very quickly. Please wait a moment and try again.',
+        moderationChecked: false,
+        moderationCheckedAt: nowIso,
+        usedAi: false,
+      };
+    }
+
+    if (!cleanText) {
+      return {
+        allowed: true,
+        flagged: false,
+        category: 'safe',
+        friendlyMessage: '',
+        moderationChecked: true,
+        moderationCheckedAt: nowIso,
+        usedAi: false,
+      };
+    }
+
+    // 3. Re-run Layer 1 multilingual normalized filter on the server (unbypassable)
+    const localVerdict = checkTextModerationLocal(cleanText);
+    if (localVerdict.flagged) {
+      return {
+        allowed: false,
+        flagged: true,
+        category: localVerdict.category,
+        friendlyMessage: MODERATION_FRIENDLY_BLOCK_MESSAGE,
+        moderationChecked: false,
+        moderationCheckedAt: nowIso,
+        usedAi: false,
+      };
+    }
+
+    // 4. Selective Layer 2 Gemini moderation ONLY for suspicious/borderline text (or forced check)
+    const apiKey = getServerGeminiKey();
+    const shouldCallAi = Boolean(apiKey && (localVerdict.suspiciousForAi || forceDeepCheck) && cleanText.length >= 6);
+    if (shouldCallAi) {
+      if (!consumeAiModerationDailyBudget(uid)) {
+        // Daily AI moderation cost cap hit: if text had strong suspicious triggers, ask user to retry gently
+        return {
+          allowed: !localVerdict.suspiciousForAi,
+          flagged: localVerdict.suspiciousForAi,
+          rateLimited: localVerdict.suspiciousForAi,
+          category: localVerdict.suspiciousForAi ? 'budget_limit' : 'safe',
+          friendlyMessage: localVerdict.suspiciousForAi
+            ? 'Our safety check is temporarily busy. Please edit your message or try again shortly.'
+            : '',
+          moderationChecked: !localVerdict.suspiciousForAi,
+          moderationCheckedAt: nowIso,
+          usedAi: false,
+        };
+      }
+
+      try {
+        const ai = new GoogleGenAI({
+          apiKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+        });
+        const modPrompt = `You are WaveLink's multilingual safety moderator (English, Swahili, and all world languages).
+Check this ${context} for: abusive language, hate speech, slurs, harassment, threats, sexual/explicit content, severe profanity (including coded/obfuscated insults), or phishing/scams asking for PINs/passwords/OTP.
+Do NOT flag normal friendly conversation, news, sports, cooking, or benign words.
+Text: "${cleanText.slice(0, 1500)}"
+Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "profanity" | "hate" | "harassment" | "sexual" | "scam", "reason": "short neutral note"}`;
+        const reply = await generateFastGeminiReply(
+          ai,
+          'gemini-3.1-flash-lite',
+          [{ role: 'user', parts: [{ text: modPrompt }] }],
+          'You are a strict yet fair multilingual safety moderator for an all-ages social platform.',
+          3000,
+          140
+        );
+        const jsonMatch = reply.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsedAi = JSON.parse(jsonMatch[0]);
+          if (parsedAi.flagged === true) {
+            return {
+              allowed: false,
+              flagged: true,
+              category: String(parsedAi.category || 'harassment'),
+              friendlyMessage: MODERATION_FRIENDLY_BLOCK_MESSAGE,
+              moderationChecked: false,
+              moderationCheckedAt: nowIso,
+              usedAi: true,
+            };
+          }
+        }
+        return {
+          allowed: true,
+          flagged: false,
+          category: 'safe',
+          friendlyMessage: '',
+          moderationChecked: true,
+          moderationCheckedAt: nowIso,
+          usedAi: true,
+        };
+      } catch {
+        // Proceed with deterministic Layer 1 result if Gemini times out
+      }
+    }
+
+    return {
+      allowed: true,
+      flagged: false,
+      category: 'safe',
+      friendlyMessage: '',
+      moderationChecked: true,
+      moderationCheckedAt: nowIso,
+      usedAi: false,
+    };
+  }
+
   /**
-   * POST /api/ai/moderate
-   * Server-side content safety moderation before publishing posts/comments/sparks.
-   * Combines fast deterministic scam/abuse rules with Gemini safety classification.
+   * Layer 3 — One-Time Upload Image / Video Thumbnail Safety Moderation
+   * Uses Google Cloud Vision SafeSearch when GOOGLE_CLOUD_VISION_API_KEY is configured,
+   * with automatic Gemini Vision (gemini-3.1-flash-lite) fallback via GEMINI_API_KEY.
    */
-  app.post('/api/ai/moderate', rateLimitPostAi, async (req, res) => {
+  async function moderateImageBufferOnServer(
+    buffer: Buffer,
+    mimeType: string,
+    uid: string
+  ): Promise<{
+    verdict: 'safe' | 'borderline' | 'unsafe';
+    category: string;
+    friendlyMessage: string;
+    provider: 'vision' | 'gemini' | 'skipped';
+  }> {
+    if (!buffer || buffer.length === 0) {
+      return { verdict: 'safe', category: 'safe', friendlyMessage: '', provider: 'skipped' };
+    }
+    if (!consumeImageModDailyBudget(uid || 'anon')) {
+      return {
+        verdict: 'safe',
+        category: 'budget_skipped',
+        friendlyMessage: '',
+        provider: 'skipped',
+      };
+    }
+
+    const base64Data = buffer.toString('base64');
+    const safeMime = /^image\/(jpeg|jpg|png|webp|gif)$/i.test(mimeType) ? mimeType : 'image/jpeg';
+
+    // Path A: Google Cloud Vision SafeSearch API (if GOOGLE_CLOUD_VISION_API_KEY is set)
+    const visionKey = (process.env.GOOGLE_CLOUD_VISION_API_KEY || '').trim();
+    if (visionKey) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        const resp = await fetch(
+          `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(visionKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              requests: [
+                {
+                  image: { content: base64Data },
+                  features: [{ type: 'SAFE_SEARCH_DETECTION' }],
+                },
+              ],
+            }),
+          }
+        );
+        clearTimeout(timer);
+        if (resp.ok) {
+          const json: any = await resp.json();
+          const ss = json?.responses?.[0]?.safeSearchAnnotation;
+          if (ss) {
+            const adult = String(ss.adult || 'UNKNOWN');
+            const violence = String(ss.violence || 'UNKNOWN');
+            const racy = String(ss.racy || 'UNKNOWN');
+            const isHigh = (v: string) => v === 'LIKELY' || v === 'VERY_LIKELY';
+            const isVeryHigh = (v: string) => v === 'VERY_LIKELY';
+            const isPossible = (v: string) => v === 'POSSIBLE';
+
+            if (isHigh(adult) || isHigh(violence) || isVeryHigh(racy)) {
+              return {
+                verdict: 'unsafe',
+                category: isHigh(adult) ? 'explicit_adult' : isHigh(violence) ? 'graphic_violence' : 'explicit_racy',
+                friendlyMessage:
+                  'This media cannot be uploaded because it does not meet WaveLink Community Safety Guidelines.',
+                provider: 'vision',
+              };
+            }
+            if (isHigh(racy) || isPossible(adult) || isPossible(violence)) {
+              return {
+                verdict: 'borderline',
+                category: 'sensitive_media',
+                friendlyMessage: 'Marked as sensitive content (blurred by default and hidden for under-18 accounts).',
+                provider: 'vision',
+              };
+            }
+            return { verdict: 'safe', category: 'safe', friendlyMessage: '', provider: 'vision' };
+          }
+        }
+      } catch {
+        // fall through to Gemini Vision fallback
+      }
+    }
+
+    // Path B: Gemini Vision SafeSearch fallback (runs ONCE on upload with gemini-3.1-flash-lite)
+    const geminiKey = getServerGeminiKey();
+    if (geminiKey && buffer.length <= 4 * 1024 * 1024) {
+      try {
+        const ai = new GoogleGenAI({
+          apiKey: geminiKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+        });
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: {
+            parts: [
+              { inlineData: { mimeType: safeMime, data: base64Data } },
+              {
+                text: `Classify this uploaded image/video thumbnail for an all-ages social platform:
+- "unsafe": nudity, explicit sexual content, pornography, graphic violence/gore, hate symbols, or self-harm.
+- "borderline": suggestive/racy imagery, swimwear/lingerie focus, mild graphic injury, or sensitive mature themes suitable only behind a sensitive-content blur for 18+ users.
+- "safe": normal photos, selfies, nature, food, fashion, sports, art, music, memes, text cards.
+Respond ONLY with JSON: {"verdict":"safe"|"borderline"|"unsafe","category":"safe|adult|violence|hate|racy"}`,
+              },
+            ],
+          },
+          config: {
+            responseMimeType: 'application/json',
+          },
+        });
+        const rawText = String(response.text || '').trim();
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (parsed.verdict === 'unsafe') {
+            return {
+              verdict: 'unsafe',
+              category: String(parsed.category || 'unsafe_media'),
+              friendlyMessage:
+                'This media cannot be uploaded because it does not meet WaveLink Community Safety Guidelines.',
+              provider: 'gemini',
+            };
+          }
+          if (parsed.verdict === 'borderline') {
+            return {
+              verdict: 'borderline',
+              category: String(parsed.category || 'sensitive_media'),
+              friendlyMessage: 'Marked as sensitive content (blurred by default and hidden for under-18 accounts).',
+              provider: 'gemini',
+            };
+          }
+          return { verdict: 'safe', category: 'safe', friendlyMessage: '', provider: 'gemini' };
+        }
+      } catch {
+        // fail safe on transient upstream timeout
+      }
+    }
+
+    return { verdict: 'safe', category: 'safe', friendlyMessage: '', provider: 'skipped' };
+  }
+
+  const handleServerTextModerationRoute = async (req: express.Request, res: express.Response) => {
     const authUser = await verifyStrictFirebaseIdToken(req);
     if (!authUser.valid || !authUser.uid) {
       return res.status(401).json({
@@ -2819,83 +3317,98 @@ Return ONLY the improved post text without surrounding quotes or markdown explan
       });
     }
 
-    const cleanText = sanitizeServerString(parsed.data.text, 4000);
-    const lower = cleanText.toLowerCase();
+    const context = sanitizeServerString(req.body?.context || 'post', 32);
+    const forceDeepCheck = Boolean(req.body?.forceDeepCheck);
+    const result = await runServerTextModeration(
+      parsed.data.text,
+      authUser.uid,
+      context,
+      forceDeepCheck
+    );
 
-    // 1. Instant deterministic checks for credential phishing, PIN harvesting, or severe abuse
-    const scamPatterns = [
-      /\b(send|share|give)\s+(me\s+)?(your\s+)?(mpesa|airtel|tigo|halopesa|mobile\s+money)?\s*(pin|password|otp|secret\s+code)\b/i,
-      /\b(free\s+money\s+multiplier|double\s+your\s+tzs\s+instantly)\b/i,
-    ];
-    for (const pat of scamPatterns) {
-      if (pat.test(lower)) {
-        return res.json({
-          success: true,
-          flagged: true,
-          category: 'phishing_or_scam',
-          reason: 'This post appears to ask for private PINs, passwords, or OTP codes, which violates WaveLink Community Safety Rules.',
-        });
-      }
-    }
-
-    const severeHatePatterns = [
-      /\b(kill\s+yourself|kys|i\s+will\s+doxx\s+you)\b/i,
-    ];
-    for (const pat of severeHatePatterns) {
-      if (pat.test(lower)) {
-        return res.json({
-          success: true,
-          flagged: true,
-          category: 'harassment_or_harm',
-          reason: 'This content contains harmful or threatening language that goes against WaveLink Community Guidelines.',
-        });
-      }
-    }
-
-    // 2. Optional Gemini AI moderation check when GEMINI_API_KEY is available
-    const apiKey = getServerGeminiKey();
-    if (apiKey && cleanText.length > 12) {
-      try {
-        const ai = new GoogleGenAI({
-          apiKey,
-          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-        });
-        const modPrompt = `Analyze this social media post for severe community guideline violations (hate speech, explicit violence, phishing/scams asking for PINs/passwords, or severe harassment).
-Post text: "${cleanText.slice(0, 1200)}"
-Respond ONLY with valid JSON: {"flagged": boolean, "category": "safe" | "scam" | "harassment" | "hate_speech" | "explicit", "reason": "short user-friendly explanation if flagged, else empty"}`;
-        const reply = await generateFastGeminiReply(
-          ai,
-          'gemini-3.1-flash-lite',
-          [{ role: 'user', parts: [{ text: modPrompt }] }],
-          'You are a fair, accurate content safety moderator for WaveLink. Only flag genuinely harmful, abusive, or scam content.',
-          2500,
-          150
-        );
-        const jsonMatch = reply.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const modResult = JSON.parse(jsonMatch[0]);
-          if (typeof modResult.flagged === 'boolean') {
-            return res.json({
-              success: true,
-              flagged: Boolean(modResult.flagged),
-              category: String(modResult.category || 'safe'),
-              reason: modResult.flagged
-                ? sanitizeServerString(modResult.reason || 'Content flagged by WaveLink AI Safety Check.', 240)
-                : '',
-            });
-          }
-        }
-      } catch {
-        // Proceed with deterministic pass if upstream AI times out
-      }
+    if (result.rateLimited) {
+      return res.status(429).json({
+        success: false,
+        allowed: false,
+        flagged: result.flagged,
+        category: result.category,
+        friendlyMessage: result.friendlyMessage,
+        reason: result.friendlyMessage,
+      });
     }
 
     return res.json({
       success: true,
-      flagged: false,
-      category: 'safe',
-      reason: '',
+      allowed: result.allowed,
+      flagged: result.flagged,
+      category: result.category,
+      friendlyMessage: result.friendlyMessage,
+      reason: result.friendlyMessage,
+      moderationChecked: result.moderationChecked,
+      moderationCheckedAt: result.moderationCheckedAt,
+      usedAi: result.usedAi,
     });
+  };
+
+  /**
+   * POST /api/moderation/check-text & POST /api/ai/moderate
+   * Layer 2 unbypassable server text moderation (Layer 1 normalization + selective Gemini AI).
+   */
+  app.post('/api/moderation/check-text', rateLimitPostAi, handleServerTextModerationRoute);
+  app.post('/api/ai/moderate', rateLimitPostAi, handleServerTextModerationRoute);
+
+  /**
+   * POST /api/moderation/check-image
+   * Layer 3 one-time image / video thumbnail safety screening before upload/publish.
+   */
+  app.post('/api/moderation/check-image', rateLimitPostAi, async (req, res) => {
+    const authUser = await verifyStrictFirebaseIdToken(req);
+    if (!authUser.valid || !authUser.uid) {
+      return res.status(401).json({
+        success: false,
+        allowed: false,
+        error: authUser.error || 'Authentication required.',
+      });
+    }
+    const rawBase64 = String(req.body?.imageBase64 || '').trim();
+    const mimeType = sanitizeServerString(req.body?.mimeType || 'image/jpeg', 40).toLowerCase();
+    const cleanedBase64 = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
+    if (!cleanedBase64 || cleanedBase64.length > 6 * 1024 * 1024) {
+      return res.status(400).json({
+        success: false,
+        allowed: false,
+        error: 'Please provide a valid image thumbnail (max 4 MB).',
+      });
+    }
+
+    try {
+      const buf = Buffer.from(cleanedBase64, 'base64');
+      const check = await moderateImageBufferOnServer(buf, mimeType, authUser.uid);
+      if (check.verdict === 'unsafe') {
+        return res.status(422).json({
+          success: false,
+          allowed: false,
+          verdict: 'unsafe',
+          category: check.category,
+          friendlyMessage: check.friendlyMessage,
+        });
+      }
+      return res.json({
+        success: true,
+        allowed: true,
+        verdict: check.verdict,
+        category: check.category,
+        friendlyMessage: check.friendlyMessage,
+      });
+    } catch {
+      return res.json({
+        success: true,
+        allowed: true,
+        verdict: 'safe',
+        category: 'safe',
+        friendlyMessage: '',
+      });
+    }
   });
 
   /**
@@ -4512,6 +5025,503 @@ Escalation Required: ${
     });
   });
 
+  // ==========================================
+  // ADMIN UPDATES — Server-Side AI Formal Announcement Rewriter
+  // Verifies Firebase ID token + Admin/Sub-Admin Role, enforces 20/day/user rate limit,
+  // and calls Gemini on the server using process.env.GEMINI_API_KEY (never from the browser).
+  // ==========================================
+  const adminUpdatesAiDailyUsage = new Map<string, { date: string; count: number }>();
+  const ADMIN_UPDATES_DAILY_AI_LIMIT = 20;
+
+  function buildFallbackFormalUpdate(
+    roughNotes: string,
+    updateType: string
+  ): { title: string; message: string; messageSw: string } {
+    const typeLabels: Record<string, { en: string; sw: string }> = {
+      new_feature: { en: 'New Feature Update', sw: 'Kipengele Kipya cha WaveLink' },
+      improvement: { en: 'Platform Improvement', sw: 'Maboresho ya WaveLink' },
+      bug_fix: { en: 'Bug Fix & Stability Update', sw: 'Marekebisho ya Mfumo' },
+      maintenance: { en: 'Scheduled Maintenance Notice', sw: 'Taarifa ya Matengenezo' },
+      announcement: { en: 'Official WaveLink Update', sw: 'Tangazo Rasmi la WaveLink' },
+    };
+    const label = typeLabels[updateType] || typeLabels.announcement;
+    const cleaned = roughNotes
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^[.,;:-]+|[.,;:-]+$/g, '');
+    const firstClause = cleaned.split(/[.,;!?]/)[0]?.trim() || label.en;
+    const rawTitle =
+      firstClause.length > 4 && firstClause.length <= 54
+        ? firstClause.charAt(0).toUpperCase() + firstClause.slice(1)
+        : label.en;
+    const title = rawTitle.slice(0, 60);
+    const capitalizedNotes = cleaned
+      ? cleaned.charAt(0).toUpperCase() + cleaned.slice(1) + (/[.!?]$/.test(cleaned) ? '' : '.')
+      : 'We have deployed important updates to improve your WaveLink experience.';
+
+    const message = `We have rolled out a new update on WaveLink: ${capitalizedNotes} Thank you for being part of the WaveLink community.`;
+    const messageSw = `Tumeboresha WaveLink kwa sasisho jipya: ${capitalizedNotes} Asante kwa kuendelea kutumia WaveLink.`;
+    return { title, message, messageSw };
+  }
+
+  app.post('/api/admin-updates/rewrite', async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || (!caller.isSuperAdmin && !caller.isModerator && !caller.isAdmin)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Unauthorized: Only WaveLink admins and sub-admins can generate formal announcements.',
+        });
+      }
+
+      const rawNotes = typeof req.body?.roughNotes === 'string' ? req.body.roughNotes.trim() : '';
+      const rawType = typeof req.body?.type === 'string' ? req.body.type.trim() : 'announcement';
+      const allowedTypes = ['new_feature', 'improvement', 'bug_fix', 'maintenance', 'announcement'];
+      const updateType = allowedTypes.includes(rawType) ? rawType : 'announcement';
+
+      if (!rawNotes) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please enter a few rough words describing the update first.',
+        });
+      }
+      if (rawNotes.length > 500) {
+        return res.status(400).json({
+          success: false,
+          error: 'Rough notes cannot exceed 500 characters.',
+        });
+      }
+
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const currentUsage = adminUpdatesAiDailyUsage.get(caller.uid);
+      const usedToday = currentUsage && currentUsage.date === todayKey ? currentUsage.count : 0;
+      if (usedToday >= ADMIN_UPDATES_DAILY_AI_LIMIT) {
+        return res.status(429).json({
+          success: false,
+          rateLimited: true,
+          remainingToday: 0,
+          error: `Daily AI limit reached (${ADMIN_UPDATES_DAILY_AI_LIMIT} formal rewrites per day). You can still edit and post your announcement manually below.`,
+        });
+      }
+
+      const apiKey = getServerGeminiKey();
+      if (!apiKey) {
+        const fallback = buildFallbackFormalUpdate(rawNotes, updateType);
+        return res.status(200).json({
+          success: true,
+          usedFallback: true,
+          title: fallback.title,
+          message: fallback.message,
+          messageSw: fallback.messageSw,
+          remainingToday: Math.max(0, ADMIN_UPDATES_DAILY_AI_LIMIT - usedToday),
+          notice: 'AI key is not configured on the server; generated a clean formal template that you can edit before posting.',
+        });
+      }
+
+      const typeNames: Record<string, string> = {
+        new_feature: 'New Feature',
+        improvement: 'Improvement',
+        bug_fix: 'Bug Fix',
+        maintenance: 'Maintenance',
+        announcement: 'Announcement',
+      };
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+      });
+
+      const promptText = `You are the official release notes editor for WaveLink.
+Update category: ${typeNames[updateType] || 'Announcement'}
+Admin's rough notes: "${rawNotes}"
+
+Turn the admin's rough words into a polished, formal, friendly, and clear announcement for WaveLink users.
+Strict rules:
+1. "title": A short, clear title (maximum 60 characters). No markdown or surrounding quotes.
+2. "message": A clear formal message in English (2 to 4 short sentences, friendly and professional). Strictly mention ONLY what the admin wrote in the rough notes — never invent features, timelines, or details that were not in the rough notes.
+3. "messageSw": A natural, accurate Swahili translation of "message" (2 to 4 short sentences, friendly and professional).`;
+
+      const responseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          title: {
+            type: Type.STRING,
+            description: 'Short announcement title, maximum 60 characters.',
+          },
+          message: {
+            type: Type.STRING,
+            description: 'Clear formal announcement in English, 2-4 short sentences, strictly based on the rough notes.',
+          },
+          messageSw: {
+            type: Type.STRING,
+            description: 'Clear formal announcement translated into Swahili, 2-4 short sentences.',
+          },
+        },
+        required: ['title', 'message', 'messageSw'],
+      };
+
+      let parsedResult: { title?: string; message?: string; messageSw?: string } | null = null;
+      const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.8-flash'];
+
+      for (const modelName of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: promptText,
+            config: {
+              temperature: 0.3,
+              responseMimeType: 'application/json',
+              responseSchema,
+            },
+          });
+          const rawJson = (response.text || '').trim();
+          if (rawJson) {
+            parsedResult = JSON.parse(rawJson);
+            if (parsedResult?.title && parsedResult?.message) {
+              break;
+            }
+          }
+        } catch {
+          // try fallback model
+        }
+      }
+
+      if (!parsedResult || !parsedResult.title || !parsedResult.message) {
+        const fallback = buildFallbackFormalUpdate(rawNotes, updateType);
+        return res.status(200).json({
+          success: true,
+          usedFallback: true,
+          title: fallback.title,
+          message: fallback.message,
+          messageSw: fallback.messageSw,
+          remainingToday: Math.max(0, ADMIN_UPDATES_DAILY_AI_LIMIT - usedToday),
+          notice: 'AI service was temporarily busy; a clean formal draft was prepared for you to edit.',
+        });
+      }
+
+      const nextCount = usedToday + 1;
+      adminUpdatesAiDailyUsage.set(caller.uid, { date: todayKey, count: nextCount });
+
+      const cleanTitle = String(parsedResult.title).trim().slice(0, 60);
+      const cleanMessage = String(parsedResult.message).trim().slice(0, 2000);
+      const cleanMessageSw = String(parsedResult.messageSw || '').trim().slice(0, 2000);
+
+      return res.json({
+        success: true,
+        title: cleanTitle,
+        message: cleanMessage,
+        messageSw: cleanMessageSw,
+        remainingToday: Math.max(0, ADMIN_UPDATES_DAILY_AI_LIMIT - nextCount),
+      });
+    } catch (err: any) {
+      console.error('Admin updates AI rewrite error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Could not generate AI rewrite right now. You can type or edit your announcement manually and post it directly.',
+      });
+    }
+  });
+
+  /**
+   * POST /api/progression/award
+   * Trusted server-side XP, Level, Streak, Badge & Challenge progress engine.
+   * Enforces daily caps per action from progressionConfig.ts and never trusts client XP/level values.
+   */
+  const progressionDailyMemoryCap = new Map<string, number>();
+
+  app.post('/api/progression/award', rateLimitGlobal, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' });
+      }
+
+      const rawAction = String(req.body?.action || '').trim() as XpActionType;
+      const actionRule = XP_ACTIONS_CONFIG[rawAction];
+      if (!actionRule) {
+        return res.status(400).json({ success: false, error: 'Invalid progression action.' });
+      }
+
+      const metadata = (req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {}) as Record<string, any>;
+
+      // Determine target UID securely:
+      // - `challenge_won` requires admin privileges
+      // - `like_received` can target another user (never self-liking)
+      // - all other actions always target caller.uid
+      let targetUid = caller.uid;
+      if (rawAction === 'challenge_won') {
+        if (!caller.isAdmin) {
+          return res.status(403).json({ success: false, error: 'Only admins can award challenge wins.' });
+        }
+        const requestedTarget = sanitizeServerString(metadata.targetUserId, 128);
+        if (requestedTarget) targetUid = requestedTarget;
+      } else if (rawAction === 'like_received') {
+        const requestedTarget = sanitizeServerString(metadata.targetUserId, 128);
+        if (!requestedTarget || requestedTarget === caller.uid) {
+          return res.status(200).json({
+            success: true,
+            xpAwarded: 0,
+            dailyCapReached: false,
+            xp: 0,
+            level: 1,
+            previousLevel: 1,
+            leveledUp: false,
+            newBadges: []
+          });
+        }
+        targetUid = requestedTarget;
+      }
+
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const memCapKey = `${targetUid}:${todayKey}:${rawAction}`;
+      const memCount = progressionDailyMemoryCap.get(memCapKey) || 0;
+
+      if (memCount >= actionRule.dailyCap) {
+        return res.status(200).json({
+          success: true,
+          xpAwarded: 0,
+          dailyCapReached: true,
+          xp: 0,
+          level: 1,
+          previousLevel: 1,
+          leveledUp: false,
+          newBadges: []
+        });
+      }
+
+      if (!ensureFirebaseAdminInitialized() || getAdminApps().length === 0) {
+        // Safe graceful response when Admin SDK credentials are unavailable in local preview
+        return res.status(200).json({
+          success: true,
+          xpAwarded: 0,
+          dailyCapReached: false,
+          xp: 0,
+          level: 1,
+          previousLevel: 1,
+          leveledUp: false,
+          newBadges: []
+        });
+      }
+
+      const { firestoreDatabaseId } = getServerFirebaseConfig();
+      const adminDb =
+        firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+          ? getAdminFirestore(getAdminApp(), firestoreDatabaseId)
+          : getAdminFirestore(getAdminApp());
+
+      const userRef = adminDb.collection('users').doc(targetUid);
+      const userSnap = await userRef.get();
+      if (!userSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Target user profile not found.' });
+      }
+
+      const data = userSnap.data() || {};
+      const existingTracker: Record<string, any> =
+        data.xpDailyTracker && data.xpDailyTracker.date === todayKey
+          ? { ...(data.xpDailyTracker as Record<string, any>) }
+          : { date: todayKey };
+
+      const persistedActionCount = Math.max(0, Number(existingTracker[rawAction] || 0));
+      const effectiveUsedToday = Math.max(memCount, persistedActionCount);
+
+      if (effectiveUsedToday >= actionRule.dailyCap) {
+        progressionDailyMemoryCap.set(memCapKey, effectiveUsedToday);
+        const currentXp = Math.max(0, Number(data.xp ?? 0));
+        const currentLevelInfo = getLevelProgress(currentXp);
+        return res.status(200).json({
+          success: true,
+          xpAwarded: 0,
+          dailyCapReached: true,
+          xp: currentXp,
+          level: currentLevelInfo.level,
+          previousLevel: currentLevelInfo.level,
+          leveledUp: false,
+          tierName: currentLevelInfo.tierName,
+          newBadges: [],
+          levelInfo: currentLevelInfo
+        });
+      }
+
+      const previousXp =
+        typeof data.xp === 'number' && Number.isFinite(data.xp) && data.xp >= 0
+          ? data.xp
+          : Math.max(0, Number(data.wavePoints ?? data.points ?? 0) * 2);
+      const previousLevelInfo = getLevelProgress(previousXp);
+
+      const xpDelta = actionRule.xp;
+      let nextXp = previousXp + xpDelta;
+
+      // Update streak / daysActive safely
+      const currentStreak = Math.max(
+        Number(data.streak ?? 0),
+        Number(data.loginStreak ?? 0),
+        rawAction === 'daily_checkin' || rawAction === 'streak_kept'
+          ? Math.min(3650, Math.max(1, Number(metadata.streak ?? data.loginStreak ?? 1)))
+          : 0
+      );
+      const nextLongestStreak = Math.max(Number(data.longestStreak ?? 0), currentStreak);
+      const nextDaysActive =
+        rawAction === 'daily_checkin'
+          ? Math.max(Number(data.daysActive ?? data.totalLoginDays ?? 0) + 1, currentStreak)
+          : Math.max(Number(data.daysActive ?? data.totalLoginDays ?? 0), currentStreak);
+
+      const nextTotalLikes =
+        rawAction === 'like_received'
+          ? Math.max(0, Number(data.totalLikesReceived ?? 0)) + 1
+          : Math.max(0, Number(data.totalLikesReceived ?? 0));
+
+      // Update challenge stats & recent challenges if challenge_joined or challenge_won
+      const existingChallengeStats = (data.challengeStats || {}) as Record<string, any>;
+      const nextChallengeStats = {
+        joined: Math.max(0, Number(existingChallengeStats.joined ?? 0)),
+        wins: Math.max(0, Number(existingChallengeStats.wins ?? 0)),
+        bestPlace:
+          typeof existingChallengeStats.bestPlace === 'number' ? existingChallengeStats.bestPlace : null,
+        entries: Math.max(0, Number(existingChallengeStats.entries ?? 0))
+      };
+
+      const existingRecentChallenges: UserRecentChallenge[] = Array.isArray(data.recentChallenges)
+        ? [...data.recentChallenges].slice(0, 10)
+        : [];
+
+      const nowIso = new Date().toISOString();
+
+      if (rawAction === 'challenge_joined' || rawAction === 'challenge_won') {
+        const challengeId =
+          sanitizeServerString(metadata.challengeId, 120) || `challenge_${Date.now()}`;
+        const challengeTitle =
+          sanitizeServerString(metadata.challengeTitle, 140) || 'Weekly Creator Challenge';
+        const challengeHashtag = sanitizeServerString(metadata.challengeHashtag, 48) || undefined;
+        const thumbnailUrl = sanitizeServerString(metadata.thumbnailUrl, 600) || undefined;
+        const placement =
+          rawAction === 'challenge_won'
+            ? 1
+            : typeof metadata.placement === 'number' && metadata.placement >= 1
+            ? Math.floor(metadata.placement)
+            : null;
+
+        const existingIdx = existingRecentChallenges.findIndex((c) => c.id === challengeId);
+        if (existingIdx >= 0) {
+          existingRecentChallenges[existingIdx] = {
+            ...existingRecentChallenges[existingIdx],
+            title: challengeTitle,
+            hashtag: challengeHashtag || existingRecentChallenges[existingIdx].hashtag,
+            thumbnailUrl: thumbnailUrl || existingRecentChallenges[existingIdx].thumbnailUrl,
+            placement:
+              placement !== null
+                ? existingRecentChallenges[existingIdx].placement
+                  ? Math.min(existingRecentChallenges[existingIdx].placement!, placement)
+                  : placement
+                : existingRecentChallenges[existingIdx].placement ?? null,
+            participated: true,
+            badgeWonId:
+              rawAction === 'challenge_won'
+                ? 'weekly_champion'
+                : existingRecentChallenges[existingIdx].badgeWonId
+          };
+        } else {
+          existingRecentChallenges.unshift({
+            id: challengeId,
+            title: challengeTitle,
+            hashtag: challengeHashtag,
+            date: nowIso,
+            placement,
+            participated: true,
+            thumbnailUrl,
+            badgeWonId: rawAction === 'challenge_won' ? 'weekly_champion' : undefined
+          });
+          nextChallengeStats.joined += 1;
+        }
+
+        if (rawAction === 'challenge_joined') {
+          nextChallengeStats.entries += 1;
+        }
+        if (rawAction === 'challenge_won') {
+          nextChallengeStats.wins += 1;
+          nextChallengeStats.bestPlace = 1;
+        } else if (placement !== null) {
+          nextChallengeStats.bestPlace =
+            nextChallengeStats.bestPlace === null
+              ? placement
+              : Math.min(nextChallengeStats.bestPlace, placement);
+        }
+      }
+
+      // Evaluate badges and add one-time badge XP bonuses
+      const existingBadges: UserEarnedBadge[] = Array.isArray(data.badges) ? [...data.badges] : [];
+      const existingBadgeIds = new Set(existingBadges.map((b) => b.id));
+
+      const interimLevelInfo = getLevelProgress(nextXp);
+      const eligibleBadgeIds = evaluateEligibleBadgeIds({
+        xp: nextXp,
+        level: interimLevelInfo.level,
+        streak: currentStreak,
+        longestStreak: nextLongestStreak,
+        daysActive: nextDaysActive,
+        wavePoints: Number(data.wavePoints ?? data.points ?? 0),
+        postsCount: Number(metadata.postsCount ?? 0) + (rawAction === 'post_created' ? 1 : 0),
+        likesReceived: nextTotalLikes,
+        connectionsCount: Array.isArray(data.followingIds) ? data.followingIds.length : 0,
+        challengeStats: nextChallengeStats,
+        recentChallenges: existingRecentChallenges,
+        badges: existingBadges,
+        weeklyWinnerChallengeTitle: data.weeklyWinnerChallengeTitle
+      });
+
+      const newlyUnlockedIds: string[] = [];
+      for (const badgeId of eligibleBadgeIds) {
+        if (!existingBadgeIds.has(badgeId) && BADGE_BY_ID[badgeId]) {
+          existingBadges.push({ id: badgeId, awardedAt: nowIso });
+          existingBadgeIds.add(badgeId);
+          newlyUnlockedIds.push(badgeId);
+          nextXp += BADGE_BY_ID[badgeId].xpReward;
+        }
+      }
+
+      const finalLevelInfo = getLevelProgress(nextXp);
+      const leveledUp = finalLevelInfo.level > previousLevelInfo.level;
+
+      existingTracker[rawAction] = effectiveUsedToday + 1;
+      progressionDailyMemoryCap.set(memCapKey, effectiveUsedToday + 1);
+
+      await userRef.set(
+        {
+          xp: nextXp,
+          level: finalLevelInfo.level,
+          streak: currentStreak,
+          longestStreak: nextLongestStreak,
+          daysActive: nextDaysActive,
+          totalLikesReceived: nextTotalLikes,
+          badges: existingBadges.slice(0, 50),
+          challengeStats: nextChallengeStats,
+          recentChallenges: existingRecentChallenges.slice(0, 10),
+          xpDailyTracker: existingTracker,
+          updatedAt: nowIso
+        },
+        { merge: true }
+      );
+
+      return res.status(200).json({
+        success: true,
+        xpAwarded: nextXp - previousXp,
+        dailyCapReached: false,
+        xp: nextXp,
+        level: finalLevelInfo.level,
+        previousLevel: previousLevelInfo.level,
+        leveledUp,
+        tierName: finalLevelInfo.tierName,
+        newBadges: newlyUnlockedIds,
+        levelInfo: finalLevelInfo
+      });
+    } catch (err: any) {
+      console.warn('[WaveLink Progression] award error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Could not process progression award right now.'
+      });
+    }
+  });
+
   /**
    * POST /api/admin/grant-pro
    * Admin & Sub-Admin capability to grant or revoke verified WaveLink Pro status for any member.
@@ -6020,6 +7030,496 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
   });
 
   // ============================================================================
+  // 4A-CF. CLOUDFLARE MEDIA UPLOAD & EDGE CDN DELIVERY GATEWAY
+  // Supports:
+  // 1) External Cloudflare Worker / R2 / Cloudflare Images / Cloudflare Stream forwarding when configured
+  // 2) Built-in WaveLink Cloudflare Edge Media Storage (/api/cloudflare/upload & /api/cloudflare/media/:fileName)
+  //    with raw binary streaming, base64/chunked upload, immutable CDN headers, and HTTP 206 byte-range video streaming.
+  // ============================================================================
+  const resolveCloudflarePublicOrigin = (req: express.Request): string => {
+    const configured = (
+      process.env.CLOUDFLARE_PUBLIC_BASE_URL ||
+      process.env.VITE_CLOUDFLARE_PUBLIC_URL ||
+      process.env.APP_URL ||
+      ''
+    )
+      .trim()
+      .replace(/\/+$/, '');
+    if (configured && configured.startsWith('http')) {
+      return configured;
+    }
+
+    const originHeader = String(req.headers.origin || '').trim().replace(/\/+$/, '');
+    if (originHeader && originHeader.startsWith('https://')) {
+      return originHeader;
+    }
+
+    const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000')
+      .split(',')[0]
+      .trim();
+    const isLocal = /^localhost(:\d+)?$|^127\.0\.0\.1(:\d+)?$/i.test(rawHost);
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+    const protocol = !isLocal || forwardedProto === 'https' ? 'https' : 'http';
+    return `${protocol}://${rawHost}`;
+  };
+
+  const getExtensionForMime = (mime: string, fallbackName = ''): string => {
+    const clean = mime.toLowerCase().split(';')[0].trim();
+    if (clean === 'image/webp') return 'webp';
+    if (clean === 'image/png') return 'png';
+    if (clean === 'image/gif') return 'gif';
+    if (clean === 'image/jpeg' || clean === 'image/jpg') return 'jpg';
+    if (clean === 'video/webm') return 'webm';
+    if (clean === 'video/quicktime') return 'mov';
+    if (clean.startsWith('video/')) return 'mp4';
+    if (clean === 'audio/mpeg' || clean === 'audio/mp3') return 'mp3';
+    if (clean === 'audio/wav') return 'wav';
+    if (clean === 'audio/ogg') return 'ogg';
+    if (clean === 'application/pdf') return 'pdf';
+    const extMatch = fallbackName.match(/\.([a-zA-Z0-9]{2,5})$/);
+    if (extMatch) return extMatch[1].toLowerCase();
+    return clean.startsWith('image/') ? 'jpg' : clean.startsWith('video/') ? 'mp4' : 'bin';
+  };
+
+  const getMimeForExtension = (ext: string): string => {
+    const clean = ext.toLowerCase().replace(/^\./, '');
+    if (clean === 'webp') return 'image/webp';
+    if (clean === 'png') return 'image/png';
+    if (clean === 'gif') return 'image/gif';
+    if (clean === 'jpg' || clean === 'jpeg') return 'image/jpeg';
+    if (clean === 'webm') return 'video/webm';
+    if (clean === 'mov') return 'video/quicktime';
+    if (clean === 'mp4' || clean === 'm4v') return 'video/mp4';
+    if (clean === 'mp3') return 'audio/mpeg';
+    if (clean === 'wav') return 'audio/wav';
+    if (clean === 'ogg') return 'audio/ogg';
+    if (clean === 'pdf') return 'application/pdf';
+    return 'application/octet-stream';
+  };
+
+  const tryForwardToExternalCloudflare = async (params: {
+    buffer: Buffer;
+    mimeType: string;
+    fileName: string;
+    resourceType: 'image' | 'video' | 'raw';
+  }): Promise<{ secureUrl: string; publicId: string } | null> => {
+    const workerUrl = (process.env.CLOUDFLARE_WORKER_UPLOAD_URL || '').trim();
+    const accountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
+    const apiToken = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
+
+    // 1. Custom Cloudflare R2 Worker upload gateway if configured
+    if (workerUrl && workerUrl.startsWith('https://')) {
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': params.mimeType || 'application/octet-stream',
+          'X-File-Name': encodeURIComponent(params.fileName || `wavelink_${Date.now()}`),
+          'X-Resource-Type': params.resourceType,
+        };
+        if (apiToken) {
+          headers['Authorization'] = `Bearer ${apiToken}`;
+        }
+        const resp = await fetch(workerUrl, {
+          method: 'POST',
+          headers,
+          body: new Uint8Array(params.buffer),
+        });
+        if (resp.ok) {
+          const data: any = await resp.json().catch(() => null);
+          const url = String(data?.secure_url || data?.url || '').trim();
+          if (url.startsWith('https://')) {
+            return {
+              secureUrl: url,
+              publicId: String(data?.public_id || data?.key || `cf_${Date.now()}`),
+            };
+          }
+        }
+      } catch (err) {
+        console.warn('[WaveLink Cloudflare Worker Forward Warning]:', err);
+      }
+    }
+
+    // 2. Cloudflare Images API if CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN are configured
+    if (accountId && apiToken && params.resourceType === 'image') {
+      try {
+        const cfEndpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(
+          accountId
+        )}/images/v1`;
+        const form = new FormData();
+        const blob = new Blob([new Uint8Array(params.buffer)], { type: params.mimeType || 'image/jpeg' });
+        form.append('file', blob, params.fileName || `wavelink_${Date.now()}.jpg`);
+
+        const resp = await fetch(cfEndpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiToken}`,
+          },
+          body: form,
+        });
+        if (resp.ok) {
+          const data: any = await resp.json().catch(() => null);
+          const variants = data?.result?.variants;
+          if (Array.isArray(variants) && variants.length > 0 && String(variants[0]).startsWith('https://')) {
+            return {
+              secureUrl: String(variants[0]),
+              publicId: String(data?.result?.id || `cf_img_${Date.now()}`),
+            };
+          }
+        }
+      } catch (err) {
+        console.warn('[WaveLink Cloudflare Images Forward Warning]:', err);
+      }
+    }
+
+    return null;
+  };
+
+  const handleCloudflareUploadRequest = async (req: express.Request, res: express.Response) => {
+    try {
+      const contentTypeHeader = String(req.headers['content-type'] || '').toLowerCase();
+      const isJsonBody = contentTypeHeader.includes('application/json');
+
+      let fileBuffer: Buffer | null = null;
+      let mimeType = String(req.headers['x-mime-type'] || '').split(';')[0].trim().toLowerCase();
+      let rawFileName = '';
+      try {
+        rawFileName = decodeURIComponent(String(req.headers['x-file-name'] || ''));
+      } catch {
+        rawFileName = String(req.headers['x-file-name'] || '');
+      }
+      let resourceTypeHeader = String(req.headers['x-resource-type'] || '').trim().toLowerCase();
+      let width = Number(req.headers['x-image-width'] || 0) || undefined;
+      let height = Number(req.headers['x-image-height'] || 0) || undefined;
+      let uploadId = String(req.headers['x-upload-id'] || '').replace(/[^a-zA-Z0-9_-]/g, '');
+
+      if (isJsonBody && req.body && typeof req.body === 'object') {
+        const body = req.body as Record<string, any>;
+        mimeType = String(body.mimeType || mimeType || 'application/octet-stream')
+          .split(';')[0]
+          .trim()
+          .toLowerCase();
+        rawFileName = String(body.fileName || rawFileName || '');
+        resourceTypeHeader = String(body.resourceType || resourceTypeHeader || '').toLowerCase();
+        width = Number(body.width || width || 0) || undefined;
+        height = Number(body.height || height || 0) || undefined;
+        uploadId = String(body.uploadId || body.videoId || uploadId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        const chunkIndex = typeof body.chunkIndex === 'number' ? body.chunkIndex : undefined;
+        const totalChunks = typeof body.totalChunks === 'number' ? body.totalChunks : undefined;
+        const rawBase64 = String(body.dataBase64 || body.fileBase64 || body.chunkData || '').trim();
+        const cleanedBase64 = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
+
+        if (!cleanedBase64) {
+          return res.status(400).json({
+            success: false,
+            error: { message: 'Missing media payload in Cloudflare upload request.' },
+          });
+        }
+
+        const chunkBuf = Buffer.from(cleanedBase64, 'base64');
+        if (typeof chunkIndex === 'number' && typeof totalChunks === 'number' && totalChunks > 1) {
+          const safeChunkId = uploadId || `cf_chunk_${Date.now()}`;
+          const ext = getExtensionForMime(mimeType, rawFileName);
+          const storedFileName = `${safeChunkId}.${ext}`;
+          const targetPath = path.join(CLOUDFLARE_MEDIA_DIR, storedFileName);
+
+          if (chunkIndex === 0) {
+            await fs.promises.writeFile(targetPath, chunkBuf);
+          } else {
+            await fs.promises.appendFile(targetPath, chunkBuf);
+          }
+
+          const isComplete = chunkIndex + 1 >= totalChunks;
+          const publicOrigin = resolveCloudflarePublicOrigin(req);
+          const deliveryUrl = `${publicOrigin}/api/cloudflare/media/${storedFileName}`;
+
+          if (isComplete) {
+            const stat = await fs.promises.stat(targetPath).catch(() => ({ size: chunkBuf.length }));
+            const resolvedType: 'image' | 'video' | 'raw' =
+              mimeType.startsWith('video/') || resourceTypeHeader === 'video'
+                ? 'video'
+                : mimeType.startsWith('image/') || resourceTypeHeader === 'image'
+                ? 'image'
+                : 'raw';
+            cloudflareMediaMetaMap.set(storedFileName, {
+              mimeType: mimeType || getMimeForExtension(ext),
+              fileName: rawFileName || storedFileName,
+              bytes: stat.size,
+              width,
+              height,
+              resourceType: resolvedType,
+              createdAt: new Date().toISOString(),
+            });
+            saveCloudflareMediaMeta();
+          }
+
+          return res.json({
+            success: true,
+            provider: 'cloudflare',
+            complete: isComplete,
+            chunkIndex,
+            totalChunks,
+            public_id: safeChunkId,
+            secure_url: deliveryUrl,
+            url: deliveryUrl,
+            videoUrl: deliveryUrl,
+            thumbnail_url: deliveryUrl,
+          });
+        }
+
+        fileBuffer = chunkBuf;
+      } else {
+        // Stream raw binary upload (Content-Type: application/octet-stream, image/*, video/*, or multipart)
+        const maxUploadBytes = 105 * 1024 * 1024; // 105 MB cap
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+
+        await new Promise<void>((resolve, reject) => {
+          req.on('data', (chunk: Buffer) => {
+            totalBytes += chunk.length;
+            if (totalBytes > maxUploadBytes) {
+              reject(new Error('File exceeds the 100 MB maximum Cloudflare upload limit.'));
+              req.destroy();
+              return;
+            }
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          req.on('end', () => resolve());
+          req.on('error', (err) => reject(err));
+        });
+
+        let combined = Buffer.concat(chunks);
+
+        // If client sent multipart/form-data to /api/cloudflare/upload, extract the embedded file payload cleanly
+        if (contentTypeHeader.includes('multipart/form-data')) {
+          const boundaryMatch = contentTypeHeader.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+          const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2]).trim() : '';
+          if (boundary) {
+            const headerEndMarker = Buffer.from('\r\n\r\n');
+            const firstHeaderEnd = combined.indexOf(headerEndMarker);
+            if (firstHeaderEnd !== -1) {
+              const partHeaders = combined.slice(0, firstHeaderEnd).toString('utf-8');
+              const ctMatch = partHeaders.match(/Content-Type:\s*([^\r\n;]+)/i);
+              if (ctMatch && !mimeType) {
+                mimeType = ctMatch[1].trim().toLowerCase();
+              }
+              const fnMatch = partHeaders.match(/filename="([^"]+)"/i);
+              if (fnMatch && !rawFileName) {
+                rawFileName = fnMatch[1].trim();
+              }
+              const bodyStart = firstHeaderEnd + 4;
+              const closingBoundary = Buffer.from(`\r\n--${boundary}`);
+              const bodyEnd = combined.indexOf(closingBoundary, bodyStart);
+              if (bodyEnd !== -1 && bodyEnd > bodyStart) {
+                combined = combined.slice(bodyStart, bodyEnd);
+              }
+            }
+          }
+        }
+
+        if (!mimeType && !contentTypeHeader.includes('octet-stream') && !contentTypeHeader.includes('multipart')) {
+          mimeType = contentTypeHeader.split(';')[0].trim();
+        }
+        fileBuffer = combined;
+      }
+
+      if (!fileBuffer || fileBuffer.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: { message: 'Uploaded media file is empty.' },
+        });
+      }
+
+      if (!mimeType || mimeType === 'application/octet-stream') {
+        // Magic-byte sniff for WebP, JPEG, PNG, GIF, MP4
+        if (
+          fileBuffer.length > 12 &&
+          fileBuffer.slice(0, 4).toString('ascii') === 'RIFF' &&
+          fileBuffer.slice(8, 12).toString('ascii') === 'WEBP'
+        ) {
+          mimeType = 'image/webp';
+        } else if (fileBuffer.length > 3 && fileBuffer[0] === 0xff && fileBuffer[1] === 0xd8) {
+          mimeType = 'image/jpeg';
+        } else if (
+          fileBuffer.length > 8 &&
+          fileBuffer[0] === 0x89 &&
+          fileBuffer.slice(1, 4).toString('ascii') === 'PNG'
+        ) {
+          mimeType = 'image/png';
+        } else if (fileBuffer.length > 12 && fileBuffer.slice(4, 8).toString('ascii') === 'ftyp') {
+          mimeType = 'video/mp4';
+        } else {
+          const ext = getExtensionForMime('', rawFileName);
+          mimeType = getMimeForExtension(ext);
+        }
+      }
+
+      const resolvedResourceType: 'image' | 'video' | 'raw' =
+        mimeType.startsWith('video/') || resourceTypeHeader === 'video'
+          ? 'video'
+          : mimeType.startsWith('image/') || resourceTypeHeader === 'image'
+          ? 'image'
+          : 'raw';
+
+      // Layer 3: One-time upload image safety moderation BEFORE persisting to disk/Cloudflare
+      let resolvedMediaSafety: 'safe' | 'borderline' = 'safe';
+      if (resolvedResourceType === 'image') {
+        const maybeAuth = await verifyStrictFirebaseIdToken(req).catch(() => ({ valid: false, uid: '' }));
+        const imgSafety = await moderateImageBufferOnServer(
+          fileBuffer,
+          mimeType,
+          maybeAuth.uid || String(req.ip || 'upload')
+        );
+        if (imgSafety.verdict === 'unsafe') {
+          return res.status(422).json({
+            success: false,
+            blocked: true,
+            mediaSafety: 'unsafe',
+            error: {
+              message:
+                imgSafety.friendlyMessage ||
+                'This image cannot be uploaded because it violates WaveLink Community Safety Guidelines.',
+            },
+          });
+        }
+        resolvedMediaSafety = imgSafety.verdict === 'borderline' ? 'borderline' : 'safe';
+      }
+
+      const ext = getExtensionForMime(mimeType, rawFileName);
+      const uniqueId =
+        uploadId ||
+        `cf_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+      const storedFileName = `${uniqueId}.${ext}`;
+      const filePath = path.join(CLOUDFLARE_MEDIA_DIR, storedFileName);
+
+      await fs.promises.writeFile(filePath, fileBuffer);
+
+      cloudflareMediaMetaMap.set(storedFileName, {
+        mimeType,
+        fileName: rawFileName || storedFileName,
+        bytes: fileBuffer.length,
+        width,
+        height,
+        resourceType: resolvedResourceType,
+        createdAt: new Date().toISOString(),
+      });
+      saveCloudflareMediaMeta();
+
+      // Check if external Cloudflare R2 Worker / Cloudflare Images is configured
+      const externalCf = await tryForwardToExternalCloudflare({
+        buffer: fileBuffer,
+        mimeType,
+        fileName: rawFileName || storedFileName,
+        resourceType: resolvedResourceType,
+      });
+
+      const publicOrigin = resolveCloudflarePublicOrigin(req);
+      const localEdgeUrl = `${publicOrigin}/api/cloudflare/media/${storedFileName}`;
+      const finalSecureUrl = externalCf?.secureUrl || localEdgeUrl;
+      const finalPublicId = externalCf?.publicId || uniqueId;
+
+      return res.json({
+        success: true,
+        provider: 'cloudflare',
+        public_id: finalPublicId,
+        secure_url: finalSecureUrl,
+        url: finalSecureUrl,
+        thumbnail_url: finalSecureUrl,
+        resource_type: resolvedResourceType,
+        mediaSafety: resolvedMediaSafety,
+        format: ext,
+        width: width || (resolvedResourceType === 'image' ? 1080 : 720),
+        height: height || (resolvedResourceType === 'image' ? 1080 : 1280),
+        bytes: fileBuffer.length,
+      });
+    } catch (err: any) {
+      console.error('[WaveLink Cloudflare Upload Error]:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        error: {
+          message: err?.message || 'Cloudflare media upload failed on server.',
+        },
+      });
+    }
+  };
+
+  app.post('/api/cloudflare/upload', handleCloudflareUploadRequest);
+  app.post('/api/media/upload', handleCloudflareUploadRequest);
+
+  app.get('/api/cloudflare/media/:fileName', async (req, res) => {
+    try {
+      const rawParam = String(req.params.fileName || '');
+      const safeFileName = path.basename(rawParam).replace(/[^a-zA-Z0-9._-]/g, '');
+      if (!safeFileName) {
+        return res.status(400).end();
+      }
+
+      let filePath = path.join(CLOUDFLARE_MEDIA_DIR, safeFileName);
+      if (!fs.existsSync(filePath)) {
+        // Also check VIDEO_STORAGE_DIR if a legacy video ID was requested
+        const altVideoPath = path.join(
+          VIDEO_STORAGE_DIR,
+          safeFileName.endsWith('.mp4') ? safeFileName : `${safeFileName}.mp4`
+        );
+        if (fs.existsSync(altVideoPath)) {
+          filePath = altVideoPath;
+        } else {
+          return res.status(404).json({ error: 'Cloudflare media asset not found.' });
+        }
+      }
+
+      const stat = await fs.promises.stat(filePath);
+      const fileSize = stat.size;
+      const meta = cloudflareMediaMetaMap.get(safeFileName);
+      const ext = path.extname(safeFileName).replace(/^\./, '');
+      const contentType = meta?.mimeType || getMimeForExtension(ext);
+
+      const commonHeaders: Record<string, string | number> = {
+        'Content-Type': contentType,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'CDN-Cache-Control': 'public, max-age=31536000, immutable',
+        'Cloudflare-CDN-Cache-Control': 'public, max-age=31536000, immutable',
+        'Access-Control-Allow-Origin': '*',
+        'Cross-Origin-Resource-Policy': 'cross-origin',
+      };
+
+      const range = req.headers.range;
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        if (isNaN(start) || isNaN(end) || start >= fileSize || end >= fileSize || start > end) {
+          res.writeHead(416, {
+            ...commonHeaders,
+            'Content-Range': `bytes */${fileSize}`,
+          });
+          return res.end();
+        }
+        const chunkLength = end - start + 1;
+        res.writeHead(206, {
+          ...commonHeaders,
+          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          'Content-Length': chunkLength,
+        });
+        fs.createReadStream(filePath, { start, end }).pipe(res);
+      } else {
+        res.writeHead(200, {
+          ...commonHeaders,
+          'Content-Length': fileSize,
+        });
+        fs.createReadStream(filePath).pipe(res);
+      }
+    } catch {
+      if (!res.headersSent) {
+        res.status(500).end();
+      }
+    }
+  });
+
+  // ============================================================================
   // 4B. FIREBASE ADMIN SDK & SERVER-ONLY FCM PUSH NOTIFICATIONS
   // ============================================================================
   let firebaseProjectId = process.env.FIREBASE_PROJECT_ID || 'formal-photon-n48x0';
@@ -6670,6 +8170,25 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         return res.status(403).json({ error: 'Cannot create post on behalf of another user.' });
       }
 
+      // Layer 2 unbypassable server text moderation before persisting post
+      const combinedPostText = [
+        postData.content || '',
+        postData.caption || '',
+        Array.isArray(postData.hashtags) ? postData.hashtags.join(' ') : '',
+        postData.locationTag || ''
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      const serverModVerdict = await runServerTextModeration(combinedPostText, caller.uid, 'post', false);
+      if (!serverModVerdict.allowed) {
+        return res.status(serverModVerdict.rateLimited ? 429 : 422).json({
+          success: false,
+          flagged: serverModVerdict.flagged,
+          error: serverModVerdict.friendlyMessage || MODERATION_FRIENDLY_BLOCK_MESSAGE,
+        });
+      }
+
       const rawAudience = String(postData.audience || 'public');
       const safeAudience =
         rawAudience === 'followers' || rawAudience === 'close_friends' ? rawAudience : 'public';
@@ -6679,35 +8198,75 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         160
       );
 
-      const adminDb = getServerFirestore();
-      if (!adminDb) {
-        return res.status(500).json({ error: 'Server database unavailable' });
-      }
-
       const nowIso = new Date().toISOString();
+      const safeMediaSafety = postData.mediaSafety === 'borderline' ? 'borderline' : 'safe';
       const payload: Record<string, any> = {
         id: postId,
         authorId: isBotPost ? 'wavelink_support_bot' : caller.uid,
+        ...(postData.authorEmail ? { authorEmail: sanitizeServerString(postData.authorEmail, 160) } : {}),
         authorName: sanitizeServerString(postData.authorName || 'WaveLink Member', 100),
         authorUsername: sanitizeServerString(postData.authorUsername || '', 60),
         ...(postData.authorPhotoURL ? { authorPhotoURL: sanitizeServerString(postData.authorPhotoURL, 150000) } : {}),
         content: sanitizeServerString(postData.content || '', 4000),
+        ...(postData.caption ? { caption: sanitizeServerString(postData.caption, 4000) } : {}),
         mediaType: ['text', 'image', 'video'].includes(String(postData.mediaType)) ? postData.mediaType : 'text',
+        mediaSafety: safeMediaSafety,
+        moderationChecked: true,
+        moderationCheckedAt: serverModVerdict.moderationCheckedAt || nowIso,
         ...(postData.mediaUrl ? { mediaUrl: sanitizeServerString(postData.mediaUrl, 4096) } : {}),
         ...(postData.imageUrl ? { imageUrl: sanitizeServerString(postData.imageUrl, 4096) } : {}),
+        ...(postData.thumbnailUrl ? { thumbnailUrl: sanitizeServerString(postData.thumbnailUrl, 4096) } : {}),
+        ...(Array.isArray(postData.imageUrls)
+          ? {
+              imageUrls: postData.imageUrls
+                .filter((u: unknown) => typeof u === 'string' && u.startsWith('http'))
+                .slice(0, 10),
+            }
+          : {}),
         ...(postData.videoUrl && !String(postData.videoUrl).startsWith('data:video/')
           ? { videoUrl: sanitizeServerString(postData.videoUrl, 4096) }
           : {}),
-        ...(typeof postData.duration === 'number' ? { duration: Math.max(0, Math.min(caller.isPro ? 90.5 : 60.5, postData.duration)) } : {}),
+        ...(typeof postData.videoWidth === 'number' ? { videoWidth: postData.videoWidth } : {}),
+        ...(typeof postData.videoHeight === 'number' ? { videoHeight: postData.videoHeight } : {}),
+        ...(postData.aspectRatio ? { aspectRatio: sanitizeServerString(postData.aspectRatio, 16) } : {}),
+        ...(typeof postData.duration === 'number' ? { duration: Math.max(0, Math.min(90.5, postData.duration)) } : {}),
         ...(typeof postData.videoDurationSeconds === 'number'
-          ? { videoDurationSeconds: Math.max(0, Math.min(caller.isPro ? 90.5 : 60.5, postData.videoDurationSeconds)) }
+          ? { videoDurationSeconds: Math.max(0, Math.min(90.5, postData.videoDurationSeconds)) }
           : {}),
+        ...(postData.countryCode ? { countryCode: sanitizeServerString(postData.countryCode, 12) } : {}),
+        ...(postData.locationTag ? { locationTag: sanitizeServerString(postData.locationTag, 120) } : {}),
+        ...(typeof postData.allowComments === 'boolean' ? { allowComments: postData.allowComments } : {}),
+        ...(postData.songTitle ? { songTitle: sanitizeServerString(postData.songTitle, 160) } : {}),
+        ...(postData.songArtist ? { songArtist: sanitizeServerString(postData.songArtist, 160) } : {}),
+        ...(postData.songAlbumArt ? { songAlbumArt: sanitizeServerString(postData.songAlbumArt, 2048) } : {}),
+        ...(postData.songPreviewUrl ? { songPreviewUrl: sanitizeServerString(postData.songPreviewUrl, 2048) } : {}),
+        ...(typeof postData.songStartTime === 'number' ? { songStartTime: postData.songStartTime } : {}),
+        ...(typeof postData.songVolume === 'number' ? { songVolume: postData.songVolume } : {}),
         ...(postData.soundtrack ? { soundtrack: postData.soundtrack } : {}),
+        ...(Array.isArray(postData.hashtags) ? { hashtags: postData.hashtags.slice(0, 20) } : {}),
         ...(Array.isArray(postData.tags) ? { tags: postData.tags.slice(0, 15) } : {}),
+        ...(postData.category ? { category: sanitizeServerString(postData.category, 40) } : {}),
+        ...(Array.isArray(postData.keywords)
+          ? {
+              keywords: postData.keywords
+                .map((kw: unknown) => sanitizeServerString(kw, 48).toLowerCase())
+                .filter((kw: string) => kw.length >= 2 && !/^(lvtemp|vid_|img_|mp4|mov)/i.test(kw) && !checkTextModerationLocal(kw).flagged)
+                .slice(0, 10),
+            }
+          : {}),
+        ...(postData.language ? { language: sanitizeServerString(postData.language, 24) } : {}),
+        ...(typeof postData.aiGenerated === 'boolean' ? { aiGenerated: postData.aiGenerated } : {}),
+        ...(typeof postData.aiConfidence === 'number'
+          ? { aiConfidence: Math.max(0, Math.min(1, Number(postData.aiConfidence))) }
+          : {}),
+        ...(postData.taggedAt ? { taggedAt: sanitizeServerString(postData.taggedAt, 64) } : {}),
         audience: safeAudience,
         likes: [],
         likesCount: 0,
+        reactions: { like: [], heart: [], fire: [] },
+        reactionCounts: { like: 0, heart: 0, fire: 0 },
         commentsCount: 0,
+        savesCount: 0,
         isBoosted: false,
         tipsTotalTZS: 0,
         tipsCount: 0,
@@ -6715,11 +8274,427 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         updatedAt: nowIso
       };
 
-      await adminDb.collection('posts').doc(postId).set(payload, { merge: true });
+      const adminDb = getServerFirestore();
+      let savedOnServer = false;
+      if (adminDb) {
+        try {
+          await adminDb.collection('posts').doc(postId).set(payload, { merge: true });
+          savedOnServer = true;
+        } catch (adminErr) {
+          console.warn('[WaveLink Server Post Admin SDK Fallback to REST]:', (adminErr as any)?.message || adminErr);
+        }
+      }
+
+      if (!savedOnServer) {
+        // Fallback to Firestore REST API using the caller's verified Firebase ID token
+        const authHeader = String(req.headers.authorization || '').trim();
+        const { projectId, firestoreDatabaseId: dbId } = getServerFirebaseConfig();
+        if (authHeader.startsWith('Bearer ') && projectId) {
+          const toFirestoreValue = (val: any): any => {
+            if (val === null || val === undefined) return { nullValue: null };
+            if (typeof val === 'boolean') return { booleanValue: val };
+            if (typeof val === 'number') {
+              return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
+            }
+            if (typeof val === 'string') return { stringValue: val };
+            if (Array.isArray(val)) {
+              return { arrayValue: { values: val.map((item) => toFirestoreValue(item)) } };
+            }
+            if (typeof val === 'object') {
+              const fieldsObj: Record<string, any> = {};
+              for (const [k, v] of Object.entries(val)) {
+                if (v !== undefined) fieldsObj[k] = toFirestoreValue(v);
+              }
+              return { mapValue: { fields: fieldsObj } };
+            }
+            return { stringValue: String(val) };
+          };
+
+          const fields: Record<string, any> = {};
+          for (const [k, v] of Object.entries(payload)) {
+            if (v !== undefined) {
+              fields[k] = toFirestoreValue(v);
+            }
+          }
+
+          const restUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+            projectId
+          )}/databases/${encodeURIComponent(dbId || '(default)')}/documents/posts/${encodeURIComponent(postId)}`;
+
+          const restResp = await fetch(restUrl, {
+            method: 'PATCH',
+            headers: {
+              Authorization: authHeader,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ fields }),
+          });
+
+          if (!restResp.ok) {
+            const errText = await restResp.text().catch(() => '');
+            throw new Error(`Firestore REST post creation failed (${restResp.status}): ${errText}`);
+          }
+          savedOnServer = true;
+        }
+      }
+
+      if (!savedOnServer) {
+        return res.status(500).json({ error: 'Server database unavailable' });
+      }
+
       return res.json({ success: true, postId, post: payload });
     } catch (err: any) {
       console.error('[WaveLink Server Post Create Error]:', err?.message || err);
       return res.status(500).json({ error: err?.message || 'Failed to save post on server' });
+    }
+  });
+
+  // ============================================================================
+  // UPLOAD-TIME GEMINI AI VIDEO & POST TAGGING (CALLED ONCE AT UPLOAD / BACKFILL)
+  // ============================================================================
+  const ALLOWED_EXPLORE_CATEGORIES = [
+    'Art',
+    'Fashion',
+    'Travel',
+    'Music',
+    'Sports',
+    'Food',
+    'Comedy',
+    'Tech',
+    'Gaming',
+    'Education',
+    'Lifestyle',
+    'Other',
+  ] as const;
+
+  type ExploreTagCategory = (typeof ALLOWED_EXPLORE_CATEGORIES)[number];
+
+  const userVideoTaggingRateMap = new Map<string, { count: number; resetAt: number }>();
+
+  function inferFallbackTaggingFromText(rawCaption: string, rawTranscript: string): {
+    category: ExploreTagCategory;
+    keywords: string[];
+    language: string;
+    aiGenerated: boolean;
+    aiConfidence: number;
+  } {
+    const combined = `${rawCaption || ''} ${rawTranscript || ''}`
+      .replace(/\b(lvtemp_[a-z0-9_-]+|vid_[a-z0-9_-]+|img_[a-z0-9_-]+|whatsapp_video_[a-z0-9_-]+)\b/gi, ' ')
+      .replace(/\.(mp4|mov|webm|mkv|avi)\b/gi, ' ')
+      .toLowerCase();
+
+    const categoryRules: Array<{ category: ExploreTagCategory; terms: string[] }> = [
+      { category: 'Music', terms: ['music', 'muziki', 'bongo', 'flava', 'amapiano', 'afrobeats', 'singeli', 'song', 'wimbo', 'dance', 'ngoma', 'beat', 'guitar', 'piano', 'choir', 'gospel'] },
+      { category: 'Comedy', terms: ['comedy', 'vichekesho', 'funny', 'skit', 'joke', 'laugh', 'cheka', 'meme', 'prank', 'humor'] },
+      { category: 'Sports', terms: ['sports', 'football', 'soccer', 'soka', 'mpira', 'simba', 'yanga', 'goal', 'gym', 'workout', 'fitness', 'running', 'basketball', 'match', 'afcon'] },
+      { category: 'Fashion', terms: ['fashion', 'mitindo', 'style', 'outfit', 'kitenge', 'kanga', 'dress', 'makeup', 'urembo', 'hair', 'drip', 'lookbook', 'model'] },
+      { category: 'Food', terms: ['food', 'chakula', 'mapishi', 'cook', 'recipe', 'pilau', 'biryani', 'nyama', 'choma', 'ugali', 'chapati', 'restaurant', 'cafe', 'tea', 'chai'] },
+      { category: 'Travel', terms: ['travel', 'safari', 'zanzibar', 'serengeti', 'kilimanjaro', 'beach', 'island', 'dar', 'arusha', 'nairobi', 'mombasa', 'vacation', 'trip', 'hotel', 'nature'] },
+      { category: 'Tech', terms: ['tech', 'coding', 'code', 'software', 'phone', 'app', 'ai', 'computer', 'laptop', 'gadget', 'startup', 'developer', 'teknolojia'] },
+      { category: 'Gaming', terms: ['gaming', 'game', 'ps5', 'fifa', 'eafc', 'pubg', 'cod', 'esports', 'gamer', 'stream', 'console'] },
+      { category: 'Art', terms: ['art', 'sanaa', 'painting', 'drawing', 'design', 'sketch', 'craft', 'photography', 'photo', 'portrait', 'canvas', 'illustration'] },
+      { category: 'Education', terms: ['education', 'elimu', 'school', 'shule', 'chuo', 'university', 'learn', 'study', 'tutorial', 'lesson', 'tips', 'history', 'science', 'book'] },
+      { category: 'Lifestyle', terms: ['lifestyle', 'maisha', 'vlog', 'morning', 'routine', 'family', 'home', 'motivation', 'faith', 'baraka', 'blessed', 'hustle', 'biashara'] },
+    ];
+
+    let matchedCategory: ExploreTagCategory = 'Other';
+    let bestHits = 0;
+    for (const rule of categoryRules) {
+      const hits = rule.terms.filter((t) => combined.includes(t)).length;
+      if (hits > bestHits) {
+        bestHits = hits;
+        matchedCategory = rule.category;
+      }
+    }
+
+    const swahiliMarkers = ['habari', 'karibu', 'asante', 'sana', 'muziki', 'chakula', 'maisha', 'soka', 'vichekesho', 'mitindo', 'kwetu', 'bongo', 'tanzania', 'kenya'];
+    const isSwahili = swahiliMarkers.some((w) => combined.includes(w));
+    const aiMarkers = ['ai generated', 'midjourney', 'runwayml', 'sora', 'pika labs', 'kling ai', 'stable diffusion', '#aivideo', '#aiart'];
+    const looksAi = aiMarkers.some((m) => combined.includes(m));
+
+    const stopWords = new Set([
+      'the', 'and', 'for', 'with', 'this', 'that', 'from', 'your', 'have', 'are', 'was',
+      'shared', 'new', 'video', 'reel', 'post', 'wavelink', 'http', 'https', 'com', 'www'
+    ]);
+
+    const words = combined
+      .replace(/[^a-z0-9_#]+/g, ' ')
+      .split(/\s+/)
+      .map((w) => w.replace(/^#/, '').trim())
+      .filter((w) => w.length >= 3 && w.length <= 28 && !stopWords.has(w) && !/^\d+$/.test(w));
+
+    const uniqueKeywords = Array.from(new Set([matchedCategory.toLowerCase(), ...words])).slice(0, 10);
+
+    return {
+      category: matchedCategory,
+      keywords: uniqueKeywords,
+      language: isSwahili ? 'sw' : 'en',
+      aiGenerated: looksAi,
+      aiConfidence: looksAi ? 0.85 : 0.15,
+    };
+  }
+
+  /**
+   * POST /api/ai/tag-video
+   * Calls Gemini ONCE at upload time (or during admin backfill) with 3-5 key frames, caption, and transcript.
+   * Returns { category, keywords, language, aiGenerated, aiConfidence, taggedAt }.
+   */
+  app.post('/api/ai/tag-video', async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ error: caller.error || 'Authentication required for AI tagging.' });
+      }
+
+      // Per-user rate limit: 25 uploads/10m for standard users, 250/10m for admins running backfill
+      const nowMs = Date.now();
+      const windowMs = 10 * 60 * 1000;
+      const maxAllowed = caller.isAdmin ? 250 : 25;
+      const bucket = userVideoTaggingRateMap.get(caller.uid);
+      if (!bucket || nowMs > bucket.resetAt) {
+        userVideoTaggingRateMap.set(caller.uid, { count: 1, resetAt: nowMs + windowMs });
+      } else if (bucket.count >= maxAllowed) {
+        return res.status(429).json({
+          error: 'Tagging rate limit reached. Please wait a few minutes.',
+        });
+      } else {
+        bucket.count += 1;
+      }
+
+      const rawCaption = sanitizeServerString(req.body?.caption || '', 2000);
+      const rawTranscript = sanitizeServerString(req.body?.transcript || '', 2000);
+      const postId = sanitizeServerString(req.body?.postId || '', 160);
+      const persistToPost = Boolean(req.body?.persistToPost && postId);
+      const rawFrames: unknown[] = Array.isArray(req.body?.framesBase64)
+        ? req.body.framesBase64.slice(0, 5)
+        : [];
+
+      const validFrames: Array<{ mimeType: string; data: string }> = [];
+      for (const item of rawFrames) {
+        if (typeof item !== 'string') continue;
+        const trimmed = item.trim();
+        const match = trimmed.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+        if (match) {
+          validFrames.push({ mimeType: match[1].toLowerCase(), data: match[2] });
+        } else if (/^[A-Za-z0-9+/=]{100,}$/.test(trimmed)) {
+          validFrames.push({ mimeType: 'image/jpeg', data: trimmed });
+        }
+      }
+
+      const fallbackResult = inferFallbackTaggingFromText(rawCaption, rawTranscript);
+      let finalCategory: ExploreTagCategory = fallbackResult.category;
+      let finalKeywords: string[] = fallbackResult.keywords;
+      let finalLanguage: string = fallbackResult.language;
+      let finalAiGenerated: boolean = fallbackResult.aiGenerated;
+      let finalAiConfidence: number = fallbackResult.aiConfidence;
+      let usedGemini = false;
+
+      const geminiKey = getServerGeminiKey();
+      if (geminiKey) {
+        try {
+          const ai = new GoogleGenAI({
+            apiKey: geminiKey,
+            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+          });
+
+          const parts: any[] = [];
+          for (const frame of validFrames) {
+            parts.push({
+              inlineData: {
+                mimeType: frame.mimeType,
+                data: frame.data,
+              },
+            });
+          }
+
+          const cleanCaptionForPrompt = rawCaption
+            .replace(/\b(lvtemp_[a-z0-9_-]+|vid_[a-z0-9_-]+|img_[a-z0-9_-]+)\b/gi, '')
+            .trim();
+
+          parts.push({
+            text: `Analyze this social video/post from East Africa (Tanzania/Kenya/global) using the attached ${validFrames.length} key frames, caption, and audio transcript.
+Caption: "${cleanCaptionForPrompt || '(none)'}"
+Audio transcript: "${rawTranscript || '(none)'}"
+
+Return JSON matching the schema:
+1. "category": Choose EXACTLY ONE from: Art, Fashion, Travel, Music, Sports, Food, Comedy, Tech, Gaming, Education, Lifestyle, Other.
+2. "keywords": Up to 10 lowercase search keywords covering objects, topics, places, actions, or themes visible in the frames or mentioned in caption/transcript (include both English and Swahili terms where relevant, e.g. "football", "soka", "food", "chakula", "music", "muziki", "zanzibar", "comedy", "vichekesho"). Never include raw file names like "lvtemp" or "mp4".
+3. "language": Main ISO language code ("en", "sw", etc.).
+4. "aiGenerated": true ONLY if the visuals/frames clearly look synthetic or AI-generated (e.g. Sora, Midjourney, Runway, AI avatar), otherwise false.
+5. "aiConfidence": Number from 0 to 1 representing confidence in aiGenerated detection.`,
+          });
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: { parts },
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  category: {
+                    type: Type.STRING,
+                    description:
+                      'One of: Art, Fashion, Travel, Music, Sports, Food, Comedy, Tech, Gaming, Education, Lifestyle, Other',
+                  },
+                  keywords: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: 'Up to 10 lowercase keywords in English and Swahili',
+                  },
+                  language: {
+                    type: Type.STRING,
+                    description: 'Main language code such as en or sw',
+                  },
+                  aiGenerated: {
+                    type: Type.BOOLEAN,
+                    description: 'True if the video/image looks AI-generated',
+                  },
+                  aiConfidence: {
+                    type: Type.NUMBER,
+                    description: 'Confidence score between 0 and 1',
+                  },
+                },
+                required: ['category', 'keywords', 'language', 'aiGenerated', 'aiConfidence'],
+              },
+            },
+          });
+
+          const rawJson = String(response.text || '').trim();
+          if (rawJson) {
+            const parsed = JSON.parse(rawJson);
+            const matchedCat = ALLOWED_EXPLORE_CATEGORIES.find(
+              (c) => c.toLowerCase() === String(parsed.category || '').trim().toLowerCase()
+            );
+            if (matchedCat) {
+              finalCategory = matchedCat;
+            }
+            if (Array.isArray(parsed.keywords)) {
+              const cleanedKw = parsed.keywords
+                .map((k: unknown) => sanitizeServerString(k, 40).toLowerCase().replace(/^#/, '').trim())
+                .filter(
+                  (k: string) =>
+                    k.length >= 2 &&
+                    !/^(lvtemp|vid_|img_|whatsapp_video|mp4|mov|webm)/i.test(k) &&
+                    !checkTextModerationLocal(k).flagged
+                );
+              if (cleanedKw.length > 0) {
+                finalKeywords = Array.from(
+                  new Set([finalCategory.toLowerCase(), ...cleanedKw])
+                ).slice(0, 10);
+              }
+            }
+            if (typeof parsed.language === 'string' && parsed.language.trim()) {
+              finalLanguage = sanitizeServerString(parsed.language.trim().toLowerCase(), 12);
+            }
+            if (typeof parsed.aiGenerated === 'boolean') {
+              finalAiGenerated = parsed.aiGenerated;
+            }
+            if (typeof parsed.aiConfidence === 'number' && !Number.isNaN(parsed.aiConfidence)) {
+              finalAiConfidence = Math.max(0, Math.min(1, Number(parsed.aiConfidence)));
+            }
+            usedGemini = true;
+          }
+        } catch (geminiErr: any) {
+          console.warn(
+            '[WaveLink AI Video Tagging Fallback Notice]:',
+            geminiErr?.message || geminiErr
+          );
+        }
+      }
+
+      const taggedAt = new Date().toISOString();
+      const tagPayload = {
+        category: finalCategory,
+        keywords: finalKeywords,
+        language: finalLanguage,
+        aiGenerated: finalAiGenerated,
+        aiConfidence: Math.round(finalAiConfidence * 100) / 100,
+        taggedAt,
+      };
+
+      // Optionally persist directly to posts/{postId} (used by background retry & admin backfill)
+      let persisted = false;
+      if (persistToPost && postId) {
+        const adminDb = getServerFirestore();
+        if (adminDb) {
+          try {
+            const snap = await adminDb.collection('posts').doc(postId).get();
+            if (snap.exists) {
+              const docData = snap.data() || {};
+              if (docData.authorId === caller.uid || caller.isAdmin) {
+                await adminDb.collection('posts').doc(postId).set(tagPayload, { merge: true });
+                persisted = true;
+              }
+            }
+          } catch {
+            // fallback to REST below
+          }
+        }
+        if (!persisted) {
+          const authHeader = String(req.headers.authorization || '').trim();
+          const { projectId, firestoreDatabaseId: dbId } = getServerFirebaseConfig();
+          if (authHeader.startsWith('Bearer ') && projectId) {
+            const maskParams = [
+              'updateMask.fieldPaths=category',
+              'updateMask.fieldPaths=keywords',
+              'updateMask.fieldPaths=language',
+              'updateMask.fieldPaths=aiGenerated',
+              'updateMask.fieldPaths=aiConfidence',
+              'updateMask.fieldPaths=taggedAt',
+            ].join('&');
+            const restUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+              projectId
+            )}/databases/${encodeURIComponent(
+              dbId || '(default)'
+            )}/documents/posts/${encodeURIComponent(postId)}?${maskParams}`;
+            const restResp = await fetch(restUrl, {
+              method: 'PATCH',
+              headers: {
+                Authorization: authHeader,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                fields: {
+                  category: { stringValue: tagPayload.category },
+                  keywords: {
+                    arrayValue: {
+                      values: tagPayload.keywords.map((kw) => ({ stringValue: kw })),
+                    },
+                  },
+                  language: { stringValue: tagPayload.language },
+                  aiGenerated: { booleanValue: tagPayload.aiGenerated },
+                  aiConfidence: { doubleValue: tagPayload.aiConfidence },
+                  taggedAt: { stringValue: tagPayload.taggedAt },
+                },
+              }),
+            });
+            if (restResp.ok) {
+              persisted = true;
+            }
+          }
+        }
+      }
+
+      return res.json({
+        success: true,
+        ...tagPayload,
+        usedGemini,
+        persisted,
+      });
+    } catch (err: any) {
+      console.error('[WaveLink AI Video Tagging Error]:', err?.message || err);
+      const fallback = inferFallbackTaggingFromText(
+        String(req.body?.caption || ''),
+        String(req.body?.transcript || '')
+      );
+      return res.json({
+        success: true,
+        ...fallback,
+        taggedAt: new Date().toISOString(),
+        usedGemini: false,
+        fallbackUsed: true,
+      });
     }
   });
 
@@ -6743,6 +8718,1028 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     }
     antiSpamShareTracker.set(dedupeKey, Date.now());
     return res.json({ counted: true, postId, sharedBy: authUser.uid });
+  });
+
+  // ============================================================================
+  // WEEKLY CHALLENGES & CUSTOM BADGES (SERVER-AUTHORITATIVE, ANTI-CHEAT, ZERO LISTENER OVERHEAD)
+  // ============================================================================
+  const CURATED_BADGE_ICONS = new Set([
+    'trophy', 'crown', 'flame', 'star', 'sparkles', 'award', 'medal', 'zap',
+    'music', 'camera', 'video', 'heart', 'shield', 'gem', 'rocket', 'palette',
+    'globe', 'compass', 'sun', 'feather',
+  ]);
+
+  function isSafeHttpsOrRelativeUrl(url: string): boolean {
+    if (!url) return true;
+    const trimmed = url.trim();
+    if (/^data:/i.test(trimmed) || /^javascript:/i.test(trimmed)) return false;
+    return /^https?:\/\//i.test(trimmed) || trimmed.startsWith('/');
+  }
+
+  // Admin / Sub-Admin: Create or update a Weekly Challenge
+  app.post('/api/challenges/save', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only WaveLink Admins and Sub-Admins can create or edit challenges.',
+        });
+      }
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const existingId = sanitizeServerString(req.body?.id || '', 120);
+      const rawTitle = sanitizeServerString(req.body?.title || req.body?.theme || '', 120);
+      const description = sanitizeServerString(req.body?.description || '', 2000);
+      const rules = sanitizeServerString(req.body?.rules || '', 2000);
+      const rawHashtag = sanitizeServerString(req.body?.hashtag || '', 60).replace(/\s+/g, '');
+      const hashtag = rawHashtag ? (rawHashtag.startsWith('#') ? rawHashtag : `#${rawHashtag}`) : '';
+      const rawType = sanitizeServerString(req.body?.type || 'any', 16).toLowerCase();
+      const type: 'photo' | 'video' | 'text' | 'any' = ['photo', 'video', 'text', 'any'].includes(rawType)
+        ? (rawType as 'photo' | 'video' | 'text' | 'any')
+        : 'any';
+      const coverImageUrl = sanitizeServerString(req.body?.coverImageUrl || '', 2048);
+      const badgeId = sanitizeServerString(req.body?.badgeId || '', 80) || null;
+      const rawStatus = sanitizeServerString(req.body?.status || 'active', 20);
+      const status: 'active' | 'completed' = rawStatus === 'completed' ? 'completed' : 'active';
+
+      const rawMaxEntries = req.body?.maxEntriesPerUser;
+      const maxEntriesPerUser =
+        rawMaxEntries === null || rawMaxEntries === undefined || rawMaxEntries === ''
+          ? null
+          : Math.max(1, Math.min(20, Math.floor(Number(rawMaxEntries) || 3)));
+
+      if (rawTitle.length < 2 || description.length < 4 || hashtag.length < 2) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please enter a challenge title, theme hashtag, and description.',
+        });
+      }
+
+      if (coverImageUrl && !isSafeHttpsOrRelativeUrl(coverImageUrl)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Cover image must be a valid HTTPS image URL (not an inline data URI).',
+        });
+      }
+
+      // Layer 1 + 2 safety check on challenge copy
+      const modCheck = await runServerTextModeration(
+        `${rawTitle} ${hashtag} ${description} ${rules}`,
+        caller.uid,
+        'challenge',
+        false
+      );
+      if (!modCheck.allowed) {
+        return res.status(400).json({
+          success: false,
+          error: modCheck.friendlyMessage || 'Challenge text violates WaveLink safety guidelines.',
+        });
+      }
+
+      const nowMs = Date.now();
+      const startParsed = req.body?.startDate ? new Date(String(req.body.startDate)) : new Date(nowMs);
+      const startMs = Number.isNaN(startParsed.getTime()) ? nowMs : startParsed.getTime();
+      const defaultEndMs = startMs + 7 * 24 * 60 * 60 * 1000; // Default 1 week
+      const endParsed = req.body?.endDate || req.body?.deadline
+        ? new Date(String(req.body.endDate || req.body.deadline))
+        : new Date(defaultEndMs);
+      const endMs = Number.isNaN(endParsed.getTime()) ? defaultEndMs : endParsed.getTime();
+
+      if (endMs <= startMs) {
+        return res.status(400).json({
+          success: false,
+          error: 'Challenge end date must be after the start date.',
+        });
+      }
+
+      const startIso = new Date(startMs).toISOString();
+      const endIso = new Date(endMs).toISOString();
+      const nowIso = new Date(nowMs).toISOString();
+      const challengeId = existingId || `ch_${nowMs}_${Math.random().toString(36).slice(2, 8)}`;
+
+      const docRef = adminDb.collection('challenges').doc(challengeId);
+      const prevSnap = existingId ? await docRef.get() : null;
+      const prevData = prevSnap?.exists ? (prevSnap.data() as Record<string, any>) : null;
+
+      const payload: Record<string, any> = {
+        id: challengeId,
+        title: rawTitle,
+        theme: rawTitle,
+        themeSw: sanitizeServerString(req.body?.themeSw || rawTitle, 120),
+        hashtag,
+        description,
+        descriptionSw: sanitizeServerString(req.body?.descriptionSw || description, 2000),
+        rules,
+        type,
+        coverImageUrl: coverImageUrl || '',
+        startDate: startIso,
+        endDate: endIso,
+        endDateMs: endMs,
+        deadline: endIso,
+        badgeId,
+        status,
+        participantsCount: Number(prevData?.participantsCount || 0),
+        entriesCount: Number(prevData?.entriesCount || 0),
+        winners: Array.isArray(prevData?.winners) ? prevData.winners : [],
+        createdBy: prevData?.createdBy || caller.uid,
+        createdByName: prevData?.createdByName || (caller.email ? caller.email.split('@')[0] : 'WaveLink Admin'),
+        createdAt: prevData?.createdAt || nowIso,
+        updatedAt: nowIso,
+      };
+      if (maxEntriesPerUser !== null) {
+        payload.maxEntriesPerUser = maxEntriesPerUser;
+      }
+
+      await docRef.set(payload, { merge: true });
+
+      await adminDb.collection('adminAuditLogs').add({
+        actorId: caller.uid,
+        actorEmail: caller.email || '',
+        actorName: caller.email ? caller.email.split('@')[0] : 'Admin',
+        actorRole: caller.isSuperAdmin ? 'admin' : 'subadmin',
+        action: 'challenge_created',
+        targetType: 'challenge',
+        targetId: challengeId,
+        details: `${existingId ? 'Updated' : 'Created'} challenge "${rawTitle}" (${hashtag})`,
+        createdAt: nowIso,
+      }).catch(() => {});
+
+      return res.json({ success: true, challenge: payload });
+    } catch (err: any) {
+      console.error('[WaveLink Challenge Save Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to save challenge.' });
+    }
+  });
+
+  // User: Enter a newly created post into an active Weekly Challenge (enforces 1 challenge/post, deadline, entry limit, safety filter, and atomic participant counter)
+  app.post('/api/challenges/enter', rateLimitAuth, async (req, res) => {
+    try {
+      const authUser = await verifyStrictFirebaseIdToken(req);
+      if (!authUser.valid || !authUser.uid) {
+        return res.status(401).json({ success: false, error: authUser.error || 'Authentication required.' });
+      }
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const challengeId = sanitizeServerString(req.body?.challengeId || '', 160);
+      const postId = sanitizeServerString(req.body?.postId || '', 160);
+      const content = sanitizeServerString(req.body?.content || '', 4000);
+      const rawMediaType = sanitizeServerString(req.body?.mediaType || 'none', 16);
+      const mediaType: 'image' | 'video' | 'none' = ['image', 'video', 'none'].includes(rawMediaType)
+        ? (rawMediaType as 'image' | 'video' | 'none')
+        : 'none';
+      const thumbnailUrl = sanitizeServerString(req.body?.thumbnailUrl || '', 2048);
+      const imageUrl = sanitizeServerString(req.body?.imageUrl || '', 2048);
+      const authorName = sanitizeServerString(
+        req.body?.authorName || (authUser.email ? authUser.email.split('@')[0] : 'Creator'),
+        100
+      );
+      const authorUsername = sanitizeServerString(req.body?.authorUsername || '', 60);
+      const authorPhotoURL = sanitizeServerString(req.body?.authorPhotoURL || '', 2048);
+
+      if (!challengeId || !postId) {
+        return res.status(400).json({ success: false, error: 'challengeId and postId are required.' });
+      }
+
+      // Layer 1 + 2 safety check on entry text
+      if (content.trim()) {
+        const modCheck = await runServerTextModeration(content, authUser.uid, 'challenge_entry', false);
+        if (!modCheck.allowed) {
+          return res.status(400).json({
+            success: false,
+            error: modCheck.friendlyMessage || 'Your challenge entry did not pass our safety filter.',
+          });
+        }
+      }
+
+      const challengeRef = adminDb.collection('challenges').doc(challengeId);
+      const challengeSnap = await challengeRef.get();
+      if (!challengeSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Challenge not found.' });
+      }
+      const challengeData = challengeSnap.data() as Record<string, any>;
+
+      // Enforce active status and endDate deadline
+      const endMs = Number(
+        challengeData.endDateMs ||
+        new Date(challengeData.endDate || challengeData.deadline || 0).getTime()
+      );
+      if (challengeData.status !== 'active' || (endMs > 0 && Date.now() > endMs)) {
+        return res.status(400).json({
+          success: false,
+          error: 'This challenge has already ended. Entries are now closed.',
+        });
+      }
+
+      // Enforce challenge type requirement
+      const reqType = String(challengeData.type || 'any');
+      if (reqType === 'photo' && mediaType !== 'image') {
+        return res.status(400).json({
+          success: false,
+          error: 'This challenge requires a photo post.',
+        });
+      }
+      if (reqType === 'video' && mediaType !== 'video') {
+        return res.status(400).json({
+          success: false,
+          error: 'This challenge requires a video post.',
+        });
+      }
+      if (reqType === 'text' && mediaType !== 'none') {
+        return res.status(400).json({
+          success: false,
+          error: 'This challenge accepts text-only posts.',
+        });
+      }
+
+      // Verify post ownership & enforce ONE challenge per post only
+      const postRef = adminDb.collection('posts').doc(postId);
+      const postSnap = await postRef.get();
+      if (postSnap.exists) {
+        const postData = postSnap.data() as Record<string, any>;
+        if (postData.authorId !== authUser.uid) {
+          return res.status(403).json({ success: false, error: 'You can only enter your own posts.' });
+        }
+        if (postData.challengeId && postData.challengeId !== challengeId) {
+          return res.status(400).json({
+            success: false,
+            error: 'A post can only be entered into one challenge.',
+          });
+        }
+      }
+
+      const entryRef = challengeRef.collection('entries').doc(postId);
+      const participantRef = challengeRef.collection('participants').doc(authUser.uid);
+      const [existingEntrySnap, participantSnap] = await Promise.all([
+        entryRef.get(),
+        participantRef.get(),
+      ]);
+
+      if (existingEntrySnap.exists) {
+        return res.json({
+          success: true,
+          alreadyEntered: true,
+          entry: existingEntrySnap.data(),
+          participant: participantSnap.exists ? participantSnap.data() : null,
+        });
+      }
+
+      const prevParticipant = participantSnap.exists
+        ? (participantSnap.data() as Record<string, any>)
+        : null;
+      const prevPostCount = Number(prevParticipant?.postCount || 0);
+      const maxEntries = Number(challengeData.maxEntriesPerUser || 0);
+      if (maxEntries > 0 && prevPostCount >= maxEntries) {
+        return res.status(400).json({
+          success: false,
+          error: `Entry limit reached: you can submit up to ${maxEntries} ${maxEntries === 1 ? 'post' : 'posts'} to this challenge.`,
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const entryDoc = {
+        id: postId,
+        postId,
+        challengeId,
+        uid: authUser.uid,
+        authorName,
+        authorUsername,
+        authorPhotoURL: isSafeHttpsOrRelativeUrl(authorPhotoURL) ? authorPhotoURL : '',
+        mediaType,
+        thumbnailUrl: isSafeHttpsOrRelativeUrl(thumbnailUrl) ? thumbnailUrl : '',
+        imageUrl: isSafeHttpsOrRelativeUrl(imageUrl) ? imageUrl : '',
+        excerpt: content.slice(0, 240),
+        likesCount: 0,
+        countedLikerIds: [],
+        moderationChecked: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      const isNewParticipant = !prevParticipant;
+      const participantDoc = {
+        uid: authUser.uid,
+        challengeId,
+        displayName: authorName,
+        username: authorUsername,
+        photoURL: isSafeHttpsOrRelativeUrl(authorPhotoURL) ? authorPhotoURL : '',
+        postCount: prevPostCount + 1,
+        likesTotal: Number(prevParticipant?.likesTotal || 0),
+        lastPostAt: nowIso,
+        suspiciousSpike: Boolean(prevParticipant?.suspiciousSpike),
+        spikeReasons: Array.isArray(prevParticipant?.spikeReasons) ? prevParticipant.spikeReasons : [],
+        updatedAt: nowIso,
+      };
+
+      const batch = adminDb.batch();
+      batch.set(entryRef, entryDoc);
+      batch.set(participantRef, participantDoc, { merge: true });
+      batch.set(
+        challengeRef,
+        {
+          entriesCount: Number(challengeData.entriesCount || 0) + 1,
+          participantsCount: Number(challengeData.participantsCount || 0) + (isNewParticipant ? 1 : 0),
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      if (postSnap.exists) {
+        batch.set(
+          postRef,
+          {
+            challengeId,
+            challengeHashtag: challengeData.hashtag || '',
+          },
+          { merge: true }
+        );
+      }
+      await batch.commit();
+
+      // Update user's aggregate challengeStats on /users/{uid} (non-blocking)
+      try {
+        const userRef = adminDb.collection('users').doc(authUser.uid);
+        const userSnap = await userRef.get();
+        if (userSnap.exists) {
+          const uData = userSnap.data() as Record<string, any>;
+          const prevStats = uData.challengeStats || { joined: 0, wins: 0, bestPlace: null, entries: 0 };
+          const prevRecent: any[] = Array.isArray(uData.recentChallenges) ? uData.recentChallenges : [];
+          const hasRecent = prevRecent.some((c) => c?.id === challengeId);
+          const updatedRecent = hasRecent
+            ? prevRecent
+            : [
+                {
+                  id: challengeId,
+                  title: challengeData.title || challengeData.theme || 'Weekly Challenge',
+                  hashtag: challengeData.hashtag || '',
+                  date: nowIso,
+                  placement: null,
+                  participated: true,
+                  thumbnailUrl: entryDoc.thumbnailUrl || entryDoc.imageUrl || challengeData.coverImageUrl || '',
+                },
+                ...prevRecent,
+              ].slice(0, 20);
+          await userRef.set(
+            {
+              challengeStats: {
+                joined: Number(prevStats.joined || 0) + (isNewParticipant ? 1 : 0),
+                wins: Number(prevStats.wins || 0),
+                bestPlace: prevStats.bestPlace ?? null,
+                entries: Number(prevStats.entries || 0) + 1,
+              },
+              recentChallenges: updatedRecent,
+            },
+            { merge: true }
+          );
+        }
+      } catch (statErr) {
+        console.warn('[WaveLink Challenge UserStats Notice]:', statErr);
+      }
+
+      return res.json({ success: true, entry: entryDoc, participant: participantDoc });
+    } catch (err: any) {
+      console.error('[WaveLink Challenge Enter Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to submit challenge entry.' });
+    }
+  });
+
+  // Anti-cheat verified like sync for challenge posts:
+  // - Distinct account UIDs only
+  // - Author self-likes NEVER count
+  // - Detects sudden suspicious like spikes and flags participant for admin review
+  app.post('/api/challenges/sync-like', async (req, res) => {
+    try {
+      const authUser = await verifyStrictFirebaseIdToken(req);
+      if (!authUser.valid || !authUser.uid) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.json({ success: true, counted: false });
+      }
+
+      const challengeId = sanitizeServerString(req.body?.challengeId || '', 160);
+      const postId = sanitizeServerString(req.body?.postId || '', 160);
+      const action = req.body?.action === 'unlike' ? 'unlike' : 'like';
+      if (!challengeId || !postId) {
+        return res.status(400).json({ success: false, error: 'challengeId and postId are required.' });
+      }
+
+      const challengeRef = adminDb.collection('challenges').doc(challengeId);
+      const entryRef = challengeRef.collection('entries').doc(postId);
+      const entrySnap = await entryRef.get();
+      if (!entrySnap.exists) {
+        return res.json({ success: true, counted: false, reason: 'entry_not_found' });
+      }
+
+      const entryData = entrySnap.data() as Record<string, any>;
+      const entryOwnerUid = String(entryData.uid || '');
+
+      // Anti-cheat rule 1: Author self-likes NEVER count toward challenge totals
+      if (!entryOwnerUid || entryOwnerUid === authUser.uid) {
+        return res.json({ success: true, counted: false, reason: 'self_like_ignored' });
+      }
+
+      // Anti-cheat rule 2: Distinct accounts only
+      const currentLikers: string[] = Array.isArray(entryData.countedLikerIds)
+        ? entryData.countedLikerIds.map(String)
+        : [];
+      const alreadyCounted = currentLikers.includes(authUser.uid);
+
+      let delta = 0;
+      let nextLikers = currentLikers;
+      if (action === 'like' && !alreadyCounted) {
+        delta = 1;
+        nextLikers = [...currentLikers, authUser.uid].slice(-2000);
+      } else if (action === 'unlike' && alreadyCounted) {
+        delta = -1;
+        nextLikers = currentLikers.filter((id) => id !== authUser.uid);
+      }
+
+      if (delta === 0) {
+        return res.json({
+          success: true,
+          counted: false,
+          likesCount: Number(entryData.likesCount || 0),
+        });
+      }
+
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const nextEntryLikes = Math.max(0, Number(entryData.likesCount || 0) + delta);
+
+      const participantRef = challengeRef.collection('participants').doc(entryOwnerUid);
+      const participantSnap = await participantRef.get();
+      const prevParticipant = participantSnap.exists
+        ? (participantSnap.data() as Record<string, any>)
+        : {};
+      const nextTotalLikes = Math.max(0, Number(prevParticipant.likesTotal || 0) + delta);
+
+      // Anti-cheat rule 3: Flag suspicious like spikes for admin review (rolling 5m and 15m window)
+      const prevTimestamps: number[] = Array.isArray(prevParticipant.recentLikeTimestamps)
+        ? prevParticipant.recentLikeTimestamps.filter((ts: any) => typeof ts === 'number' && nowMs - ts <= 15 * 60 * 1000)
+        : [];
+      const nextTimestamps = delta > 0 ? [...prevTimestamps, nowMs].slice(-50) : prevTimestamps;
+      const likesLast5Min = nextTimestamps.filter((ts) => nowMs - ts <= 5 * 60 * 1000).length;
+      const likesLast15Min = nextTimestamps.length;
+
+      let suspiciousSpike = Boolean(prevParticipant.suspiciousSpike);
+      const spikeReasons: string[] = Array.isArray(prevParticipant.spikeReasons)
+        ? [...prevParticipant.spikeReasons]
+        : [];
+
+      if (likesLast5Min >= 12) {
+        suspiciousSpike = true;
+        const msg = `${likesLast5Min} likes received within 5 minutes (flagged for review)`;
+        if (!spikeReasons.includes(msg)) spikeReasons.push(msg);
+      } else if (likesLast15Min >= 25) {
+        suspiciousSpike = true;
+        const msg = `${likesLast15Min} likes received within 15 minutes (flagged for review)`;
+        if (!spikeReasons.includes(msg)) spikeReasons.push(msg);
+      }
+
+      const batch = adminDb.batch();
+      batch.set(
+        entryRef,
+        {
+          likesCount: nextEntryLikes,
+          countedLikerIds: nextLikers,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      batch.set(
+        participantRef,
+        {
+          uid: entryOwnerUid,
+          challengeId,
+          likesTotal: nextTotalLikes,
+          suspiciousSpike,
+          spikeReasons: spikeReasons.slice(-5),
+          recentLikeTimestamps: nextTimestamps,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      await batch.commit();
+
+      return res.json({
+        success: true,
+        counted: true,
+        likesCount: nextEntryLikes,
+        likesTotal: nextTotalLikes,
+        suspiciousSpike,
+      });
+    } catch (err: any) {
+      console.error('[WaveLink Challenge Sync-Like Notice]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Could not sync challenge like.' });
+    }
+  });
+
+  // Admin / Sub-Admin ONLY: Paginated Participants list for a challenge (20 at a time — NEVER lists all users of the app)
+  app.get('/api/challenges/:challengeId/participants', async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only WaveLink Admins and Sub-Admins can review challenge participants.',
+        });
+      }
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const challengeId = sanitizeServerString(req.params.challengeId || '', 160);
+      const sortBy = req.query.sortBy === 'entries' ? 'postCount' : 'likesTotal';
+      const pageSize = Math.max(1, Math.min(20, Number(req.query.limit) || 20));
+      const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
+      const search = sanitizeServerString(String(req.query.search || ''), 60).toLowerCase();
+
+      const colRef = adminDb.collection('challenges').doc(challengeId).collection('participants');
+
+      if (search) {
+        // Bounded search strictly within THIS challenge's participants only (never /users)
+        const snap = await colRef.orderBy(sortBy, 'desc').limit(100).get().catch(() => colRef.limit(100).get());
+        const allMatched: Record<string, any>[] = [];
+        snap.forEach((d) => {
+          const data = d.data();
+          const name = String(data.displayName || '').toLowerCase();
+          const uname = String(data.username || '').toLowerCase();
+          if (name.includes(search) || uname.includes(search)) {
+            allMatched.push({ uid: d.id, ...data });
+          }
+        });
+        allMatched.sort((a, b) => Number(b[sortBy] || 0) - Number(a[sortBy] || 0));
+        const page = allMatched.slice(offset, offset + pageSize);
+        return res.json({
+          success: true,
+          participants: page,
+          hasMore: offset + pageSize < allMatched.length,
+          nextOffset: offset + page.length,
+        });
+      }
+
+      // Single-field orderBy (no composite index required) + fetch pageSize + 1 to detect hasMore
+      const snap = await colRef
+        .orderBy(sortBy, 'desc')
+        .offset(offset)
+        .limit(pageSize + 1)
+        .get()
+        .catch(() => colRef.limit(pageSize + 1).get());
+
+      const docs: Record<string, any>[] = [];
+      snap.forEach((d) => docs.push({ uid: d.id, ...d.data() }));
+      const hasMore = docs.length > pageSize;
+      const participants = hasMore ? docs.slice(0, pageSize) : docs;
+
+      return res.json({
+        success: true,
+        participants,
+        hasMore,
+        nextOffset: offset + participants.length,
+      });
+    } catch (err: any) {
+      console.error('[WaveLink Challenge Participants Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to load challenge participants.' });
+    }
+  });
+
+  // Admin / Sub-Admin ONLY: Inspect a specific participant's entries inside a challenge
+  app.get('/api/challenges/:challengeId/participants/:participantUid/entries', async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only WaveLink Admins and Sub-Admins can inspect participant entries.',
+        });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const challengeId = sanitizeServerString(req.params.challengeId || '', 160);
+      const participantUid = sanitizeServerString(req.params.participantUid || '', 128);
+      const snap = await adminDb
+        .collection('challenges')
+        .doc(challengeId)
+        .collection('entries')
+        .where('uid', '==', participantUid)
+        .limit(20)
+        .get();
+
+      const entries: Record<string, any>[] = [];
+      snap.forEach((d) => entries.push({ id: d.id, ...d.data() }));
+      entries.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+      return res.json({ success: true, entries });
+    } catch (err: any) {
+      console.error('[WaveLink Participant Entries Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to load participant entries.' });
+    }
+  });
+
+  // Admin / Sub-Admin ONLY: Choose 1 or more winners -> auto-posts Admin Update + notifies winners + awards badge + triggers Winner Celebration
+  app.post('/api/challenges/:challengeId/choose-winners', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only WaveLink Admins and Sub-Admins can choose challenge winners.',
+        });
+      }
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const challengeId = sanitizeServerString(req.params.challengeId || '', 160);
+      const rawWinners: any[] = Array.isArray(req.body?.winners) ? req.body.winners : [];
+      const globalBadgeId = sanitizeServerString(req.body?.badgeId || '', 80) || null;
+      const customNote = sanitizeServerString(req.body?.announcementNote || '', 400);
+      const markCompleted = req.body?.markCompleted !== false;
+
+      if (rawWinners.length === 0 || rawWinners.length > 10) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please select between 1 and 10 challenge winners.',
+        });
+      }
+
+      const challengeRef = adminDb.collection('challenges').doc(challengeId);
+      const challengeSnap = await challengeRef.get();
+      if (!challengeSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Challenge not found.' });
+      }
+      const challengeData = challengeSnap.data() as Record<string, any>;
+      const challengeTitle = String(challengeData.title || challengeData.theme || 'Weekly Challenge');
+      const challengeHashtag = String(challengeData.hashtag || '');
+      const defaultBadgeId = globalBadgeId || challengeData.badgeId || 'weekly_winner';
+
+      // Resolve custom badge name if a custom badge doc exists
+      let resolvedBadgeName = 'Challenge Winner';
+      if (defaultBadgeId) {
+        try {
+          const badgeSnap = await adminDb.collection('badges').doc(defaultBadgeId).get();
+          if (badgeSnap.exists) {
+            resolvedBadgeName = String(badgeSnap.data()?.name || resolvedBadgeName);
+          } else if (defaultBadgeId === 'weekly_winner') {
+            resolvedBadgeName = 'Challenge Champion';
+          }
+        } catch {
+          // fallback to default name
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const winnerUntilIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const enrichedWinners: any[] = [];
+      const seenUids = new Set<string>();
+
+      for (let i = 0; i < rawWinners.length; i++) {
+        const w = rawWinners[i];
+        const uid = sanitizeServerString(w?.uid || '', 128);
+        if (!uid || seenUids.has(uid)) continue;
+        seenUids.add(uid);
+
+        const placement = Math.max(1, Math.min(10, Number(w?.placement || i + 1)));
+        const participantSnap = await challengeRef.collection('participants').doc(uid).get();
+        if (!participantSnap.exists) {
+          return res.status(400).json({
+            success: false,
+            error: `Selected user (${uid}) is not a participant in this challenge.`,
+          });
+        }
+        const pData = participantSnap.data() as Record<string, any>;
+
+        let postId = sanitizeServerString(w?.postId || '', 160);
+        let postThumbnailUrl = '';
+        let postExcerpt = '';
+
+        if (postId) {
+          const eSnap = await challengeRef.collection('entries').doc(postId).get();
+          if (eSnap.exists) {
+            const eData = eSnap.data() as Record<string, any>;
+            postThumbnailUrl = String(eData.thumbnailUrl || eData.imageUrl || '');
+            postExcerpt = String(eData.excerpt || '');
+          }
+        } else {
+          const topEntries = await challengeRef
+            .collection('entries')
+            .where('uid', '==', uid)
+            .limit(5)
+            .get();
+          let bestEntry: Record<string, any> | null = null;
+          topEntries.forEach((docSnap) => {
+            const d = docSnap.data();
+            if (!bestEntry || Number(d.likesCount || 0) > Number(bestEntry.likesCount || 0)) {
+              bestEntry = { id: docSnap.id, ...d };
+            }
+          });
+          if (bestEntry) {
+            postId = String((bestEntry as any).postId || (bestEntry as any).id || '');
+            postThumbnailUrl = String((bestEntry as any).thumbnailUrl || (bestEntry as any).imageUrl || '');
+            postExcerpt = String((bestEntry as any).excerpt || '');
+          }
+        }
+
+        const awardedBadgeId = sanitizeServerString(w?.badgeId || '', 80) || defaultBadgeId;
+        enrichedWinners.push({
+          uid,
+          displayName: String(pData.displayName || 'WaveLink Creator'),
+          username: String(pData.username || ''),
+          photoURL: String(pData.photoURL || ''),
+          placement,
+          postId: postId || undefined,
+          postThumbnailUrl: postThumbnailUrl || undefined,
+          postExcerpt: postExcerpt || undefined,
+          likesTotal: Number(pData.likesTotal || 0),
+          postCount: Number(pData.postCount || 0),
+          badgeId: awardedBadgeId,
+          awardedAt: nowIso,
+        });
+      }
+
+      if (enrichedWinners.length === 0) {
+        return res.status(400).json({ success: false, error: 'No valid winners selected.' });
+      }
+
+      enrichedWinners.sort((a, b) => a.placement - b.placement);
+      const firstWinner = enrichedWinners[0];
+
+      // 1. Update challenge document with winners
+      const challengeUpdate = {
+        winners: enrichedWinners,
+        badgeId: defaultBadgeId,
+        status: markCompleted ? 'completed' : challengeData.status || 'active',
+        winnerUserId: firstWinner.uid,
+        winnerName: firstWinner.displayName,
+        winnerUsername: firstWinner.username || '',
+        winnerPhotoURL: firstWinner.photoURL || '',
+        winnerAwardedAt: nowIso,
+        winnerBadgeUntil: winnerUntilIso,
+        updatedAt: nowIso,
+      };
+      await challengeRef.set(challengeUpdate, { merge: true });
+
+      // 2. Award badges + trigger celebration + send notifications to every winner
+      const placeLabel = (p: number) => (p === 1 ? '1st Place' : p === 2 ? '2nd Place' : p === 3 ? '3rd Place' : `#${p} Winner`);
+      for (const w of enrichedWinners) {
+        const userRef = adminDb.collection('users').doc(w.uid);
+        const userSnap = await userRef.get();
+        if (userSnap.exists) {
+          const uData = userSnap.data() as Record<string, any>;
+          const prevBadges: Array<{ id: string; awardedAt: string }> = Array.isArray(uData.badges)
+            ? uData.badges
+            : [];
+          const hasBadgeAlready = prevBadges.some((b) => b?.id === w.badgeId);
+          const nextBadges = w.badgeId && !hasBadgeAlready
+            ? [...prevBadges, { id: w.badgeId, awardedAt: nowIso }]
+            : prevBadges;
+
+          const prevStats = uData.challengeStats || { joined: 1, wins: 0, bestPlace: null, entries: w.postCount || 1 };
+          const prevBest = typeof prevStats.bestPlace === 'number' ? prevStats.bestPlace : null;
+          const nextBest = prevBest === null ? w.placement : Math.min(prevBest, w.placement);
+
+          const prevRecent: any[] = Array.isArray(uData.recentChallenges) ? uData.recentChallenges : [];
+          const filteredRecent = prevRecent.filter((c) => c?.id !== challengeId);
+          const nextRecent = [
+            {
+              id: challengeId,
+              title: challengeTitle,
+              hashtag: challengeHashtag,
+              date: nowIso,
+              placement: w.placement,
+              participated: true,
+              thumbnailUrl: w.postThumbnailUrl || challengeData.coverImageUrl || '',
+              badgeWonId: w.badgeId || undefined,
+              likesCount: w.likesTotal || 0,
+            },
+            ...filteredRecent,
+          ].slice(0, 20);
+
+          await userRef.set(
+            {
+              badges: nextBadges,
+              weeklyWinnerUntil: winnerUntilIso,
+              challengeStats: {
+                joined: Math.max(1, Number(prevStats.joined || 0)),
+                wins: Number(prevStats.wins || 0) + 1,
+                bestPlace: nextBest,
+                entries: Math.max(Number(w.postCount || 1), Number(prevStats.entries || 0)),
+              },
+              recentChallenges: nextRecent,
+              pendingWinnerCelebration: {
+                challengeId,
+                challengeTitle,
+                hashtag: challengeHashtag,
+                placement: w.placement,
+                badgeId: w.badgeId || null,
+                badgeName: resolvedBadgeName,
+                awardedAt: nowIso,
+              },
+            },
+            { merge: true }
+          );
+        }
+
+        // Send in-app notification to winner
+        await adminDb.collection('notifications').add({
+          recipientId: w.uid,
+          actorId: caller.uid,
+          actorName: 'WaveLink Challenges',
+          type: 'challenge_won',
+          title: `You won ${placeLabel(w.placement)} in ${challengeTitle}!`,
+          body: `Congratulations! You earned the "${resolvedBadgeName}" badge for ${challengeHashtag || challengeTitle}.`,
+          entityId: challengeId,
+          read: false,
+          createdAt: nowIso,
+        });
+      }
+
+      // 3. Auto-post "Winner" announcement using Admin Updates (appears inside WaveLink Assistant!)
+      const winnerSummaryLines = enrichedWinners
+        .map((w) => `${placeLabel(w.placement)}: ${w.displayName}${w.username ? ` (@${w.username})` : ''}`)
+        .join(' • ');
+      const announcementTitle = `Winner: ${challengeTitle}`.slice(0, 60);
+      const announcementMessage = [
+        `Congratulations to our ${challengeTitle} (${challengeHashtag}) ${enrichedWinners.length > 1 ? 'winners' : 'winner'}!`,
+        winnerSummaryLines,
+        `Awarded badge: ${resolvedBadgeName}.`,
+        customNote || 'Visit the Winners Wall in Challenges to view their winning entries.',
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+        .slice(0, 3000);
+      const announcementMessageSw = [
+        `Hongera kwa ${enrichedWinners.length > 1 ? 'washindi' : 'mshindi'} wetu wa shindano la ${challengeTitle} (${challengeHashtag})!`,
+        winnerSummaryLines,
+        `Beji iliyotolewa: ${resolvedBadgeName}. Tembelea Ukuta wa Washindi kuona machapisho yao.`,
+      ]
+        .join('\n\n')
+        .slice(0, 3000);
+
+      const updateRef = await adminDb.collection('adminUpdates').add({
+        title: announcementTitle,
+        message: announcementMessage,
+        messageSw: announcementMessageSw,
+        type: 'announcement',
+        imageUrl: challengeData.coverImageUrl || '',
+        authorUid: caller.uid,
+        authorName: caller.email ? caller.email.split('@')[0] : 'WaveLink Admin',
+        role: caller.isSuperAdmin ? 'admin' : 'subadmin',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        pinned: false,
+        deleted: false,
+        alsoSendPush: false,
+      });
+
+      // 4. Audit log
+      await adminDb.collection('adminAuditLogs').add({
+        actorId: caller.uid,
+        actorEmail: caller.email || '',
+        actorName: caller.email ? caller.email.split('@')[0] : 'Admin',
+        actorRole: caller.isSuperAdmin ? 'admin' : 'subadmin',
+        action: 'challenge_winners_chosen',
+        targetType: 'challenge',
+        targetId: challengeId,
+        details: `Awarded ${enrichedWinners.length} winner(s) for "${challengeTitle}" (${winnerSummaryLines})`,
+        createdAt: nowIso,
+      }).catch(() => {});
+
+      return res.json({
+        success: true,
+        challenge: { ...challengeData, ...challengeUpdate },
+        winners: enrichedWinners,
+        adminUpdateId: updateRef.id,
+      });
+    } catch (err: any) {
+      console.error('[WaveLink Choose Winners Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to award challenge winners.' });
+    }
+  });
+
+  // Admin / Sub-Admin ONLY: Create or update a Custom Badge
+  app.post('/api/badges/save', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only WaveLink Admins and Sub-Admins can create custom badges.',
+        });
+      }
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const existingId = sanitizeServerString(req.body?.id || '', 80);
+      const name = sanitizeServerString(req.body?.name || '', 60);
+      const description = sanitizeServerString(req.body?.description || '', 240);
+      const rawColor = sanitizeServerString(req.body?.color || '#8b5cf6', 32);
+      const color = /^#[0-9a-fA-F]{3,8}$/.test(rawColor) ? rawColor : '#8b5cf6';
+      const rawIcon = sanitizeServerString(req.body?.iconName || 'trophy', 48).toLowerCase();
+      const iconName = CURATED_BADGE_ICONS.has(rawIcon) ? rawIcon : 'trophy';
+      const imageUrl = sanitizeServerString(req.body?.imageUrl || '', 2048);
+      const challengeId = sanitizeServerString(req.body?.challengeId || '', 160) || null;
+      const challengeTitle = sanitizeServerString(req.body?.challengeTitle || '', 120) || null;
+
+      if (name.length < 2) {
+        return res.status(400).json({ success: false, error: 'Badge name must be at least 2 characters.' });
+      }
+      if (imageUrl && !isSafeHttpsOrRelativeUrl(imageUrl)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Badge image must be a valid HTTPS URL.',
+        });
+      }
+
+      const modCheck = await runServerTextModeration(`${name} ${description}`, caller.uid, 'badge', false);
+      if (!modCheck.allowed) {
+        return res.status(400).json({
+          success: false,
+          error: modCheck.friendlyMessage || 'Badge text violates WaveLink safety guidelines.',
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const badgeId = existingId || `badge_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const badgePayload = {
+        id: badgeId,
+        name,
+        description: description || 'Awarded by WaveLink for outstanding community contributions.',
+        color,
+        iconName,
+        imageUrl: imageUrl || '',
+        challengeId,
+        challengeTitle,
+        createdBy: caller.uid,
+        createdByName: caller.email ? caller.email.split('@')[0] : 'WaveLink Admin',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      await adminDb.collection('badges').doc(badgeId).set(badgePayload, { merge: true });
+
+      await adminDb.collection('adminAuditLogs').add({
+        actorId: caller.uid,
+        actorEmail: caller.email || '',
+        actorName: caller.email ? caller.email.split('@')[0] : 'Admin',
+        actorRole: caller.isSuperAdmin ? 'admin' : 'subadmin',
+        action: 'badge_created',
+        targetType: 'badge',
+        targetId: badgeId,
+        details: `Saved custom badge "${name}"`,
+        createdAt: nowIso,
+      }).catch(() => {});
+
+      return res.json({ success: true, badge: badgePayload });
+    } catch (err: any) {
+      console.error('[WaveLink Badge Save Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to save custom badge.' });
+    }
+  });
+
+  // Admin / Sub-Admin ONLY: Delete a Custom Badge
+  app.delete('/api/badges/:badgeId', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only WaveLink Admins and Sub-Admins can delete badges.',
+        });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+      const badgeId = sanitizeServerString(req.params.badgeId || '', 80);
+      if (!badgeId) {
+        return res.status(400).json({ success: false, error: 'badgeId is required.' });
+      }
+      await adminDb.collection('badges').doc(badgeId).delete();
+      return res.json({ success: true, deleted: badgeId });
+    } catch (err: any) {
+      console.error('[WaveLink Badge Delete Error]:', err?.message || err);
+      return res.status(500).json({ success: false, error: 'Failed to delete badge.' });
+    }
   });
 
   // Phase 5: Server-enforced Private Creator Stats access check (strictly account owner only)
@@ -7660,9 +10657,20 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       | 'message'
       | 'bot_reply';
     const targetId = sanitizeServerString(req.body?.targetId, 160);
-    const postId = sanitizeServerString(req.body?.postId, 160);
+    const targetAuthorId = sanitizeServerString(req.body?.targetAuthorId || '', 128);
+    const postId = sanitizeServerString(req.body?.postId || '', 160);
+    const channelId = sanitizeServerString(req.body?.channelId || '', 160);
+    const groupId = sanitizeServerString(req.body?.groupId || '', 160);
     const targetSummary = sanitizeServerString(req.body?.targetSummary || '', 300);
-    const reason = sanitizeServerString(req.body?.reason || 'Community guideline violation', 500);
+    const rawCat = sanitizeServerString(req.body?.reasonCategory || 'other', 24).toLowerCase();
+    const reasonCategory = (['abuse', 'sexual', 'hate', 'spam', 'other'].includes(rawCat)
+      ? rawCat
+      : 'other') as 'abuse' | 'sexual' | 'hate' | 'spam' | 'other';
+    const details = sanitizeServerString(req.body?.details || '', 1000);
+    const reason = sanitizeServerString(
+      req.body?.reason || `${reasonCategory.toUpperCase()}${details ? `: ${details}` : ''}`,
+      500
+    );
 
     if (!targetId) {
       return res.status(400).json({ success: false, error: 'targetId is required.' });
@@ -7674,14 +10682,50 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       reporters = new Set<string>();
       targetReportTrackers.set(trackerKey, reporters);
     }
-    reporters.add(caller.uid);
 
-    const independentCount = reporters.size;
+    const adminDb = getServerFirestore();
+    // Hydrate independent reporters from target document so 3-reporter auto-hide persists across restarts
+    let resolvedAuthorId = targetAuthorId;
+    let targetDocRef: FirebaseFirestore.DocumentReference | null = null;
+    if (adminDb) {
+      if (targetType === 'post' || targetType === 'reel') {
+        targetDocRef = adminDb.collection('posts').doc(targetId);
+      } else if (targetType === 'spark') {
+        targetDocRef = adminDb.collection('sparks').doc(targetId);
+      } else if (targetType === 'comment' && postId) {
+        targetDocRef = adminDb.collection('posts').doc(postId).collection('comments').doc(targetId);
+      } else if (targetType === 'message' && channelId) {
+        targetDocRef = adminDb.collection('channels').doc(channelId).collection('messages').doc(targetId);
+      } else if (targetType === 'message' && groupId) {
+        targetDocRef = adminDb.collection('groups').doc(groupId).collection('messages').doc(targetId);
+      }
+      if (targetDocRef) {
+        try {
+          const snap = await targetDocRef.get();
+          if (snap.exists) {
+            const tData = snap.data() || {};
+            if (Array.isArray(tData.reportedBy)) {
+              tData.reportedBy.forEach((u: unknown) => {
+                if (typeof u === 'string' && u) reporters!.add(u);
+              });
+            }
+            if (!resolvedAuthorId) {
+              resolvedAuthorId = String(tData.authorId || tData.senderId || '');
+            }
+          }
+        } catch {
+          // continue with in-memory tracker
+        }
+      }
+    }
+
+    reporters.add(caller.uid);
+    const uniqueReportersArr = Array.from(reporters);
+    const independentCount = uniqueReportersArr.length;
     const shouldAutoHide = independentCount >= 3 || caller.isStaff;
     const nowIso = new Date().toISOString();
     const reportId = `rep_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
-    const adminDb = getServerFirestore();
     if (adminDb) {
       await adminDb
         .collection('contentReports')
@@ -7692,10 +10736,17 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
           reporterEmail: caller.email || 'member',
           targetType,
           targetId,
+          ...(resolvedAuthorId ? { targetAuthorId: resolvedAuthorId } : {}),
+          ...(postId ? { postId } : {}),
+          ...(channelId ? { channelId } : {}),
+          ...(groupId ? { groupId } : {}),
           targetSummary,
+          reasonCategory,
           reason,
+          ...(details ? { details } : {}),
+          source: 'user_report',
           reportCount: independentCount,
-          independentReporters: Array.from(reporters),
+          independentReporters: uniqueReportersArr,
           autoHidden: shouldAutoHide,
           status: shouldAutoHide ? 'auto_hidden' : 'open',
           createdAt: nowIso,
@@ -7703,35 +10754,43 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         })
         .catch(() => {});
 
+      if (targetDocRef) {
+        await targetDocRef
+          .set(
+            {
+              reportedBy: uniqueReportersArr,
+              reportCount: independentCount,
+              ...(shouldAutoHide
+                ? {
+                    isHidden: true,
+                    moderationStatus: 'auto_hidden',
+                    moderationReason: `Auto-hidden after ${independentCount} report(s): ${reasonCategory}`,
+                  }
+                : {}),
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          )
+          .catch(() => {});
+      }
+
       if (shouldAutoHide) {
-        if (targetType === 'post' || targetType === 'reel') {
+        // Notify content author when content is auto-hidden pending review
+        if (resolvedAuthorId && resolvedAuthorId !== caller.uid && resolvedAuthorId !== 'wavelink_support_bot') {
           await adminDb
-            .collection('posts')
-            .doc(targetId)
-            .set(
-              {
-                isHidden: true,
-                moderationStatus: 'auto_hidden',
-                moderationReason: `Auto-hidden after ${independentCount} independent safety report(s): ${reason}`,
-                reportCount: independentCount,
-                updatedAt: nowIso,
-              },
-              { merge: true }
-            )
-            .catch(() => {});
-        } else if (targetType === 'spark') {
-          await adminDb
-            .collection('sparks')
-            .doc(targetId)
-            .set({ isHidden: true, reportCount: independentCount }, { merge: true })
-            .catch(() => {});
-        } else if (targetType === 'comment' && postId) {
-          await adminDb
-            .collection('posts')
-            .doc(postId)
-            .collection('comments')
-            .doc(targetId)
-            .set({ isHidden: true, reportCount: independentCount, updatedAt: nowIso }, { merge: true })
+            .collection('notifications')
+            .doc(`notif_autohide_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`)
+            .set({
+              recipientId: resolvedAuthorId,
+              actorId: 'wavelink_moderation',
+              actorName: 'WaveLink Safety',
+              type: 'system',
+              title: 'Content hidden pending review',
+              body: `Your ${targetType} was temporarily hidden after community reports. If you believe this is a mistake, you can submit an appeal in Settings.`,
+              entityId: targetId,
+              read: false,
+              createdAt: nowIso,
+            })
             .catch(() => {});
         }
 
@@ -7746,7 +10805,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
             action: caller.isStaff ? 'hide_content' : 'auto_hide_content',
             targetId,
             targetLabel: `${targetType}:${targetId}`,
-            details: `Hidden ${targetType} (${targetId}) — ${independentCount} independent report(s). Reason: ${reason}`,
+            details: `Hidden ${targetType} (${targetId}) — ${independentCount} independent report(s) [${reasonCategory}].`,
             createdAt: nowIso,
           })
           .catch(() => {});
@@ -7766,17 +10825,19 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
 
   app.post('/api/safety/restore-content', rateLimitAuth, async (req, res) => {
     const caller = await resolveServerUserPrivileges(req);
-    // Only Owner or Moderator can restore hidden content (Support Helper cannot restore or unban)
     if (!caller.valid || !caller.isAdmin) {
       return res.status(403).json({
         success: false,
-        error: 'Only the Platform Owner or a Moderator can restore hidden content.',
+        error: 'Only Admin or Sub-Admin can restore hidden content.',
       });
     }
 
     const targetType = sanitizeServerString(req.body?.targetType || 'post', 32);
     const targetId = sanitizeServerString(req.body?.targetId, 160);
     const reportId = sanitizeServerString(req.body?.reportId, 160);
+    const postId = sanitizeServerString(req.body?.postId || '', 160);
+    const channelId = sanitizeServerString(req.body?.channelId || '', 160);
+    const groupId = sanitizeServerString(req.body?.groupId || '', 160);
     if (!targetId) {
       return res.status(400).json({ success: false, error: 'targetId is required.' });
     }
@@ -7785,27 +10846,24 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     const nowIso = new Date().toISOString();
     const adminDb = getServerFirestore();
     if (adminDb) {
+      const restorePatch = {
+        isHidden: false,
+        moderationStatus: 'restored',
+        moderationReason: '',
+        reportCount: 0,
+        reportedBy: [],
+        updatedAt: nowIso,
+      };
       if (targetType === 'post' || targetType === 'reel' || targetType === 'video') {
-        await adminDb
-          .collection('posts')
-          .doc(targetId)
-          .set(
-            {
-              isHidden: false,
-              moderationStatus: 'restored',
-              moderationReason: '',
-              reportCount: 0,
-              updatedAt: nowIso,
-            },
-            { merge: true }
-          )
-          .catch(() => {});
+        await adminDb.collection('posts').doc(targetId).set(restorePatch, { merge: true }).catch(() => {});
       } else if (targetType === 'spark') {
-        await adminDb
-          .collection('sparks')
-          .doc(targetId)
-          .set({ isHidden: false, reportCount: 0 }, { merge: true })
-          .catch(() => {});
+        await adminDb.collection('sparks').doc(targetId).set(restorePatch, { merge: true }).catch(() => {});
+      } else if (targetType === 'comment' && postId) {
+        await adminDb.collection('posts').doc(postId).collection('comments').doc(targetId).set(restorePatch, { merge: true }).catch(() => {});
+      } else if (targetType === 'message' && channelId) {
+        await adminDb.collection('channels').doc(channelId).collection('messages').doc(targetId).set(restorePatch, { merge: true }).catch(() => {});
+      } else if (targetType === 'message' && groupId) {
+        await adminDb.collection('groups').doc(groupId).collection('messages').doc(targetId).set(restorePatch, { merge: true }).catch(() => {});
       }
       if (reportId) {
         await adminDb
@@ -7820,7 +10878,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         .set({
           actorId: caller.uid,
           actorEmail: caller.email || 'admin',
-          actorName: caller.isSuperAdmin ? 'Platform Owner' : 'Moderator',
+          actorName: caller.isSuperAdmin ? 'Platform Admin' : 'Sub-Admin',
           actorRole: caller.role,
           action: 'restore_content',
           targetId,
@@ -7839,7 +10897,357 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     });
   });
 
-  // Appeals for Hidden Content or Account Bans
+  // ============================================================================
+  // LAYER 4: ADMIN / SUB-ADMIN MODERATION QUEUE & STRIKES LADDER
+  // Strike 1: Warning -> Strike 2: 24h Mute -> Strike 3: 7d Suspension -> Strike 4: Permanent Ban
+  // On-demand fetch ONLY (zero background Firestore listeners).
+  // ============================================================================
+  app.get('/api/moderation/queue', async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only WaveLink Admins and Sub-Admins can access the Moderation Queue.',
+      });
+    }
+
+    const adminDb = getServerFirestore();
+    const reports: Record<string, any>[] = [];
+    const appeals: Record<string, any>[] = [];
+    const auditLogs: Record<string, any>[] = [];
+
+    if (adminDb) {
+      try {
+        const [repSnap, appSnap, logSnap] = await Promise.all([
+          adminDb.collection('contentReports').orderBy('createdAt', 'desc').limit(50).get().catch(() =>
+            adminDb.collection('contentReports').limit(50).get()
+          ),
+          adminDb.collection('appeals').orderBy('createdAt', 'desc').limit(40).get().catch(() =>
+            adminDb.collection('appeals').limit(40).get()
+          ),
+          adminDb.collection('adminAuditLogs').orderBy('createdAt', 'desc').limit(30).get().catch(() =>
+            adminDb.collection('adminAuditLogs').limit(30).get()
+          ),
+        ]);
+        repSnap.forEach((d) => reports.push({ id: d.id, ...d.data() }));
+        appSnap.forEach((d) => appeals.push({ id: d.id, ...d.data() }));
+        logSnap.forEach((d) => auditLogs.push({ id: d.id, ...d.data() }));
+      } catch (err) {
+        console.warn('[WaveLink Moderation Queue] Fetch notice:', err);
+      }
+    }
+
+    const sortByCreatedDesc = (a: Record<string, any>, b: Record<string, any>) =>
+      String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    reports.sort(sortByCreatedDesc);
+    appeals.sort(sortByCreatedDesc);
+    auditLogs.sort(sortByCreatedDesc);
+
+    return res.json({
+      success: true,
+      reports,
+      appeals,
+      auditLogs,
+    });
+  });
+
+  app.post('/api/moderation/action', rateLimitAuth, async (req, res) => {
+    const caller = await resolveServerUserPrivileges(req);
+    if (!caller.valid || !caller.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only WaveLink Admins and Sub-Admins can execute moderation actions.',
+      });
+    }
+
+    const action = sanitizeServerString(req.body?.action || '', 32);
+    const reportId = sanitizeServerString(req.body?.reportId || '', 160);
+    const targetType = sanitizeServerString(req.body?.targetType || 'post', 32);
+    const targetId = sanitizeServerString(req.body?.targetId || '', 160);
+    const targetUserId = sanitizeServerString(req.body?.targetUserId || '', 128);
+    const postId = sanitizeServerString(req.body?.postId || '', 160);
+    const channelId = sanitizeServerString(req.body?.channelId || '', 160);
+    const groupId = sanitizeServerString(req.body?.groupId || '', 160);
+    const reason = sanitizeServerString(req.body?.reason || 'Community Guidelines enforcement', 500);
+
+    const allowedActions = ['approve', 'remove', 'warn', 'mute_24h', 'suspend_7d', 'ban', 'strike_auto'];
+    if (!allowedActions.includes(action)) {
+      return res.status(400).json({ success: false, error: 'Invalid moderation action.' });
+    }
+
+    const adminDb = getServerFirestore();
+    if (!adminDb) {
+      return res.status(503).json({ success: false, error: 'Database unavailable.' });
+    }
+
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const actorName = caller.isSuperAdmin ? 'Platform Admin' : 'Sub-Admin';
+
+    // Helper to resolve target content doc ref
+    const getTargetRef = () => {
+      if (!targetId) return null;
+      if (targetType === 'post' || targetType === 'reel') return adminDb.collection('posts').doc(targetId);
+      if (targetType === 'spark') return adminDb.collection('sparks').doc(targetId);
+      if (targetType === 'comment' && postId) return adminDb.collection('posts').doc(postId).collection('comments').doc(targetId);
+      if (targetType === 'message' && channelId) return adminDb.collection('channels').doc(channelId).collection('messages').doc(targetId);
+      if (targetType === 'message' && groupId) return adminDb.collection('groups').doc(groupId).collection('messages').doc(targetId);
+      return null;
+    };
+
+    if (action === 'approve') {
+      const tRef = getTargetRef();
+      if (tRef) {
+        await tRef
+          .set(
+            {
+              isHidden: false,
+              moderationStatus: 'approved',
+              moderationReason: '',
+              reportCount: 0,
+              reportedBy: [],
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          )
+          .catch(() => {});
+      }
+      if (reportId) {
+        await adminDb
+          .collection('contentReports')
+          .doc(reportId)
+          .set({ status: 'dismissed', autoHidden: false, reviewedBy: caller.uid, updatedAt: nowIso }, { merge: true })
+          .catch(() => {});
+      }
+      await adminDb
+        .collection('adminAuditLogs')
+        .doc(`audit_mod_approve_${nowMs}`)
+        .set({
+          actorId: caller.uid,
+          actorEmail: caller.email || 'admin',
+          actorName,
+          actorRole: caller.role,
+          action: 'restore_content',
+          targetId: targetId || reportId,
+          targetLabel: `${targetType}:${targetId || reportId}`,
+          details: `Approved & restored content. Note: ${reason}`,
+          createdAt: nowIso,
+        })
+        .catch(() => {});
+
+      return res.json({ success: true, message: 'Content approved and report dismissed.' });
+    }
+
+    if (action === 'remove') {
+      const tRef = getTargetRef();
+      if (tRef) {
+        await tRef
+          .set(
+            {
+              isHidden: true,
+              moderationStatus: 'removed',
+              moderationReason: reason,
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          )
+          .catch(() => {});
+      }
+      if (reportId) {
+        await adminDb
+          .collection('contentReports')
+          .doc(reportId)
+          .set({ status: 'resolved', autoHidden: true, reviewedBy: caller.uid, updatedAt: nowIso }, { merge: true })
+          .catch(() => {});
+      }
+      if (targetUserId && targetUserId !== 'wavelink_support_bot') {
+        await adminDb
+          .collection('notifications')
+          .doc(`notif_removed_${nowMs}_${Math.random().toString(36).slice(2, 6)}`)
+          .set({
+            recipientId: targetUserId,
+            actorId: caller.uid,
+            actorName: 'WaveLink Moderation',
+            type: 'system',
+            title: 'Content removed',
+            body: `Your ${targetType} was removed for violating WaveLink Community Guidelines (${reason}). You may appeal in Settings.`,
+            entityId: targetId || reportId,
+            read: false,
+            createdAt: nowIso,
+          })
+          .catch(() => {});
+      }
+      await adminDb
+        .collection('adminAuditLogs')
+        .doc(`audit_mod_remove_${nowMs}`)
+        .set({
+          actorId: caller.uid,
+          actorEmail: caller.email || 'admin',
+          actorName,
+          actorRole: caller.role,
+          action: 'moderation_remove',
+          targetId: targetId || reportId,
+          targetLabel: `${targetType}:${targetId || reportId}`,
+          details: `Removed content (${reason})`,
+          createdAt: nowIso,
+        })
+        .catch(() => {});
+
+      return res.json({ success: true, message: 'Content removed and logged.' });
+    }
+
+    // Strike actions: warn | mute_24h | suspend_7d | ban | strike_auto
+    if (!targetUserId) {
+      return res.status(400).json({ success: false, error: 'targetUserId is required to issue a strike.' });
+    }
+    if (targetUserId === caller.uid) {
+      return res.status(400).json({ success: false, error: 'You cannot issue a strike to yourself.' });
+    }
+
+    const userRef = adminDb.collection('users').doc(targetUserId);
+    const userSnap = await userRef.get().catch(() => null);
+    const uData = userSnap?.exists ? userSnap.data() || {} : {};
+    if (uData.isOwner === true || uData.role === 'super_admin') {
+      return res.status(403).json({ success: false, error: 'Cannot issue moderation strikes against the Platform Owner.' });
+    }
+
+    const prevStrikes = Number(uData.strikesCount || 0);
+    const nextStrikeNumber = prevStrikes + 1;
+
+    let resolvedLevel: 'warning' | 'muted_24h' | 'suspended_7d' | 'permanent_ban' = 'warning';
+    if (action === 'strike_auto') {
+      resolvedLevel =
+        nextStrikeNumber <= 1
+          ? 'warning'
+          : nextStrikeNumber === 2
+          ? 'muted_24h'
+          : nextStrikeNumber === 3
+          ? 'suspended_7d'
+          : 'permanent_ban';
+    } else if (action === 'warn') {
+      resolvedLevel = 'warning';
+    } else if (action === 'mute_24h') {
+      resolvedLevel = 'muted_24h';
+    } else if (action === 'suspend_7d') {
+      resolvedLevel = 'suspended_7d';
+    } else if (action === 'ban') {
+      resolvedLevel = 'permanent_ban';
+    }
+
+    const strikeEntry = {
+      id: `strike_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
+      strikeNumber: nextStrikeNumber,
+      level: resolvedLevel,
+      reason,
+      issuedBy: caller.uid,
+      issuedByName: actorName,
+      createdAt: nowIso,
+      ...(resolvedLevel === 'muted_24h'
+        ? { expiresAt: new Date(nowMs + 24 * 60 * 60 * 1000).toISOString() }
+        : resolvedLevel === 'suspended_7d'
+        ? { expiresAt: new Date(nowMs + 7 * 24 * 60 * 60 * 1000).toISOString() }
+        : {}),
+    };
+
+    const existingHistory = Array.isArray(uData.strikeHistory) ? uData.strikeHistory.slice(-19) : [];
+    const userPatch: Record<string, any> = {
+      strikesCount: nextStrikeNumber,
+      strikeLevel: resolvedLevel,
+      strikeHistory: [...existingHistory, strikeEntry],
+      warnings: Number(uData.warnings || 0) + 1,
+      warningMessage: reason,
+      lastWarningAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    let notifTitle = 'Community Safety Warning (Strike 1)';
+    let notifBody = `You received a warning on WaveLink: ${reason}. Please review Community Guidelines. Repeated violations lead to mute, suspension, or permanent ban.`;
+    let auditAction = 'strike_warning';
+
+    if (resolvedLevel === 'muted_24h') {
+      userPatch.mutedUntilMs = nowMs + 24 * 60 * 60 * 1000;
+      userPatch.status = 'warned';
+      notifTitle = '24-Hour Posting Mute (Strike 2)';
+      notifBody = `Your account is muted for 24 hours due to: ${reason}. You can still read WaveLink and submit an appeal if you think this was a mistake.`;
+      auditAction = 'strike_mute_24h';
+    } else if (resolvedLevel === 'suspended_7d') {
+      userPatch.suspendedUntilMs = nowMs + 7 * 24 * 60 * 60 * 1000;
+      userPatch.status = 'warned';
+      notifTitle = '7-Day Account Suspension (Strike 3)';
+      notifBody = `Your account has been suspended for 7 days due to: ${reason}. You may submit an appeal from the suspension screen.`;
+      auditAction = 'strike_suspend_7d';
+    } else if (resolvedLevel === 'permanent_ban') {
+      userPatch.isBanned = true;
+      userPatch.status = 'banned';
+      userPatch.banReason = reason;
+      userPatch.bannedAt = nowIso;
+      notifTitle = 'Account Permanently Banned (Strike 4)';
+      notifBody = `Your account was permanently banned due to repeated or severe violations: ${reason}.`;
+      auditAction = 'ban_user';
+    } else {
+      userPatch.status = 'warned';
+    }
+
+    await userRef.set(userPatch, { merge: true });
+    userRestrictionCache.delete(targetUserId);
+
+    // Also hide the offending content & resolve report if provided
+    const tRef = getTargetRef();
+    if (tRef) {
+      await tRef
+        .set({ isHidden: true, moderationStatus: 'removed', moderationReason: reason, updatedAt: nowIso }, { merge: true })
+        .catch(() => {});
+    }
+    if (reportId) {
+      await adminDb
+        .collection('contentReports')
+        .doc(reportId)
+        .set({ status: 'resolved', autoHidden: true, reviewedBy: caller.uid, updatedAt: nowIso }, { merge: true })
+        .catch(() => {});
+    }
+
+    await Promise.all([
+      adminDb
+        .collection('notifications')
+        .doc(`notif_strike_${nowMs}_${Math.random().toString(36).slice(2, 6)}`)
+        .set({
+          recipientId: targetUserId,
+          actorId: caller.uid,
+          actorName: 'WaveLink Safety',
+          type: 'system',
+          title: notifTitle,
+          body: notifBody,
+          entityId: targetId || targetUserId,
+          read: false,
+          createdAt: nowIso,
+        })
+        .catch(() => {}),
+      adminDb
+        .collection('adminAuditLogs')
+        .doc(`audit_strike_${nowMs}`)
+        .set({
+          actorId: caller.uid,
+          actorEmail: caller.email || 'admin',
+          actorName,
+          actorRole: caller.role,
+          action: auditAction,
+          targetId: targetUserId,
+          targetLabel: `${uData.displayName || uData.username || targetUserId} (Strike #${nextStrikeNumber}: ${resolvedLevel})`,
+          details: `Issued ${resolvedLevel} (Strike #${nextStrikeNumber}). Reason: ${reason}`,
+          createdAt: nowIso,
+        })
+        .catch(() => {}),
+    ]);
+
+    return res.json({
+      success: true,
+      strikeLevel: resolvedLevel,
+      strikesCount: nextStrikeNumber,
+      message: `Issued ${resolvedLevel.replace(/_/g, ' ')} (Strike #${nextStrikeNumber}).`,
+    });
+  });
+
+  // Appeals for Hidden Content or Account Bans / Mutes / Suspensions
   const inMemoryAppeals = new Map<string, Record<string, any>>();
 
   app.post('/api/safety/appeal', rateLimitChatAndSafety, async (req, res) => {
@@ -7935,7 +11343,7 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
     if (!caller.valid || !caller.isAdmin) {
       return res.status(403).json({
         success: false,
-        error: 'Only the Platform Owner or a Moderator can review appeals.',
+        error: 'Only Admin or Sub-Admin can review appeals.',
       });
     }
     const appealId = sanitizeServerString(req.body?.appealId, 160);
@@ -7973,12 +11381,30 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         .catch(() => {});
 
       if (status === 'approved' && data) {
-        if (data.targetType === 'account_ban' && data.userId) {
+        if (
+          (data.targetType === 'account_ban' ||
+            data.targetType === 'account_mute' ||
+            data.targetType === 'account_suspension' ||
+            data.targetType === 'strike') &&
+          data.userId
+        ) {
           await adminDb
             .collection('users')
             .doc(data.userId)
-            .set({ isBanned: false, status: 'active', warningMessage: '', updatedAt: nowIso }, { merge: true })
+            .set(
+              {
+                isBanned: false,
+                status: 'active',
+                warningMessage: '',
+                mutedUntilMs: 0,
+                suspendedUntilMs: 0,
+                strikeLevel: 'none',
+                updatedAt: nowIso,
+              },
+              { merge: true }
+            )
             .catch(() => {});
+          userRestrictionCache.delete(data.userId);
         } else if ((data.targetType === 'post' || data.targetType === 'reel') && data.targetId) {
           await adminDb
             .collection('posts')
@@ -7988,13 +11414,34 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
         }
       }
 
+      if (data?.userId) {
+        await adminDb
+          .collection('notifications')
+          .doc(`notif_appeal_rev_${Date.now()}`)
+          .set({
+            recipientId: data.userId,
+            actorId: caller.uid,
+            actorName: 'WaveLink Safety',
+            type: 'system',
+            title: status === 'approved' ? 'Your appeal was approved' : 'Update on your appeal',
+            body:
+              status === 'approved'
+                ? `Your appeal was approved and your restriction/content has been restored.${resolutionNote ? ` Note: ${resolutionNote}` : ''}`
+                : `Your appeal was reviewed and could not be approved at this time.${resolutionNote ? ` Note: ${resolutionNote}` : ''}`,
+            entityId: appealId,
+            read: false,
+            createdAt: nowIso,
+          })
+          .catch(() => {});
+      }
+
       await adminDb
         .collection('adminAuditLogs')
         .doc(`audit_appeal_rev_${Date.now()}`)
         .set({
           actorId: caller.uid,
           actorEmail: caller.email || 'admin',
-          actorName: caller.isSuperAdmin ? 'Platform Owner' : 'Moderator',
+          actorName: caller.isSuperAdmin ? 'Platform Admin' : 'Sub-Admin',
           actorRole: caller.role,
           action: 'appeal_reviewed',
           targetId: appealId,
@@ -8223,6 +11670,1256 @@ Keep your response warm, conversational, natural to speak aloud, and concise (2 
       roleVerified: caller.role,
       checkedAt: new Date().toISOString(),
     });
+  });
+
+  // ============================================================================
+  // 4.9 PARENTAL CONTROLS & TEEN SAFETY API (SERVER-AUTHORITATIVE)
+  // ============================================================================
+  // Single server constant matching src/config/ageConfig.ts -> MIN_SIGNUP_AGE
+  const SERVER_MIN_SIGNUP_AGE = 13;
+
+  const PARENTAL_DEFAULT_CONTROLS = {
+    dailyLimitMinutes: 90,
+    bedtimeEnabled: false,
+    bedtimeStart: '22:00',
+    bedtimeEnd: '06:30',
+    messagingPolicy: 'approved_friends' as 'nobody' | 'approved_friends',
+    profileVisibility: 'private' as 'private' | 'public',
+    allowCalls: false,
+    strictSensitiveFilter: true as const,
+    requireFollowerApproval: true,
+    isPaused: false,
+    allowLocationSharing: false as const,
+    emailAlertsEnabled: true,
+  };
+
+  function maskParentEmail(email: string): string {
+    const clean = String(email || '').trim().toLowerCase();
+    const parts = clean.split('@');
+    if (parts.length !== 2) return '***';
+    const local = parts[0];
+    const domain = parts[1];
+    if (local.length <= 2) return `${local[0] || '*'}***@${domain}`;
+    return `${local.slice(0, 2)}***@${domain}`;
+  }
+
+  function hashParentalSecret(raw: string): string {
+    return crypto
+      .createHash('sha256')
+      .update(`${String(raw || '').trim()}::wavelink_parental_secret_v1`)
+      .digest('hex');
+  }
+
+  function timingSafeHexEqual(hexA: string, hexB: string): boolean {
+    if (!hexA || !hexB || hexA.length !== hexB.length) return false;
+    try {
+      return crypto.timingSafeEqual(Buffer.from(hexA, 'hex'), Buffer.from(hexB, 'hex'));
+    } catch {
+      return false;
+    }
+  }
+
+  function resolveWaveLinkPublicBaseUrl(req: express.Request): string {
+    const envUrl = String(process.env.APP_BASE_URL || '').trim().replace(/\/+$/, '');
+    if (envUrl && /^https?:\/\//i.test(envUrl)) return envUrl;
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000').split(',')[0].trim();
+    return `${proto}://${host}`;
+  }
+
+  function isValidHHMM(val: unknown): val is string {
+    return typeof val === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(val.trim());
+  }
+
+  function isCallerVerifiedParentOfLink(
+    caller: { uid: string; email?: string; emailVerified?: boolean },
+    linkData: Record<string, any>
+  ): boolean {
+    if (!caller.uid || !linkData) return false;
+    if (linkData.teenUid === caller.uid) return false; // Teen can NEVER act as their own parent
+    if (linkData.parentUid && linkData.parentUid === caller.uid) return true;
+    const callerEmail = String(caller.email || '').trim().toLowerCase();
+    if (callerEmail && caller.emailVerified && linkData.parentEmailLower === callerEmail) {
+      return true;
+    }
+    return false;
+  }
+
+  async function createAndEmailParentalAlert(
+    adminDb: FirebaseFirestore.Firestore,
+    params: {
+      teenUid: string;
+      type:
+        | 'teen_reported'
+        | 'flagged_message'
+        | 'new_chat_request'
+        | 'new_follow_request'
+        | 'link_verified'
+        | 'deletion_requested';
+      title: string;
+      summary: string;
+      actorUid?: string;
+      actorName?: string;
+      sendEmail?: boolean;
+    }
+  ): Promise<{ created: boolean; emailed: boolean }> {
+    try {
+      const linkSnap = await adminDb.collection('parentalLinks').doc(params.teenUid).get();
+      if (!linkSnap.exists) return { created: false, emailed: false };
+      const link = linkSnap.data() as Record<string, any>;
+      if (link.status !== 'verified' && params.type !== 'link_verified') {
+        return { created: false, emailed: false };
+      }
+
+      const nowIso = new Date().toISOString();
+      const alertId = `palert_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const safeTitle = sanitizeServerString(params.title, 140);
+      const safeSummary = sanitizeServerString(params.summary, 500);
+
+      await adminDb.collection('parentalAlerts').doc(alertId).set({
+        id: alertId,
+        teenUid: params.teenUid,
+        teenName: sanitizeServerString(link.teenDisplayName || 'Teen account', 100),
+        parentUid: link.parentUid || null,
+        parentEmailLower: String(link.parentEmailLower || '').toLowerCase(),
+        type: params.type,
+        title: safeTitle,
+        summary: safeSummary,
+        ...(params.actorUid ? { actorUid: sanitizeServerString(params.actorUid, 128) } : {}),
+        ...(params.actorName ? { actorName: sanitizeServerString(params.actorName, 100) } : {}),
+        read: false,
+        createdAt: nowIso,
+      });
+
+      let emailed = false;
+      const shouldEmail =
+        params.sendEmail !== false &&
+        link.controls?.emailAlertsEnabled !== false &&
+        typeof link.parentEmailLower === 'string' &&
+        link.parentEmailLower.includes('@');
+
+      if (shouldEmail) {
+        const html = `
+          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; color: #0f172a;">
+            <h2 style="margin: 0 0 12px; font-size: 20px;">WaveLink Parent Safety Alert</h2>
+            <p style="margin: 0 0 12px; font-size: 14px; line-height: 1.6;"><strong>${safeTitle}</strong></p>
+            <p style="margin: 0 0 16px; font-size: 14px; line-height: 1.6; color: #334155;">${safeSummary}</p>
+            <p style="margin: 0; font-size: 12px; color: #64748b;">Sign in to your WaveLink Parent Dashboard to review activity and controls. Private message contents are never shared in alerts.</p>
+          </div>
+        `;
+        emailed = await sendWaveLinkSecurityEmail(
+          link.parentEmailLower,
+          `[WaveLink Parent Alert] ${safeTitle}`,
+          html
+        );
+      }
+
+      return { created: true, emailed };
+    } catch (err) {
+      console.warn('[WaveLink Parental Alert] Notice:', err);
+      return { created: false, emailed: false };
+    }
+  }
+
+  // 1. Teen requests parent linking -> server sends email with confirmation link + 6-digit one-time code
+  app.post('/api/parental/request-link', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Please sign in first.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const rawParentEmail = sanitizeServerString(req.body?.parentEmail || '', 160).toLowerCase();
+      if (!rawParentEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawParentEmail)) {
+        return res.status(400).json({ success: false, error: 'Please enter a valid parent or guardian email address.' });
+      }
+
+      const callerEmail = String(caller.email || '').trim().toLowerCase();
+      if (callerEmail && rawParentEmail === callerEmail) {
+        return res.status(400).json({
+          success: false,
+          error: 'Parent email must be different from your own account email.',
+        });
+      }
+
+      const teenRef = adminDb.collection('users').doc(caller.uid);
+      const teenSnap = await teenRef.get();
+      const teenData = teenSnap.exists ? (teenSnap.data() as Record<string, any>) : {};
+
+      const existingLinkRef = adminDb.collection('parentalLinks').doc(caller.uid);
+      const existingLinkSnap = await existingLinkRef.get();
+      if (existingLinkSnap.exists) {
+        const existingLink = existingLinkSnap.data() as Record<string, any>;
+        // Anti-tamper: once verified by a parent, the teen cannot overwrite or swap the parent email!
+        if (existingLink.status === 'verified') {
+          return res.status(403).json({
+            success: false,
+            error: 'Parental Control is already verified. Only your parent or guardian can change or remove this link.',
+          });
+        }
+      }
+
+      const confirmToken = crypto.randomBytes(24).toString('hex');
+      const otpCode = String(crypto.randomInt(100000, 999999));
+      const nowIso = new Date().toISOString();
+      const expiresAtMs = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+      const maskedEmail = maskParentEmail(rawParentEmail);
+      const baseUrl = resolveWaveLinkPublicBaseUrl(req);
+      const confirmUrl = `${baseUrl}/?parentVerify=${encodeURIComponent(confirmToken)}&teen=${encodeURIComponent(caller.uid)}`;
+
+      const teenDisplayName = sanitizeServerString(teenData.displayName || 'WaveLink Teen', 100);
+      const teenUsername = sanitizeServerString(teenData.username || '@waver', 60);
+
+      await existingLinkRef.set(
+        {
+          id: caller.uid,
+          teenUid: caller.uid,
+          teenDisplayName,
+          teenUsername,
+          teenEmailLower: callerEmail,
+          parentUid: null,
+          parentEmailLower: rawParentEmail,
+          parentEmailMasked: maskedEmail,
+          status: 'pending_parent',
+          tokenHash: hashParentalSecret(confirmToken),
+          codeHash: hashParentalSecret(otpCode),
+          codeExpiresAtMs: expiresAtMs,
+          verifyAttempts: 0,
+          controls: {
+            ...PARENTAL_DEFAULT_CONTROLS,
+            dailyLimitMinutes: 60,
+            bedtimeEnabled: true,
+            allowCalls: false,
+            profileVisibility: 'private',
+            strictSensitiveFilter: true,
+            allowLocationSharing: false,
+            updatedAt: nowIso,
+          },
+          dailyScreenTime: existingLinkSnap.exists
+            ? existingLinkSnap.data()?.dailyScreenTime || {}
+            : {},
+          createdAt: existingLinkSnap.exists
+            ? existingLinkSnap.data()?.createdAt || nowIso
+            : nowIso,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      // Keep teen account strictly limited until parent confirms
+      await teenRef.set(
+        {
+          isUnder18: true,
+          sensitiveContentFilter: true,
+          parentalLinkId: caller.uid,
+          parentalStatus: 'pending_parent',
+          parentEmailMasked: maskedEmail,
+          privacySettings: {
+            ...(teenData.privacySettings || {}),
+            isTeenAccount: true,
+            hideAdultMedia: true,
+            whoCanSeePosts: 'followers',
+            whoCanMessageMe: 'followers',
+            whoCanCallMe: 'nobody',
+            updatedAt: nowIso,
+          },
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      const emailHtml = `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 580px; margin: 0 auto; padding: 24px; color: #0f172a; background: #ffffff;">
+          <h2 style="margin: 0 0 12px; font-size: 22px; color: #0f172a;">Confirm WaveLink Parental Controls</h2>
+          <p style="margin: 0 0 14px; font-size: 14px; line-height: 1.6;">
+            <strong>${teenDisplayName}</strong> (${teenUsername}) has listed your email address as their parent or guardian on WaveLink (minimum age ${SERVER_MIN_SIGNUP_AGE}+).
+          </p>
+          <p style="margin: 0 0 16px; font-size: 14px; line-height: 1.6; color: #334155;">
+            Until you confirm, their account remains in protected limited mode (private profile, no messages from strangers, no calls, no public posts, and strict safety filter locked ON).
+          </p>
+          <div style="margin: 20px 0; padding: 16px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; text-align: center;">
+            <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 6px;">One-Time Verification Code (24h)</div>
+            <div style="font-size: 30px; font-weight: 800; letter-spacing: 0.22em; color: #0f172a; font-family: monospace;">${otpCode}</div>
+          </div>
+          <p style="margin: 0 0 20px; text-align: center;">
+            <a href="${confirmUrl}" style="display: inline-block; padding: 12px 24px; background: #2563eb; color: #ffffff; text-decoration: none; border-radius: 999px; font-weight: 700; font-size: 14px;">
+              Open Parent Confirmation Link
+            </a>
+          </p>
+          <p style="margin: 0 0 10px; font-size: 12px; line-height: 1.6; color: #475569;">
+            <strong>How to confirm:</strong> Sign in to WaveLink using <strong>${rawParentEmail}</strong> (separate from your teen&apos;s account), then open the confirmation link above or enter the 6-digit code in <strong>Settings &rarr; Parent Dashboard</strong>.
+          </p>
+          <p style="margin: 0; font-size: 12px; line-height: 1.5; color: #64748b;">
+            <strong>Privacy Notice:</strong> Your Parent Dashboard shows daily time spent, post count, followers/following, challenges joined, and safety alerts. Private message contents are never shared. If you did not expect this request, you can safely ignore this email.
+          </p>
+        </div>
+      `;
+
+      const emailSent = await sendWaveLinkSecurityEmail(
+        rawParentEmail,
+        `Confirm WaveLink Parental Controls for ${teenDisplayName}`,
+        emailHtml
+      );
+
+      if (!emailSent) {
+        console.log(
+          `[WaveLink Parental Control] BREVO_API_KEY not configured — verification code for ${maskedEmail} (teen ${caller.uid}): ${otpCode} | Link: ${confirmUrl}`
+        );
+      }
+
+      return res.json({
+        success: true,
+        maskedEmail,
+        emailSent,
+        expiresAt: new Date(expiresAtMs).toISOString(),
+        message: emailSent
+          ? `Confirmation link and one-time code sent to ${maskedEmail}.`
+          : `Verification link created for ${maskedEmail}. Email delivery requires BREVO_API_KEY to be configured on the server.`,
+      });
+    } catch (err) {
+      console.error('[WaveLink Parental Request Link Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not send parent verification request.' });
+    }
+  });
+
+  // 2. Parent confirms link (via confirmation link token OR 6-digit OTP code)
+  app.post('/api/parental/verify-link', rateLimitStrictLogin, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({
+          success: false,
+          error: 'Please sign in with your parent email address first to confirm.',
+        });
+      }
+
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database is temporarily unavailable.' });
+      }
+
+      const parentEmail = String(caller.email || '').trim().toLowerCase();
+      if (!parentEmail || !caller.emailVerified) {
+        return res.status(403).json({
+          success: false,
+          error: 'Please verify your own email address before confirming a parent link.',
+        });
+      }
+
+      const rawToken = sanitizeServerString(req.body?.token || '', 128);
+      const rawCode = sanitizeServerString(req.body?.code || '', 12).replace(/\D/g, '');
+      const rawTeenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+
+      if (!rawToken && rawCode.length !== 6) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please provide either the confirmation link token or the 6-digit one-time code.',
+        });
+      }
+
+      let linkSnap: FirebaseFirestore.DocumentSnapshot | null = null;
+      if (rawTeenUid) {
+        const direct = await adminDb.collection('parentalLinks').doc(rawTeenUid).get();
+        if (direct.exists) linkSnap = direct;
+      } else {
+        // Lookup pending link addressed to this verified parent email (bounded limit(5))
+        const snap = await adminDb
+          .collection('parentalLinks')
+          .where('parentEmailLower', '==', parentEmail)
+          .where('status', '==', 'pending_parent')
+          .limit(5)
+          .get();
+        if (!snap.empty) {
+          // If multiple pending links exist, find the one matching the code hash
+          const codeHash = rawCode ? hashParentalSecret(rawCode) : '';
+          linkSnap =
+            snap.docs.find((d) => codeHash && timingSafeHexEqual(String(d.data()?.codeHash || ''), codeHash)) ||
+            snap.docs[0];
+        }
+      }
+
+      if (!linkSnap || !linkSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: 'No pending parental link found for your email address.',
+        });
+      }
+
+      const link = linkSnap.data() as Record<string, any>;
+      if (link.teenUid === caller.uid) {
+        return res.status(403).json({
+          success: false,
+          error: 'A teen account cannot verify its own parental control request. The parent must sign in separately.',
+        });
+      }
+
+      if (String(link.parentEmailLower || '').toLowerCase() !== parentEmail) {
+        return res.status(403).json({
+          success: false,
+          error: 'Signed-in email does not match the parent email listed on this request.',
+        });
+      }
+
+      if (link.status === 'verified') {
+        return res.json({
+          success: true,
+          alreadyVerified: true,
+          teenUid: link.teenUid,
+          message: 'This teen account is already verified and linked to your Parent Dashboard.',
+        });
+      }
+
+      if (Number(link.verifyAttempts || 0) >= 5) {
+        return res.status(429).json({
+          success: false,
+          error: 'Too many invalid code attempts. Ask your teen to send a new confirmation code.',
+        });
+      }
+
+      if (!link.codeExpiresAtMs || Date.now() > Number(link.codeExpiresAtMs)) {
+        return res.status(400).json({
+          success: false,
+          error: 'This confirmation code or link has expired. Ask your teen to request a fresh link.',
+        });
+      }
+
+      const tokenValid =
+        Boolean(rawToken) &&
+        timingSafeHexEqual(String(link.tokenHash || ''), hashParentalSecret(rawToken));
+      const codeValid =
+        rawCode.length === 6 &&
+        timingSafeHexEqual(String(link.codeHash || ''), hashParentalSecret(rawCode));
+
+      if (!tokenValid && !codeValid) {
+        await linkSnap.ref.set(
+          { verifyAttempts: Number(link.verifyAttempts || 0) + 1 },
+          { merge: true }
+        );
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid confirmation code or link. Please check the email and try again.',
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const verifiedControls = {
+        ...PARENTAL_DEFAULT_CONTROLS,
+        strictSensitiveFilter: true as const,
+        allowLocationSharing: false as const,
+        updatedAt: nowIso,
+        updatedByParentUid: caller.uid,
+      };
+
+      const batch = adminDb.batch();
+      batch.set(
+        linkSnap.ref,
+        {
+          parentUid: caller.uid,
+          status: 'verified',
+          verifiedAt: nowIso,
+          tokenHash: null,
+          codeHash: null,
+          codeExpiresAtMs: null,
+          verifyAttempts: 0,
+          controls: verifiedControls,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      batch.set(
+        adminDb.collection('users').doc(link.teenUid),
+        {
+          isUnder18: true,
+          sensitiveContentFilter: true,
+          parentalLinkId: link.teenUid,
+          parentalStatus: 'linked',
+          parentEmailMasked: link.parentEmailMasked || maskParentEmail(parentEmail),
+          parentalSettings: verifiedControls,
+          'privacySettings.isTeenAccount': true,
+          'privacySettings.hideAdultMedia': true,
+          'privacySettings.whoCanSeePosts': verifiedControls.profileVisibility === 'public' ? 'everyone' : 'followers',
+          'privacySettings.whoCanMessageMe': verifiedControls.messagingPolicy === 'nobody' ? 'nobody' : 'followers',
+          'privacySettings.whoCanCallMe': verifiedControls.allowCalls ? 'followers' : 'nobody',
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      // Flag parent user profile so Parent Dashboard entry appears with 0 extra reads
+      batch.set(
+        adminDb.collection('users').doc(caller.uid),
+        { hasLinkedTeens: true, updatedAt: nowIso },
+        { merge: true }
+      );
+
+      await batch.commit();
+
+      await createAndEmailParentalAlert(adminDb, {
+        teenUid: link.teenUid,
+        type: 'link_verified',
+        title: 'Parental Controls Confirmed',
+        summary: `Your Parent Dashboard is now linked to ${link.teenDisplayName || 'your teen'} (${link.teenUsername || ''}). You can adjust daily limits, bedtime, calls, messaging, and approvals at any time.`,
+        sendEmail: true,
+      });
+
+      return res.json({
+        success: true,
+        teenUid: link.teenUid,
+        teenDisplayName: link.teenDisplayName || 'Teen account',
+        controls: verifiedControls,
+      });
+    } catch (err) {
+      console.error('[WaveLink Parental Verify Link Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not verify parent link.' });
+    }
+  });
+
+  // 3. Teen transparency status (on-demand, 0 listeners)
+  app.get('/api/parental/teen-status', rateLimitChatAndSafety, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Please sign in first.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) {
+        return res.status(503).json({ success: false, error: 'Database unavailable.' });
+      }
+
+      const [userSnap, linkSnap] = await Promise.all([
+        adminDb.collection('users').doc(caller.uid).get(),
+        adminDb.collection('parentalLinks').doc(caller.uid).get(),
+      ]);
+
+      const userData = userSnap.exists ? (userSnap.data() as Record<string, any>) : {};
+      const linkData = linkSnap.exists ? (linkSnap.data() as Record<string, any>) : null;
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const dailyMap = (linkData?.dailyScreenTime || {}) as Record<string, number>;
+
+      return res.json({
+        success: true,
+        isUnder18: Boolean(userData.isUnder18 || userData.privacySettings?.isTeenAccount),
+        turns18At: userData.turns18At || null,
+        parentalStatus: userData.parentalStatus || (userData.isUnder18 ? 'unverified_teen' : 'none'),
+        parentEmailMasked: linkData?.parentEmailMasked || userData.parentEmailMasked || null,
+        verifiedAt: linkData?.verifiedAt || null,
+        controls: linkData?.controls || userData.parentalSettings || null,
+        todayMinutes: Number(dailyMap[todayKey] || 0),
+        deletionRequested: Boolean(linkData?.deletionRequested),
+      });
+    } catch (err) {
+      console.error('[WaveLink Parental Teen Status Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not load parental status.' });
+    }
+  });
+
+  // 4. Sync teen daily screen time (batched from client every few minutes, bounded)
+  app.post('/api/parental/sync-screen-time', rateLimitChatAndSafety, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Sign in required.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const rawDate = sanitizeServerString(req.body?.date || '', 16);
+      const dateKey = /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+        ? rawDate
+        : new Date().toISOString().slice(0, 10);
+      const deltaMinutes = Math.max(0, Math.min(15, Math.round(Number(req.body?.deltaMinutes || 0))));
+      if (deltaMinutes <= 0) {
+        return res.json({ success: true, todayMinutes: 0 });
+      }
+
+      const linkRef = adminDb.collection('parentalLinks').doc(caller.uid);
+      const linkSnap = await linkRef.get();
+      if (!linkSnap.exists) {
+        return res.json({ success: true, todayMinutes: deltaMinutes });
+      }
+
+      const prevMap = (linkSnap.data()?.dailyScreenTime || {}) as Record<string, number>;
+      const nextMinutes = Math.min(1440, Number(prevMap[dateKey] || 0) + deltaMinutes);
+      const nextMap: Record<string, number> = { ...prevMap, [dateKey]: nextMinutes };
+
+      // Prune to most recent 14 days to keep document tiny
+      const sortedDates = Object.keys(nextMap).sort().slice(-14);
+      const prunedMap: Record<string, number> = {};
+      for (const k of sortedDates) prunedMap[k] = nextMap[k];
+
+      await linkRef.set(
+        { dailyScreenTime: prunedMap, updatedAt: new Date().toISOString() },
+        { merge: true }
+      );
+
+      return res.json({ success: true, todayMinutes: nextMinutes });
+    } catch (err) {
+      console.warn('[WaveLink Parental Screen Time Sync Notice]:', err);
+      return res.status(500).json({ success: false, error: 'Could not sync screen time.' });
+    }
+  });
+
+  // 5. Parent Dashboard data (activity summary — STRICTLY NO private message contents!)
+  app.get('/api/parental/dashboard', rateLimitChatAndSafety, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Please sign in first.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const parentEmail = String(caller.email || '').trim().toLowerCase();
+
+      const [byUidSnap, byEmailSnap] = await Promise.all([
+        adminDb.collection('parentalLinks').where('parentUid', '==', caller.uid).limit(10).get(),
+        parentEmail && caller.emailVerified
+          ? adminDb.collection('parentalLinks').where('parentEmailLower', '==', parentEmail).limit(10).get()
+          : Promise.resolve(null),
+      ]);
+
+      const linkMap = new Map<string, Record<string, any>>();
+      byUidSnap.forEach((d) => {
+        const data = d.data();
+        if (data.status !== 'unlinked' && data.teenUid !== caller.uid) {
+          linkMap.set(d.id, { id: d.id, ...data });
+        }
+      });
+      if (byEmailSnap) {
+        byEmailSnap.forEach((d) => {
+          const data = d.data();
+          if (data.status !== 'unlinked' && data.teenUid !== caller.uid && !linkMap.has(d.id)) {
+            linkMap.set(d.id, { id: d.id, ...data });
+          }
+        });
+      }
+
+      const today = new Date();
+      const last7Dates: string[] = [];
+      for (let i = 6; i >= 0; i--) {
+        const dt = new Date(today.getTime() - i * 86400000);
+        last7Dates.push(dt.toISOString().slice(0, 10));
+      }
+      const todayKey = last7Dates[last7Dates.length - 1];
+
+      const teens: any[] = [];
+      for (const link of linkMap.values()) {
+        const teenUid = String(link.teenUid || link.id);
+        const [teenUserSnap, postsSnap, followingSnap, followersSnap, pendingFollowSnap, alertsSnap] =
+          await Promise.all([
+            adminDb.collection('users').doc(teenUid).get(),
+            adminDb.collection('posts').where('authorId', '==', teenUid).limit(100).get().catch(() => null),
+            adminDb.collection('follows').where('followerId', '==', teenUid).limit(30).get().catch(() => null),
+            adminDb.collection('follows').where('targetUserId', '==', teenUid).limit(30).get().catch(() => null),
+            adminDb
+              .collection('parentalFollowRequests')
+              .where('teenUid', '==', teenUid)
+              .where('status', '==', 'pending')
+              .limit(25)
+              .get()
+              .catch(() => null),
+            adminDb
+              .collection('parentalAlerts')
+              .where('teenUid', '==', teenUid)
+              .limit(30)
+              .get()
+              .catch(() => null),
+          ]);
+
+        const teenProfile = teenUserSnap.exists ? (teenUserSnap.data() as Record<string, any>) : {};
+        const screenMap = (link.dailyScreenTime || {}) as Record<string, number>;
+        const dailyScreenTime = last7Dates.map((d) => ({
+          date: d,
+          minutes: Number(screenMap[d] || 0),
+        }));
+
+        // Resolve compact user summaries for following/followers (safe public fields only)
+        const followingIds = new Set<string>();
+        const followingList: Array<{ uid: string; displayName: string; username?: string; photoURL?: string }> = [];
+        if (followingSnap) {
+          followingSnap.forEach((docSnap) => {
+            const fd = docSnap.data();
+            const uid = String(fd.targetUserId || '');
+            if (uid && !followingIds.has(uid)) {
+              followingIds.add(uid);
+              followingList.push({
+                uid,
+                displayName: sanitizeServerString(fd.targetUserName || 'WaveLink member', 80),
+              });
+            }
+          });
+        }
+
+        const followerIds = new Set<string>();
+        const followersList: Array<{ uid: string; displayName: string; username?: string; photoURL?: string }> = [];
+        if (followersSnap) {
+          followersSnap.forEach((docSnap) => {
+            const fd = docSnap.data();
+            const uid = String(fd.followerId || '');
+            if (uid && !followerIds.has(uid)) {
+              followerIds.add(uid);
+              followersList.push({
+                uid,
+                displayName: sanitizeServerString(fd.followerName || 'WaveLink member', 80),
+              });
+            }
+          });
+        }
+
+        const pendingFollowers: any[] = [];
+        if (pendingFollowSnap) {
+          pendingFollowSnap.forEach((d) => {
+            const rd = d.data();
+            pendingFollowers.push({
+              id: d.id,
+              requesterUid: rd.requesterUid,
+              requesterName: rd.requesterName || 'Member',
+              requesterUsername: rd.requesterUsername || '',
+              requesterPhotoURL: rd.requesterPhotoURL || '',
+              requestedAt: rd.requestedAt || '',
+              status: rd.status || 'pending',
+            });
+          });
+        }
+
+        const alerts: any[] = [];
+        if (alertsSnap) {
+          alertsSnap.forEach((d) => {
+            const ad = d.data();
+            alerts.push({
+              id: d.id,
+              teenUid: ad.teenUid,
+              teenName: ad.teenName || teenProfile.displayName || 'Teen',
+              parentUid: ad.parentUid || null,
+              parentEmailLower: ad.parentEmailLower || '',
+              type: ad.type,
+              title: ad.title,
+              summary: ad.summary,
+              actorUid: ad.actorUid,
+              actorName: ad.actorName,
+              read: Boolean(ad.read),
+              createdAt: ad.createdAt || '',
+            });
+          });
+          alerts.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        }
+
+        const recentChallenges = Array.isArray(teenProfile.recentChallenges)
+          ? teenProfile.recentChallenges.slice(0, 15).map((c: any) => ({
+              id: String(c.id || ''),
+              title: String(c.title || 'Challenge'),
+              hashtag: c.hashtag ? String(c.hashtag) : undefined,
+              date: String(c.date || ''),
+            }))
+          : [];
+
+        teens.push({
+          linkId: link.id,
+          teenUid,
+          teenDisplayName: teenProfile.displayName || link.teenDisplayName || 'Teen account',
+          teenUsername: teenProfile.username || link.teenUsername || '@waver',
+          teenPhotoURL: teenProfile.photoURL || '',
+          turns18At: teenProfile.turns18At || undefined,
+          status: link.status,
+          parentEmailMasked: link.parentEmailMasked || maskParentEmail(parentEmail),
+          verifiedAt: link.verifiedAt || undefined,
+          controls: {
+            ...PARENTAL_DEFAULT_CONTROLS,
+            ...(link.controls || {}),
+            strictSensitiveFilter: true,
+            allowLocationSharing: false,
+          },
+          activity: {
+            todayMinutes: Number(screenMap[todayKey] || 0),
+            dailyScreenTime,
+            postsCount: postsSnap ? postsSnap.size : 0,
+            following: followingList,
+            followers: followersList,
+            challengesJoined: recentChallenges,
+          },
+          pendingFollowers,
+          alerts,
+          deletionRequested: Boolean(link.deletionRequested),
+          deletionRequestedAt: link.deletionRequestedAt || undefined,
+        });
+      }
+
+      return res.json({ success: true, teens });
+    } catch (err) {
+      console.error('[WaveLink Parent Dashboard Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not load Parent Dashboard.' });
+    }
+  });
+
+  // 6. Parent updates teen controls (verified parent ONLY; teen gets 403)
+  app.post('/api/parental/update-controls', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Please sign in first.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const teenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+      if (!teenUid) {
+        return res.status(400).json({ success: false, error: 'Missing teen account ID.' });
+      }
+
+      const linkRef = adminDb.collection('parentalLinks').doc(teenUid);
+      const linkSnap = await linkRef.get();
+      if (!linkSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Parental link not found.' });
+      }
+      const linkData = linkSnap.data() as Record<string, any>;
+
+      if (linkData.status !== 'verified' || !isCallerVerifiedParentOfLink(caller, linkData)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only the verified parent or guardian can change parental controls.',
+        });
+      }
+
+      const incoming = req.body?.controls || {};
+      const prev = linkData.controls || PARENTAL_DEFAULT_CONTROLS;
+      const dailyLimitMinutes = Math.max(
+        15,
+        Math.min(360, Math.round(Number(incoming.dailyLimitMinutes ?? prev.dailyLimitMinutes ?? 90)))
+      );
+      const bedtimeEnabled = Boolean(incoming.bedtimeEnabled ?? prev.bedtimeEnabled);
+      const bedtimeStart = isValidHHMM(incoming.bedtimeStart) ? incoming.bedtimeStart : prev.bedtimeStart || '22:00';
+      const bedtimeEnd = isValidHHMM(incoming.bedtimeEnd) ? incoming.bedtimeEnd : prev.bedtimeEnd || '06:30';
+      const messagingPolicy: 'nobody' | 'approved_friends' =
+        incoming.messagingPolicy === 'nobody' ? 'nobody' : 'approved_friends';
+      const profileVisibility: 'private' | 'public' =
+        incoming.profileVisibility === 'public' ? 'public' : 'private';
+      const allowCalls = Boolean(incoming.allowCalls ?? prev.allowCalls);
+      const requireFollowerApproval = Boolean(incoming.requireFollowerApproval ?? prev.requireFollowerApproval ?? true);
+      const isPaused = Boolean(incoming.isPaused ?? prev.isPaused);
+      const emailAlertsEnabled = Boolean(incoming.emailAlertsEnabled ?? prev.emailAlertsEnabled ?? true);
+
+      const nowIso = new Date().toISOString();
+      const nextControls = {
+        dailyLimitMinutes,
+        bedtimeEnabled,
+        bedtimeStart,
+        bedtimeEnd,
+        messagingPolicy,
+        profileVisibility,
+        allowCalls,
+        strictSensitiveFilter: true as const, // ALWAYS locked ON for teens
+        requireFollowerApproval,
+        isPaused,
+        allowLocationSharing: false as const, // ALWAYS OFF for teens
+        emailAlertsEnabled,
+        updatedAt: nowIso,
+        updatedByParentUid: caller.uid,
+      };
+
+      const batch = adminDb.batch();
+      batch.set(linkRef, { controls: nextControls, updatedAt: nowIso }, { merge: true });
+      batch.set(
+        adminDb.collection('users').doc(teenUid),
+        {
+          sensitiveContentFilter: true,
+          parentalSettings: nextControls,
+          'privacySettings.isTeenAccount': true,
+          'privacySettings.hideAdultMedia': true,
+          'privacySettings.whoCanSeePosts': profileVisibility === 'public' ? 'everyone' : 'followers',
+          'privacySettings.whoCanMessageMe': messagingPolicy === 'nobody' ? 'nobody' : 'followers',
+          'privacySettings.whoCanCallMe': allowCalls ? 'followers' : 'nobody',
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      await batch.commit();
+
+      return res.json({ success: true, controls: nextControls });
+    } catch (err) {
+      console.error('[WaveLink Parental Update Controls Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not update parental controls.' });
+    }
+  });
+
+  // 7. Request to follow a teen account (creates pending approval for parent + alert)
+  app.post('/api/parental/follow-request', rateLimitChatAndSafety, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Please sign in first.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const teenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+      if (!teenUid || teenUid === caller.uid) {
+        return res.status(400).json({ success: false, error: 'Invalid follow target.' });
+      }
+
+      const [requesterSnap, teenSnap, linkSnap] = await Promise.all([
+        adminDb.collection('users').doc(caller.uid).get(),
+        adminDb.collection('users').doc(teenUid).get(),
+        adminDb.collection('parentalLinks').doc(teenUid).get(),
+      ]);
+
+      if (!teenSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Account not found.' });
+      }
+      const requesterData = requesterSnap.exists ? (requesterSnap.data() as Record<string, any>) : {};
+      const linkData = linkSnap.exists ? (linkSnap.data() as Record<string, any>) : {};
+      const reqId = `pfreq_${teenUid}_${caller.uid}`;
+      const nowIso = new Date().toISOString();
+
+      const requesterName = sanitizeServerString(requesterData.displayName || 'WaveLink member', 100);
+      const requesterUsername = sanitizeServerString(requesterData.username || '', 60);
+      const requesterPhotoURL = sanitizeServerString(requesterData.photoURL || '', 2048);
+
+      await adminDb.collection('parentalFollowRequests').doc(reqId).set(
+        {
+          id: reqId,
+          teenUid,
+          parentUid: linkData.parentUid || null,
+          parentEmailLower: String(linkData.parentEmailLower || '').toLowerCase(),
+          requesterUid: caller.uid,
+          requesterName,
+          requesterUsername,
+          requesterPhotoURL,
+          status: 'pending',
+          requestedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      await createAndEmailParentalAlert(adminDb, {
+        teenUid,
+        type: 'new_follow_request',
+        title: 'New Follow Request Needs Approval',
+        summary: `${requesterName}${requesterUsername ? ` (${requesterUsername})` : ''} requested to follow your teen's account. Open your Parent Dashboard to approve or decline.`,
+        actorUid: caller.uid,
+        actorName: requesterName,
+      });
+
+      return res.json({
+        success: true,
+        pendingApproval: true,
+        message: 'Follow request sent for parent approval.',
+      });
+    } catch (err) {
+      console.error('[WaveLink Parental Follow Request Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not submit follow request.' });
+    }
+  });
+
+  // 8. Parent approves or declines a pending follower/friend request
+  app.post('/api/parental/approve-follower', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Please sign in first.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const requestId = sanitizeServerString(req.body?.requestId || '', 180);
+      const decision = req.body?.decision === 'approve' ? 'approved' : 'declined';
+      if (!requestId) {
+        return res.status(400).json({ success: false, error: 'Missing request ID.' });
+      }
+
+      const reqRef = adminDb.collection('parentalFollowRequests').doc(requestId);
+      const reqSnap = await reqRef.get();
+      if (!reqSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Follow request not found.' });
+      }
+      const reqData = reqSnap.data() as Record<string, any>;
+      const teenUid = String(reqData.teenUid || '');
+
+      const linkSnap = await adminDb.collection('parentalLinks').doc(teenUid).get();
+      if (!linkSnap.exists || !isCallerVerifiedParentOfLink(caller, linkSnap.data() as Record<string, any>)) {
+        return res.status(403).json({ success: false, error: 'Only the verified parent can approve or decline followers.' });
+      }
+
+      const nowIso = new Date().toISOString();
+      await reqRef.set(
+        { status: decision, decidedAt: nowIso, decidedByParentUid: caller.uid },
+        { merge: true }
+      );
+
+      if (decision === 'approved') {
+        const requesterUid = String(reqData.requesterUid || '');
+        const followId = `follow_${requesterUid}_${teenUid}`;
+        const linkData = linkSnap.data() as Record<string, any>;
+        const batch = adminDb.batch();
+        batch.set(adminDb.collection('follows').doc(followId), {
+          id: followId,
+          followerId: requesterUid,
+          followerName: reqData.requesterName || 'Member',
+          targetUserId: teenUid,
+          targetUserName: linkData.teenDisplayName || 'Teen account',
+          approvedByParentUid: caller.uid,
+          createdAt: nowIso,
+        });
+        batch.set(
+          adminDb.collection('users').doc(requesterUid),
+          {
+            followingIds: FieldValue.arrayUnion(teenUid),
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+        await batch.commit();
+      }
+
+      return res.json({ success: true, decision });
+    } catch (err) {
+      console.error('[WaveLink Parental Approve Follower Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not update follow request.' });
+    }
+  });
+
+  // 9. Trigger safety alert to teen's linked parent (teen reported, flagged message, new chat request)
+  app.post('/api/parental/trigger-alert', rateLimitChatAndSafety, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Sign in required.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const teenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+      const rawType = sanitizeServerString(req.body?.type || '', 40);
+      const allowedTypes = ['teen_reported', 'flagged_message', 'new_chat_request', 'new_follow_request'];
+      if (!teenUid || !allowedTypes.includes(rawType)) {
+        return res.status(400).json({ success: false, error: 'Invalid alert parameters.' });
+      }
+
+      const actorName = sanitizeServerString(req.body?.actorName || 'A WaveLink user', 80);
+      let title = 'Safety Alert';
+      let summary = 'A safety event occurred on your teen account.';
+
+      if (rawType === 'teen_reported') {
+        title = 'Account or Content Reported';
+        summary = 'A report was filed involving your teen account. WaveLink moderation is reviewing it.';
+      } else if (rawType === 'flagged_message') {
+        title = 'Flagged Message Blocked';
+        summary = `Our safety filter blocked an inappropriate message attempt involving ${actorName}. Private message contents are not shown.`;
+      } else if (rawType === 'new_chat_request') {
+        title = 'New Chat Request Blocked or Pending';
+        summary = `${actorName} attempted to start a new chat with your teen account.`;
+      } else if (rawType === 'new_follow_request') {
+        title = 'New Follow Request';
+        summary = `${actorName} asked to follow your teen account.`;
+      }
+
+      const result = await createAndEmailParentalAlert(adminDb, {
+        teenUid,
+        type: rawType as any,
+        title,
+        summary,
+        actorUid: caller.uid,
+        actorName,
+      });
+
+      return res.json({ success: true, ...result });
+    } catch (err) {
+      console.warn('[WaveLink Trigger Parental Alert Notice]:', err);
+      return res.status(500).json({ success: false, error: 'Could not dispatch alert.' });
+    }
+  });
+
+  // 10. Parent marks alerts as read
+  app.post('/api/parental/alerts/mark-read', rateLimitChatAndSafety, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Sign in required.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const teenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+      if (!teenUid) return res.status(400).json({ success: false, error: 'Missing teenUid.' });
+
+      const linkSnap = await adminDb.collection('parentalLinks').doc(teenUid).get();
+      if (!linkSnap.exists || !isCallerVerifiedParentOfLink(caller, linkSnap.data() as Record<string, any>)) {
+        return res.status(403).json({ success: false, error: 'Parent access required.' });
+      }
+
+      const alertsSnap = await adminDb
+        .collection('parentalAlerts')
+        .where('teenUid', '==', teenUid)
+        .where('read', '==', false)
+        .limit(30)
+        .get();
+
+      if (!alertsSnap.empty) {
+        const batch = adminDb.batch();
+        alertsSnap.forEach((d) => batch.set(d.ref, { read: true }, { merge: true }));
+        await batch.commit();
+      }
+
+      return res.json({ success: true, markedCount: alertsSnap.size });
+    } catch (err) {
+      console.warn('[WaveLink Mark Parental Alerts Read Notice]:', err);
+      return res.status(500).json({ success: false, error: 'Could not mark alerts as read.' });
+    }
+  });
+
+  // 11. Parent approves turning off / unlinking parental controls (teen CANNOT call this)
+  app.post('/api/parental/unlink', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Sign in required.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const teenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+      if (!teenUid) return res.status(400).json({ success: false, error: 'Missing teenUid.' });
+
+      const linkRef = adminDb.collection('parentalLinks').doc(teenUid);
+      const linkSnap = await linkRef.get();
+      if (!linkSnap.exists) return res.status(404).json({ success: false, error: 'Link not found.' });
+      const linkData = linkSnap.data() as Record<string, any>;
+
+      if (!isCallerVerifiedParentOfLink(caller, linkData)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only the verified parent or guardian can turn off or unlink Parental Controls.',
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const batch = adminDb.batch();
+      batch.set(
+        linkRef,
+        { status: 'unlinked', unlinkedAt: nowIso, unlinkedByParentUid: caller.uid, updatedAt: nowIso },
+        { merge: true }
+      );
+      batch.set(
+        adminDb.collection('users').doc(teenUid),
+        {
+          parentalStatus: 'unverified_teen',
+          parentalLinkId: null,
+          parentEmailMasked: null,
+          parentalSettings: null,
+          sensitiveContentFilter: true, // Always stays ON for under-18 accounts
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      await batch.commit();
+
+      return res.json({ success: true, message: 'Parental link removed by parent approval.' });
+    } catch (err) {
+      console.error('[WaveLink Parental Unlink Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not unlink account.' });
+    }
+  });
+
+  // 12. Parent requests full deletion of the teen's data and account
+  app.post('/api/parental/request-deletion', rateLimitAuth, async (req, res) => {
+    try {
+      const caller = await resolveServerUserPrivileges(req);
+      if (!caller.valid || !caller.uid) {
+        return res.status(401).json({ success: false, error: 'Sign in required.' });
+      }
+      const adminDb = getServerFirestore();
+      if (!adminDb) return res.status(503).json({ success: false, error: 'Database unavailable.' });
+
+      const teenUid = sanitizeServerString(req.body?.teenUid || '', 128);
+      const reason = sanitizeServerString(req.body?.reason || 'Parent-requested teen account and data deletion', 500);
+      if (!teenUid) return res.status(400).json({ success: false, error: 'Missing teenUid.' });
+
+      const linkRef = adminDb.collection('parentalLinks').doc(teenUid);
+      const linkSnap = await linkRef.get();
+      if (!linkSnap.exists) return res.status(404).json({ success: false, error: 'Link not found.' });
+      const linkData = linkSnap.data() as Record<string, any>;
+
+      if (linkData.status !== 'verified' || !isCallerVerifiedParentOfLink(caller, linkData)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only the verified parent or guardian can request deletion of this teen account.',
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const delId = `pdel_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const pausedControls = {
+        ...(linkData.controls || PARENTAL_DEFAULT_CONTROLS),
+        isPaused: true,
+        strictSensitiveFilter: true as const,
+        allowLocationSharing: false as const,
+        updatedAt: nowIso,
+        updatedByParentUid: caller.uid,
+      };
+
+      const batch = adminDb.batch();
+      batch.set(adminDb.collection('parentalDeletionRequests').doc(delId), {
+        id: delId,
+        teenUid,
+        teenDisplayName: linkData.teenDisplayName || 'Teen account',
+        parentUid: caller.uid,
+        parentEmailLower: String(linkData.parentEmailLower || caller.email || '').toLowerCase(),
+        reason,
+        status: 'requested',
+        requestedAt: nowIso,
+      });
+      batch.set(
+        linkRef,
+        {
+          controls: pausedControls,
+          deletionRequested: true,
+          deletionRequestedAt: nowIso,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      batch.set(
+        adminDb.collection('users').doc(teenUid),
+        {
+          parentalSettings: pausedControls,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      batch.set(adminDb.collection('adminAuditLogs').doc(`audit_${delId}`), {
+        id: `audit_${delId}`,
+        actorId: caller.uid,
+        actorEmail: String(caller.email || ''),
+        actorName: 'Verified Parent',
+        action: 'parental_teen_deletion_requested',
+        targetId: teenUid,
+        targetLabel: linkData.teenUsername || teenUid,
+        details: reason,
+        createdAt: nowIso,
+      });
+      await batch.commit();
+
+      await createAndEmailParentalAlert(adminDb, {
+        teenUid,
+        type: 'deletion_requested',
+        title: 'Teen Account Deletion Request Received',
+        summary: `We have paused ${linkData.teenDisplayName || 'your teen'}'s account immediately and logged your deletion request (${delId}). All profile and activity data will be removed.`,
+        sendEmail: true,
+      });
+
+      return res.json({
+        success: true,
+        requestId: delId,
+        message: 'Deletion request recorded. The teen account has been paused immediately.',
+      });
+    } catch (err) {
+      console.error('[WaveLink Parental Request Deletion Error]:', err);
+      return res.status(500).json({ success: false, error: 'Could not submit deletion request.' });
+    }
   });
 
   // ============================================================================

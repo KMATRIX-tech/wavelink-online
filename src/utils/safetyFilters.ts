@@ -7,99 +7,52 @@
  * - Support Helper PII email redactor
  */
 
-// Bilingual English + Swahili word filter terms (profanity, hate speech, and phishing/scam lures)
-const BLOCKED_WORDS_EN = [
-  'fuck',
-  'fucking',
-  'motherfucker',
-  'bitch',
-  'asshole',
-  'bastard',
-  'dickhead',
-  'cunt',
-  'whore',
-  'slut',
-  'nigger',
-  'nigga',
-  'faggot',
-  'retard',
-  'kill yourself',
-  'kys',
-  'send your password',
-  'send your pin',
-  'mpesa pin',
-  'airtel pin',
-  'tigopesa pin'
-];
-
-const BLOCKED_WORDS_SW = [
-  'kuma',
-  'kumamako',
-  'kumamae',
-  'malaya',
-  'msenge',
-  'wasenge',
-  'mboo',
-  'mkundu',
-  'kundu',
-  'shoga',
-  'mashoga',
-  'mpumbavu',
-  'mjinga mkubwa',
-  'mbwa wewe',
-  'shetani wewe',
-  'tuma nenosiri',
-  'tuma siri yako',
-  'namba ya siri ya mpesa',
-  'tuma pin yako'
-];
-
-const ALL_BLOCKED_TERMS = [...BLOCKED_WORDS_EN, ...BLOCKED_WORDS_SW];
+import {
+  checkTextModerationLocal,
+  MODERATION_FRIENDLY_BLOCK_MESSAGE,
+  MODERATION_FRIENDLY_BLOCK_MESSAGE_SW,
+} from './contentModeration';
 
 export interface WordFilterResult {
   flagged: boolean;
   matchedTerms: string[];
   cleanedText: string;
+  category?: string;
+  suspiciousForAi?: boolean;
   friendlyReasonEn?: string;
   friendlyReasonSw?: string;
 }
 
 /**
- * Checks text against English & Swahili word filters and returns both a flag and a masked version.
+ * Layer 1 fast multilingual word filter (delegates to normalized contentModeration engine).
+ * Catches English, Swahili, and major global profanity/hate/sexual/harassment/scam language,
+ * including leetspeak, accents, repeated characters, dot/space separation, and embedded words,
+ * while protecting allowlisted innocent words against the Scunthorpe problem.
  */
 export function checkWordFilter(rawText: string): WordFilterResult {
   if (!rawText || typeof rawText !== 'string') {
     return { flagged: false, matchedTerms: [], cleanedText: '' };
   }
 
-  let cleanedText = rawText;
-  const matchedTerms: string[] = [];
-
-  for (const term of ALL_BLOCKED_TERMS) {
-    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escaped}\\b`, 'gi');
-    if (regex.test(cleanedText)) {
-      matchedTerms.push(term);
-      cleanedText = cleanedText.replace(regex, (m) => '*'.repeat(Math.max(3, m.length)));
-    }
-  }
-
-  if (matchedTerms.length > 0) {
+  const res = checkTextModerationLocal(rawText);
+  if (res.blocked) {
     return {
       flagged: true,
-      matchedTerms,
-      cleanedText,
-      friendlyReasonEn:
-        'Please keep WaveLink respectful and safe. Your message contains blocked words or unsafe phrases (such as asking for PINs/passwords or profanity).',
-      friendlyReasonSw:
-        'Tafadhali dumisha heshima na usalama kwenye WaveLink. Ujumbe wako una maneno yasiyoruhusiwa au ombi la nenosiri/PIN.'
+      matchedTerms: res.matchedTerms,
+      cleanedText: rawText,
+      category: res.category,
+      suspiciousForAi: false,
+      friendlyReasonEn: MODERATION_FRIENDLY_BLOCK_MESSAGE,
+      friendlyReasonSw: MODERATION_FRIENDLY_BLOCK_MESSAGE_SW,
     };
   }
 
   return {
     flagged: false,
     matchedTerms: [],
-    cleanedText
+    cleanedText: rawText,
+    category: 'safe',
+    suspiciousForAi: res.suspiciousForAi,
   };
 }
 

@@ -17,8 +17,17 @@
         "savedPostIds": { "type": "array" },
         "followingIds": { "type": "array" },
         "blockedUserIds": { "type": "array" },
+        "mutedUserIds": { "type": "array" },
         "closeFriendIds": { "type": "array" },
         "privacySettings": { "type": "object" },
+        "sensitiveContentFilter": { "type": "boolean" },
+        "strikesCount": { "type": "number" },
+        "strikeLevel": { "type": "string", "enum": ["none", "warning", "muted_24h", "suspended_7d", "banned"] },
+        "mutedUntilMs": { "type": "number" },
+        "suspendedUntilMs": { "type": "number" },
+        "strikeHistory": { "type": "array" },
+        "guidelinesAcceptedAt": { "type": "string" },
+        "guidelinesVersion": { "type": "string" },
         "chatThemes": { "type": "object" },
         "isSubAdmin": { "type": "boolean" },
         "role": { "type": "string", "enum": ["super_admin", "sub_admin", "user"] },
@@ -36,8 +45,28 @@
         "lastDailyRewardAmount": { "type": "number" },
         "totalLoginDays": { "type": "number" },
         "pointTransactions": { "type": "array" },
+        "xp": { "type": "number" },
+        "level": { "type": "number" },
+        "streak": { "type": "number" },
+        "longestStreak": { "type": "number" },
+        "daysActive": { "type": "number" },
+        "totalLikesReceived": { "type": "number" },
+        "highlightedBadges": { "type": "array" },
+        "badges": { "type": "array" },
+        "challengeStats": { "type": "object" },
+        "recentChallenges": { "type": "array" },
+        "isUnder18": { "type": "boolean" },
+        "birthYear": { "type": "number" },
+        "birthMonth": { "type": "number" },
+        "turns18At": { "type": "string", "maxLength": 16 },
+        "parentalLinkId": { "type": "string", "maxLength": 128 },
+        "parentalStatus": { "type": "string", "enum": ["none", "unverified_teen", "pending_parent", "linked"] },
+        "parentEmailMasked": { "type": "string", "maxLength": 160 },
+        "parentalSettings": { "type": "object" },
+        "hasLinkedTeens": { "type": "boolean" },
         "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "updatedAt": { "type": "string" },
+        "lastSeenUpdateAt": { "type": "string" }
       },
       "required": ["id", "email", "displayName", "status", "isBanned"]
     },
@@ -71,6 +100,11 @@
         "songAlbumArt": { "type": "string" },
         "songPreviewUrl": { "type": "string" },
         "songAlbumName": { "type": "string" },
+        "mediaSafety": { "type": "string", "enum": ["safe", "borderline"] },
+        "moderationChecked": { "type": "boolean" },
+        "moderationCheckedAt": { "type": "string" },
+        "isHidden": { "type": "boolean" },
+        "moderationStatus": { "type": "string", "enum": ["approved", "auto_hidden", "removed"] },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
@@ -106,6 +140,9 @@
         "songPreviewUrl": { "type": "string" },
         "likes": { "type": "array" },
         "likesCount": { "type": "number" },
+        "mediaSafety": { "type": "string", "enum": ["safe", "borderline"] },
+        "moderationChecked": { "type": "boolean" },
+        "isHidden": { "type": "boolean" },
         "createdAt": { "type": "string" },
         "expiresAt": { "type": "string" }
       },
@@ -123,6 +160,8 @@
         "authorName": { "type": "string", "maxLength": 80 },
         "authorPhotoURL": { "type": "string" },
         "content": { "type": "string", "maxLength": 500 },
+        "moderationChecked": { "type": "boolean" },
+        "isHidden": { "type": "boolean" },
         "createdAt": { "type": "string" }
       },
       "required": ["id", "postId", "authorId", "authorName", "content"]
@@ -199,6 +238,8 @@
         "readBy": { "type": "array" },
         "lastSeenAt": { "type": "string" },
         "expiresAt": { "type": "string" },
+        "moderationChecked": { "type": "boolean" },
+        "isHidden": { "type": "boolean" },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
@@ -385,12 +426,15 @@
         "reporterId": { "type": "string" },
         "reporterEmail": { "type": "string" },
         "reporterName": { "type": "string", "maxLength": 80 },
-        "targetType": { "type": "string", "enum": ["user", "post", "bot_reply"] },
+        "targetType": { "type": "string", "enum": ["user", "post", "reel", "comment", "message", "spark", "bot_reply"] },
         "targetId": { "type": "string" },
         "targetAuthorId": { "type": "string" },
         "targetSummary": { "type": "string", "maxLength": 500 },
+        "reasonCategory": { "type": "string", "enum": ["abuse", "sexual", "hate", "spam", "other"] },
         "reason": { "type": "string", "maxLength": 500 },
-        "status": { "type": "string", "enum": ["open", "reviewed", "dismissed"] },
+        "details": { "type": "string", "maxLength": 2000 },
+        "source": { "type": "string", "enum": ["user_report", "auto_filter", "auto_ai", "image_filter"] },
+        "status": { "type": "string", "enum": ["open", "auto_hidden", "reviewed", "approved", "removed", "dismissed"] },
         "createdAt": { "type": "string" }
       },
       "required": ["id", "reporterId", "targetType", "targetId", "reason", "status", "createdAt"]
@@ -464,6 +508,191 @@
         "timezoneOffsetMinutes": { "type": "number" },
         "updatedAt": { "type": "string" }
       }
+    },
+    "AdminRole": {
+      "title": "AdminRole",
+      "description": "Role assignment document in /roles/{uid} writable only by main admin",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "subadmin"] },
+        "username": { "type": "string", "maxLength": 60 },
+        "displayName": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 160 },
+        "photoURL": { "type": "string", "maxLength": 2048 },
+        "assignedBy": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["uid", "role", "updatedAt"]
+    },
+    "AdminUpdate": {
+      "title": "AdminUpdate",
+      "description": "Official app announcements posted by admin and sub-admins to the WaveLink Assistant",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string", "maxLength": 60 },
+        "message": { "type": "string", "maxLength": 3000 },
+        "messageSw": { "type": "string", "maxLength": 3000 },
+        "type": { "type": "string", "enum": ["new_feature", "improvement", "bug_fix", "maintenance", "announcement"] },
+        "imageUrl": { "type": "string", "maxLength": 2048 },
+        "authorUid": { "type": "string", "maxLength": 128 },
+        "authorName": { "type": "string", "maxLength": 100 },
+        "role": { "type": "string", "enum": ["admin", "subadmin"] },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 },
+        "pinned": { "type": "boolean" },
+        "deleted": { "type": "boolean" },
+        "alsoSendPush": { "type": "boolean" }
+      },
+      "required": ["title", "message", "type", "authorUid", "authorName", "role", "createdAt", "deleted"]
+    },
+    "CreatorChallenge": {
+      "title": "CreatorChallenge",
+      "description": "Weekly creator challenge managed by admin and sub-admins",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string", "maxLength": 120 },
+        "theme": { "type": "string", "maxLength": 120 },
+        "hashtag": { "type": "string", "maxLength": 60 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "rules": { "type": "string", "maxLength": 2000 },
+        "type": { "type": "string", "enum": ["photo", "video", "text", "any"] },
+        "coverImageUrl": { "type": "string", "maxLength": 2048 },
+        "startDate": { "type": "string", "maxLength": 64 },
+        "endDate": { "type": "string", "maxLength": 64 },
+        "endDateMs": { "type": "number" },
+        "deadline": { "type": "string", "maxLength": 64 },
+        "maxEntriesPerUser": { "type": "number" },
+        "badgeId": { "type": "string", "maxLength": 80 },
+        "status": { "type": "string", "enum": ["active", "completed"] },
+        "participantsCount": { "type": "number" },
+        "entriesCount": { "type": "number" },
+        "winners": { "type": "array", "items": { "type": "object" } },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["theme", "hashtag", "description", "deadline", "status", "createdBy", "createdAt"]
+    },
+    "ChallengeEntry": {
+      "title": "ChallengeEntry",
+      "description": "Single post submitted to a weekly challenge",
+      "type": "object",
+      "properties": {
+        "postId": { "type": "string", "maxLength": 160 },
+        "challengeId": { "type": "string", "maxLength": 160 },
+        "uid": { "type": "string", "maxLength": 128 },
+        "authorName": { "type": "string", "maxLength": 100 },
+        "mediaType": { "type": "string", "enum": ["image", "video", "none"] },
+        "thumbnailUrl": { "type": "string", "maxLength": 2048 },
+        "excerpt": { "type": "string", "maxLength": 300 },
+        "likesCount": { "type": "number" },
+        "moderationChecked": { "type": "boolean" },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["postId", "challengeId", "uid", "likesCount", "moderationChecked", "createdAt"]
+    },
+    "ChallengeParticipant": {
+      "title": "ChallengeParticipant",
+      "description": "Per-user aggregated entry and verified like counters inside a challenge",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "challengeId": { "type": "string", "maxLength": 160 },
+        "displayName": { "type": "string", "maxLength": 100 },
+        "username": { "type": "string", "maxLength": 60 },
+        "photoURL": { "type": "string", "maxLength": 2048 },
+        "postCount": { "type": "number" },
+        "likesTotal": { "type": "number" },
+        "lastPostAt": { "type": "string", "maxLength": 64 },
+        "suspiciousSpike": { "type": "boolean" }
+      },
+      "required": ["uid", "challengeId", "postCount", "likesTotal", "lastPostAt"]
+    },
+    "CustomBadge": {
+      "title": "CustomBadge",
+      "description": "Custom achievement or challenge winner badge created by admin and sub-admins",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 80 },
+        "name": { "type": "string", "maxLength": 60 },
+        "description": { "type": "string", "maxLength": 240 },
+        "color": { "type": "string", "maxLength": 32 },
+        "iconName": { "type": "string", "maxLength": 48 },
+        "imageUrl": { "type": "string", "maxLength": 2048 },
+        "challengeId": { "type": "string", "maxLength": 160 },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["name", "description", "color", "createdBy", "createdAt"]
+    },
+    "ParentalLink": {
+      "title": "ParentalLink",
+      "description": "Server-managed verified parent-teen link with controls, hashed verification codes, and daily screen time counters",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "teenUid": { "type": "string", "maxLength": 128 },
+        "parentUid": { "type": "string", "maxLength": 128 },
+        "parentEmailLower": { "type": "string", "maxLength": 160 },
+        "parentEmailMasked": { "type": "string", "maxLength": 160 },
+        "status": { "type": "string", "enum": ["pending_parent", "verified", "unlinked"] },
+        "controls": { "type": "object" },
+        "dailyScreenTime": { "type": "object" },
+        "verifiedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["teenUid", "parentEmailLower", "status", "controls", "createdAt"]
+    },
+    "ParentalAlert": {
+      "title": "ParentalAlert",
+      "description": "Safety alerts sent to a verified parent (reports, flagged messages, new chat/follow requests; never private chat contents)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "teenUid": { "type": "string", "maxLength": 128 },
+        "parentUid": { "type": "string", "maxLength": 128 },
+        "parentEmailLower": { "type": "string", "maxLength": 160 },
+        "type": { "type": "string", "enum": ["teen_reported", "flagged_message", "new_chat_request", "new_follow_request", "link_verified", "deletion_requested"] },
+        "title": { "type": "string", "maxLength": 140 },
+        "summary": { "type": "string", "maxLength": 500 },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["teenUid", "parentEmailLower", "type", "title", "summary", "read", "createdAt"]
+    },
+    "ParentalFollowRequest": {
+      "title": "ParentalFollowRequest",
+      "description": "Pending follower/friend request awaiting parent approval for a teen account",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 160 },
+        "teenUid": { "type": "string", "maxLength": 128 },
+        "parentUid": { "type": "string", "maxLength": 128 },
+        "parentEmailLower": { "type": "string", "maxLength": 160 },
+        "requesterUid": { "type": "string", "maxLength": 128 },
+        "requesterName": { "type": "string", "maxLength": 100 },
+        "status": { "type": "string", "enum": ["pending", "approved", "declined"] },
+        "requestedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["teenUid", "requesterUid", "requesterName", "status", "requestedAt"]
+    },
+    "ParentalDeletionRequest": {
+      "title": "ParentalDeletionRequest",
+      "description": "Parent-initiated teen account and data deletion request",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "teenUid": { "type": "string", "maxLength": 128 },
+        "parentUid": { "type": "string", "maxLength": 128 },
+        "parentEmailLower": { "type": "string", "maxLength": 160 },
+        "reason": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["requested", "processing", "completed"] },
+        "requestedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["teenUid", "parentUid", "parentEmailLower", "status", "requestedAt"]
     }
   },
   "firestore": {
@@ -566,7 +795,48 @@
     "/savedPosts/{savedPostId}": {
       "schema": { "$ref": "#/entities/SavedPost" },
       "description": "Private collection of saved posts accessible only by the owner or admin"
+    },
+    "/roles/{roleUid}": {
+      "schema": { "$ref": "#/entities/AdminRole" },
+      "description": "Protected admin and subadmin role documents writable only by main admin"
+    },
+    "/adminUpdates/{updateId}": {
+      "schema": { "$ref": "#/entities/AdminUpdate" },
+      "description": "Official WaveLink app updates displayed inside the WaveLink assistant"
+    },
+    "/challenges/{challengeId}": {
+      "schema": { "$ref": "#/entities/CreatorChallenge" },
+      "description": "Weekly creator challenges with active countdowns and past winners"
+    },
+    "/challenges/{challengeId}/entries/{postId}": {
+      "schema": { "$ref": "#/entities/ChallengeEntry" },
+      "description": "Challenge post entries indexed per challenge"
+    },
+    "/challenges/{challengeId}/participants/{uid}": {
+      "schema": { "$ref": "#/entities/ChallengeParticipant" },
+      "description": "Per-user challenge counters for paginated winner review"
+    },
+    "/badges/{badgeId}": {
+      "schema": { "$ref": "#/entities/CustomBadge" },
+      "description": "Custom badges created by admin and sub-admins"
+    },
+    "/parentalLinks/{linkId}": {
+      "schema": { "$ref": "#/entities/ParentalLink" },
+      "description": "Verified parent-teen links, controls, and daily screen time counters (server-write only)"
+    },
+    "/parentalAlerts/{alertId}": {
+      "schema": { "$ref": "#/entities/ParentalAlert" },
+      "description": "Parent safety alerts readable only by linked parent and teen (server-write only)"
+    },
+    "/parentalFollowRequests/{reqId}": {
+      "schema": { "$ref": "#/entities/ParentalFollowRequest" },
+      "description": "Follower/friend requests awaiting parent approval (server-write only)"
+    },
+    "/parentalDeletionRequests/{reqId}": {
+      "schema": { "$ref": "#/entities/ParentalDeletionRequest" },
+      "description": "Parent-verified requests to delete a teen account and its data (server-write only)"
     }
   }
 }
+
 

@@ -22,7 +22,7 @@ import { recordSystemDomain } from './services/verificationService';
 import { triggerHaptic } from './utils/haptics';
 import { getCloudinaryTinyPlaceholderUrl } from './utils/mediaStorage';
 import { checkActionRateLimit } from './utils/safetyFilters';
-import { ActiveTab, CallRecipient } from './types';
+import { ActiveTab, CallRecipient, CreatorChallenge } from './types';
 import { AuthPage } from './components/AuthPage';
 import { TopHeader } from './components/TopHeader';
 import { Sidebar } from './components/Sidebar';
@@ -44,22 +44,32 @@ import { SettingsView } from './components/SettingsView';
 import { CreatorAnalyticsView } from './components/CreatorAnalyticsView';
 import { MonetizationHub } from './components/MonetizationHub';
 import { CallingModal } from './components/CallingModal';
-import { WelinkAssistantDrawer } from './components/WelinkAssistantDrawer';
+import { WelinkAssistantDrawer, WelinkMode } from './components/WelinkAssistantDrawer';
+import { useAdminUpdates } from './services/adminUpdatesService';
 import { SparkUploadQueueBanner } from './components/SparkUploadQueueBanner';
 import { VideoUploadProgressChip } from './components/VideoUploadProgressChip';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { validateFrontendEnvironment } from './utils/envValidation';
 import { setDataSaverPreference } from './services/dataSaverService';
-import { SimpleModeProvider } from './context/SimpleModeContext';
+import { SimpleModeProvider, useSimpleMode } from './context/SimpleModeContext';
 import { FirstTimeTourModal } from './components/FirstTimeTourModal';
 import { HelpModal } from './components/HelpModal';
 import { CelebrationBanner } from './components/CelebrationBanner';
+import { WinnerCelebrationModal } from './components/WinnerCelebrationModal';
+import { fetchCustomBadgesCached } from './services/challengesService';
 import { PushNotificationPrompt } from './components/PushNotificationPrompt';
 import {
   subscribeToForegroundPushMessages,
   closeCallNotificationInSW
 } from './services/fcmService';
 import { GlobalServiceStatusBanner, ExternalLinkInterceptorModal } from './components/ExternalLinkModal';
+import { TeenLockScreen } from './components/TeenLockScreen';
+import {
+  getTeenRestrictionState,
+  getLocalTodayMinutes,
+  addLocalTodayMinutes,
+  syncTeenScreenTime
+} from './services/parentalService';
 import { Waves, PhoneCall, PhoneOff, Video, AlertTriangle, Sparkles, Volume2, VolumeX, MessageSquare, Send, X, Bell } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 
@@ -150,7 +160,7 @@ function CustomAppBackgroundLayer({ hidden }: { hidden: boolean }) {
 }
 
 function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
-  const { userProfile, isAdmin, showGlobalToast } = useAuth();
+  const { userProfile, isAdmin, showGlobalToast, updateUserProfile, signOut } = useAuth();
   const { appearanceTheme, setAppearanceTheme } = useTheme();
   const { setLanguage, language, t } = useLanguage();
 
@@ -203,9 +213,98 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     initialOffer?: any;
   } | null>(null);
   const [selectedHashtag, setSelectedHashtag] = useState<string | null>(null);
+  const [joiningChallenge, setJoiningChallenge] = useState<CreatorChallenge | null>(null);
   const [viewedProfileUserId, setViewedProfileUserId] = useState<string | null>(null);
+  const { isSimpleMode } = useSimpleMode();
   const [isWelinkOpen, setIsWelinkOpen] = useState(false);
-  const [welinkInitialMode, setWelinkInitialMode] = useState<'chat' | 'image' | 'voice'>('chat');
+
+  // Lazily warm custom badges cache once per session (bounded limit(50), 0 listeners)
+  useEffect(() => {
+    if (!currentUser?.uid) return;
+    fetchCustomBadgesCached(false).catch(() => {});
+  }, [currentUser?.uid]);
+
+  // Parental verification deep-link (?parentVerify=<token>&teen=<uid>)
+  const [parentVerifyToken, setParentVerifyToken] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      return new URLSearchParams(window.location.search).get('parentVerify');
+    } catch {
+      return null;
+    }
+  });
+  const [parentVerifyTeenUid, setParentVerifyTeenUid] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      return new URLSearchParams(window.location.search).get('teen');
+    } catch {
+      return null;
+    }
+  });
+  const [requestedSettingsSection, setRequestedSettingsSection] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      return new URLSearchParams(window.location.search).get('parentVerify')
+        ? 'parent_dashboard'
+        : null;
+    } catch {
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    if (parentVerifyToken) {
+      setActiveTabState('settings');
+      setRequestedSettingsSection('parent_dashboard');
+      try {
+        const cleanUrl = new URL(window.location.href);
+        cleanUrl.searchParams.delete('parentVerify');
+        cleanUrl.searchParams.delete('teen');
+        window.history.replaceState({}, document.title, cleanUrl.pathname + cleanUrl.search);
+      } catch {
+        // ignore
+      }
+    }
+  }, [parentVerifyToken]);
+
+  // Lightweight Teen Daily Screen-Time Tracker (1-min visible tick, localStorage + 5-min batched server sync, ZERO Firestore listeners)
+  const [teenTodayMinutes, setTeenTodayMinutes] = useState<number>(() =>
+    getLocalTodayMinutes(currentUser?.uid || '')
+  );
+  const unsyncedTeenMinutesRef = useRef<number>(0);
+  const teenRestriction = getTeenRestrictionState(userProfile, teenTodayMinutes);
+
+  useEffect(() => {
+    if (!currentUser?.uid || !teenRestriction.isTeen) return;
+    setTeenTodayMinutes(getLocalTodayMinutes(currentUser.uid));
+
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      const next = addLocalTodayMinutes(currentUser.uid, 1);
+      setTeenTodayMinutes(next);
+      unsyncedTeenMinutesRef.current += 1;
+      if (unsyncedTeenMinutesRef.current >= 5) {
+        const toFlush = unsyncedTeenMinutesRef.current;
+        unsyncedTeenMinutesRef.current = 0;
+        syncTeenScreenTime(toFlush).catch(() => {});
+      }
+    }, 60 * 1000);
+
+    return () => {
+      clearInterval(timer);
+      if (unsyncedTeenMinutesRef.current > 0) {
+        const toFlush = unsyncedTeenMinutesRef.current;
+        unsyncedTeenMinutesRef.current = 0;
+        syncTeenScreenTime(toFlush).catch(() => {});
+      }
+    };
+  }, [currentUser?.uid, teenRestriction.isTeen]);
+  const [welinkInitialMode, setWelinkInitialMode] = useState<WelinkMode>('chat');
+  const {
+    unseenCount: unseenAdminUpdatesCount,
+    latestUnseenToast,
+    dismissUnseenToast,
+  } = useAdminUpdates(currentUser?.uid, userProfile?.lastSeenUpdateAt, updateUserProfile);
   const [unreadNotificationIds, setUnreadNotificationIds] = useState<string[]>([]);
   const [unreadChatCount, setUnreadChatCount] = useState<number>(0);
   const [hasNewPosts, setHasNewPosts] = useState<boolean>(false);
@@ -1189,6 +1288,14 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
   ]);
 
   const handleOpenCall = (type: 'video' | 'voice', recipient?: CallRecipient) => {
+    if (teenRestriction.isTeen && !teenRestriction.canUseCalls) {
+      showGlobalToast(
+        teenRestriction.isParentVerified
+          ? 'Voice and video calls are disabled by Parental Control.'
+          : 'Voice and video calls are locked until a parent confirms your Teen Account.'
+      );
+      return;
+    }
     const callRate = checkActionRateLimit(currentUser?.uid || 'user', 'call');
     if (!callRate.allowed) {
       showGlobalToast(callRate.message || 'You are starting calls too fast. Please wait a moment and try again.');
@@ -1196,6 +1303,13 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     }
     if (recipient?.id) {
       const targetCached = getCachedUserProfile(recipient.id);
+      if (targetCached) {
+        const targetTeen = getTeenRestrictionState(targetCached);
+        if (targetTeen.isTeen && !targetTeen.canUseCalls) {
+          showGlobalToast('This teen account cannot receive voice or video calls.');
+          return;
+        }
+      }
       if (
         (userProfile?.blockedUserIds || []).includes(recipient.id) ||
         (currentUser?.uid && targetCached?.blockedUserIds?.includes(currentUser.uid))
@@ -1225,6 +1339,12 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
 
   const handleAcceptIncomingCall = (overrideMode?: 'video' | 'voice') => {
     if (!incomingCall) return;
+    if (teenRestriction.isTeen && !teenRestriction.canUseCalls) {
+      stopIncomingRingtone();
+      setIncomingCall(null);
+      showGlobalToast('Calls are currently blocked by Parental Control.');
+      return;
+    }
     stopIncomingRingtone();
     const { callId, callerId, callerName, callerPhotoURL, callType, offer } = incomingCall;
     closeCallNotificationInSW(callId).catch(() => {});
@@ -1317,6 +1437,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           mediaType: 'none',
           isEdited: false,
           isDeleted: false,
+          moderationChecked: true,
+          moderationCheckedAt: nowIso,
           readBy: [currentUser.uid],
           timestamp: serverTimestamp(),
           createdAt: nowIso
@@ -1352,10 +1474,10 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     }
   };
 
-  const handleOpenWelink = (mode: 'chat' | 'image' | 'voice' = 'chat') => {
+  const handleOpenWelink = (mode: WelinkMode = 'chat') => {
     triggerHaptic('medium');
     setActiveCall(null);
-    setWelinkInitialMode(mode);
+    setWelinkInitialMode(unseenAdminUpdatesCount > 0 && mode === 'chat' ? 'updates' : mode);
     setIsWelinkOpen(true);
   };
 
@@ -1530,7 +1652,10 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
     };
   }, [currentUser?.uid]);
 
-  if (userProfile?.isBanned) {
+  if (
+    userProfile?.isBanned ||
+    (typeof userProfile?.suspendedUntilMs === 'number' && userProfile.suspendedUntilMs > Date.now())
+  ) {
     return <BannedView onOpenSupport={() => setActiveTab('settings')} />;
   }
 
@@ -1581,7 +1706,7 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
           key={activeTab}
           className={`wavelink-main-content wavelink-tab-fade-in ${
             activeTab === 'chat' ? 'wavelink-main-content--chat' : ''
-          } ${activeTab === 'videos' ? 'wavelink-main-content--reels' : ''}`}
+          } ${activeTab === 'videos' ? 'wavelink-main-content--explore' : ''}`}
         >
           {activeTab === 'feed' && (
             <FeedView
@@ -1596,6 +1721,8 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
               onLoadNewPosts={markFeedVisitedNow}
               hasUnreadNotifications={unreadNotificationIds.length > 0}
               unreadNotificationCount={unreadNotificationIds.length}
+              joiningChallenge={joiningChallenge}
+              onClearJoiningChallenge={() => setJoiningChallenge(null)}
             />
           )}
           {activeTab === 'trending' && (
@@ -1608,6 +1735,15 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                 setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
                 setActiveTab('feed');
               }}
+              onJoinChallenge={(challenge) => {
+                setJoiningChallenge(challenge);
+                setActiveTab('feed');
+              }}
+              onViewProfile={(uid) => {
+                setViewedProfileUserId(uid);
+                setActiveTab('settings');
+              }}
+              onOpenAdminPanel={() => setActiveTab('admin')}
             />
           )}
           {activeTab === 'studio' && (
@@ -1627,18 +1763,18 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
             </div>
           )}
           {activeTab === 'videos' && (
-            <div className="wavelink-reels-desktop-row">
-              <div className="wavelink-reels-desktop-center">
-                <VideosHubView onNavigateToFeed={() => setActiveTab('feed')} />
-              </div>
-              <RightSidebar
-                onNavigateTab={(tab) => setActiveTab(tab)}
-                onSelectHashtag={(tag) => {
-                  setSelectedHashtag(tag.startsWith('#') ? tag : `#${tag}`);
-                  setActiveTab('feed');
-                }}
-              />
-            </div>
+            <VideosHubView
+              onNavigateToFeed={() => setActiveTab('feed')}
+              onJoinChallenge={(challenge) => {
+                setJoiningChallenge(challenge);
+                setActiveTab('feed');
+              }}
+              onOpenChallengesTab={() => setActiveTab('trending')}
+              onViewProfile={(uid) => {
+                setViewedProfileUserId(uid);
+                setActiveTab('settings');
+              }}
+            />
           )}
           {activeTab === 'announcements' && <AnnouncementsView />}
           {activeTab === 'chat' && (
@@ -1670,11 +1806,28 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
                 onSelectUserProfile={(uid) => setViewedProfileUserId(uid)}
                 onStartChatWithUser={handleStartChatWithUser}
                 onStartCallWithUser={(recipient, callType) => handleOpenCall(callType, recipient)}
+                initialSettingsSection={requestedSettingsSection}
+                onClearInitialSettingsSection={() => setRequestedSettingsSection(null)}
+                parentVerifyToken={parentVerifyToken}
+                parentVerifyTeenUid={parentVerifyTeenUid}
+                onClearParentVerify={() => {
+                  setParentVerifyToken(null);
+                  setParentVerifyTeenUid(null);
+                }}
               />
             </div>
           )}
         </main>
       </div>
+
+      {/* Teen Account Lock Screen (Daily Time Limit / Bedtime Hours / Parent Pause) */}
+      {teenRestriction.lockReason && (
+        <TeenLockScreen
+          restriction={teenRestriction}
+          parentEmailMasked={userProfile?.parentEmailMasked}
+          onSignOut={() => signOut()}
+        />
+      )}
 
       {/* Phase 3: Skippable Post-Signup Interest Picker Modal */}
       {showInterestPicker && (
@@ -1700,17 +1853,75 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         hasNewPosts={hasNewPosts}
       />
 
-      {/* Single Floating Assistant Button (hidden on Chat, Studio Editor, and when any bottom sheet or keyboard is open) */}
+      {/* Single Floating Assistant Button + Unseen Admin Updates Badge + Brief Toast */}
       {!isWelinkOpen && !activeCall && activeTab !== 'chat' && activeTab !== 'studio' && (
-        <button
-          type="button"
-          onClick={() => handleOpenWelink('chat')}
-          aria-label="Open WELINK AI Assistant"
-          title="WELINK AI Assistant"
-          className="wavelink-floating-ai-btn fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 h-12 w-12 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-lg hover:shadow-xl hover:scale-105 transition-all duration-200 active:scale-95 cursor-pointer group"
-        >
-          <Sparkles size={20} className="transition-transform group-hover:rotate-12" />
-        </button>
+        <>
+          {latestUnseenToast && (
+            <div
+              className="fixed bottom-36 lg:bottom-20 right-4 sm:right-6 z-40 max-w-[270px] sm:max-w-xs rounded-2xl p-3 border shadow-xl flex items-start gap-2.5 animate-in fade-in slide-in-from-bottom-2"
+              style={{
+                background: 'var(--bg-surface, rgba(17, 24, 39, 0.94))',
+                backdropFilter: 'blur(16px)',
+                WebkitBackdropFilter: 'blur(16px)',
+                borderColor: 'var(--accent-primary, #2563EB)',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  dismissUnseenToast(latestUnseenToast.id);
+                  handleOpenWelink('updates');
+                }}
+                className="flex-1 text-left min-w-0 cursor-pointer"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="inline-flex h-2 w-2 rounded-full bg-sky-400 animate-pulse shrink-0" />
+                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-[var(--accent-primary,#38BDF8)] truncate">
+                    New update from WaveLink
+                  </span>
+                </div>
+                <p className="text-xs font-extrabold text-[var(--text-primary,#1C1917)] truncate mt-0.5">
+                  {latestUnseenToast.title}
+                </p>
+                <p className="text-[11px] text-[var(--text-secondary,#78716C)] line-clamp-1 mt-0.5">
+                  Tap to view announcement
+                </p>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  dismissUnseenToast(latestUnseenToast.id);
+                }}
+                aria-label="Dismiss update notification"
+                className="p-1 rounded-lg text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] shrink-0"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() =>
+              handleOpenWelink(unseenAdminUpdatesCount > 0 ? 'updates' : 'chat')
+            }
+            aria-label="Open WELINK AI Assistant"
+            title={
+              unseenAdminUpdatesCount > 0
+                ? `WELINK AI Assistant (${unseenAdminUpdatesCount} new updates)`
+                : 'WELINK AI Assistant'
+            }
+            className="wavelink-floating-ai-btn fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 h-12 w-12 rounded-full bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center shadow-lg hover:shadow-xl hover:scale-105 transition-all duration-200 active:scale-95 cursor-pointer group"
+          >
+            <Sparkles size={20} className="transition-transform group-hover:rotate-12" />
+            {unseenAdminUpdatesCount > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-black flex items-center justify-center border-2 border-[var(--bg-canvas,#0F172A)] shadow-md">
+                {unseenAdminUpdatesCount > 99 ? '99+' : unseenAdminUpdatesCount}
+              </span>
+            )}
+          </button>
+        </>
       )}
 
       {/* WELINK AI Assistant Drawer */}
@@ -2053,6 +2264,19 @@ function AuthenticatedApp({ currentUser }: AuthenticatedAppProps) {
         onClose={() => setIsHelpOpen(false)}
         onOpenWelink={handleOpenWelink}
         onOpenTour={() => setIsTourOpen(true)}
+      />
+
+      {/* Weekly Challenge Winner Celebration Modal (respects prefers-reduced-motion & isSimpleMode, 0 extra reads) */}
+      <WinnerCelebrationModal
+        celebration={userProfile?.pendingWinnerCelebration}
+        isSimpleMode={isSimpleMode}
+        onDismiss={async () => {
+          await updateUserProfile({ pendingWinnerCelebration: null });
+        }}
+        onEquipBadge={async (badgeId) => {
+          await updateUserProfile({ highlightedBadgeId: badgeId });
+        }}
+        onOpenChallenges={() => setActiveTab('trending')}
       />
     </div>
   );

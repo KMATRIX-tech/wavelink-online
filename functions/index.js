@@ -1405,4 +1405,348 @@ exports.verifyMobileMoneyProPayment = onCall(async (request) => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// 15. LAYER 2 BACKUP MODERATION CLOUD FUNCTIONS
+//     Honest note: No single automated filter is 100% perfect, so WaveLink uses
+//     multiple defense layers. Even if a modified client bypasses Layer 1 or the
+//     Express API and writes directly to Firestore, these triggers re-check new
+//     posts, comments, DM messages, and group messages, auto-hide flagged items,
+//     log a content report + audit trail, and notify the author.
+// ---------------------------------------------------------------------------
+const MOD_LEET_MAP = {
+  '@': 'a', '4': 'a', '^': 'a',
+  '8': 'b',
+  '3': 'e',
+  '6': 'g', '9': 'g',
+  '1': 'i', '!': 'i', '|': 'i',
+  '0': 'o',
+  '$': 's', '5': 's',
+  '7': 't', '+': 't',
+  '2': 'z'
+};
+
+const MOD_ALLOWLIST = new Set([
+  'scunthorpe', 'assassin', 'assassins', 'assassination', 'class', 'classic',
+  'classical', 'classroom', 'pass', 'passed', 'passing', 'passion', 'compass',
+  'grass', 'glass', 'glasses', 'brass', 'mass', 'massive', 'assistant', 'assist',
+  'assess', 'asset', 'assets', 'assume', 'assignment', 'hello', 'shell', 'cocktail',
+  'peacock', 'hancock', 'hitchcock', 'woodcock', 'scrap', 'scrape', 'skyscraper',
+  'therapist', 'grape', 'grapes', 'drape', 'document', 'cumulative', 'cucumber',
+  'documentary', 'analysis', 'analytics', 'canal', 'banal', 'butter', 'button',
+  'butterfly', 'sextet', 'sexton', 'sussex', 'essex', 'middlesex', 'dickens',
+  'titans', 'title', 'entitle', 'institution', 'constitution', 'snigger', 'nigeria',
+  'nigerian', 'niger', 'kuma', 'kumbe', 'kumaliza', 'kumbuka', 'kumbi', 'tomb',
+  'tomato', 'shika', 'shida', 'shitaki', 'shiitake'
+]);
+
+const MOD_WORD_TERMS = [
+  // English profanity, hate, sexual, harassment
+  'fuck', 'fucker', 'fucking', 'motherfucker', 'shit', 'bullshit', 'bitch', 'asshole',
+  'bastard', 'dickhead', 'cocksucker', 'cunt', 'whore', 'slut', 'pussy', 'porn',
+  'pornhub', 'xvideos', 'xnxx', 'onlyfans', 'blowjob', 'handjob', 'nudes', 'sendnudes',
+  'nigger', 'nigga', 'faggot', 'retard', 'retarded', 'kike', 'spic', 'chink', 'wetback',
+  'rape', 'rapist', 'pedophile', 'pedo', 'kys', 'kill yourself',
+  // Swahili profanity, insults, sexual & hate terms
+  'kumamako', 'kumamake', 'kumamayo', 'kuma la mama', 'kuma lako', 'kuma yako',
+  'mkundu', 'matako', 'malaya', 'kahaba', 'msenge', 'shoga', 'tomba', 'kutomba',
+  'tombaneni', 'mboo', 'mboro', 'mbwa wewe', 'pumbavu', 'mpumbavu', 'fala wewe',
+  'shenzi', 'mshenzi', 'mjinga sana', 'laana', 'nyoko', 'mama yako', 'baba yako',
+  'tombwa', 'kufira', 'firauni', 'ufiraji',
+  // Multilingual major profanity/slurs
+  'puta', 'putamadre', 'cabron', 'pendejo', 'verga', 'chingar', 'maricon', 'mierda',
+  'putain', 'salope', 'connard', 'encule', 'fils de pute', 'bordel', 'merde',
+  'sharmouta', 'kosomak', 'ibn el kalb', 'kuss', 'zabour',
+  'caralho', 'porra', 'buceta', 'filho da puta', 'viado',
+  'madarchod', 'behenchod', 'bhenchod', 'chutiya', 'bhosdike', 'harami', 'randi',
+  'arschloch', 'hurensohn', 'fotze', 'scheisse', 'wichser',
+  'orospu', 'siktir', 'amk', 'piç',
+  'blyat', 'suka', 'pizdec', 'khuy',
+  'vaffanculo', 'stronzo', 'puttana', 'cazzo',
+  'anjing', 'bangsat', 'kontol', 'memek', 'ngentot'
+];
+
+const MOD_STRONG_SUBSTRINGS = [
+  'fuck', 'fack', 'motherfuck', 'cunt', 'nigger', 'faggot', 'pornhub', 'xvideos',
+  'xnxx', 'kumamako', 'kumamake', 'mkundu', 'msenge', 'kutomba', 'madarchod',
+  'behenchod', 'bhenchod', 'sharmouta', 'kosomak', 'filsdepute', 'hurensohn',
+  'killyourself', 'pedophile'
+];
+
+function normalizeBackupModerationText(raw) {
+  const str = String(raw || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .toLowerCase();
+  const decoded = str
+    .split('')
+    .map((ch) => MOD_LEET_MAP[ch] || ch)
+    .join('')
+    .replace(/(.)\1{2,}/g, '$1$1');
+  const spaced = decoded.replace(/[^a-z0-9]+/g, ' ').trim();
+  const compact = decoded.replace(/[^a-z0-9]+/g, '');
+  return { spaced, compact };
+}
+
+function checkBackupLocalModeration(rawText) {
+  const input = String(rawText || '').trim();
+  if (!input) return { flagged: false, suspicious: false, reason: '' };
+
+  const { spaced, compact } = normalizeBackupModerationText(input);
+  const tokens = spaced.split(' ').filter(Boolean);
+  const safeTokens = tokens.filter((t) => !MOD_ALLOWLIST.has(t));
+
+  for (const term of MOD_WORD_TERMS) {
+    if (term.includes(' ')) {
+      if (spaced.includes(term)) {
+        return { flagged: true, suspicious: true, reason: `Matched blocked phrase (${term.slice(0, 3)}***)` };
+      }
+    } else if (safeTokens.includes(term)) {
+      return { flagged: true, suspicious: true, reason: `Matched blocked term (${term.slice(0, 3)}***)` };
+    }
+  }
+
+  for (const sub of MOD_STRONG_SUBSTRINGS) {
+    const matchedByAllowedWord = tokens.some((t) => MOD_ALLOWLIST.has(t) && t.includes(sub));
+    if (!matchedByAllowedWord && compact.includes(sub)) {
+      return { flagged: true, suspicious: true, reason: `Matched evaded blocked term` };
+    }
+  }
+
+  // Flag suspicious patterns (slang harassment, threats, scam links, spaced letters) for optional AI review
+  const suspicious =
+    /\b(kill|die|suicide|nude|sex|scam|send money|crypto giveaway|whatsapp me|dm for nudes|hate all|go back to)\b/i.test(spaced) ||
+    /(?:[a-z]\s+){4,}[a-z]/i.test(input);
+
+  return { flagged: false, suspicious, reason: '' };
+}
+
+async function checkBackupWithGeminiIfNeeded(rawText) {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey || !rawText || rawText.length < 3) return { flagged: false, reason: '' };
+  try {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'aistudio-build'
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: `Classify if this social media text violates safety rules (profanity, hate speech, harassment, sexual content, threats, or scam) in ANY language including Swahili/English slang. Reply strictly as JSON: {"safe":boolean,"reason":"short reason"}. Text: ${JSON.stringify(rawText.slice(0, 800))}`
+              }
+            ]
+          }
+        ],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 120,
+          responseMimeType: 'application/json'
+        }
+      })
+    });
+    if (!resp.ok) return { flagged: false, reason: '' };
+    const json = await resp.json();
+    const rawOut = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const parsed = JSON.parse(rawOut);
+    if (parsed && parsed.safe === false) {
+      return { flagged: true, reason: String(parsed.reason || 'Flagged by Layer 2 AI moderation').slice(0, 180) };
+    }
+    return { flagged: false, reason: '' };
+  } catch {
+    return { flagged: false, reason: '' };
+  }
+}
+
+async function runBackupModerationOnCreatedDoc({
+  docRef,
+  targetType,
+  targetId,
+  authorId,
+  textToCheck,
+  extraMeta = {}
+}) {
+  if (!textToCheck || !authorId || authorId === 'wavelink_support_bot') return;
+  const local = checkBackupLocalModeration(textToCheck);
+  let flagged = local.flagged;
+  let reason = local.reason;
+
+  if (!flagged && local.suspicious) {
+    const aiRes = await checkBackupWithGeminiIfNeeded(textToCheck);
+    if (aiRes.flagged) {
+      flagged = true;
+      reason = aiRes.reason;
+    }
+  }
+
+  if (!flagged) return;
+
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+  const reportId = `auto_mod_${targetType}_${Date.now()}_${String(targetId).slice(0, 8)}`;
+
+  await Promise.all([
+    docRef
+      .set(
+        {
+          isHidden: true,
+          moderationStatus: 'auto_hidden',
+          moderationReason: reason || 'Automated Layer 2 safety check',
+          updatedAt: nowIso
+        },
+        { merge: true }
+      )
+      .catch(() => {}),
+    db
+      .collection('contentReports')
+      .doc(reportId)
+      .set({
+        id: reportId,
+        reporterId: 'system_layer2_cf',
+        reporterName: 'WaveLink Safety Shield',
+        source: 'auto_ai',
+        targetType,
+        targetId,
+        targetAuthorId: authorId,
+        targetSummary: String(textToCheck).slice(0, 300),
+        reasonCategory: 'abuse',
+        reason: reason || 'Automated Layer 2 safety check',
+        status: 'auto_hidden',
+        ...extraMeta,
+        createdAt: nowIso
+      })
+      .catch(() => {}),
+    db
+      .collection('adminAuditLogs')
+      .doc(`audit_${reportId}`)
+      .set({
+        id: `audit_${reportId}`,
+        actorId: 'system_layer2_cf',
+        actorEmail: 'safety@wavelink.app',
+        actorName: 'WaveLink Safety Shield (Cloud Function)',
+        action: 'auto_hide_content',
+        targetId,
+        targetLabel: `${targetType}:${targetId}`,
+        details: `Auto-hidden ${targetType} by ${authorId}: ${reason}`,
+        createdAt: nowIso
+      })
+      .catch(() => {}),
+    db
+      .collection('notifications')
+      .add({
+        recipientId: authorId,
+        actorId: 'wavelink_support_bot',
+        actorName: 'WaveLink Safety',
+        type: 'system',
+        title: 'Content hidden by safety review',
+        body: 'One of your recent submissions was hidden because it may break WaveLink Community Guidelines. You can submit an appeal from Settings.',
+        entityId: targetId,
+        read: false,
+        createdAt: nowIso
+      })
+      .catch(() => {})
+  ]);
+}
+
+exports.onPostCreatedModeration = onDocumentCreated(
+  {
+    document: 'posts/{postId}',
+    database: FIRESTORE_DATABASE_ID,
+    secrets: ['GEMINI_API_KEY']
+  },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const data = snap.data() || {};
+    if (data.isHidden === true) return;
+    const combinedText = [
+      data.content || '',
+      Array.isArray(data.hashtags) ? data.hashtags.join(' ') : '',
+      data.locationTag || ''
+    ]
+      .filter(Boolean)
+      .join(' ');
+    await runBackupModerationOnCreatedDoc({
+      docRef: snap.ref,
+      targetType: data.mediaType === 'video' ? 'reel' : 'post',
+      targetId: event.params.postId,
+      authorId: String(data.authorId || ''),
+      textToCheck: combinedText,
+      extraMeta: { postId: event.params.postId }
+    });
+  }
+);
+
+exports.onCommentCreatedModeration = onDocumentCreated(
+  {
+    document: 'posts/{postId}/comments/{commentId}',
+    database: FIRESTORE_DATABASE_ID,
+    secrets: ['GEMINI_API_KEY']
+  },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const data = snap.data() || {};
+    if (data.isHidden === true) return;
+    await runBackupModerationOnCreatedDoc({
+      docRef: snap.ref,
+      targetType: 'comment',
+      targetId: event.params.commentId,
+      authorId: String(data.authorId || ''),
+      textToCheck: String(data.content || ''),
+      extraMeta: { postId: event.params.postId }
+    });
+  }
+);
+
+exports.onDmMessageCreatedModeration = onDocumentCreated(
+  {
+    document: 'channels/{channelId}/messages/{messageId}',
+    database: FIRESTORE_DATABASE_ID,
+    secrets: ['GEMINI_API_KEY']
+  },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const data = snap.data() || {};
+    if (data.isHidden === true || data.isSystem === true || data.isDeleted === true) return;
+    await runBackupModerationOnCreatedDoc({
+      docRef: snap.ref,
+      targetType: 'message',
+      targetId: event.params.messageId,
+      authorId: String(data.senderId || ''),
+      textToCheck: String(data.text || ''),
+      extraMeta: { channelId: event.params.channelId }
+    });
+  }
+);
+
+exports.onGroupMessageCreatedModeration = onDocumentCreated(
+  {
+    document: 'groups/{groupId}/messages/{messageId}',
+    database: FIRESTORE_DATABASE_ID,
+    secrets: ['GEMINI_API_KEY']
+  },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const data = snap.data() || {};
+    if (data.isHidden === true || data.isSystem === true || data.isDeleted === true) return;
+    await runBackupModerationOnCreatedDoc({
+      docRef: snap.ref,
+      targetType: 'message',
+      targetId: event.params.messageId,
+      authorId: String(data.senderId || ''),
+      textToCheck: String(data.text || ''),
+      extraMeta: { groupId: event.params.groupId }
+    });
+  }
+);
+
+
 

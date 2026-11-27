@@ -11,12 +11,19 @@ import {
 } from '../firebase';
 import {
   compressVideoBeforeUpload,
+  generateVideoThumbnail,
   startDirectVideoUploadToCloudinary,
   DirectVideoUploadTaskHandle,
   formatVideoFileSize,
   getMaxVideoDurationSeconds
 } from '../utils/mediaStorage';
-import type { Post } from '../types';
+import {
+  requestUploadTimeVideoTagging,
+  sanitizeVideoCaptionText,
+  scheduleBackgroundVideoTagRetry
+} from './videoAiTagger';
+import { checkImageSafetyOnce } from './moderationService';
+import type { Post, MediaSafetyLevel } from '../types';
 
 export interface VideoPostUploadJobInput {
   postId?: string;
@@ -38,6 +45,9 @@ export interface VideoPostUploadJobInput {
   locationTag?: string;
   allowComments?: boolean;
   hashtags?: string[];
+  challengeId?: string;
+  challengeHashtag?: string;
+  authorHighlightedBadgeId?: string | null;
   songTitle?: string;
   songArtist?: string;
   songAlbumArt?: string;
@@ -429,7 +439,7 @@ class VideoUploadQueueManager {
 
       const uploadSizeLabel = formatVideoFileSize(prepared.file.size);
 
-      // Step 2: Direct browser -> Cloudinary unsigned upload API (Cloud name monarcking72, preset monarcking72)
+      // Step 2: Direct browser -> Cloudflare Edge Media Upload API
       this.updateJob(jobId, {
         phase: 'uploading',
         status: 'uploading',
@@ -437,10 +447,10 @@ class VideoUploadQueueManager {
         bytesTransferred: 0,
         fileSize: prepared.file.size,
         formattedFileSize: `0 KB / ${uploadSizeLabel}`,
-        statusText: `Uploading 1% • 0 KB / ${uploadSizeLabel}`
+        statusText: `Uploading via Cloudflare 1% • 0 KB / ${uploadSizeLabel}`
       });
       if (input.onProgress) {
-        input.onProgress(20, `Uploading to Cloudinary (1% • ${uploadSizeLabel})...`);
+        input.onProgress(20, `Uploading via Cloudflare (1% • ${uploadSizeLabel})...`);
       }
 
       const handle = startDirectVideoUploadToCloudinary({
@@ -484,8 +494,51 @@ class VideoUploadQueueManager {
       });
 
       this.activeHandles.set(jobId, handle);
-      const uploadResult = await handle.promise;
+
+      // Run Gemini upload-time AI tagging + Layer 3 single thumbnail safety check in parallel with Cloudflare upload
+      const cleanedCaption = sanitizeVideoCaptionText(input.caption ?? input.content ?? '');
+      const aiTagPromise = requestUploadTimeVideoTagging({
+        file: prepared.file,
+        thumbnailDataUrl: prepared.thumbnailUrl,
+        caption: cleanedCaption,
+        postId
+      });
+
+      const thumbSafetyPromise = (async (): Promise<{ allowed: boolean; mediaSafety: MediaSafetyLevel; message?: string }> => {
+        try {
+          let thumbData = prepared!.thumbnailUrl && prepared!.thumbnailUrl.startsWith('data:image/')
+            ? prepared!.thumbnailUrl
+            : '';
+          if (!thumbData) {
+            thumbData = await generateVideoThumbnail(prepared!.file, 1.0).catch(() => '');
+          }
+          if (!thumbData || !thumbData.startsWith('data:image/')) {
+            return { allowed: true, mediaSafety: 'safe' };
+          }
+          const check = await checkImageSafetyOnce(thumbData, 'image/jpeg', 'video_thumbnail');
+          return {
+            allowed: check.allowed,
+            mediaSafety: check.mediaSafety,
+            message: check.reason
+          };
+        } catch {
+          return { allowed: true, mediaSafety: 'safe' };
+        }
+      })();
+
+      const [uploadResult, aiTagResult, thumbSafety] = await Promise.all([
+        handle.promise,
+        aiTagPromise,
+        thumbSafetyPromise
+      ]);
       this.activeHandles.delete(jobId);
+
+      if (!thumbSafety.allowed) {
+        throw new Error(
+          thumbSafety.message ||
+            'This video thumbnail includes imagery that is not allowed on WaveLink.'
+        );
+      }
 
       if (
         !uploadResult.videoUrl ||
@@ -494,18 +547,18 @@ class VideoUploadQueueManager {
         !uploadResult.videoUrl.startsWith('http')
       ) {
         throw new Error(
-          'Cloudinary upload did not return a valid secure_url. Never saving base64 or raw video data in Firestore.'
+          'Cloudflare upload did not return a valid HTTPS URL. Never saving base64 or raw video data in Firestore.'
         );
       }
 
-      // Step 3: Create the post in Firestore ONLY after the Cloudinary upload has finished,
-      // saving only the returned secure_url, small HTTP thumbnail URL, duration, width, and height.
+      // Step 3: Create the post in Firestore ONLY after the Cloudflare upload has finished,
+      // saving only the returned HTTPS URL, small HTTP thumbnail URL, duration, width, height, and AI tags.
       const extractedHashtags =
         input.hashtags && input.hashtags.length > 0
           ? input.hashtags
           : Array.from(
               new Set(
-                ((input.caption || '').match(/#[a-zA-Z0-9_]+/g) || []).map((tag) =>
+                (cleanedCaption.match(/#[a-zA-Z0-9_]+/g) || []).map((tag) =>
                   tag.replace(/^#/, '')
                 )
               )
@@ -519,10 +572,13 @@ class VideoUploadQueueManager {
       const finalWidth = uploadResult.width || prepared.width || 720;
       const finalHeight = uploadResult.height || prepared.height || 1280;
 
-      // Strictly use an HTTPS thumbnail URL (either uploaded custom cover URL or Cloudinary derived .jpg URL)
-      const derivedFallbackThumb = uploadResult.videoUrl
-        .replace('/video/upload/', '/video/upload/so_1.0,w_640,c_limit,q_auto:good/')
-        .replace(/\.[a-zA-Z0-9]+(\?.*)?$/, '.jpg');
+      // Strictly use an HTTPS thumbnail URL (either uploaded Cloudflare frame/cover URL or Cloudinary derived .jpg URL)
+      const isCloudinaryAsset = uploadResult.videoUrl.includes('res.cloudinary.com');
+      const derivedFallbackThumb = isCloudinaryAsset
+        ? uploadResult.videoUrl
+            .replace('/video/upload/', '/video/upload/so_1.0,w_640,c_limit,q_auto:good/')
+            .replace(/\.[a-zA-Z0-9]+(\?.*)?$/, '.jpg')
+        : '';
       const cloudPosterUrl =
         uploadResult.thumbnailUrl && uploadResult.thumbnailUrl.startsWith('http')
           ? uploadResult.thumbnailUrl
@@ -532,6 +588,13 @@ class VideoUploadQueueManager {
 
       const safeAuthorPhotoUrl = sanitizeAvatarUrlForFirestore(input.authorPhotoURL, input.authorId);
 
+      const mergedKeywords = Array.from(
+        new Set([
+          ...(aiTagResult.keywords || []),
+          ...extractedHashtags.map((h) => h.toLowerCase())
+        ])
+      ).slice(0, 10);
+
       const postPayload: Post = {
         id: postId,
         authorId: input.authorId,
@@ -539,7 +602,7 @@ class VideoUploadQueueManager {
         authorName: input.authorName || 'Creator',
         authorUsername: input.authorUsername || '@waver',
         authorPhotoURL: safeAuthorPhotoUrl,
-        content: (input.caption || '').trim(),
+        content: cleanedCaption,
         mediaType: 'video',
         videoUrl: uploadResult.videoUrl,
         thumbnailUrl: cloudPosterUrl,
@@ -548,15 +611,23 @@ class VideoUploadQueueManager {
         videoDurationSeconds: roundedDuration,
         videoWidth: finalWidth,
         videoHeight: finalHeight,
-        videoFileName: prepared.file.name,
         videoTrimStart: input.trimStart ?? 0,
         videoTrimEnd: input.trimEnd ?? roundedDuration,
         hasVideoChunks: false,
-        aspectRatio: input.aspectRatio || '9:16',
+        aspectRatio: input.aspectRatio || (finalHeight > finalWidth ? '9:16' : finalWidth === finalHeight ? '1:1' : '4:5'),
         audience: input.audience || 'public',
         locationTag: input.locationTag?.trim() || undefined,
         allowComments: input.allowComments !== undefined ? input.allowComments : true,
         hashtags: extractedHashtags.length > 0 ? extractedHashtags : undefined,
+        challengeId: input.challengeId || undefined,
+        challengeHashtag: input.challengeHashtag || undefined,
+        authorHighlightedBadgeId: input.authorHighlightedBadgeId || null,
+        category: aiTagResult.category || 'Other',
+        keywords: mergedKeywords.length > 0 ? mergedKeywords : ['other'],
+        language: aiTagResult.language || 'en',
+        aiGenerated: Boolean(aiTagResult.aiGenerated),
+        aiConfidence: typeof aiTagResult.aiConfidence === 'number' ? aiTagResult.aiConfidence : 0.1,
+        taggedAt: aiTagResult.taggedAt || new Date().toISOString(),
         songTitle: input.songTitle,
         songArtist: input.songArtist,
         songAlbumArt: sanitizeOptionalHttpUrl(input.songAlbumArt),
@@ -564,6 +635,9 @@ class VideoUploadQueueManager {
         songAlbumName: input.songAlbumName,
         songStartTime: input.songStartTime,
         songVolume: input.songVolume,
+        mediaSafety: thumbSafety.mediaSafety === 'borderline' ? 'borderline' : 'safe',
+        moderationChecked: true,
+        moderationCheckedAt: new Date().toISOString(),
         likes: [],
         likesCount: 0,
         reactions: { like: [], heart: [], fire: [] },
@@ -581,6 +655,15 @@ class VideoUploadQueueManager {
           handleFirestoreError(firestoreErr, OperationType.CREATE, `posts/${postId}`);
         } catch {}
         throw firestoreErr;
+      }
+
+      // If tagging fell back due to transient network error, retry once in the background
+      if (!aiTagResult.taggedAt) {
+        scheduleBackgroundVideoTagRetry({
+          postId,
+          caption: cleanedCaption,
+          videoUrl: uploadResult.videoUrl
+        });
       }
 
       clearFailedVideoAndStudioDrafts();

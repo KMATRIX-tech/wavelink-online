@@ -3143,6 +3143,7 @@ html[data-keyboard-open="true"] .wavelink-comments-input-footer {
   flex-direction: column;
   gap: 1rem;
   width: 100%;
+  min-width: 0;
 }
 
 .wavelink-profile-main-col {
@@ -3161,17 +3162,161 @@ html[data-keyboard-open="true"] .wavelink-comments-input-footer {
   min-width: 0;
 }
 
+/* Gamer Profile Additions (100% theme-variable driven, mobile-first, zero horizontal overflow) */
+.wavelink-gamer-header-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.wavelink-gamer-avatar-level-badge {
+  position: absolute;
+  top: -0.25rem;
+  right: -0.35rem;
+  z-index: 25;
+  min-width: 2.125rem;
+  height: 1.625rem;
+  padding: 0 0.45rem;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  color: #FFFFFF;
+  border: 2px solid var(--bg-surface);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.35);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.2rem;
+  font-size: 0.6875rem;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.wavelink-gamer-level-card {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0.875rem 1rem;
+  border-radius: 1.375rem;
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--bg-subtle) 86%, var(--accent-primary) 14%),
+    var(--bg-subtle)
+  );
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 30%, var(--border-hairline));
+  box-shadow: 0 10px 24px -14px rgba(15, 23, 42, 0.32);
+  cursor: pointer;
+  transition: transform 160ms ease, border-color 160ms ease;
+}
+
+.wavelink-gamer-level-card:hover {
+  border-color: color-mix(in srgb, var(--accent-primary) 55%, var(--border-hairline));
+}
+
+.wavelink-gamer-level-emblem {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.875rem;
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  color: #FFFFFF;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  box-shadow: 0 6px 14px -4px color-mix(in srgb, var(--accent-primary) 50%, transparent);
+}
+
+.wavelink-gamer-xp-bar-fill {
+  background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+}
+
+/* Mobile Sticky Pill Bar for Main Gamer Profile Tabs (Posts | Achievements | Challenges | About) */
+.wavelink-gamer-tabs-bar {
+  position: sticky;
+  top: 0.5rem;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  width: 100%;
+  max-width: 100%;
+  padding: 0.375rem;
+  border-radius: 9999px;
+  background-color: color-mix(in srgb, var(--bg-surface) 92%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border-hairline);
+  box-shadow: 0 8px 20px -10px rgba(15, 23, 42, 0.25);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.wavelink-gamer-tabs-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.wavelink-gamer-tab-pill {
+  flex: 1 0 auto;
+  min-height: 44px;
+  padding: 0.5rem 0.875rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 800;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  color: var(--text-secondary);
+  background: transparent;
+  transition: background-color 160ms ease, color 160ms ease, transform 140ms ease;
+  cursor: pointer;
+}
+
+.wavelink-gamer-tab-pill:hover {
+  color: var(--text-primary);
+  background-color: color-mix(in srgb, var(--bg-subtle) 70%, transparent);
+}
+
+.wavelink-gamer-tab-pill--active {
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  color: #FFFFFF;
+  box-shadow: 0 6px 14px -6px color-mix(in srgb, var(--accent-primary) 55%, transparent);
+}
+
+.wavelink-gamer-tab-pill--active:hover {
+  color: #FFFFFF;
+}
+
+@keyframes wavelink-levelup-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, 16px) scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+
+.wavelink-levelup-enter {
+  animation: wavelink-levelup-pop 280ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
 /* DESKTOP PROFILE LAYOUT (1024px and up):
    Strictly inside @media (min-width: 1024px) so phone layouts are never affected */
 @media (min-width: 1024px) {
   .wavelink-profile-shell {
-    max-width: 72rem; /* 1152px max width */
+    max-width: 76rem; /* 1216px wide gamer dashboard */
     padding: 0.5rem 0 2.5rem;
     gap: 1.25rem;
   }
 
   .wavelink-profile-cover {
-    height: 14.5rem; /* 232px wide cover on desktop */
+    height: 15rem; /* 240px wide cover banner on desktop */
   }
 
   .wavelink-profile-header-inner {
@@ -3188,23 +3333,62 @@ html[data-keyboard-open="true"] .wavelink-comments-input-footer {
   }
 
   .wavelink-profile-avatar-ring {
-    width: 7.25rem; /* 116px on desktop */
-    height: 7.25rem;
+    width: 7.5rem; /* 120px on desktop */
+    height: 7.5rem;
   }
 
   .wavelink-profile-identity-col {
     flex: 1 1 0%;
     padding-top: 0.75rem;
-    gap: 0.75rem;
+    gap: 0.875rem;
+  }
+
+  .wavelink-gamer-header-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(17.5rem, 20.5rem);
+    align-items: start;
+    gap: 1.25rem;
   }
 
   .wavelink-profile-stats-row {
-    max-width: 34rem;
+    max-width: 38rem;
     gap: 0.625rem;
   }
 
+  /* Two-Column Gamer Dashboard Layout:
+     Left Column = Favorite badges, Next goals (owner), Quick Settings/Profile Menu
+     Right Column = Tabs + Posts / Achievements / Challenges / About */
+  .wavelink-profile-desktop-body {
+    display: grid;
+    grid-template-columns: minmax(17.5rem, 21rem) minmax(0, 1fr);
+    align-items: start;
+    gap: 1.375rem;
+  }
+
+  .wavelink-profile-side-col {
+    order: 1;
+    position: sticky;
+    top: 4.5rem;
+  }
+
+  .wavelink-profile-main-col {
+    order: 2;
+    max-width: 100%;
+  }
+
+  .wavelink-gamer-tabs-bar {
+    position: static;
+    border-radius: 1.25rem;
+    padding: 0.425rem;
+  }
+
+  .wavelink-gamer-tab-pill {
+    font-size: 0.8125rem;
+    border-radius: 0.875rem;
+  }
+
   .wavelink-profile-posts-grid {
-    max-width: 45rem; /* 720px max width for 3-column post grid */
+    max-width: 100%;
     gap: 0.625rem;
   }
 
@@ -3224,31 +3408,14 @@ html[data-keyboard-open="true"] .wavelink-comments-input-footer {
   }
 }
 
-/* Wide Desktop Two-Column Profile Body (1280px and up):
-   Left column = Posts grid (max 720px), Right column = Side panel (320-360px) with Menu cards, Badges & WavePoints */
-@media (min-width: 1280px) {
-  .wavelink-profile-desktop-body {
-    flex-direction: row;
-    align-items: flex-start;
-    gap: 1.5rem;
-  }
-
-  .wavelink-profile-main-col {
-    flex: 1 1 0%;
-    max-width: 45rem; /* 720px */
-  }
-
-  .wavelink-profile-side-col {
-    width: clamp(20rem, 24vw, 22.5rem); /* 320px - 360px */
-    flex-shrink: 0;
-    position: sticky;
-    top: 4.75rem;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .wavelink-profile-cover--animated {
+  .wavelink-profile-cover--animated,
+  .wavelink-levelup-enter {
     animation: none !important;
+  }
+  .wavelink-gamer-level-card,
+  .wavelink-gamer-tab-pill {
+    transition: none !important;
   }
 }
 
@@ -4812,6 +4979,8 @@ html[data-has-custom-bg="true"] .wavelink-feed-vivid-bg {
   .wavelink-trending-creator-card img,
   .wavelink-masonry-card,
   .wavelink-masonry-card img,
+  .wavelink-explore-card,
+  .wavelink-explore-card img,
   .wavelink-mobile-bottom-nav nav,
   .wavelink-mobile-bottom-nav button {
     transition: none !important;
@@ -4819,4 +4988,459 @@ html[data-has-custom-bg="true"] .wavelink-feed-vivid-bg {
     transform: none !important;
   }
 }
+
+/* ============================================================================
+   WAVELINK VISUAL EXPLORE PAGE & CLEAN MASONRY CARDS (MOBILE & DESKTOP)
+   - Mobile (< 768px): 2-column masonry grid with equal gaps
+   - Desktop (>= 1024px): 4-5 column masonry centered up to 1400px, min card width ~220px
+   - Natural 9:16 / 4:5 / 1:1 aspect ratios with zero stretching or fixed pixel widths
+   ============================================================================ */
+
+.wavelink-explore-shell {
+  width: 100%;
+  max-width: 100%;
+  min-height: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  padding: 0.75rem 0.75rem calc(5.75rem + env(safe-area-inset-bottom, 0px));
+  overflow-x: hidden;
+}
+
+.wavelink-explore-masonry {
+  column-count: 2;
+  column-gap: 0.75rem;
+  width: 100%;
+}
+
+.wavelink-explore-card {
+  break-inside: avoid;
+  page-break-inside: avoid;
+  margin-bottom: 0.75rem;
+  width: 100%;
+  display: block;
+  position: relative;
+  border-radius: 1.25rem;
+  overflow: hidden;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 200ms ease;
+}
+
+.wavelink-profile-posts-grid .wavelink-explore-card,
+.grid > .wavelink-explore-card {
+  margin-bottom: 0;
+}
+
+.wavelink-explore-ratio--9-16 {
+  aspect-ratio: 9 / 16;
+}
+
+.wavelink-explore-ratio--4-5 {
+  aspect-ratio: 4 / 5;
+}
+
+.wavelink-explore-ratio--1-1 {
+  aspect-ratio: 1 / 1;
+}
+
+/* Heart button visibility: subtle on mobile, appears on hover on desktop */
+.wavelink-explore-heart-btn {
+  opacity: 0.82;
+  transition: opacity 160ms ease, transform 160ms ease, background-color 160ms ease;
+}
+
+@media (max-width: 767px) {
+  .wavelink-explore-shell {
+    padding-left: 0.65rem;
+    padding-right: 0.65rem;
+  }
+
+  .wavelink-explore-masonry {
+    column-count: 2;
+    column-gap: 0.65rem;
+  }
+
+  .wavelink-explore-card {
+    margin-bottom: 0.65rem;
+    border-radius: 1.2rem;
+  }
+
+  .wavelink-explore-card * {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
+@media (min-width: 768px) {
+  .wavelink-explore-shell {
+    padding: 1.25rem 1.25rem 3rem;
+  }
+
+  .wavelink-explore-masonry {
+    column-count: 3;
+    column-gap: 1rem;
+  }
+
+  .wavelink-explore-card {
+    margin-bottom: 1rem;
+    border-radius: 1.35rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  /* Allow Explore view to use full width up to 1400px centered */
+  .wavelink-main-content--explore {
+    max-width: 1400px !important;
+    width: 100% !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+
+  .wavelink-explore-shell {
+    max-width: 1400px;
+    padding: 1.5rem 1.5rem 3.5rem;
+  }
+
+  /* 4-5 column responsive masonry with min card width ~220px */
+  .wavelink-explore-masonry {
+    column-width: 225px;
+    column-count: 5;
+    column-gap: 1.1rem;
+  }
+
+  .wavelink-explore-card {
+    margin-bottom: 1.1rem;
+    border-radius: 1.4rem;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .wavelink-explore-heart-btn:not([data-liked="true"]) {
+    opacity: 0;
+  }
+
+  .wavelink-explore-card:hover .wavelink-explore-heart-btn,
+  .wavelink-explore-card:focus-within .wavelink-explore-heart-btn {
+    opacity: 1;
+  }
+
+  .wavelink-explore-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 18px 36px -12px rgba(15, 23, 42, 0.28),
+      0 0 0 1px color-mix(in srgb, var(--accent-primary) 38%, transparent);
+  }
+}
+
+/* ============================================================================
+   WAVELINK GLASSY "MESSAGE" INBOX REDESIGN (MOBILE-FIRST + DESKTOP 2-PANE)
+   - Uses active theme CSS variables (--bg-surface, --accent-primary, --accent-secondary, etc.)
+   - Top round glass back & "..." buttons + centered "Message" title
+   - Organic cluster row of floating profile bubbles with center user bubble + 24h note speech bubbles
+   - Glass segmented 3-tab pill ("Inbox 26", "Unread", "Requests")
+   - Clean 56px avatar conversation cards with swipe-left Delete/Mute tray & inline mute bell
+   - Tablet (< 1024px) uses mobile layout; Desktop (@media (min-width: 1024px)) uses ~380px left pane + right conversation pane
+   ============================================================================ */
+
+.wavelink-msg-inbox-col {
+  background:
+    radial-gradient(
+      120% 65% at 50% 0%,
+      color-mix(in srgb, var(--accent-primary) 16%, transparent) 0%,
+      transparent 68%
+    ),
+    radial-gradient(
+      95% 55% at 90% 18%,
+      color-mix(in srgb, var(--accent-secondary) 13%, transparent) 0%,
+      transparent 64%
+    ),
+    var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.wavelink-msg-glass-header {
+  background: color-mix(in srgb, var(--bg-surface) 84%, transparent);
+  backdrop-filter: blur(22px) saturate(160%);
+  -webkit-backdrop-filter: blur(22px) saturate(160%);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-hairline) 85%, rgba(255, 255, 255, 0.08));
+}
+
+.wavelink-msg-glass-circle-btn {
+  width: 2.65rem;
+  height: 2.65rem;
+  min-width: 2.65rem;
+  min-height: 2.65rem;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg-subtle) 82%, rgba(255, 255, 255, 0.07));
+  border: 1px solid color-mix(in srgb, var(--border-hairline) 90%, rgba(255, 255, 255, 0.14));
+  color: var(--text-primary);
+  box-shadow: 0 6px 18px -6px rgba(15, 23, 42, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 160ms ease,
+    border-color 160ms ease;
+}
+
+.wavelink-msg-glass-circle-btn:active {
+  transform: scale(0.93);
+}
+
+/* Organic floating bubble cluster under the top bar (staggered vertical offsets for cluster feel) */
+.wavelink-msg-bubble-cluster {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.7rem;
+  overflow-x: auto;
+  overflow-y: visible;
+  padding: 1.55rem 0.4rem 0.45rem;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.wavelink-msg-bubble-cluster::-webkit-scrollbar {
+  display: none;
+}
+
+.wavelink-msg-bubble-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+  transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.wavelink-msg-bubble-node--offset-up {
+  transform: translateY(-5px);
+}
+
+.wavelink-msg-bubble-node--offset-down {
+  transform: translateY(4px);
+}
+
+.wavelink-msg-bubble-node--center {
+  transform: translateY(-2px);
+  z-index: 3;
+}
+
+.wavelink-msg-bubble-ring {
+  padding: 2.5px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    135deg,
+    var(--accent-primary) 0%,
+    color-mix(in srgb, var(--accent-primary) 50%, #ec4899) 50%,
+    var(--accent-secondary) 100%
+  );
+  box-shadow: 0 10px 24px -8px color-mix(in srgb, var(--accent-primary) 42%, rgba(15, 23, 42, 0.32));
+}
+
+.wavelink-msg-bubble-ring--self {
+  padding: 3px;
+  box-shadow: 0 12px 28px -8px color-mix(in srgb, var(--accent-primary) 55%, rgba(15, 23, 42, 0.4));
+}
+
+/* Speech-bubble 24h note floating above avatar bubbles */
+.wavelink-msg-note-bubble {
+  position: absolute;
+  bottom: calc(100% - 0.15rem);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+  max-width: 6.75rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0.22rem 0.55rem;
+  border-radius: 0.85rem;
+  font-size: 0.65rem;
+  font-weight: 800;
+  line-height: 1.2;
+  background: color-mix(in srgb, var(--bg-surface) 94%, #ffffff);
+  color: var(--text-primary);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 35%, var(--border-hairline));
+  box-shadow: 0 8px 18px -6px rgba(15, 23, 42, 0.25);
+  pointer-events: auto;
+}
+
+.wavelink-msg-note-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  background: inherit;
+  border-right: inherit;
+  border-bottom: inherit;
+  transform: translateX(-50%) rotate(45deg);
+}
+
+/* Glass segmented pill with 3 tabs: Inbox 26 | Unread | Requests */
+.wavelink-msg-segmented-pill {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.3rem;
+  padding: 0.28rem;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--bg-subtle) 86%, rgba(15, 23, 42, 0.08));
+  border: 1px solid color-mix(in srgb, var(--border-hairline) 90%, rgba(255, 255, 255, 0.1));
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.wavelink-msg-segmented-tab {
+  min-height: 2.35rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 9999px;
+  font-size: 0.76rem;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  color: var(--text-secondary);
+  transition: background 180ms ease, color 180ms ease, box-shadow 180ms ease, transform 150ms ease;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.wavelink-msg-segmented-tab[data-active="true"] {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent-primary) 92%, #2563eb) 0%,
+    color-mix(in srgb, var(--accent-secondary) 90%, #0d9488) 100%
+  );
+  color: #ffffff;
+  box-shadow: 0 6px 16px -4px color-mix(in srgb, var(--accent-primary) 45%, rgba(15, 23, 42, 0.28));
+}
+
+/* Conversation row card with 56px avatar + gradient ring + swipe-left tray */
+.wavelink-msg-row-wrap {
+  position: relative;
+  border-radius: 1.35rem;
+  overflow: hidden;
+  margin-bottom: 0.5rem;
+}
+
+.wavelink-msg-row-actions-tray {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: stretch;
+  z-index: 1;
+}
+
+.wavelink-msg-row-card {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.72rem 0.85rem;
+  border-radius: 1.35rem;
+  background: color-mix(in srgb, var(--bg-surface) 92%, var(--bg-subtle));
+  border: 1px solid color-mix(in srgb, var(--border-hairline) 85%, rgba(255, 255, 255, 0.08));
+  box-shadow: 0 6px 18px -10px rgba(15, 23, 42, 0.14);
+  transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.wavelink-msg-row-card[data-active="true"] {
+  background: color-mix(in srgb, var(--accent-primary) 13%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--accent-primary) 45%, var(--border-hairline));
+  box-shadow: 0 10px 24px -10px color-mix(in srgb, var(--accent-primary) 28%, transparent);
+}
+
+.wavelink-msg-row-card[data-focused="true"] {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.wavelink-msg-unread-badge {
+  min-width: 1.35rem;
+  height: 1.35rem;
+  padding: 0 0.4rem;
+  border-radius: 9999px;
+  font-size: 0.68rem;
+  font-weight: 800;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  color: #ffffff;
+  box-shadow: 0 4px 10px -2px color-mix(in srgb, var(--accent-primary) 50%, transparent);
+}
+
+.wavelink-msg-unread-badge--muted {
+  background: color-mix(in srgb, var(--text-secondary) 32%, var(--bg-subtle));
+  color: var(--text-primary);
+  box-shadow: none;
+}
+
+/* Tablet (768px - 1023px) uses the same collapsible mobile inbox layout */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .wavelink-chat-left-col {
+    position: relative;
+    overflow: hidden;
+    height: 100%;
+    width: 100%;
+  }
+
+  .wavelink-chat-home-header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 25;
+    transform: translate3d(0, 0, 0);
+    transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 220ms ease;
+    will-change: transform;
+  }
+
+  .wavelink-chat-home-header[data-header-hidden="true"] {
+    transform: translate3d(0, -104%, 0);
+    box-shadow: none;
+    pointer-events: none;
+  }
+
+  .wavelink-chat-home-scroll {
+    padding-top: calc(var(--chat-home-header-h, 15.5rem) + 0.75rem) !important;
+    padding-bottom: calc(8.5rem + env(safe-area-inset-bottom, 0px)) !important;
+  }
+}
+
+/* Desktop (1024px and up): Two panes — Inbox on left (~380px) and Open Conversation on right */
+@media (min-width: 1024px) {
+  .wavelink-chat-left-col {
+    width: clamp(22.5rem, 26vw, 24.5rem) !important; /* ~380px */
+    position: relative;
+    overflow: hidden;
+  }
+
+  .wavelink-msg-row-card:hover {
+    background: color-mix(in srgb, var(--accent-primary) 8%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent-primary) 30%, var(--border-hairline));
+  }
+
+  .wavelink-msg-glass-circle-btn:hover {
+    background: color-mix(in srgb, var(--accent-primary) 14%, var(--bg-subtle));
+    border-color: color-mix(in srgb, var(--accent-primary) 35%, var(--border-hairline));
+  }
+
+  .wavelink-msg-bubble-node:hover {
+    transform: translateY(-4px) scale(1.03);
+  }
+}
+
+
 

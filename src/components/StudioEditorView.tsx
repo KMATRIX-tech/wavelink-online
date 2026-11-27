@@ -28,6 +28,8 @@ import {
   clearFailedVideoAndStudioDrafts,
 } from '../services/videoUploadQueue';
 import { savePostDocument } from '../services/postService';
+import { validateAndModerateText } from '../services/moderationService';
+import { cleanCaption } from '../utils/cleanCaption';
 import { SongSelectorModal } from './SongSelectorModal';
 import { SongPlayerCard } from './SongPlayerCard';
 import { useBottomSheetLock } from '../utils/sheetLock';
@@ -438,7 +440,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
   const [isHeavyActionLoading, setIsHeavyActionLoading] = useState<string | null>(null);
   const [isPublishing, setIsPublishing] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
-  const [uploadStatusText, setUploadStatusText] = useState<string>('Uploading to Cloudinary...');
+  const [uploadStatusText, setUploadStatusText] = useState<string>('Uploading via Cloudflare...');
   const [canRetryUpload, setCanRetryUpload] = useState<boolean>(false);
   const [publishSuccess, setPublishSuccess] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -1637,13 +1639,28 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       }
     }
 
+    // Layer 1 + Layer 2 moderation on caption, hashtags & locationTag before upload
+    const studioTextToCheck = [caption.trim(), locationTag.trim()].filter(Boolean).join(' ');
+    const cachedProfileForMod = getCachedUserProfile(currentUser.uid);
+    let modCheckedAt = new Date().toISOString();
+    if (studioTextToCheck) {
+      const modVerdict = await validateAndModerateText(studioTextToCheck, 'post', cachedProfileForMod);
+      if (!modVerdict.allowed) {
+        setErrorMsg(modVerdict.friendlyMessage);
+        return;
+      }
+      if (modVerdict.moderationCheckedAt) {
+        modCheckedAt = modVerdict.moderationCheckedAt;
+      }
+    }
+
     // Clear any old failed drafts before starting a fresh upload from the browser
     clearFailedVideoAndStudioDrafts();
 
     setIsPublishing(true);
     setCanRetryUpload(false);
     setUploadProgress(5);
-    setUploadStatusText('Preparing export for Cloudinary...');
+    setUploadStatusText('Preparing export for Cloudflare...');
     setErrorMsg(null);
 
     const extractedHashtags = Array.from(
@@ -1729,7 +1746,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
             authorUsername,
             authorPhotoURL,
             file: selectedFile,
-            caption: caption.trim() || 'New Wave Video ✨',
+            caption: cleanCaption(caption),
             trimStart,
             trimEnd,
             customThumbnailUrl: customCoverHttpUrl,
@@ -1742,7 +1759,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
             songMetadata: songMetadataPayload,
             onProgress: (pct, statusLabel) => {
               setUploadProgress(Math.max(5, Math.min(99, pct)));
-              setUploadStatusText(statusLabel || `Uploading to Cloudinary (${pct}%)...`);
+              setUploadStatusText(statusLabel || `Uploading via Cloudflare (${pct}%)...`);
             },
             onComplete: () => {
               resolve();
@@ -1770,6 +1787,7 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
       let finalThumbnailUrl: string | undefined = undefined;
       let finalWidth: number | undefined = undefined;
       let finalHeight: number | undefined = undefined;
+      let finalMediaSafety: 'safe' | 'borderline' = 'safe';
       const uploadedCarouselUrls: string[] = [];
 
       if (selectedFile && mediaType === 'image') {
@@ -1789,22 +1807,25 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
           maxHeight: 1280,
           targetMaxBytes: 240 * 1024,
         });
-        setUploadStatusText('Uploading optimized photo to Cloudinary...');
+        setUploadStatusText('Uploading optimized photo via Cloudflare...');
         const mainUploaded = await uploadImageToCloudinary(
           compressedMain.blob,
           (pct) => {
             const totalFiles = Math.max(1, carouselFiles.length);
             const scaled = Math.round(15 + (pct / totalFiles) * 0.75);
             setUploadProgress(Math.max(15, Math.min(90, scaled)));
-            setUploadStatusText(`Uploading optimized photo (${pct}%)...`);
+            setUploadStatusText(`Uploading optimized photo via Cloudflare (${pct}%)...`);
           },
           { maxWidth: 1080, maxHeight: 1080, targetMaxBytes: 240 * 1024, thumbnailWidth: 720 }
         );
 
         if (!mainUploaded.secureUrl || !mainUploaded.secureUrl.startsWith('http')) {
-          throw new Error('Cloudinary photo upload did not return a valid secure_url.');
+          throw new Error('Cloudflare photo upload did not return a valid HTTPS URL.');
         }
 
+        if (mainUploaded.mediaSafety === 'borderline') {
+          finalMediaSafety = 'borderline';
+        }
         finalImageUrl = optimizeCloudinaryThumbnailUrl(mainUploaded.secureUrl, { width: 1080 });
         finalThumbnailUrl =
           mainUploaded.thumbnailUrl ||
@@ -1831,6 +1852,9 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
               },
               { maxWidth: 1080, maxHeight: 1080, targetMaxBytes: 240 * 1024, thumbnailWidth: 720 }
             );
+            if (extraUploaded.mediaSafety === 'borderline') {
+              finalMediaSafety = 'borderline';
+            }
             if (extraUploaded.secureUrl && extraUploaded.secureUrl.startsWith('http')) {
               uploadedCarouselUrls.push(
                 optimizeCloudinaryThumbnailUrl(extraUploaded.secureUrl, { width: 1080 })
@@ -1851,11 +1875,14 @@ export const StudioEditorView: React.FC<StudioEditorViewProps> = ({ onNavigateTo
         authorName,
         authorUsername,
         authorPhotoURL,
-        content: caption.trim() || 'Created with WaveLink Studio ✨',
+        content: cleanCaption(caption),
         imageUrl: finalImageUrl,
         thumbnailUrl: finalThumbnailUrl,
         imageUrls: uploadedCarouselUrls.length > 1 ? uploadedCarouselUrls : undefined,
         mediaType: mediaType === 'image' ? 'image' : undefined,
+        mediaSafety: finalMediaSafety,
+        moderationChecked: true,
+        moderationCheckedAt: modCheckedAt,
         videoWidth: finalWidth,
         videoHeight: finalHeight,
         aspectRatio,

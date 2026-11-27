@@ -165,9 +165,23 @@ export async function sharePost(post) {
  * @returns {Promise<{ success: boolean, method: string }>}
  */
 export async function inviteFriends(customMessage) {
+  let inviteUrl = APP_URL;
+  try {
+    const cachedUid =
+      (typeof window !== 'undefined' &&
+        (window.__WAVELINK_CURRENT_UID__ ||
+          localStorage.getItem('wavelink_current_uid'))) ||
+      '';
+    if (cachedUid && typeof cachedUid === 'string' && cachedUid.trim()) {
+      inviteUrl = `${APP_URL}/?invite=${encodeURIComponent(cachedUid.trim())}`;
+    }
+  } catch {
+    // use default APP_URL
+  }
+
   const defaultMessage =
     customMessage ||
-    `Hey! 🌊 Join me on WaveLink — the modern social platform with Video Reels, 24-hour Sparks, live AI voice talks, and creator tipping. Check it out here: ${APP_URL}`;
+    `Hey! 🌊 Join me on WaveLink — the modern social platform with Video Reels, 24-hour Sparks, live AI voice talks, and creator tipping. Check it out here: ${inviteUrl}`;
 
   // 1. Try Web Share API first
   if (typeof navigator !== 'undefined' && navigator.share) {
@@ -175,7 +189,7 @@ export async function inviteFriends(customMessage) {
       await navigator.share({
         title: 'Join me on WaveLink 🌊',
         text: defaultMessage,
-        url: APP_URL
+        url: inviteUrl
       });
       return { success: true, method: 'web_share' };
     } catch (err) {

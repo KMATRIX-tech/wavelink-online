@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
+import { awardProgressionAction } from '../services/progressionService';
 import {
   User as FirebaseUser,
   onAuthStateChanged,
@@ -62,7 +63,8 @@ import {
   CustomAppBackground,
   CustomBackgroundHistoryItem,
   CustomThemeMix,
-  SavedThemeMix
+  SavedThemeMix,
+  UserChatNote
 } from '../types';
 import {
   removeCurrentDeviceFcmToken,
@@ -347,6 +349,7 @@ interface AuthContextType {
     kangaBackgroundEnabled?: boolean;
     interests?: string[];
     interestsCompleted?: boolean;
+    hideAiGenerated?: boolean;
     weeklyWinnerUntil?: string;
     weeklyWinnerChallengeTitle?: string;
     weeklyWinnerHashtag?: string;
@@ -363,6 +366,19 @@ interface AuthContextType {
     customThemeMix?: CustomThemeMix | null;
     savedThemeMixes?: SavedThemeMix[];
     mutedChannelIds?: string[];
+    contactIds?: string[];
+    invitedByUid?: string;
+    pinnedChannelIds?: string[];
+    archivedChannelIds?: string[];
+    chatNote?: UserChatNote | null;
+    showChatNotes?: boolean;
+    chatUnreadFirst?: boolean;
+    lastSeenUpdateAt?: string;
+    highlightedBadges?: string[];
+    highlightedBadgeId?: string | null;
+    pendingWinnerCelebration?: null;
+    sensitiveContentFilter?: boolean;
+    mutedUserIds?: string[];
   }) => Promise<void>;
   toggleSavePost: (postId: string) => Promise<boolean>;
   toggleBlockUser: (targetUserId: string) => Promise<boolean>;
@@ -419,6 +435,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [customClaimRole, setCustomClaimRole] = useState<'admin' | 'sub_admin' | 'user'>('user');
   const [serverVerifiedRole, setServerVerifiedRole] = useState<'admin' | 'super_admin' | 'sub_admin' | 'user'>('user');
+  const [roleDocRole, setRoleDocRole] = useState<'admin' | 'subadmin' | 'user'>('user');
   const [adminCheckFailedReason, setAdminCheckFailedReason] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [globalToast, setGlobalToast] = useState<string | null>(null);
@@ -671,6 +688,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const claimRole = await readTokenClaimRole(user, false);
 
       if (isOwnerEmail) {
+        setRoleDocRole('admin');
         setDoc(
           userDocRef,
           {
@@ -680,7 +698,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           },
           { merge: true }
         ).catch(() => {});
+        setDoc(
+          doc(db, 'roles', user.uid),
+          {
+            uid: user.uid,
+            role: 'admin',
+            email: cleanUserEmail,
+            displayName: user.displayName || 'Keylan',
+            username: '@keylan',
+            assignedBy: 'bootstrap',
+            updatedAt: nowIso
+          },
+          { merge: true }
+        ).catch(() => {});
       }
+
+      // Single one-time read of /roles/{uid} on sign-in to check protected admin/subadmin role document
+      let fetchedRoleDocVal: 'admin' | 'subadmin' | 'user' = isOwnerEmail ? 'admin' : 'user';
+      try {
+        const roleSnap = await getDoc(doc(db, 'roles', user.uid));
+        if (roleSnap.exists()) {
+          const rawRoleVal = String(roleSnap.data()?.role || '').trim().toLowerCase();
+          if (rawRoleVal === 'admin' || rawRoleVal === 'super_admin') {
+            fetchedRoleDocVal = 'admin';
+          } else if (rawRoleVal === 'subadmin' || rawRoleVal === 'sub_admin') {
+            fetchedRoleDocVal = 'subadmin';
+          }
+        }
+      } catch {
+        // non-fatal if quota or network unavailable
+      }
+      setRoleDocRole(fetchedRoleDocVal);
 
       // 1. Look up existing user document by Firebase UID first
       let resolvedData: UserProfile | null = null;
@@ -720,9 +768,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // No existing profile found for UID or verified email: initialize single primary profile
         const { rewardFields, newlyAwarded, pointsAwarded } = computeDailyRewardState(user.uid, null);
         const initialRole: UserProfile['role'] =
-          isOwnerEmail || verifiedRoleOverride === 'admin' || claimRole === 'admin'
+          isOwnerEmail || fetchedRoleDocVal === 'admin' || verifiedRoleOverride === 'admin' || claimRole === 'admin'
             ? 'admin'
-            : verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin'
+            : fetchedRoleDocVal === 'subadmin' || verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin'
             ? 'sub_admin'
             : 'user';
         const isInitialAdmin = initialRole === 'admin';
@@ -772,9 +820,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const canonicalExistingRole = resolveCanonicalAdminRole(data.role, data.isSubAdmin);
         const effectiveRole: UserProfile['role'] =
-          isOwnerEmail || (data as any).isOwner === true || verifiedRoleOverride === 'admin' || claimRole === 'admin' || canonicalExistingRole === 'admin'
+          isOwnerEmail ||
+          (data as any).isOwner === true ||
+          fetchedRoleDocVal === 'admin' ||
+          verifiedRoleOverride === 'admin' ||
+          claimRole === 'admin' ||
+          canonicalExistingRole === 'admin'
             ? 'admin'
-            : verifiedRoleOverride === 'sub_admin' || claimRole === 'sub_admin' || canonicalExistingRole === 'sub_admin'
+            : fetchedRoleDocVal === 'subadmin' ||
+              verifiedRoleOverride === 'sub_admin' ||
+              claimRole === 'sub_admin' ||
+              canonicalExistingRole === 'sub_admin'
             ? 'sub_admin'
             : data.role || 'user';
         const isEffectiveAdmin = effectiveRole === 'admin';
@@ -838,6 +894,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             totalPoints: rewardFields.points
           });
           showGlobalToast(`🎁 Daily Login Bonus: +${pointsAwarded} WavePoints! (${rewardFields.loginStreak}-Day Streak 🔥)`);
+          awardProgressionAction('daily_checkin', { streak: rewardFields.loginStreak }).catch(() => {});
         }
 
         // One-time migration for any legacy data:image/* or blob: media still stored in /users/{uid}
@@ -1200,6 +1257,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     let presenceInterval: ReturnType<typeof setInterval> | null = null;
     let revocationSignOutTriggered = false;
 
+    try {
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const inviteParam = (params.get('invite') || params.get('ref') || '').trim();
+        if (inviteParam && /^[a-zA-Z0-9_-]{4,128}$/.test(inviteParam)) {
+          localStorage.setItem('wavelink_pending_invite_uid', inviteParam);
+        }
+      }
+    } catch {
+      // ignore URL param errors
+    }
+
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
       // If Hidden Owner Sign-In, Existing Account Setup, or Sign-Up Email Verification is pending, keep user on AuthPage
       try {
@@ -1228,6 +1297,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setCurrentUser(user);
 
       if (user) {
+        try {
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('wavelink_current_uid', user.uid);
+          }
+        } catch {
+          // ignore
+        }
         const cleanEmail = (user.email || '').trim().toLowerCase();
         const isVerifiedOwnerEmail =
           cleanEmail === 'keylanmbilinyi5@gmail.com' && Boolean(user.emailVerified);
@@ -1327,6 +1403,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 totalLoginDays: Math.max(snapData.totalLoginDays ?? 0, localReward?.totalLoginDays ?? 1),
                 pointTransactions: mergedTxs
               });
+
+              // Automatically add inviter from invite link (?invite=<uid>) to my contacts once authenticated
+              try {
+                if (typeof window !== 'undefined') {
+                  const pendingInviter = (localStorage.getItem('wavelink_pending_invite_uid') || '').trim();
+                  if (pendingInviter && pendingInviter !== user.uid) {
+                    localStorage.removeItem('wavelink_pending_invite_uid');
+                    const existingContacts = Array.isArray(snapData.contactIds) ? snapData.contactIds : [];
+                    if (!existingContacts.includes(pendingInviter)) {
+                      const nextContacts = [pendingInviter, ...existingContacts].slice(0, 500);
+                      setDoc(
+                        userDocRef,
+                        {
+                          contactIds: nextContacts,
+                          ...(snapData.invitedByUid ? {} : { invitedByUid: pendingInviter }),
+                          updatedAt: new Date().toISOString()
+                        },
+                        { merge: true }
+                      ).catch(() => {});
+                    }
+                  } else if (pendingInviter === user.uid) {
+                    localStorage.removeItem('wavelink_pending_invite_uid');
+                  }
+                }
+              } catch {
+                // ignore invite contact storage errors
+              }
             }
           },
           (error) => {
@@ -1772,6 +1875,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     kangaBackgroundEnabled?: boolean;
     interests?: string[];
     interestsCompleted?: boolean;
+    hideAiGenerated?: boolean;
     weeklyWinnerUntil?: string;
     weeklyWinnerChallengeTitle?: string;
     weeklyWinnerHashtag?: string;
@@ -1788,6 +1892,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     customThemeMix?: CustomThemeMix | null;
     savedThemeMixes?: SavedThemeMix[];
     mutedChannelIds?: string[];
+    contactIds?: string[];
+    invitedByUid?: string;
+    pinnedChannelIds?: string[];
+    archivedChannelIds?: string[];
+    chatNote?: UserChatNote | null;
+    showChatNotes?: boolean;
+    chatUnreadFirst?: boolean;
+    lastSeenUpdateAt?: string;
+    highlightedBadges?: string[];
+    highlightedBadgeId?: string | null;
+    pendingWinnerCelebration?: null;
+    sensitiveContentFilter?: boolean;
+    mutedUserIds?: string[];
   }) => {
     if (!currentUser) return;
     try {
@@ -1845,6 +1962,85 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
           .slice(0, 200);
       }
+      if (data.mutedUserIds !== undefined && Array.isArray(data.mutedUserIds)) {
+        updatePayload.mutedUserIds = Array.from(
+          new Set(
+            data.mutedUserIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          )
+        ).slice(0, 500);
+      }
+      if (data.sensitiveContentFilter !== undefined) {
+        const lockedUnder18 = Boolean(
+          userProfile?.isUnder18 || userProfile?.privacySettings?.isTeenAccount
+        );
+        updatePayload.sensitiveContentFilter = lockedUnder18
+          ? true
+          : Boolean(data.sensitiveContentFilter);
+      }
+      if (data.contactIds !== undefined && Array.isArray(data.contactIds)) {
+        updatePayload.contactIds = Array.from(
+          new Set(
+            data.contactIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          )
+        ).slice(0, 500);
+      }
+      if (data.invitedByUid !== undefined) {
+        updatePayload.invitedByUid = sanitizeUserText(data.invitedByUid, 128);
+      }
+      if (data.pinnedChannelIds !== undefined && Array.isArray(data.pinnedChannelIds)) {
+        updatePayload.pinnedChannelIds = Array.from(
+          new Set(
+            data.pinnedChannelIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          )
+        ).slice(0, 100);
+      }
+      if (data.archivedChannelIds !== undefined && Array.isArray(data.archivedChannelIds)) {
+        updatePayload.archivedChannelIds = Array.from(
+          new Set(
+            data.archivedChannelIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          )
+        ).slice(0, 200);
+      }
+      if (data.chatNote !== undefined) {
+        if (data.chatNote === null || !data.chatNote.text?.trim()) {
+          updatePayload.chatNote = null;
+        } else {
+          const cleanNoteText = sanitizeUserText(data.chatNote.text.trim(), 60);
+          const nowMs = Date.now();
+          updatePayload.chatNote = {
+            text: cleanNoteText,
+            createdAt: data.chatNote.createdAt || new Date(nowMs).toISOString(),
+            expiresAt: data.chatNote.expiresAt || new Date(nowMs + 24 * 60 * 60 * 1000).toISOString()
+          };
+        }
+      }
+      if (data.showChatNotes !== undefined) {
+        updatePayload.showChatNotes = Boolean(data.showChatNotes);
+      }
+      if (data.chatUnreadFirst !== undefined) {
+        updatePayload.chatUnreadFirst = Boolean(data.chatUnreadFirst);
+      }
+      if (data.lastSeenUpdateAt !== undefined) {
+        updatePayload.lastSeenUpdateAt = sanitizeUserText(data.lastSeenUpdateAt, 64);
+      }
+      if (data.highlightedBadges !== undefined && Array.isArray(data.highlightedBadges)) {
+        updatePayload.highlightedBadges = Array.from(
+          new Set(
+            data.highlightedBadges
+              .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+              .map((id) => sanitizeUserText(id.trim(), 48))
+          )
+        ).slice(0, 3);
+      }
+      if (data.highlightedBadgeId !== undefined) {
+        updatePayload.highlightedBadgeId =
+          typeof data.highlightedBadgeId === 'string' && data.highlightedBadgeId.trim()
+            ? sanitizeUserText(data.highlightedBadgeId.trim(), 80)
+            : null;
+      }
+      if (data.pendingWinnerCelebration === null) {
+        updatePayload.pendingWinnerCelebration = null;
+      }
       if (data.termsAgreement !== undefined) {
         updatePayload.termsAgreement = data.termsAgreement;
       }
@@ -1877,6 +2073,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       if (data.interestsCompleted !== undefined) {
         updatePayload.interestsCompleted = Boolean(data.interestsCompleted);
+      }
+      if (data.hideAiGenerated !== undefined) {
+        updatePayload.hideAiGenerated = Boolean(data.hideAiGenerated);
       }
       if (data.weeklyWinnerUntil !== undefined) {
         updatePayload.weeklyWinnerUntil = data.weeklyWinnerUntil;
@@ -2412,12 +2611,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const isSuperAdmin =
     isOwnerEmailMatch ||
     Boolean((userProfile as any)?.isOwner) ||
+    roleDocRole === 'admin' ||
     canonicalClaimRole === 'admin' ||
     canonicalProfileRole === 'admin' ||
     canonicalServerRole === 'admin';
   const isSubAdmin =
     !isSuperAdmin &&
-    (canonicalClaimRole === 'sub_admin' ||
+    (roleDocRole === 'subadmin' ||
+      canonicalClaimRole === 'sub_admin' ||
       canonicalProfileRole === 'sub_admin' ||
       canonicalServerRole === 'sub_admin' ||
       canonicalStaffRole === 'moderator');

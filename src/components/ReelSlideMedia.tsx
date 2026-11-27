@@ -21,6 +21,9 @@ import {
   getOptimizedImagePreviewUrl
 } from '../services/dataSaverService';
 import { EXCLUSIVE_AUDIO_EVENT } from './VideoPlayer';
+import { cleanCaption } from '../utils/cleanCaption';
+import { useAuth } from '../context/AuthContext';
+import { SensitiveMediaGate } from './SensitiveMediaGate';
 
 export interface ReelSlideMediaProps {
   post: Post;
@@ -56,6 +59,7 @@ export const ReelSlideMedia: React.FC<ReelSlideMediaProps> = ({
   language,
   registerVideoActions
 }) => {
+  const { userProfile } = useAuth();
   const { enabled: isDataSaverOn } = useDataSaver();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -417,7 +421,11 @@ export const ReelSlideMedia: React.FC<ReelSlideMediaProps> = ({
     >
       {/* 1. VIDEO POST */}
       {hasVideo && (
-        <>
+        <SensitiveMediaGate
+          mediaSafety={post.mediaSafety}
+          userProfile={userProfile}
+          className="w-full h-full"
+        >
           {/* Thumbnail / Poster First */}
           {optimizedPoster && (
             <img
@@ -499,12 +507,16 @@ export const ReelSlideMedia: React.FC<ReelSlideMediaProps> = ({
               </button>
             </div>
           )}
-        </>
+        </SensitiveMediaGate>
       )}
 
       {/* 2. PHOTO / CAROUSEL POST (Full-screen object-fit: cover frame) */}
       {hasImages && (
-        <div className="relative w-full h-full">
+        <SensitiveMediaGate
+          mediaSafety={post.mediaSafety}
+          userProfile={userProfile}
+          className="relative w-full h-full"
+        >
           {!imageLoaded && (
             <div className="absolute inset-0 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950 animate-pulse" />
           )}
@@ -563,7 +575,7 @@ export const ReelSlideMedia: React.FC<ReelSlideMediaProps> = ({
               </div>
             </div>
           )}
-        </div>
+        </SensitiveMediaGate>
       )}
 
       {/* 3. TEXT / AUDIO WAVE POST (Full-screen atmospheric gradient canvas) */}
@@ -584,9 +596,11 @@ export const ReelSlideMedia: React.FC<ReelSlideMediaProps> = ({
               </span>
             </div>
           )}
-          <p className="text-white text-xl sm:text-2xl font-extrabold leading-relaxed max-w-md text-balance drop-shadow-md">
-            {post.content}
-          </p>
+          {cleanCaption(post.content) && (
+            <p className="text-white text-xl sm:text-2xl font-extrabold leading-relaxed max-w-md text-balance drop-shadow-md">
+              {cleanCaption(post.content)}
+            </p>
+          )}
         </div>
       )}
 

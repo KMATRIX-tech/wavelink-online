@@ -18,6 +18,7 @@ import {
 } from '../services/videoUploadQueue';
 import { CrystalBadge } from './CrystalBadge';
 import { PostBody } from './PostBody';
+import { cleanCaption } from '../utils/cleanCaption';
 
 interface VideoUploadProgressChipProps {
   /** When 'feed-inline', renders inline at the top of the feed. Otherwise renders a floating notification chip. */
@@ -363,9 +364,9 @@ export const VideoUploadingFeedPostList: React.FC = () => {
             </div>
 
             {/* Caption */}
-            {caption && (
+            {cleanCaption(caption) && (
               <PostBody
-                content={caption}
+                content={cleanCaption(caption)}
                 createdAt={job.createdAt || Date.now()}
                 showEditButton={false}
                 showBookmarkButton={false}
@@ -398,7 +399,7 @@ export const VideoUploadingFeedPostList: React.FC = () => {
               ) : (
                 <div className="flex flex-col items-center justify-center text-white/80 p-6">
                   <Film className="w-10 h-10 mb-2 text-blue-400" />
-                  <span className="text-xs font-bold">{job.fileName}</span>
+                  <span className="text-xs font-bold">Uploading video...</span>
                 </div>
               )}
 

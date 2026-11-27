@@ -11,6 +11,7 @@ import {
   setDoc
 } from 'firebase/firestore';
 import { Post, UserFollow, CreatorPrivateStats } from '../types';
+import { cleanCaption } from '../utils/cleanCaption';
 import {
   BarChart3,
   TrendingUp,
@@ -460,7 +461,7 @@ export const CreatorAnalyticsView: React.FC<CreatorAnalyticsViewProps> = ({
                   </span>
                   <div className="min-w-0 flex-1">
                     <p className="text-xs sm:text-sm font-bold text-stone-900 truncate">
-                      {item.post.content || (language === 'sw' ? 'Chapisho la Picha/Video' : 'Media post')}
+                      {cleanCaption(item.post.content) || (language === 'sw' ? 'Chapisho la Picha/Video' : 'Media post')}
                     </p>
                     <span className="text-[10px] text-stone-400 font-mono">
                       {new Date(item.post.createdAt).toLocaleDateString()}

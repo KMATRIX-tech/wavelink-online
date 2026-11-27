@@ -33,6 +33,7 @@ import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
 import { sanitizeUserText } from '../utils/security';
 import { sendNotification } from '../services/notificationService';
+import { validateAndModerateText } from '../services/moderationService';
 import { CrystalBadge } from './CrystalBadge';
 
 interface ReelDesktopRightPanelProps {
@@ -139,11 +140,20 @@ export const ReelDesktopRightPanel: React.FC<ReelDesktopRightPanelProps> = ({
     );
   }, [latestComments, paginatedComments]);
 
+  const [commentModNotice, setCommentModNotice] = useState<string | null>(null);
+
   const handleSubmitComment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser || !post || isSending) return;
     const clean = sanitizeUserText(commentInput, 800);
     if (!clean) return;
+
+    setCommentModNotice(null);
+    const modVerdict = await validateAndModerateText(clean, 'comment', userProfile);
+    if (!modVerdict.allowed) {
+      setCommentModNotice(modVerdict.friendlyMessage);
+      return;
+    }
 
     setIsSending(true);
     setCommentInput('');
@@ -162,6 +172,8 @@ export const ReelDesktopRightPanel: React.FC<ReelDesktopRightPanelProps> = ({
       authorName,
       authorPhotoURL: authorAvatar,
       content: clean,
+      moderationChecked: true,
+      moderationCheckedAt: modVerdict.moderationCheckedAt || nowIso,
       createdAt: nowIso
     };
 
@@ -181,6 +193,8 @@ export const ReelDesktopRightPanel: React.FC<ReelDesktopRightPanelProps> = ({
         authorName,
         authorPhotoURL: authorAvatar,
         content: clean,
+        moderationChecked: true,
+        moderationCheckedAt: modVerdict.moderationCheckedAt || nowIso,
         createdAt: nowIso
       });
       await updateDoc(doc(db, 'posts', post.id), {
@@ -484,6 +498,11 @@ export const ReelDesktopRightPanel: React.FC<ReelDesktopRightPanelProps> = ({
         onSubmit={handleSubmitComment}
         className="wavelink-reel-comment-bar p-3 border-t border-white/15 bg-slate-950/90 shrink-0 space-y-2"
       >
+        {commentModNotice && (
+          <div className="px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-400/35 text-[11px] font-semibold text-amber-100 leading-snug">
+            {commentModNotice}
+          </div>
+        )}
         {showEmojiRow && (
           <div className="flex items-center justify-between gap-1 px-1">
             {PANEL_EMOJIS.map((em) => (

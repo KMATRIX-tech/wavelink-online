@@ -45,8 +45,15 @@ import {
 } from '../firebase';
 import { recordSystemDomain } from '../services/verificationService';
 import { validateStrongPassword, clearClientFailedLogins } from '../utils/security';
+import { checkTextModerationLocal } from '../utils/contentModeration';
 import { useAuth } from '../context/AuthContext';
 import { LegalModal, LegalDocType } from './LegalModals';
+import {
+  MIN_SIGNUP_AGE,
+  ADULT_AGE_THRESHOLD,
+  deriveMinimalAgeRecord,
+  PARENTAL_PRIVACY_NOTICE
+} from '../config/ageConfig';
 import {
   Waves,
   Mail,
@@ -783,6 +790,12 @@ export const AuthPage: React.FC = () => {
       return;
     }
 
+    const identityMod = checkTextModerationLocal(`${rawUsername} ${displayName.trim()}`);
+    if (identityMod.flagged) {
+      setError(identityMod.friendlyMessage);
+      return;
+    }
+
     const pwValidation = validateStrongPassword(password);
     if (!pwValidation.valid) {
       setError(
@@ -982,6 +995,34 @@ export const AuthPage: React.FC = () => {
         return;
       }
 
+      const ageRecord = deriveMinimalAgeRecord(birthDate);
+      if (!ageRecord.valid) {
+        setError(ageRecord.reason || 'Please enter your date of birth to continue.');
+        setIsLoading(false);
+        return;
+      }
+      if (!ageRecord.allowed) {
+        setError(
+          ageRecord.reason ||
+            `You must be at least ${MIN_SIGNUP_AGE} years old to join WaveLink.`
+        );
+        setIsLoading(false);
+        return;
+      }
+
+      if (!isAgeConfirmed) {
+        setError('Please accept WaveLink Community Guidelines, Terms of Service, and Privacy Policy before creating your account.');
+        setIsLoading(false);
+        return;
+      }
+
+      const signupIdentityMod = checkTextModerationLocal(`${rawUsername} ${displayName.trim()}`);
+      if (signupIdentityMod.flagged) {
+        setError(signupIdentityMod.friendlyMessage);
+        setIsLoading(false);
+        return;
+      }
+
       const cleanHandle =
         rawUsername.replace(/^@/, '').toLowerCase().replace(/[^a-z0-9_.-]/g, '') || 'waver';
       const formattedUsername = `@${cleanHandle}`;
@@ -1031,7 +1072,10 @@ export const AuthPage: React.FC = () => {
         }
 
         // Write Firestore profile document (enforced by Firestore rules requiring request.auth.token.email_verified == true)
+        // Data minimization: store only birthYear, birthMonth, turns18At, and isUnder18 (never expose raw birthday publicly)
         const signupPhotoUrl = getBestAuthUserPhotoUrl(activeUser, null);
+        const acceptedIso = new Date().toISOString();
+        const isTeenSignup = ageRecord.isTeen;
         await setDoc(
           doc(db, 'users', activeUser.uid),
           cleanFirestoreData({
@@ -1040,7 +1084,37 @@ export const AuthPage: React.FC = () => {
             username: formattedUsername,
             displayName: name,
             ...(isRealUserPhotoUrl(signupPhotoUrl) ? { photoURL: signupPhotoUrl } : {}),
-            updatedAt: new Date().toISOString()
+            isUnder18: isTeenSignup,
+            birthYear: ageRecord.birthYear,
+            birthMonth: ageRecord.birthMonth,
+            turns18At: ageRecord.turns18At,
+            parentalStatus: isTeenSignup ? 'unverified_teen' : 'none',
+            sensitiveContentFilter: true,
+            guidelinesAcceptedAt: acceptedIso,
+            guidelinesVersion: '2026-v2',
+            termsAgreement: {
+              accepted: true,
+              acceptedAt: acceptedIso,
+              termsVersion: '2026-v2',
+              marketingOptIn: false,
+              communityCodeAccepted: true
+            },
+            ...(isTeenSignup
+              ? {
+                  privacySettings: {
+                    whoCanSeePosts: 'followers',
+                    whoCanMessageMe: 'followers',
+                    whoCanCallMe: 'nobody',
+                    showOnlineStatus: false,
+                    showLastSeen: false,
+                    onlineVisibility: 'nobody',
+                    isTeenAccount: true,
+                    hideAdultMedia: true,
+                    updatedAt: acceptedIso
+                  }
+                }
+              : {}),
+            updatedAt: acceptedIso
           }),
           { merge: true }
         );
@@ -1320,6 +1394,7 @@ export const AuthPage: React.FC = () => {
     const path = window.location.pathname.toLowerCase();
     const params = new URLSearchParams(window.location.search);
     const legalParam = params.get('legal');
+    if (path === '/guidelines' || legalParam === 'guidelines') return 'guidelines';
     if (path === '/privacy' || legalParam === 'privacy') return 'privacy';
     if (path === '/terms' || legalParam === 'terms') return 'terms';
     if (legalParam === 'security') return 'security';
@@ -1327,6 +1402,8 @@ export const AuthPage: React.FC = () => {
     return null;
   });
   const [isAgeConfirmed, setIsAgeConfirmed] = useState(false);
+  const [birthDate, setBirthDate] = useState('');
+  const signupAgeEval = birthDate ? deriveMinimalAgeRecord(birthDate) : null;
   const stepTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const emailFieldRef = useRef<HTMLInputElement | null>(null);
   const passwordFieldRef = useRef<HTMLInputElement | null>(null);
@@ -2560,47 +2637,115 @@ export const AuthPage: React.FC = () => {
                 </div>
               )}
 
-              {/* Google Play Readiness: 13+ Age Gate & Community Content Rules Checkbox on Sign-Up */}
+              {/* Date of Birth (Minimum Age Check + Teen Protection Notice) + Legal Acceptance on Sign-Up */}
               {authMode === 'signup' && (
-                <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-slate-50/80 border border-slate-200/80 text-xs text-slate-700 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={isAgeConfirmed}
-                    onChange={(e) => setIsAgeConfirmed(e.target.checked)}
-                    className="mt-0.5 w-4 h-4 rounded border-slate-300 text-[#0F172A] focus:ring-[#0F172A]"
-                  />
-                  <span className="leading-snug">
-                    I confirm I am <strong>13 years or older</strong> and agree to WaveLink&apos;s{' '}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        setActiveLegalNotice('terms');
+                <div className="space-y-2.5">
+                  <div className="p-3 rounded-2xl bg-slate-50/90 border border-slate-200/90 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label
+                        htmlFor="signup-dob-input"
+                        className="text-xs font-semibold text-slate-800"
+                      >
+                        Date of birth <span className="text-rose-600">*</span>
+                      </label>
+                      <span className="text-[11px] text-slate-500">
+                        Minimum age: {MIN_SIGNUP_AGE}+
+                      </span>
+                    </div>
+                    <input
+                      id="signup-dob-input"
+                      type="date"
+                      value={birthDate}
+                      max={new Date().toISOString().slice(0, 10)}
+                      min="1905-01-01"
+                      onChange={(e) => {
+                        setBirthDate(e.target.value);
+                        if (error) setError(null);
                       }}
-                      className="underline font-semibold text-[#0F172A]"
-                    >
-                      Terms &amp; Content Rules
-                    </button>{' '}
-                    and{' '}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        setActiveLegalNotice('privacy');
-                      }}
-                      className="underline font-semibold text-[#0F172A]"
-                    >
-                      Privacy Policy
-                    </button>
-                    .
-                  </span>
-                </label>
+                      required
+                      className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-white border border-slate-300 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#0F172A]/20 focus:border-[#0F172A]"
+                    />
+                    <p className="text-[11px] leading-relaxed text-slate-600">
+                      {PARENTAL_PRIVACY_NOTICE.signupShortEn}
+                    </p>
+
+                    {signupAgeEval && !signupAgeEval.allowed && signupAgeEval.valid && (
+                      <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-medium flex items-start gap-2">
+                        <AlertCircle size={15} className="shrink-0 mt-0.5" />
+                        <span>
+                          Sorry, you must be at least <strong>{MIN_SIGNUP_AGE} years old</strong> to create a WaveLink account.
+                        </span>
+                      </div>
+                    )}
+
+                    {signupAgeEval && signupAgeEval.allowed && signupAgeEval.isTeen && (
+                      <div className="p-2.5 rounded-xl bg-teal-50/90 border border-teal-200 text-teal-900 text-xs space-y-1">
+                        <p className="font-semibold flex items-center gap-1.5">
+                          <ShieldCheck size={14} className="shrink-0 text-teal-700" />
+                          <span>Teen Account Safety Active (Under {ADULT_AGE_THRESHOLD})</span>
+                        </p>
+                        <p className="text-[11px] leading-snug text-teal-800">
+                          Your account starts in protected private mode (no stranger messages, no calls, no public posting, strict safety filter ON) until a parent or guardian confirms in <strong>Settings &rarr; Parental Control</strong>.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-slate-50/80 border border-slate-200/80 text-xs text-slate-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={isAgeConfirmed}
+                      onChange={(e) => setIsAgeConfirmed(e.target.checked)}
+                      className="mt-0.5 w-4 h-4 rounded border-slate-300 text-[#0F172A] focus:ring-[#0F172A]"
+                    />
+                    <span className="leading-snug">
+                      I confirm my date of birth is accurate, I am <strong>{MIN_SIGNUP_AGE} years or older</strong>, and I agree to WaveLink&apos;s{' '}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setActiveLegalNotice('guidelines');
+                        }}
+                        className="underline font-semibold text-[#0F172A]"
+                      >
+                        Community Guidelines
+                      </button>
+                      ,{' '}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setActiveLegalNotice('terms');
+                        }}
+                        className="underline font-semibold text-[#0F172A]"
+                      >
+                        Terms of Service
+                      </button>{' '}
+                      and{' '}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setActiveLegalNotice('privacy');
+                        }}
+                        className="underline font-semibold text-[#0F172A]"
+                      >
+                        Privacy Policy
+                      </button>
+                      .
+                    </span>
+                  </label>
+                </div>
               )}
 
               {/* Full-Width Rounded Pill Submit Button */}
               <button
                 type="submit"
-                disabled={isLoading || (authMode === 'signup' && (!isEmailVerified || !isAgeConfirmed))}
+                disabled={
+                  isLoading ||
+                  (authMode === 'signup' &&
+                    (!isEmailVerified || !isAgeConfirmed || !signupAgeEval?.allowed))
+                }
                 className="w-full h-12 px-6 rounded-full bg-[#0F172A] hover:bg-slate-800 active:scale-[0.99] text-white text-sm font-medium tracking-tight flex items-center justify-center gap-2 shadow-2xs transition-all duration-200 cursor-pointer disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed"
               >
                 {isLoading ? (

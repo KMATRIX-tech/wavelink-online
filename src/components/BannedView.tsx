@@ -3,7 +3,8 @@ import { useAuth } from '../context/AuthContext';
 import { getAuthHeaders } from '../firebase';
 import { ContentAppeal } from '../types';
 import { sanitizeUserFacingError } from '../utils/safetyFilters';
-import { ShieldAlert, LogOut, Mail, HelpCircle, Scale, CheckCircle2, Send } from 'lucide-react';
+import { getUserRestrictionStatus } from '../utils/contentModeration';
+import { ShieldAlert, LogOut, Mail, HelpCircle, Scale, CheckCircle2, Send, Clock } from 'lucide-react';
 
 interface BannedViewProps {
   onOpenSupport: () => void;
@@ -18,6 +19,9 @@ export const BannedView: React.FC<BannedViewProps> = ({ onOpenSupport }) => {
     text: string;
   } | null>(null);
   const [appeals, setAppeals] = useState<ContentAppeal[]>([]);
+
+  const restriction = getUserRestrictionStatus(userProfile);
+  const isTempSuspension = !restriction.isPermanentlyBanned && restriction.isSuspended;
 
   const loadAppeals = useCallback(async () => {
     if (!currentUser) return;
@@ -51,7 +55,8 @@ export const BannedView: React.FC<BannedViewProps> = ({ onOpenSupport }) => {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          appealType: 'account_ban',
+          targetType: isTempSuspension ? 'account_suspension' : 'account_ban',
+          appealType: isTempSuspension ? 'account_suspension' : 'account_ban',
           targetId: currentUser.uid,
           reason: appealReason.trim()
         })
@@ -81,26 +86,43 @@ export const BannedView: React.FC<BannedViewProps> = ({ onOpenSupport }) => {
   return (
     <div className="min-h-screen flex items-center justify-center p-4 bg-[#FAF7F2] text-[#1C1917]">
       <div className="w-full max-w-lg bg-white border border-rose-200 rounded-3xl p-6 sm:p-8 text-center shadow-xl space-y-5">
-        <div className="w-16 h-16 rounded-full bg-rose-100 text-rose-600 mx-auto flex items-center justify-center ring-8 ring-rose-50">
-          <ShieldAlert size={36} />
+        <div
+          className={`w-16 h-16 rounded-full mx-auto flex items-center justify-center ring-8 ${
+            isTempSuspension
+              ? 'bg-orange-100 text-orange-600 ring-orange-50'
+              : 'bg-rose-100 text-rose-600 ring-rose-50'
+          }`}
+        >
+          {isTempSuspension ? <Clock size={36} /> : <ShieldAlert size={36} />}
         </div>
 
         <div>
           <h2 className="text-2xl font-extrabold text-[#1C1917] mb-2">
-            Account Suspended
+            {isTempSuspension ? 'Temporary 7-Day Suspension' : 'Account Suspended'}
           </h2>
           <p className="text-sm text-[#57534E] leading-relaxed">
             Your WaveLink account (<span className="font-bold text-rose-600">{currentUser?.email}</span>) has been restricted due to community safety guidelines.
           </p>
+          {isTempSuspension && restriction.remainingText && (
+            <p className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-orange-100 px-3 py-1 text-xs font-extrabold text-orange-800">
+              <Clock size={13} />
+              <span>Time remaining: {restriction.remainingText}</span>
+            </p>
+          )}
+          {typeof userProfile?.strikesCount === 'number' && userProfile.strikesCount > 0 && (
+            <p className="mt-1 text-xs font-semibold text-[#57534E]">
+              Active safety strikes: {userProfile.strikesCount}
+            </p>
+          )}
         </div>
 
-        {userProfile?.warningMessage && (
+        {(userProfile?.warningMessage || userProfile?.banReason) && (
           <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-left">
             <p className="text-xs font-bold text-rose-800 uppercase tracking-wider mb-1">
               Moderation Reason:
             </p>
             <p className="text-xs sm:text-sm text-rose-950 italic">
-              &quot;{userProfile.warningMessage}&quot;
+              &quot;{userProfile.warningMessage || userProfile.banReason}&quot;
             </p>
           </div>
         )}

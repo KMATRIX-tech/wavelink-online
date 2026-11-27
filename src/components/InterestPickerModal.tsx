@@ -10,6 +10,7 @@ import { Sparkles, Check, X, Compass, Globe } from 'lucide-react';
 
 export interface InterestCategoryItem {
   id: string;
+  exploreCategory: string;
   labelEn: string;
   labelSw: string;
   emoji: string;
@@ -19,39 +20,17 @@ export interface InterestCategoryItem {
 
 export const INTEREST_CATALOG: InterestCategoryItem[] = [
   {
-    id: 'bongo_flava',
-    labelEn: 'Bongo Flava',
-    labelSw: 'Bongo Flava',
+    id: 'music',
+    exploreCategory: 'Music',
+    labelEn: 'Music & Bongo Flava',
+    labelSw: 'Muziki & Bongo Flava',
     emoji: '🎶',
-    hashtags: ['#BongoFlava', '#MuzikiTZ', '#NewBongo', '#Singeli'],
-    keywords: ['bongo', 'flava', 'bongoflava', 'diamond', 'alikiba', 'harmonize', 'zuchu', 'jaymelody', 'singeli', 'wimbo']
-  },
-  {
-    id: 'amapiano',
-    labelEn: 'Amapiano',
-    labelSw: 'Amapiano',
-    emoji: '🎹',
-    hashtags: ['#Amapiano', '#PianoVibes', '#AmapianoDance', '#LogDrum'],
-    keywords: ['amapiano', 'piano', 'logdrum', 'yano', 'mzansi', 'dance']
-  },
-  {
-    id: 'afrobeats',
-    labelEn: 'Afrobeats',
-    labelSw: 'Afrobeats',
-    emoji: '🥁',
-    hashtags: ['#Afrobeats', '#AfricanMusic', '#AfroFusion', '#NaijaToEast'],
-    keywords: ['afrobeats', 'afrobeat', 'afrofusion', 'burna', 'wizkid', 'rema', 'ayra', 'music', 'muziki']
-  },
-  {
-    id: 'gengetone',
-    labelEn: 'Gengetone',
-    labelSw: 'Gengetone & Arbantone',
-    emoji: '🎤',
-    hashtags: ['#Gengetone', '#Arbantone', '#254Music', '#NairobiVibes'],
-    keywords: ['gengetone', 'arbantone', 'nairobi', '254', 'matatu', 'sheng', 'kenya']
+    hashtags: ['#BongoFlava', '#Amapiano', '#Afrobeats', '#MuzikiTZ'],
+    keywords: ['music', 'muziki', 'bongo', 'flava', 'amapiano', 'afrobeats', 'singeli', 'wimbo', 'dance']
   },
   {
     id: 'comedy',
+    exploreCategory: 'Comedy',
     labelEn: 'Comedy & Skits',
     labelSw: 'Vichekesho & Igizo',
     emoji: '😂',
@@ -59,15 +38,17 @@ export const INTEREST_CATALOG: InterestCategoryItem[] = [
     keywords: ['comedy', 'skit', 'skits', 'funny', 'joke', 'laugh', 'vichekesho', 'cheka', 'meme']
   },
   {
-    id: 'football',
-    labelEn: 'Football',
-    labelSw: 'Soka & Mpira',
+    id: 'sports',
+    exploreCategory: 'Sports',
+    labelEn: 'Sports & Football',
+    labelSw: 'Michezo & Soka',
     emoji: '⚽',
-    hashtags: ['#Football', '#Soka', '#SimbaYanga', '#MashemejiDerby', '#AFCON'],
-    keywords: ['football', 'soccer', 'soka', 'mpira', 'goal', 'simba', 'yanga', 'gor mahia', 'afcon', 'premier', 'match']
+    hashtags: ['#Football', '#Soka', '#SimbaYanga', '#AFCON'],
+    keywords: ['sports', 'football', 'soccer', 'soka', 'mpira', 'goal', 'simba', 'yanga', 'afcon', 'match']
   },
   {
     id: 'fashion',
+    exploreCategory: 'Fashion',
     labelEn: 'Fashion & Kitenge',
     labelSw: 'Mitindo & Kitenge',
     emoji: '👗',
@@ -75,23 +56,8 @@ export const INTEREST_CATALOG: InterestCategoryItem[] = [
     keywords: ['fashion', 'style', 'mitindo', 'kitenge', 'kanga', 'ankara', 'outfit', 'dress', 'urembo']
   },
   {
-    id: 'school_life',
-    labelEn: 'School Life',
-    labelSw: 'Maisha ya Shule & Chuo',
-    emoji: '🎓',
-    hashtags: ['#SchoolLife', '#CampusVibes', '#Wanafunzi', '#ChuoLife'],
-    keywords: ['school', 'campus', 'student', 'uni', 'college', 'shule', 'chuo', 'exam', 'class', 'study']
-  },
-  {
-    id: 'business',
-    labelEn: 'Small Business',
-    labelSw: 'Biashara Ndogo',
-    emoji: '💼',
-    hashtags: ['#SmallBusiness', '#Biashara', '#Kariakoo', '#HustleAfrica'],
-    keywords: ['business', 'biashara', 'hustle', 'money', 'pesa', 'shop', 'duka', 'kariakoo', 'market', 'entrepreneur']
-  },
-  {
     id: 'food',
+    exploreCategory: 'Food',
     labelEn: 'Food & Local Dishes',
     labelSw: 'Chakula & Mapishi',
     emoji: '🍲',
@@ -99,30 +65,113 @@ export const INTEREST_CATALOG: InterestCategoryItem[] = [
     keywords: ['food', 'cook', 'recipe', 'chakula', 'mapishi', 'pilau', 'biryani', 'nyama choma', 'ugali', 'chapati']
   },
   {
-    id: 'farming',
-    labelEn: 'Farming (Kilimo)',
-    labelSw: 'Kilimo & Ufugaji',
-    emoji: '🌾',
-    hashtags: ['#KilimoBiashara', '#FarmingAfrica', '#AgriTech', '#ShambaLife'],
-    keywords: ['farming', 'kilimo', 'shamba', 'crops', 'maize', 'avocado', 'coffee', 'cattle', 'ufugaji', 'agribusiness']
+    id: 'travel',
+    exploreCategory: 'Travel',
+    labelEn: 'Travel & Safari',
+    labelSw: 'Safari & Utalii',
+    emoji: '🏝️',
+    hashtags: ['#Zanzibar', '#Serengeti', '#TravelAfrica', '#Utalii'],
+    keywords: ['travel', 'safari', 'zanzibar', 'serengeti', 'kilimanjaro', 'beach', 'dar', 'arusha', 'nairobi']
   },
   {
-    id: 'faith',
-    labelEn: 'Faith & Inspiration',
-    labelSw: 'Imani & Hamasa',
-    emoji: '🙏',
-    hashtags: ['#FaithAndHope', '#Baraka', '#GospelAfrica', '#Inspiration'],
-    keywords: ['faith', 'imani', 'blessed', 'baraka', 'gospel', 'worship', 'prayer', 'dua', 'shukrani', 'motivation']
+    id: 'art',
+    exploreCategory: 'Art',
+    labelEn: 'Art & Photography',
+    labelSw: 'Sanaa & Picha',
+    emoji: '🎨',
+    hashtags: ['#AfricanArt', '#Sanaa', '#PhotographyTZ', '#CreativeAfrica'],
+    keywords: ['art', 'sanaa', 'painting', 'drawing', 'design', 'photography', 'photo', 'portrait', 'canvas']
+  },
+  {
+    id: 'tech',
+    exploreCategory: 'Tech',
+    labelEn: 'Tech & Innovation',
+    labelSw: 'Teknolojia & Ubunifu',
+    emoji: '💻',
+    hashtags: ['#TechAfrica', '#SiliconSavannah', '#CodingTZ', '#Teknolojia'],
+    keywords: ['tech', 'coding', 'code', 'software', 'phone', 'app', 'ai', 'laptop', 'gadget', 'teknolojia']
   },
   {
     id: 'gaming',
-    labelEn: 'Gaming',
+    exploreCategory: 'Gaming',
+    labelEn: 'Gaming & Esports',
     labelSw: 'Michezo ya Video',
     emoji: '🎮',
     hashtags: ['#GamingAfrica', '#EAFC', '#EsportsKE_TZ', '#MobileGaming'],
     keywords: ['game', 'gaming', 'ps5', 'fifa', 'eafc', 'cod', 'pubg', 'esports', 'stream', 'gamer']
+  },
+  {
+    id: 'education',
+    exploreCategory: 'Education',
+    labelEn: 'Education & Campus',
+    labelSw: 'Elimu & Maisha ya Chuo',
+    emoji: '🎓',
+    hashtags: ['#Elimu', '#CampusVibes', '#Wanafunzi', '#ChuoLife'],
+    keywords: ['education', 'elimu', 'school', 'campus', 'student', 'uni', 'college', 'shule', 'chuo', 'study']
+  },
+  {
+    id: 'lifestyle',
+    exploreCategory: 'Lifestyle',
+    labelEn: 'Lifestyle & Business',
+    labelSw: 'Maisha, Biashara & Kilimo',
+    emoji: '✨',
+    hashtags: ['#Maisha', '#Biashara', '#KilimoBiashara', '#FaithAndHope'],
+    keywords: ['lifestyle', 'maisha', 'business', 'biashara', 'farming', 'kilimo', 'faith', 'imani', 'baraka', 'vlog']
+  },
+  {
+    id: 'other',
+    exploreCategory: 'Other',
+    labelEn: 'General & Community',
+    labelSw: 'Habari & Jamii',
+    emoji: '🌍',
+    hashtags: ['#WaveLink', '#EastAfrica', '#Jamii', '#Habari'],
+    keywords: ['community', 'jamii', 'news', 'habari', 'daily', 'africa', 'tanzania', 'kenya']
   }
 ];
+
+const LEGACY_INTEREST_TO_CATEGORY: Record<string, string> = {
+  music: 'Music',
+  bongo_flava: 'Music',
+  amapiano: 'Music',
+  afrobeats: 'Music',
+  gengetone: 'Music',
+  comedy: 'Comedy',
+  sports: 'Sports',
+  football: 'Sports',
+  fashion: 'Fashion',
+  food: 'Food',
+  travel: 'Travel',
+  art: 'Art',
+  tech: 'Tech',
+  gaming: 'Gaming',
+  education: 'Education',
+  school_life: 'Education',
+  lifestyle: 'Lifestyle',
+  business: 'Lifestyle',
+  farming: 'Lifestyle',
+  faith: 'Lifestyle',
+  other: 'Other'
+};
+
+export function mapUserInterestsToExploreCategories(interests?: string[]): string[] {
+  if (!Array.isArray(interests) || interests.length === 0) return [];
+  const mapped = new Set<string>();
+  for (const raw of interests) {
+    const key = String(raw || '').trim().toLowerCase();
+    if (!key) continue;
+    if (LEGACY_INTEREST_TO_CATEGORY[key]) {
+      mapped.add(LEGACY_INTEREST_TO_CATEGORY[key]);
+    } else {
+      const cat = INTEREST_CATALOG.find(
+        (c) => c.id.toLowerCase() === key || c.exploreCategory.toLowerCase() === key
+      );
+      if (cat) {
+        mapped.add(cat.exploreCategory);
+      }
+    }
+  }
+  return Array.from(mapped);
+}
 
 export const DEFAULT_FALLBACK_HASHTAGS = [
   '#BongoFlava',
@@ -130,7 +179,7 @@ export const DEFAULT_FALLBACK_HASHTAGS = [
   '#ComedySkits',
   '#KilimoBiashara',
   '#Amapiano',
-  '#Gengetone',
+  '#Zanzibar',
   '#Afrobeats'
 ];
 
@@ -155,12 +204,12 @@ export function hasUserCompletedOrSkippedInterests(
 ): boolean {
   if (!uid) return true;
   if (profile?.interestsCompleted) return true;
-  if (Array.isArray(profile?.interests) && profile!.interests.length >= 3) return true;
+  if (Array.isArray(profile?.interests) && profile!.interests.length >= 1) return true;
   if (typeof window === 'undefined') return false;
   try {
     if (localStorage.getItem(`wavelink_interests_done_${uid}`) === '1') return true;
     const saved = getSavedUserInterests(uid);
-    return saved.length >= 3;
+    return saved.length >= 1;
   } catch {
     return false;
   }
@@ -187,7 +236,11 @@ export function getSuggestedHashtagsForInterests(interests: string[]): string[] 
   }
   const matchedTags: string[] = [];
   for (const interestId of interests) {
-    const cat = INTEREST_CATALOG.find((c) => c.id === interestId.toLowerCase());
+    const cat = INTEREST_CATALOG.find(
+      (c) =>
+        c.id === interestId.toLowerCase() ||
+        c.exploreCategory.toLowerCase() === interestId.toLowerCase()
+    );
     if (cat) {
       for (const tag of cat.hashtags) {
         if (!matchedTags.includes(tag)) {
@@ -201,14 +254,25 @@ export function getSuggestedHashtagsForInterests(interests: string[]): string[] 
 
 /**
  * Computes an interest relevance score (0+) for a post based on the user's chosen interests
+ * and the post's stored AI category and keywords.
  */
 export function scorePostByInterests(post: Post, interests: string[]): number {
   if (!post || !Array.isArray(interests) || interests.length === 0) return 0;
-  const text = `${post.content || ''} ${(post.hashtags || []).join(' ')} ${post.songTitle || ''}`.toLowerCase();
   let score = 0;
 
+  const userCategories = mapUserInterestsToExploreCategories(interests);
+  if (post.category && userCategories.some((c) => c.toLowerCase() === post.category!.toLowerCase())) {
+    score += 8;
+  }
+
+  const text = `${post.content || ''} ${(post.hashtags || []).join(' ')} ${(post.keywords || []).join(' ')} ${post.songTitle || ''}`.toLowerCase();
+
   for (const interestId of interests) {
-    const cat = INTEREST_CATALOG.find((c) => c.id === interestId.toLowerCase());
+    const cat = INTEREST_CATALOG.find(
+      (c) =>
+        c.id === interestId.toLowerCase() ||
+        c.exploreCategory.toLowerCase() === interestId.toLowerCase()
+    );
     if (!cat) continue;
     for (const tag of cat.hashtags) {
       if (text.includes(tag.toLowerCase())) {

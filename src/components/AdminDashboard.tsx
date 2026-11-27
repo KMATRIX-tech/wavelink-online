@@ -63,6 +63,8 @@ import { CrystalBadge } from './CrystalBadge';
 import { SupportDeskView } from './SupportDeskView';
 import { AnnouncementsView } from './AnnouncementsView';
 import { TrendingChallengesView } from './TrendingChallengesView';
+import { ModerationQueuePanel } from './ModerationQueuePanel';
+import { AdminChallengesManager } from './AdminChallengesManager';
 import {
   SUPPORT_BOT_ID,
   SUPPORT_BOT_EMAIL,
@@ -3224,6 +3226,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       {/* Tab: Admin Audit Log & Content Safety Reports */}
       {activeTab === 'audit' && (
         <div className="space-y-6">
+          {/* Layer 4 On-Demand Moderation Queue (Flagged & Reports, Appeals, Audit Log) */}
+          <ModerationQueuePanel isAdmin={isAdmin} />
+
           {/* Content & User Safety Reports */}
           <div className="bg-white border border-[#EFECE6] rounded-3xl p-6 shadow-xs space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
@@ -3446,8 +3451,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onReturnToFeed }
       {/* Tab: Admin-Only Updates Group */}
       {activeTab === 'updates_group' && <AnnouncementsView />}
 
-      {/* Tab: Weekly Creator Challenges & Leaderboard */}
-      {activeTab === 'challenges' && <TrendingChallengesView />}
+      {/* Tab: Weekly Creator Challenges, Winner Picker & Custom Badges */}
+      {activeTab === 'challenges' && (
+        <div className="space-y-6">
+          <AdminChallengesManager isAdmin={Boolean(isAdmin)} />
+          <TrendingChallengesView />
+        </div>
+      )}
 
       {/* Tab 1: Overview */}
       {activeTab === 'overview' && (

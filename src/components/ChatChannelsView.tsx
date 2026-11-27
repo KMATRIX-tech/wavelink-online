@@ -63,6 +63,8 @@ import {
   sanitizeUserFacingError,
   checkActionRateLimit
 } from '../utils/safetyFilters';
+import { validateAndModerateText } from '../services/moderationService';
+import { ReportContentModal, type ReportModalTarget } from './ReportContentModal';
 import {
   Send,
   Smile,
@@ -114,7 +116,13 @@ import {
   Pencil,
   Paperclip,
   Palette,
-  Clock
+  Clock,
+  Pin,
+  Archive,
+  MailOpen,
+  MoreHorizontal,
+  Share2,
+  SlidersHorizontal
 } from 'lucide-react';
 import { ADMIN_EMAIL, isSuperAdminEmail, getAuthHeaders } from '../firebase';
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
@@ -125,6 +133,7 @@ import {
   getChatThemeDisplayName
 } from '../utils/chatThemes';
 import { sendNotification, toggleFollowUser } from '../services/notificationService';
+import { getTeenRestrictionState, triggerParentalAlert } from '../services/parentalService';
 import {
   detectUpgradeIdea,
   recordUpgradeFeedback,
@@ -400,11 +409,18 @@ const formatCompactConvoTime = (iso?: string): string => {
   if (!iso) return '';
   const date = new Date(iso);
   if (isNaN(date.getTime())) return '';
-  const diffSec = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (diffSec < 60) return 'Now';
+  const now = new Date();
+  const diffSec = Math.floor((now.getTime() - date.getTime()) / 1000);
+  if (diffSec < 60) return '1m';
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
-  if (diffSec < 86400) {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const msgDayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const diffDays = Math.round((todayStart - msgDayStart) / 86400000);
+  if (diffDays === 0) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+  if (diffDays === 1) {
+    return 'Yesterday';
   }
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 };
@@ -723,6 +739,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
   const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [chatReportTarget, setChatReportTarget] = useState<ReportModalTarget | null>(null);
 
   // Real-time typing indicator state: channelId -> Record<userId, TypingStatusEntry>
   const [firestoreChannelTyping, setFirestoreChannelTyping] = useState<
@@ -878,9 +895,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const [isLoadingMessages, setIsLoadingMessages] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [convoFilter, setConvoFilter] = useState<'chats' | 'people' | 'groups'>('chats');
+  const [inboxTab, setInboxTab] = useState<'inbox' | 'unread' | 'requests' | 'groups' | 'archived'>('inbox');
   const [messageLimit, setMessageLimit] = useState<number>(30);
   const [convoDisplayLimit, setConvoDisplayLimit] = useState<number>(20);
-  const [convoFetchLimit, setConvoFetchLimit] = useState<number>(50);
+  const [convoFetchLimit, setConvoFetchLimit] = useState<number>(20);
   const [followingMap, setFollowingMap] = useState<Record<string, boolean>>({});
   const [searchedAllowedUserIds, setSearchedAllowedUserIds] = useState<string[]>(() => {
     try {
@@ -892,41 +910,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     }
   });
 
-  // Load user's follows from both `follows` collection and `userProfile.followingIds`
+  // Derive followingMap directly from already-loaded userProfile.followingIds (0 extra Firestore reads)
   useEffect(() => {
     if (!currentUser?.uid) return;
-    let isMounted = true;
     const baseMap: Record<string, boolean> = {};
     (userProfile?.followingIds || []).forEach((fId) => {
       if (fId) baseMap[fId] = true;
     });
     setFollowingMap((prev) => ({ ...prev, ...baseMap }));
-
-    const fetchFollows = async () => {
-      try {
-        const q = query(
-          collection(db, 'follows'),
-          where('followerId', '==', currentUser.uid),
-          limit(100)
-        );
-        const snap = await getDocs(q);
-        if (!isMounted) return;
-        const nextMap: Record<string, boolean> = { ...baseMap };
-        snap.forEach((d) => {
-          const data = d.data();
-          if (data?.targetUserId) {
-            nextMap[data.targetUserId] = true;
-          }
-        });
-        setFollowingMap(nextMap);
-      } catch {
-        // ignore follows read error
-      }
-    };
-    fetchFollows();
-    return () => {
-      isMounted = false;
-    };
   }, [currentUser?.uid, userProfile?.followingIds]);
 
   useEffect(() => {
@@ -1006,6 +997,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const newChatInputRef = useRef<HTMLInputElement | null>(null);
   const isInputFocusedRef = useRef<boolean>(false);
   const wasKeyboardOpenRef = useRef<boolean>(false);
   const isLoadingOlderRef = useRef<boolean>(false);
@@ -1042,7 +1034,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const toggleMuteChannel = (channelId: string) => {
     if (!channelId) return;
     setMutedChannelIds((prev) => {
-      const next = prev.includes(channelId)
+      const isMutedNow = prev.includes(channelId);
+      const next = isMutedNow
         ? prev.filter((id) => id !== channelId)
         : [...prev, channelId].slice(0, 200);
       try {
@@ -1051,9 +1044,163 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         // ignore storage errors
       }
       updateUserProfile({ mutedChannelIds: next }).catch(() => {});
+      showGlobalToast(isMutedNow ? 'Notifications unmuted for this chat.' : 'Chat notifications muted.');
       return next;
     });
   };
+
+  // Per-channel pin preference persisted locally & synced to users/{uid}.pinnedChannelIds
+  const [pinnedChannelIds, setPinnedChannelIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_pinned_channels');
+      const parsed = raw ? JSON.parse(raw) : [];
+      const fromProfile = Array.isArray(userProfile?.pinnedChannelIds) ? userProfile!.pinnedChannelIds : [];
+      return Array.from(new Set([...parsed, ...fromProfile]));
+    } catch {
+      return Array.isArray(userProfile?.pinnedChannelIds) ? userProfile!.pinnedChannelIds : [];
+    }
+  });
+
+  useEffect(() => {
+    if (Array.isArray(userProfile?.pinnedChannelIds)) {
+      setPinnedChannelIds((prev) => {
+        const merged = Array.from(new Set([...userProfile!.pinnedChannelIds!, ...prev])).slice(0, 100);
+        try {
+          localStorage.setItem('wavelink_pinned_channels', JSON.stringify(merged));
+        } catch {
+          // ignore
+        }
+        return merged;
+      });
+    }
+  }, [userProfile?.pinnedChannelIds]);
+
+  const togglePinChannel = (channelId: string) => {
+    if (!channelId) return;
+    setPinnedChannelIds((prev) => {
+      const isPinnedNow = prev.includes(channelId);
+      const next = isPinnedNow
+        ? prev.filter((id) => id !== channelId)
+        : [channelId, ...prev].slice(0, 100);
+      try {
+        localStorage.setItem('wavelink_pinned_channels', JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      updateUserProfile({ pinnedChannelIds: next }).catch(() => {});
+      showGlobalToast(isPinnedNow ? 'Conversation unpinned.' : 'Conversation pinned to top.');
+      return next;
+    });
+  };
+
+  // Per-channel archive preference persisted locally & synced to users/{uid}.archivedChannelIds
+  const [archivedChannelIds, setArchivedChannelIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_archived_channels');
+      const parsed = raw ? JSON.parse(raw) : [];
+      const fromProfile = Array.isArray(userProfile?.archivedChannelIds) ? userProfile!.archivedChannelIds : [];
+      return Array.from(new Set([...parsed, ...fromProfile]));
+    } catch {
+      return Array.isArray(userProfile?.archivedChannelIds) ? userProfile!.archivedChannelIds : [];
+    }
+  });
+
+  useEffect(() => {
+    if (Array.isArray(userProfile?.archivedChannelIds)) {
+      setArchivedChannelIds((prev) => {
+        const merged = Array.from(new Set([...userProfile!.archivedChannelIds!, ...prev])).slice(0, 200);
+        try {
+          localStorage.setItem('wavelink_archived_channels', JSON.stringify(merged));
+        } catch {
+          // ignore
+        }
+        return merged;
+      });
+    }
+  }, [userProfile?.archivedChannelIds]);
+
+  const toggleArchiveChannel = (channelId: string) => {
+    if (!channelId) return;
+    setArchivedChannelIds((prev) => {
+      const isArchivedNow = prev.includes(channelId);
+      const next = isArchivedNow
+        ? prev.filter((id) => id !== channelId)
+        : [...prev, channelId].slice(0, 200);
+      try {
+        localStorage.setItem('wavelink_archived_channels', JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      updateUserProfile({ archivedChannelIds: next }).catch(() => {});
+      showGlobalToast(isArchivedNow ? 'Moved back to Inbox.' : 'Conversation archived.');
+      return next;
+    });
+  };
+
+  // Per-channel delete-for-me & clear-for-me timestamps
+  const [localDeletedAtByChannel, setLocalDeletedAtByChannel] = useState<Record<string, string>>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_deleted_at_channels');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const [localAcceptedChannels, setLocalAcceptedChannels] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('wavelink_accepted_channels');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // "Unread first" sorting toggle (defaults to ON as required)
+  const [unreadFirstSort, setUnreadFirstSort] = useState<boolean>(() => {
+    if (typeof userProfile?.chatUnreadFirst === 'boolean') return userProfile.chatUnreadFirst;
+    try {
+      const raw = localStorage.getItem('wavelink_chat_unread_first');
+      return raw === null ? true : raw === 'true';
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleUnreadFirstSort = () => {
+    setUnreadFirstSort((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('wavelink_chat_unread_first', String(next));
+      } catch {
+        // ignore
+      }
+      updateUserProfile({ chatUnreadFirst: next }).catch(() => {});
+      return next;
+    });
+  };
+
+  // New Chat Search Sheet state (debounced prefix search >= 2 chars, limit 10)
+  const [isNewChatSheetOpen, setIsNewChatSheetOpen] = useState<boolean>(false);
+  const [newChatSearchQuery, setNewChatSearchQuery] = useState<string>('');
+  const [newChatSearchResults, setNewChatSearchResults] = useState<UserProfile[]>([]);
+  const [isSearchingNewChat, setIsSearchingNewChat] = useState<boolean>(false);
+
+  // 24-Hour Note modal state (60 chars max)
+  const [isNoteModalOpen, setIsNoteModalOpen] = useState<boolean>(false);
+  const [noteDraftText, setNoteDraftText] = useState<string>('');
+  const [isSavingNote, setIsSavingNote] = useState<boolean>(false);
+
+  // Top "..." menu, Chat Settings modal, swipe-left row tray, long-press action sheet & delete confirmation modal
+  const [showInboxMoreMenu, setShowInboxMoreMenu] = useState<boolean>(false);
+  const [isChatSettingsModalOpen, setIsChatSettingsModalOpen] = useState<boolean>(false);
+  const [swipedRowId, setSwipedRowId] = useState<string | null>(null);
+  const rowSwipeTouchRef = useRef<{ id: string; startX: number; startY: number } | null>(null);
+  const [actionMenuRowId, setActionMenuRowId] = useState<string | null>(null);
+  const rowLongPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [confirmDeleteChannelId, setConfirmDeleteChannelId] = useState<string | null>(null);
+  const [focusedRowIndex, setFocusedRowIndex] = useState<number>(-1);
 
   useEffect(() => {
     if (initialTargetChannelId) {
@@ -1238,38 +1385,47 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     };
   }, [showMobileChannels, activeChannel]);
 
-  // 1. Load registered users / online members once with limit(convoFetchLimit) and in-memory caching
+  // 1. Load ONLY the current user's followed contacts, invite-link contacts, and initialTargetUserId via in-memory cache (NEVER load the full users collection)
   useEffect(() => {
     let isMounted = true;
-    const fetchUsers = async () => {
+    const loadKnownContacts = async () => {
       try {
-        if (chatProfileMemoryCache.size === 0) {
-          setIsLoadingConversations(true);
+        const contactUidSet = new Set<string>();
+        (userProfile?.followingIds || []).forEach((id) => {
+          if (id && id !== currentUser?.uid && id !== SUPPORT_BOT_ID) contactUidSet.add(id);
+        });
+        (userProfile?.contactIds || []).forEach((id) => {
+          if (id && id !== currentUser?.uid && id !== SUPPORT_BOT_ID) contactUidSet.add(id);
+        });
+        if (initialTargetUserId && initialTargetUserId !== currentUser?.uid && initialTargetUserId !== SUPPORT_BOT_ID) {
+          contactUidSet.add(initialTargetUserId);
         }
-        const usersCol = query(collection(db, 'users'), limit(convoFetchLimit));
-        const snap = await getDocs(usersCol);
-        if (!isMounted) return;
-        const otherUsers: UserProfile[] = [];
-        snap.forEach((d) => {
-          const prof = normalizeUserProfileData(d.id, d.data() as Record<string, any>);
-          chatProfileMemoryCache.set(d.id, prof);
-          if (d.id !== currentUser?.uid && d.id !== SUPPORT_BOT_ID) {
-            otherUsers.push(prof);
-          }
-        });
-        batchCacheUserProfiles(otherUsers);
-        // Sort client-side by createdAt descending so users without createdAt are never excluded
-        otherUsers.sort((a, b) => {
-          const timeA = a.createdAt ? Date.parse(a.createdAt) || 0 : 0;
-          const timeB = b.createdAt ? Date.parse(b.createdAt) || 0 : 0;
-          return timeB - timeA;
-        });
 
-        const list: UserProfile[] = [SUPPORT_BOT_PROFILE, ...otherUsers];
-        setMembers(list);
+        const uidsToFetch = Array.from(contactUidSet).filter((uid) => !chatProfileMemoryCache.has(uid));
+        if (uidsToFetch.length > 0) {
+          const fetchedProfiles = await Promise.all(
+            uidsToFetch.slice(0, 30).map((uid) => fetchUserProfileCached(uid).catch(() => null))
+          );
+          if (!isMounted) return;
+          const validProfiles: UserProfile[] = [];
+          fetchedProfiles.forEach((p) => {
+            if (p && p.id) {
+              chatProfileMemoryCache.set(p.id, p);
+              validProfiles.push(p);
+            }
+          });
+          if (validProfiles.length > 0) {
+            batchCacheUserProfiles(validProfiles);
+          }
+        }
+
+        if (!isMounted) return;
+        const cachedUsers = Array.from(chatProfileMemoryCache.values()).filter(
+          (u) => u.id !== currentUser?.uid && u.id !== SUPPORT_BOT_ID
+        );
+        setMembers([SUPPORT_BOT_PROFILE, ...cachedUsers]);
         setIsLoadingConversations(false);
 
-        // If target channel or target user specified from notification/directory/feed, open that chat immediately
         if (initialTargetChannelId) {
           setActiveChannel(initialTargetChannelId);
           setShowMobileChannels(false);
@@ -1278,18 +1434,122 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
           setActiveChannel(dmId);
           setShowMobileChannels(false);
         }
-      } catch (e) {
+      } catch {
         if (isMounted) {
           setMembers([SUPPORT_BOT_PROFILE]);
           setIsLoadingConversations(false);
         }
       }
     };
-    fetchUsers();
+    loadKnownContacts();
     return () => {
       isMounted = false;
     };
-  }, [currentUser?.uid, initialTargetUserId, convoFetchLimit]);
+  }, [currentUser?.uid, initialTargetUserId, initialTargetChannelId, userProfile?.followingIds, userProfile?.contactIds]);
+
+  // 1b. Debounced (400ms) New Chat user search ONLY after typing at least 2 characters (limit 10, no listing of everyone)
+  useEffect(() => {
+    const rawQuery = (isNewChatSheetOpen ? newChatSearchQuery : searchQuery).trim();
+    if (rawQuery.length < 2) {
+      setNewChatSearchResults([]);
+      setIsSearchingNewChat(false);
+      return;
+    }
+
+    let isCancelled = false;
+    setIsSearchingNewChat(true);
+
+    const timer = setTimeout(async () => {
+      try {
+        const cleanQ = rawQuery.replace(/^@/, '').trim();
+        const lowerQ = cleanQ.toLowerCase();
+        const capQ = cleanQ.charAt(0).toUpperCase() + cleanQ.slice(1);
+        const resultsMap = new Map<string, UserProfile>();
+
+        // First match any already-cached profiles in memory (0 reads)
+        chatProfileMemoryCache.forEach((prof) => {
+          if (prof.id === currentUser?.uid || prof.id === SUPPORT_BOT_ID) return;
+          if (
+            (prof.displayName || '').toLowerCase().includes(lowerQ) ||
+            (prof.username || '').toLowerCase().includes(lowerQ) ||
+            (prof.email || '').toLowerCase().includes(lowerQ)
+          ) {
+            resultsMap.set(prof.id, prof);
+          }
+        });
+
+        // Query Firestore by displayName prefix and username prefix (limit 10)
+        const queries = [
+          query(
+            collection(db, 'users'),
+            where('displayName', '>=', cleanQ),
+            where('displayName', '<=', cleanQ + '\uf8ff'),
+            limit(10)
+          ),
+          query(
+            collection(db, 'users'),
+            where('username', '>=', lowerQ),
+            where('username', '<=', lowerQ + '\uf8ff'),
+            limit(10)
+          ),
+          query(
+            collection(db, 'users'),
+            where('username', '>=', '@' + lowerQ),
+            where('username', '<=', '@' + lowerQ + '\uf8ff'),
+            limit(10)
+          )
+        ];
+        if (capQ !== cleanQ) {
+          queries.push(
+            query(
+              collection(db, 'users'),
+              where('displayName', '>=', capQ),
+              where('displayName', '<=', capQ + '\uf8ff'),
+              limit(10)
+            )
+          );
+        }
+
+        const snaps = await Promise.all(queries.map((q) => getDocs(q).catch(() => null)));
+        if (isCancelled) return;
+
+        const newlyFetched: UserProfile[] = [];
+        snaps.forEach((snap) => {
+          if (!snap) return;
+          snap.forEach((d) => {
+            if (d.id === currentUser?.uid || d.id === SUPPORT_BOT_ID) return;
+            const prof = normalizeUserProfileData(d.id, d.data() as Record<string, any>);
+            chatProfileMemoryCache.set(d.id, prof);
+            newlyFetched.push(prof);
+            resultsMap.set(d.id, prof);
+          });
+        });
+
+        if (newlyFetched.length > 0) {
+          batchCacheUserProfiles(newlyFetched);
+          setMembers((prev) => {
+            const existingIds = new Set(prev.map((m) => m.id));
+            const additions = newlyFetched.filter((p) => !existingIds.has(p.id));
+            return additions.length > 0 ? [...prev, ...additions] : prev;
+          });
+        }
+
+        if (!isCancelled) {
+          setNewChatSearchResults(Array.from(resultsMap.values()).slice(0, 10));
+          setIsSearchingNewChat(false);
+        }
+      } catch {
+        if (!isCancelled) {
+          setIsSearchingNewChat(false);
+        }
+      }
+    }, 400);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, [newChatSearchQuery, searchQuery, isNewChatSheetOpen, currentUser?.uid]);
 
   // 2. Load user-created groups once with limit(20) scoped to memberIds and in-memory caching
   useEffect(() => {
@@ -1374,7 +1634,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     };
   }, []);
 
-  // Synthesize any DM participants discovered in `channels` who might not have a document in `users` yet
+  // Synthesize any DM participants discovered in non-empty `channels` who might not be in `members` yet
   const allMembers = React.useMemo(() => {
     if (!currentUser?.uid) return members;
     const knownIds = new Set(members.map((m) => m.id));
@@ -1382,6 +1642,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
     Object.values(channelMetaMap).forEach((meta) => {
       if (!meta?.id?.startsWith('dm_')) return;
+      // Hide empty conversation documents that have zero messages
+      if (!meta.lastMessageText && !meta.lastMessageAt && meta.id !== activeChannel) return;
       const otherUid = getOtherDmParticipantId(meta.id, currentUser.uid);
       if (otherUid && otherUid !== currentUser.uid && !knownIds.has(otherUid)) {
         knownIds.add(otherUid);
@@ -1412,7 +1674,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     });
 
     return extraMembers.length > 0 ? [...members, ...extraMembers] : members;
-  }, [members, channelMetaMap, currentUser?.uid]);
+  }, [members, channelMetaMap, currentUser?.uid, activeChannel]);
 
   // Determine current active chat item info using deterministic conversationId helpers
   const supportBotChannelId = currentUser?.uid
@@ -1455,7 +1717,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const isFollowingRecipient = Boolean(
     directRecipient &&
       (followingMap[directRecipient.id] ||
-        (userProfile?.followingIds || []).includes(directRecipient.id))
+        (userProfile?.followingIds || []).includes(directRecipient.id) ||
+        (userProfile?.contactIds || []).includes(directRecipient.id))
   );
   const hasExistingDmHistoryWithRecipient = Boolean(
     isDirectMessage &&
@@ -1486,21 +1749,52 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     if (isBlockedByRecipient && !isAdmin) {
       return 'You cannot message this user.';
     }
-    if (!isAdmin && !isRecipientSearchedOrFollowed) {
-      return `Follow ${directRecipient.displayName} or search for them to start texting.`;
+    const selfTeen = getTeenRestrictionState(userProfile);
+    const targetTeen = getTeenRestrictionState(directRecipient);
+    const recipientFollowsOrContactsMe =
+      (directRecipient.followingIds || []).includes(currentUser?.uid || '') ||
+      (directRecipient.contactIds || []).includes(currentUser?.uid || '');
+    const areMutualFriends = recipientFollowsOrContactsMe && isFollowingRecipient;
+
+    if (selfTeen.isTeen) {
+      if (selfTeen.messagingPolicy === 'nobody') {
+        return 'Direct messages are currently disabled by Parental Control.';
+      }
+      if (!areMutualFriends && !isAdmin) {
+        return 'Teen Account Safety: You can only message approved mutual friends.';
+      }
     }
+
+    if (targetTeen.isTeen && !isAdmin) {
+      if (targetTeen.messagingPolicy === 'nobody') {
+        return 'This teen account does not accept direct messages right now.';
+      }
+      if (!areMutualFriends) {
+        return 'Teen Account Safety: This person only accepts messages from approved friends.';
+      }
+    }
+
     if (!isAdmin) {
       const dmPref = directRecipient.privacySettings?.allowDirectMessages || 'everyone';
       if (dmPref === 'none') {
-        return `${directRecipient.displayName} has turned off incoming direct messages.`;
+        return 'This person only accepts messages from friends';
       }
+      if (dmPref === 'followers' && !recipientFollowsOrContactsMe && !isFollowingRecipient) {
+        return 'This person only accepts messages from friends';
+      }
+      const activeMeta = channelMetaMap[activeChannel];
       if (
-        dmPref === 'followers' &&
-        !isFollowingRecipient &&
-        !(directRecipient.followingIds || []).includes(currentUser?.uid || '')
+        activeMeta &&
+        activeMeta.requestStatus === 'pending' &&
+        activeMeta.initiatedBy === currentUser?.uid &&
+        !(activeMeta.acceptedBy || []).includes(directRecipient.id) &&
+        (activeMeta.senderMessageCount || 0) >= 2
       ) {
-        return `Follow ${directRecipient.displayName} to send a direct message.`;
+        return `You have sent 2 messages. Wait for ${directRecipient.displayName} to accept your request.`;
       }
+    }
+    if (!isAdmin && !isRecipientSearchedOrFollowed) {
+      return `Follow ${directRecipient.displayName} or search for them in New Chat to start texting.`;
     }
     return null;
   })();
@@ -1511,6 +1805,16 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     }
     if (isBlockedByRecipient && !isAdmin) {
       return 'You cannot call this user.';
+    }
+    const selfTeen = getTeenRestrictionState(userProfile);
+    if (selfTeen.isTeen && !selfTeen.canUseCalls) {
+      return selfTeen.isParentVerified
+        ? 'Voice and video calls are blocked by Parental Control.'
+        : 'Voice and video calls are disabled until a parent confirms your Teen Account.';
+    }
+    const targetTeen = getTeenRestrictionState(directRecipient);
+    if (targetTeen.isTeen && !targetTeen.canUseCalls) {
+      return 'This teen account cannot receive voice or video calls.';
     }
     if (!isAdmin) {
       const callPref = directRecipient.privacySettings?.allowCalls || 'everyone';
@@ -1560,7 +1864,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       0
   );
 
-  // 2b. Real-time listener for DM channels metadata (limited to convoFetchLimit, default 20)
+  // 2b. Single real-time listener for DM channels metadata (where participants array-contains myUid, limit(convoFetchLimit), default 20)
   // NOTE: Real-time message subcollection listener is strictly scoped ONLY to the open `activeChannel`.
   useEffect(() => {
     if (!currentUser?.uid) return;
@@ -1587,6 +1891,12 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             participantPhotos?: Record<string, string>;
           };
           const chanId = docSnap.id;
+
+          // Hide any empty conversation document that has zero messages (without deleting data)
+          if (!data?.lastMessageText && !data?.lastMessageAt) {
+            return;
+          }
+
           nextMetaMap[chanId] = { ...data, id: chanId };
           if (data?.typing && typeof data.typing === 'object') {
             nextTypingMap[chanId] = data.typing as Record<string, TypingStatusEntry>;
@@ -1643,6 +1953,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         });
         setChannelMetaMap(nextMetaMap);
         setFirestoreChannelTyping(nextTypingMap);
+        setIsLoadingConversations(false);
         if (Object.keys(nextLatestMap).length > 0) {
           setLatestMessageByChannel((prev) => ({ ...prev, ...nextLatestMap }));
         }
@@ -1652,13 +1963,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       },
       (err) => {
         console.warn('[WaveLink Chat] Channels metadata listener notice:', err?.message || err);
+        setIsLoadingConversations(false);
       }
     );
 
     return () => unsub();
   }, [currentUser?.uid, activeChannel, convoFetchLimit]);
 
-  // Recover real login profile pictures for DM participants whose profile still has a placeholder avatar
+  // Cache participant user profiles in memory so each profile is read at most once (0 extra collection scans)
   useEffect(() => {
     if (!currentUser?.uid) return;
     const channelEntries = Object.values(channelMetaMap);
@@ -1668,6 +1980,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
     channelEntries.forEach((meta) => {
       if (!meta?.id?.startsWith('dm_')) return;
+      if (!meta.lastMessageText && !meta.lastMessageAt) return;
       const otherUid = getOtherDmParticipantId(meta.id, currentUser.uid);
       if (!otherUid || otherUid === currentUser.uid || otherUid === SUPPORT_BOT_ID) return;
 
@@ -1682,67 +1995,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       }
 
       const currentPhoto = knownMember?.photoURL;
-      if (!isRealUserPhotoUrl(currentPhoto)) {
-        if (!serverResolvedAvatarUids.has(otherUid)) {
-          serverResolvedAvatarUids.add(otherUid);
-          uidsNeedingServerLookup.push(otherUid);
-        }
-
-        if (!checkedDmAvatarChannels.has(meta.id)) {
-          checkedDmAvatarChannels.add(meta.id);
-          // Check latest messages in this DM channel for the friend's real senderPhotoURL
-          getDocs(
-            query(
-              collection(db, 'channels', meta.id, 'messages'),
-              orderBy('createdAt', 'desc'),
-              limit(6)
-            )
-          )
-            .then((msgSnap) => {
-              msgSnap.forEach((mDoc) => {
-                const mData = mDoc.data();
-                const sId = mData?.senderId;
-                const sPhoto = mData?.senderPhotoURL || mData?.senderAvatar;
-                if (sId && isRealUserPhotoUrl(sPhoto)) {
-                  recordDiscoveredUserAvatar(sId, sPhoto, true);
-                }
-              });
-            })
-            .catch(() => {});
-        }
+      if (!isRealUserPhotoUrl(currentPhoto) && !serverResolvedAvatarUids.has(otherUid)) {
+        serverResolvedAvatarUids.add(otherUid);
+        uidsNeedingServerLookup.push(otherUid);
       }
     });
 
     if (uidsNeedingServerLookup.length > 0) {
-      const batchUids = uidsNeedingServerLookup.slice(0, 10);
-
-      // Also check posts & notifications authored by these friends in case they haven't sent a DM message yet
-      getDocs(query(collection(db, 'posts'), where('authorId', 'in', batchUids), limit(15)))
-        .then((postSnap) => {
-          postSnap.forEach((pDoc) => {
-            const pData = pDoc.data();
-            const aId = pData?.authorId;
-            const aPhoto = pData?.authorPhotoURL || pData?.authorAvatar;
-            if (aId && isRealUserPhotoUrl(aPhoto)) {
-              recordDiscoveredUserAvatar(aId, aPhoto, true);
-            }
-          });
-        })
-        .catch(() => {});
-
-      getDocs(query(collection(db, 'notifications'), where('actorId', 'in', batchUids), limit(15)))
-        .then((notifSnap) => {
-          notifSnap.forEach((nDoc) => {
-            const nData = nDoc.data();
-            const actId = nData?.actorId;
-            const actPhoto = nData?.actorPhotoURL || nData?.actorAvatar;
-            if (actId && isRealUserPhotoUrl(actPhoto)) {
-              recordDiscoveredUserAvatar(actId, actPhoto, true);
-            }
-          });
-        })
-        .catch(() => {});
-
       getAuthHeaders()
         .then((headers) =>
           fetch('/api/users/resolve-avatars', {
@@ -1930,20 +2189,26 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     };
 
     const isDm = channelId.startsWith('dm_');
-    const targetDocRef = isDm
-      ? doc(db, 'channels', channelId)
-      : doc(db, 'groups', channelId);
+    const dmExistsWithMessage =
+      !isDm ||
+      Boolean(channelMetaMap[channelId]?.lastMessageText || channelMetaMap[channelId]?.lastMessageAt);
 
-    setDoc(
-      targetDocRef,
-      {
-        ...(isDm ? { id: channelId, conversationId: channelId } : {}),
-        typing: {
-          [currentUser.uid]: typingEntry
-        }
-      },
-      { merge: true }
-    ).catch(() => {});
+    if (dmExistsWithMessage) {
+      const targetDocRef = isDm
+        ? doc(db, 'channels', channelId)
+        : doc(db, 'groups', channelId);
+
+      setDoc(
+        targetDocRef,
+        {
+          ...(isDm ? { id: channelId, conversationId: channelId } : {}),
+          typing: {
+            [currentUser.uid]: typingEntry
+          }
+        },
+        { merge: true }
+      ).catch(() => {});
+    }
   };
 
   // Clear typing status on previous channel when switching conversations & subscribe to active channel RTDB typing
@@ -2150,6 +2415,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     const publishMergedMessages = () => {
       const combined: ChannelMessage[] = [];
       const nowMs = Date.now();
+      const myUid = currentUser?.uid || '';
+      const activeMeta = channelMetaMap[activeChannel];
+      const myDeletedIso =
+        (myUid && (activeMeta?.deletedAt?.[myUid] || activeMeta?.clearedAt?.[myUid])) ||
+        localDeletedAtByChannel[activeChannel] ||
+        '';
+      const myDeletedMs = myDeletedIso ? Date.parse(myDeletedIso) || 0 : 0;
+
       mergedDocsMap.forEach((msgData) => {
         // Ensure Support Bot messages stay strictly inside the WaveLink Support DM channel
         if (
@@ -2159,6 +2432,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             isSupportBotUser(msgData.senderEmail))
         ) {
           return;
+        }
+        // Only show messages sent AFTER the user's delete-for-me / clear-for-me timestamp
+        if (myDeletedMs > 0) {
+          const msgMs = getMessageTimestampMs(msgData);
+          if (msgMs > 0 && msgMs <= myDeletedMs) {
+            return;
+          }
         }
         // Hide expired disappearing messages
         if (msgData.expiresAt) {
@@ -2252,7 +2532,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     return () => {
       unsub();
     };
-  }, [activeChannel, isDirectMessage, showMobileChannels, currentUser?.uid, messageLimit, retryTrigger]);
+  }, [activeChannel, isDirectMessage, showMobileChannels, currentUser?.uid, messageLimit, retryTrigger, localDeletedAtByChannel]);
 
   // Automatically load 30 older messages when scrolled near top & track stick-to-bottom state
   const handleMessagesScroll = () => {
@@ -2290,22 +2570,30 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
       try {
         // Update channel or group lastSeen and reset unread count for current user to 0
+        // CRITICAL: For DMs, ONLY update the channel document if a conversation already exists with at least one message!
+        // Never create an empty conversation document when merely opening a draft chat from search.
         if (isDirectMessage) {
-          const otherUid = getOtherDmParticipantId(activeChannel, currentUser.uid);
-          const participants = Array.from(new Set([currentUser.uid, otherUid].filter(Boolean))).sort();
-          await setDoc(
-            doc(db, 'channels', activeChannel),
-            {
-              id: activeChannel,
-              conversationId: activeChannel,
-              participants,
-              lastSeen: { [currentUser.uid]: nowIso },
-              unread: { [currentUser.uid]: 0 },
-              unreadCounts: { [currentUser.uid]: 0 },
-              updatedAt: nowIso
-            },
-            { merge: true }
+          const existingMeta = channelMetaMap[activeChannel];
+          const hasAtLeastOneMessage = Boolean(
+            existingMeta?.lastMessageText || existingMeta?.lastMessageAt || messages.length > 0
           );
+          if (hasAtLeastOneMessage) {
+            const otherUid = getOtherDmParticipantId(activeChannel, currentUser.uid);
+            const participants = Array.from(new Set([currentUser.uid, otherUid].filter(Boolean))).sort();
+            await setDoc(
+              doc(db, 'channels', activeChannel),
+              {
+                id: activeChannel,
+                conversationId: activeChannel,
+                participants,
+                lastSeen: { [currentUser.uid]: nowIso },
+                unread: { [currentUser.uid]: 0 },
+                unreadCounts: { [currentUser.uid]: 0 },
+                updatedAt: nowIso
+              },
+              { merge: true }
+            );
+          }
         } else if (isCurrentUserMember) {
           await setDoc(
             doc(db, 'groups', activeChannel),
@@ -2887,6 +3175,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     if ((!inputText.trim() && !customGifUrl && !chatMediaUrl) || !currentUser || !activeChannel) return;
     if (dmPrivacyBlockReason) {
       setChatMediaNotice(dmPrivacyBlockReason);
+      if (isDirectMessage && directRecipient && getTeenRestrictionState(directRecipient).isTeen) {
+        triggerParentalAlert(
+          directRecipient.id,
+          'new_chat_request',
+          userProfile?.displayName || currentUser.displayName || 'A WaveLink user'
+        ).catch(() => {});
+      }
       return;
     }
 
@@ -2899,6 +3194,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
       return;
     }
 
+    let messageModCheckedAt = new Date().toISOString();
     if (inputText.trim()) {
       const spamCheck = checkClientSpam('message', inputText.trim());
       if (spamCheck.isSpam) {
@@ -2906,11 +3202,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         setTimeout(() => setChatMediaNotice(null), 4000);
         return;
       }
-      const wordCheck = checkWordFilter(inputText.trim());
-      if (wordCheck.flagged) {
-        setChatMediaNotice('Message blocked by WaveLink safety word filter (EN/SW).');
-        setTimeout(() => setChatMediaNotice(null), 4000);
+      const modVerdict = await validateAndModerateText(inputText.trim(), 'chat', userProfile);
+      if (!modVerdict.allowed) {
+        setChatMediaNotice(modVerdict.friendlyMessage);
+        setTimeout(() => setChatMediaNotice(null), 5000);
+        if (isDirectMessage && directRecipient && getTeenRestrictionState(directRecipient).isTeen) {
+          triggerParentalAlert(
+            directRecipient.id,
+            'flagged_message',
+            userProfile?.displayName || currentUser.displayName || 'A WaveLink user'
+          ).catch(() => {});
+        }
         return;
+      }
+      if (modVerdict.moderationCheckedAt) {
+        messageModCheckedAt = modVerdict.moderationCheckedAt;
       }
     }
 
@@ -2966,6 +3272,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         senderPhotoURL: resolvedSenderPhotoURL,
         text: sanitizedText,
         mediaType: chatMediaType,
+        moderationChecked: true,
+        moderationCheckedAt: messageModCheckedAt,
         isEdited: false,
         isDeleted: false,
         readBy: [currentUser.uid],
@@ -3018,21 +3326,77 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         }
       );
 
-      // Update conversation metadata document (participants, lastMessage, lastSeen, unread count per participant)
+      // Update conversation metadata document (participants, lastMessage, lastSeen, unread count per participant, request status)
       if (isDirectMessage) {
+        const existingMeta = channelMetaMap[targetChannel];
         const unreadPatch: Record<string, any> = {
           [currentUser.uid]: 0
         };
         if (rawOtherId && rawOtherId !== currentUser.uid && !isBotConvo) {
           unreadPatch[rawOtherId] = increment(1);
         }
+
+        const recipientFollowsOrContactsMe =
+          isBotConvo ||
+          Boolean(
+            directRecipient &&
+              ((directRecipient.followingIds || []).includes(currentUser.uid) ||
+                (directRecipient.contactIds || []).includes(currentUser.uid))
+          );
+        const isReplyingToOther =
+          Boolean(
+            existingMeta &&
+              ((existingMeta.initiatedBy && existingMeta.initiatedBy === rawOtherId) ||
+                existingMeta.lastMessageSenderId === rawOtherId)
+          );
+        const isAlreadyAccepted =
+          isBotConvo ||
+          recipientFollowsOrContactsMe ||
+          isReplyingToOther ||
+          existingMeta?.requestStatus === 'accepted' ||
+          (existingMeta?.acceptedBy || []).includes(rawOtherId);
+
+        const nextAcceptedBy = isAlreadyAccepted
+          ? Array.from(
+              new Set([
+                ...(existingMeta?.acceptedBy || []),
+                currentUser.uid,
+                ...(rawOtherId ? [rawOtherId] : [])
+              ])
+            )
+          : [currentUser.uid];
+
+        const nextRequestStatus: 'accepted' | 'pending' = isAlreadyAccepted
+          ? 'accepted'
+          : 'pending';
+        const nextSenderMessageCount = isAlreadyAccepted
+          ? (existingMeta?.senderMessageCount || 1)
+          : Math.min(2, (existingMeta?.senderMessageCount || 0) + 1);
+
+        if (isReplyingToOther && !localAcceptedChannels.includes(targetChannel)) {
+          setLocalAcceptedChannels((prev) => {
+            const next = Array.from(new Set([...prev, targetChannel]));
+            try {
+              localStorage.setItem('wavelink_accepted_channels', JSON.stringify(next));
+            } catch {
+              // ignore
+            }
+            return next;
+          });
+        }
+
         setDoc(
           doc(db, 'channels', targetChannel),
           {
             id: targetChannel,
             conversationId: targetChannel,
             participants,
+            initiatedBy: existingMeta?.initiatedBy || currentUser.uid,
+            acceptedBy: nextAcceptedBy,
+            requestStatus: nextRequestStatus,
+            senderMessageCount: nextSenderMessageCount,
             lastMessageText: messagePreview,
+            lastMessageMediaType: customGifUrl ? 'image' : chatMediaType,
             lastMessageSenderId: currentUser.uid,
             lastMessageSenderName: senderDisplayName,
             lastMessageSenderPhotoURL: resolvedSenderPhotoURL,
@@ -3040,6 +3404,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
               [currentUser.uid]: resolvedSenderPhotoURL
             },
             lastMessageAt: nowIso,
+            createdAt: existingMeta?.createdAt || nowIso,
             lastSeen: { [currentUser.uid]: nowIso },
             unread: unreadPatch,
             unreadCounts: unreadPatch,
@@ -3220,6 +3585,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                 senderPhotoURL: SUPPORT_BOT_AVATAR,
                 text: botReplyText,
                 mediaType: 'none',
+                moderationChecked: true,
+                moderationCheckedAt: replyIso,
                 isEdited: false,
                 isDeleted: false,
                 isBotReply: true,
@@ -3337,13 +3704,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   const handleSaveEdit = async (messageId: string) => {
     const cleanEdit = sanitizeUserText(editText.trim(), 2000);
     if (!cleanEdit) return;
+    const modVerdict = await validateAndModerateText(cleanEdit, 'chat', userProfile);
+    if (!modVerdict.allowed) {
+      setChatMediaNotice(modVerdict.friendlyMessage);
+      setTimeout(() => setChatMediaNotice(null), 5000);
+      return;
+    }
     try {
       const docRef = isDirectMessage
         ? doc(db, 'channels', activeChannel, 'messages', messageId)
         : doc(db, 'groups', activeChannel, 'messages', messageId);
 
       await updateDoc(docRef, {
-        text: editText.trim(),
+        text: cleanEdit,
+        moderationChecked: true,
+        moderationCheckedAt: modVerdict.moderationCheckedAt || new Date().toISOString(),
         isEdited: true,
         updatedAt: new Date().toISOString()
       });
@@ -3416,6 +3791,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
   // Create new user group
   const handleCreateGroup = async () => {
     if (!newGroupName.trim() || !currentUser) return;
+    const groupTextToCheck = `${newGroupName.trim()} ${newGroupDesc.trim()}`.trim();
+    const modVerdict = await validateAndModerateText(groupTextToCheck, 'group', userProfile);
+    if (!modVerdict.allowed) {
+      setChatMediaNotice(modVerdict.friendlyMessage);
+      showGlobalToast(modVerdict.friendlyMessage);
+      return;
+    }
     setIsCreatingGroup(true);
 
     try {
@@ -3459,6 +3841,8 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             `https://api.dicebear.com/7.x/shapes/svg?seed=${currentUser.uid}`,
           text: `Welcome to ${newGroupName.trim()}! Wave, chat, and share ideas together. 🎉`,
           mediaType: 'none',
+          moderationChecked: true,
+          moderationCheckedAt: nowIso,
           isEdited: false,
           isDeleted: false,
           readBy: [currentUser.uid],
@@ -3736,6 +4120,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         isEdited: false,
         isDeleted: false,
         isSystem: true,
+        moderationChecked: true,
         readBy: [currentUser.uid],
         timestamp: serverTimestamp(),
         createdAt: nowIso
@@ -3965,18 +4350,6 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     }
   };
 
-  // Filter & sort conversations so unread or recent conversations surface cleanly
-  const filteredGroups = groups
-    .filter((g) => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
-    .sort((a, b) => {
-      const unreadA = unreadCountsByChannel[a.id] || 0;
-      const unreadB = unreadCountsByChannel[b.id] || 0;
-      if (unreadA !== unreadB) return unreadB - unreadA;
-      const latestA = latestMessageByChannel[a.id]?.createdAt || a.lastMessageAt || a.updatedAt || a.createdAt || '';
-      const latestB = latestMessageByChannel[b.id]?.createdAt || b.lastMessageAt || b.updatedAt || b.createdAt || '';
-      return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
-    });
-
   const isSearchingUsers = searchQuery.trim().length > 0;
   const cleanSearch = searchQuery.trim().toLowerCase();
 
@@ -3987,16 +4360,68 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     );
   };
 
-  const hasTextedMember = (memberId: string): boolean => {
+  const isMemberInMyContacts = (memberId: string): boolean => {
     if (memberId === SUPPORT_BOT_ID) return true;
+    return Boolean(
+      isMemberFollowed(memberId) || (userProfile?.contactIds || []).includes(memberId)
+    );
+  };
+
+  const isChannelDeletedForMe = (channelId: string, latestMsgIso?: string): boolean => {
+    if (!channelId || !currentUser?.uid) return false;
+    const meta = channelMetaMap[channelId];
+    const delIso = meta?.deletedAt?.[currentUser.uid] || localDeletedAtByChannel[channelId] || '';
+    if (!delIso) return false;
+    const delMs = Date.parse(delIso) || 0;
+    if (!delMs) return false;
+    const msgIso =
+      latestMsgIso ||
+      latestMessageByChannel[channelId]?.createdAt ||
+      meta?.lastMessageAt ||
+      meta?.updatedAt ||
+      '';
+    const msgMs = msgIso ? Date.parse(msgIso) || 0 : 0;
+    // Disappears from my inbox and comes back ONLY if a new message arrives after deletion time
+    return msgMs <= delMs;
+  };
+
+  // A DM conversation exists ONLY when someone has sent at least one message (hide empty conversation docs)
+  const hasTextedMember = (memberId: string): boolean => {
     if (!currentUser?.uid) return false;
     const dmId = computeDmConversationId(currentUser.uid, memberId);
     const meta = channelMetaMap[dmId];
     const latest = latestMessageByChannel[dmId];
-    return Boolean(
-      (latest && latest.text) ||
-        (meta && (meta.lastMessageText || meta.lastMessageAt || meta.lastMessageSenderId))
+    const hasMessage = Boolean(
+      (latest && latest.text) || (meta && (meta.lastMessageText || meta.lastMessageAt))
     );
+    if (!hasMessage) return false;
+    if (isChannelDeletedForMe(dmId, latest?.createdAt || meta?.lastMessageAt)) return false;
+    return true;
+  };
+
+  // Determine whether a non-empty DM conversation belongs in the "Requests" tab (stranger who messaged me and I haven't accepted/replied)
+  const isPendingRequestMember = (memberId: string): boolean => {
+    if (!currentUser?.uid || memberId === SUPPORT_BOT_ID) return false;
+    if (!hasTextedMember(memberId)) return false;
+    const dmId = computeDmConversationId(currentUser.uid, memberId);
+    const meta = channelMetaMap[dmId];
+    if (!meta) return false;
+    // If I follow them or they are in my contacts, they go straight to Inbox
+    if (isMemberInMyContacts(memberId)) return false;
+    // If I accepted locally or in Firestore, they are in Inbox
+    if (
+      localAcceptedChannels.includes(dmId) ||
+      meta.requestStatus === 'accepted' ||
+      (meta.acceptedBy || []).includes(currentUser.uid)
+    ) {
+      return false;
+    }
+    // If I initiated the conversation or sent the last message, it's in my Inbox
+    if (meta.initiatedBy === currentUser.uid || meta.lastMessageSenderId === currentUser.uid) {
+      return false;
+    }
+    // If explicitly marked pending or sent by a non-followed stranger with no acceptance from me
+    return true;
   };
 
   const matchesMemberSearch = (m: UserProfile): boolean => {
@@ -4009,55 +4434,238 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     );
   };
 
-  const sortMembersByRecentActivity = (a: UserProfile, b: UserProfile): number => {
-    if (a.id === SUPPORT_BOT_ID) return -1;
-    if (b.id === SUPPORT_BOT_ID) return 1;
-    if (!currentUser?.uid) return 0;
-    if (onlineFirstSort) {
-      const onlineA = getCachedIsOnline(a.id) ? 1 : 0;
-      const onlineB = getCachedIsOnline(b.id) ? 1 : 0;
-      if (onlineA !== onlineB) return onlineB - onlineA;
+  // Helper to check if a user's 24-hour chatNote is currently active (not expired)
+  const getActiveChatNoteText = (note?: { text?: string; expiresAt?: string } | null): string | null => {
+    if (!note || !note.text || !note.text.trim()) return null;
+    if (note.expiresAt) {
+      const expMs = Date.parse(note.expiresAt);
+      if (Number.isFinite(expMs) && expMs <= Date.now()) return null;
     }
+    return note.text.trim().slice(0, 60);
+  };
+
+  const myActiveNoteText = getActiveChatNoteText(userProfile?.chatNote);
+  const showNotesInInbox = userProfile?.showChatNotes !== false;
+
+  const sortMembersByRecentActivity = (a: UserProfile, b: UserProfile): number => {
+    if (!currentUser?.uid) return 0;
     const dmA = computeDmConversationId(currentUser.uid, a.id);
     const dmB = computeDmConversationId(currentUser.uid, b.id);
-    const unreadA = unreadCountsByChannel[dmA] || 0;
-    const unreadB = unreadCountsByChannel[dmB] || 0;
-    if (unreadA !== unreadB) return unreadB - unreadA;
+
+    // 1. Pinned first
+    const pinA = pinnedChannelIds.includes(dmA) ? 1 : 0;
+    const pinB = pinnedChannelIds.includes(dmB) ? 1 : 0;
+    if (pinA !== pinB) return pinB - pinA;
+
+    // 2. Unread above read within the same group when "Unread first" is enabled (default ON)
+    if (unreadFirstSort) {
+      const unreadA = (unreadCountsByChannel[dmA] || 0) > 0 ? 1 : 0;
+      const unreadB = (unreadCountsByChannel[dmB] || 0) > 0 ? 1 : 0;
+      if (unreadA !== unreadB) return unreadB - unreadA;
+    }
+
+    // 3. Optional "Online first" sort
+    if (onlineFirstSort) {
+      const onlineA = a.id === SUPPORT_BOT_ID || getCachedIsOnline(a.id) ? 1 : 0;
+      const onlineB = b.id === SUPPORT_BOT_ID || getCachedIsOnline(b.id) ? 1 : 0;
+      if (onlineA !== onlineB) return onlineB - onlineA;
+    }
+
+    // 4. Newest message on top (lastMessageAt desc)
     const latestA =
       latestMessageByChannel[dmA]?.createdAt ||
       channelMetaMap[dmA]?.lastMessageAt ||
       channelMetaMap[dmA]?.updatedAt ||
-      a.createdAt ||
       '';
     const latestB =
       latestMessageByChannel[dmB]?.createdAt ||
       channelMetaMap[dmB]?.lastMessageAt ||
       channelMetaMap[dmB]?.updatedAt ||
-      b.createdAt ||
       '';
     return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
   };
 
-  // 1) Recent Conversations: strictly ONLY users you have actually texted (plus Support Bot)
+  // Filter & sort groups
+  const filteredGroups = groups
+    .filter(
+      (g) =>
+        !isChannelDeletedForMe(g.id, latestMessageByChannel[g.id]?.createdAt || g.lastMessageAt) &&
+        g.name.toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    .sort((a, b) => {
+      const pinA = pinnedChannelIds.includes(a.id) ? 1 : 0;
+      const pinB = pinnedChannelIds.includes(b.id) ? 1 : 0;
+      if (pinA !== pinB) return pinB - pinA;
+      if (unreadFirstSort) {
+        const uA = (unreadCountsByChannel[a.id] || 0) > 0 ? 1 : 0;
+        const uB = (unreadCountsByChannel[b.id] || 0) > 0 ? 1 : 0;
+        if (uA !== uB) return uB - uA;
+      }
+      const latestA =
+        latestMessageByChannel[a.id]?.createdAt || a.lastMessageAt || a.updatedAt || a.createdAt || '';
+      const latestB =
+        latestMessageByChannel[b.id]?.createdAt || b.lastMessageAt || b.updatedAt || b.createdAt || '';
+      return (Date.parse(latestB) || 0) - (Date.parse(latestA) || 0);
+    });
+
+  // 1) Inbox DM members: strictly conversations I started/accepted or contacts I have exchanged a message with (excluding pending stranger requests & blocked users)
   const recentChatMembers = allMembers
-    .filter((m) => hasTextedMember(m.id) && matchesMemberSearch(m))
+    .filter(
+      (m) =>
+        m.id !== currentUser?.uid &&
+        !(userProfile?.blockedUserIds || []).includes(m.id) &&
+        hasTextedMember(m.id) &&
+        !isPendingRequestMember(m.id) &&
+        matchesMemberSearch(m)
+    )
     .sort(sortMembersByRecentActivity);
 
-  // 2) Connected Contacts (for Active Now & Quick Connect when not searching): ONLY users you follow or have texted
+  // 2) Pending Message Requests (from strangers not yet accepted)
+  const requestChatMembers = allMembers
+    .filter(
+      (m) =>
+        m.id !== currentUser?.uid &&
+        !(userProfile?.blockedUserIds || []).includes(m.id) &&
+        isPendingRequestMember(m.id) &&
+        matchesMemberSearch(m)
+    )
+    .sort(sortMembersByRecentActivity);
+
+  // 3) My Contacts (for the top floating bubble cluster & New Chat sheet — 0 new reads: people I follow, invite-link contacts, and people I've chatted with)
   const connectedMembers = allMembers
-    .filter((m) => isMemberFollowed(m.id) || hasTextedMember(m.id))
-    .sort(sortMembersByRecentActivity);
+    .filter(
+      (m) =>
+        m.id !== currentUser?.uid &&
+        !(userProfile?.blockedUserIds || []).includes(m.id) &&
+        (m.id === SUPPORT_BOT_ID || isMemberInMyContacts(m.id) || (hasTextedMember(m.id) && !isPendingRequestMember(m.id)))
+    )
+    .sort((a, b) => {
+      const onlineA = a.id === SUPPORT_BOT_ID || getCachedIsOnline(a.id) ? 1 : 0;
+      const onlineB = b.id === SUPPORT_BOT_ID || getCachedIsOnline(b.id) ? 1 : 0;
+      if (onlineA !== onlineB) return onlineB - onlineA;
+      return sortMembersByRecentActivity(a, b);
+    });
 
-  // 3) Search Results / All People: when searching, find any matching user in the app; when not searching, show followed/texted contacts
-  const filteredMembers = (
-    isSearchingUsers
-      ? allMembers.filter(matchesMemberSearch)
-      : connectedMembers
-  ).sort(sortMembersByRecentActivity);
+  // Top cluster bubbles: max 8 contacts/online friends arranged loosely around my center bubble
+  const clusterContacts = connectedMembers.slice(0, 8);
+  const leftClusterContacts = clusterContacts.slice(0, Math.ceil(clusterContacts.length / 2));
+  const rightClusterContacts = clusterContacts.slice(Math.ceil(clusterContacts.length / 2));
 
-  // Total unread conversations count for header badge
-  const totalUnreadMessages = Object.entries(unreadCountsByChannel).reduce(
-    (sum, [chId, count]) => (chId === activeChannel && !showMobileChannels ? sum : sum + (count || 0)),
+  // Build unified Inbox rows (combining DMs and Groups I am in)
+  type UnifiedInboxRow =
+    | {
+        kind: 'dm';
+        channelId: string;
+        member: UserProfile;
+        unreadCount: number;
+        isPinned: boolean;
+        isMuted: boolean;
+        isArchived: boolean;
+        lastMessageAt: string;
+      }
+    | {
+        kind: 'group';
+        channelId: string;
+        group: ChatGroup;
+        unreadCount: number;
+        isPinned: boolean;
+        isMuted: boolean;
+        isArchived: boolean;
+        lastMessageAt: string;
+      };
+
+  const allUnifiedInboxRows: UnifiedInboxRow[] = React.useMemo(() => {
+    if (!currentUser?.uid) return [];
+    const rows: UnifiedInboxRow[] = [];
+
+    recentChatMembers.forEach((member) => {
+      const dmId = computeDmConversationId(currentUser.uid, member.id);
+      const isActive = activeChannel === dmId && !showMobileChannels;
+      const unreadCount = isActive ? 0 : unreadCountsByChannel[dmId] || 0;
+      const lastMessageAt =
+        latestMessageByChannel[dmId]?.createdAt ||
+        channelMetaMap[dmId]?.lastMessageAt ||
+        channelMetaMap[dmId]?.updatedAt ||
+        '';
+      rows.push({
+        kind: 'dm',
+        channelId: dmId,
+        member,
+        unreadCount,
+        isPinned: pinnedChannelIds.includes(dmId),
+        isMuted: mutedChannelIds.includes(dmId),
+        isArchived: archivedChannelIds.includes(dmId),
+        lastMessageAt
+      });
+    });
+
+    filteredGroups.forEach((group) => {
+      const isActive = activeChannel === group.id && !showMobileChannels;
+      const unreadCount = isActive ? 0 : unreadCountsByChannel[group.id] || 0;
+      const lastMessageAt =
+        latestMessageByChannel[group.id]?.createdAt ||
+        group.lastMessageAt ||
+        group.updatedAt ||
+        group.createdAt ||
+        '';
+      rows.push({
+        kind: 'group',
+        channelId: group.id,
+        group,
+        unreadCount,
+        isPinned: pinnedChannelIds.includes(group.id),
+        isMuted: mutedChannelIds.includes(group.id),
+        isArchived: archivedChannelIds.includes(group.id),
+        lastMessageAt
+      });
+    });
+
+    rows.sort((a, b) => {
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      if (unreadFirstSort) {
+        const uA = a.unreadCount > 0 ? 1 : 0;
+        const uB = b.unreadCount > 0 ? 1 : 0;
+        if (uA !== uB) return uB - uA;
+      }
+      if (onlineFirstSort && a.kind === 'dm' && b.kind === 'dm') {
+        const oA = a.member.id === SUPPORT_BOT_ID || getCachedIsOnline(a.member.id) ? 1 : 0;
+        const oB = b.member.id === SUPPORT_BOT_ID || getCachedIsOnline(b.member.id) ? 1 : 0;
+        if (oA !== oB) return oB - oA;
+      }
+      return (Date.parse(b.lastMessageAt) || 0) - (Date.parse(a.lastMessageAt) || 0);
+    });
+
+    return rows;
+  }, [
+    currentUser?.uid,
+    recentChatMembers,
+    filteredGroups,
+    activeChannel,
+    showMobileChannels,
+    unreadCountsByChannel,
+    latestMessageByChannel,
+    channelMetaMap,
+    pinnedChannelIds,
+    mutedChannelIds,
+    archivedChannelIds,
+    unreadFirstSort,
+    onlineFirstSort
+  ]);
+
+  const unarchivedInboxRows = allUnifiedInboxRows.filter((r) => !r.isArchived);
+  const archivedInboxRows = allUnifiedInboxRows.filter((r) => r.isArchived);
+  const unreadInboxRows = unarchivedInboxRows.filter((r) => r.unreadCount > 0);
+  const groupInboxRows = allUnifiedInboxRows.filter((r) => r.kind === 'group');
+
+  // Requests never create notification badges on the Inbox tab — only on the Requests tab
+  const pendingRequestsCount = requestChatMembers.length;
+  const unreadConversationsCount = unreadInboxRows.length;
+  const inboxTabBadgeNumber =
+    unreadConversationsCount > 0 ? unreadConversationsCount : unarchivedInboxRows.length;
+
+  // Total unread messages across non-request, non-muted inbox conversations for global nav badge
+  const totalUnreadMessages = unarchivedInboxRows.reduce(
+    (sum, r) => (r.channelId === activeChannel && !showMobileChannels ? sum : sum + (r.unreadCount || 0)),
     0
   );
 
@@ -4079,11 +4687,21 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     };
   }, []);
 
+  // Visible rows for the currently active tab
+  const displayedInboxRows =
+    inboxTab === 'unread'
+      ? unreadInboxRows
+      : inboxTab === 'groups'
+      ? groupInboxRows
+      : inboxTab === 'archived'
+      ? archivedInboxRows
+      : unarchivedInboxRows;
+  const visibleInboxRows = displayedInboxRows.slice(0, convoDisplayLimit);
+
   // On mobile/tablet (< 1024px), show the Chat List screen when showMobileChannels is true or no conversation is active
   const isMobileListScreenVisible = showMobileChannels || !activeChannel;
-  const visibleMembersList = filteredMembers.slice(0, convoDisplayLimit);
-  const visibleRecentChatMembers = recentChatMembers.slice(0, convoDisplayLimit);
   const isActiveChannelMuted = Boolean(activeChannel && mutedChannelIds.includes(activeChannel));
+
   const sharedPhotosInChat = messages.flatMap((m) => {
     if (m.isDeleted || m.mediaType === 'audio' || m.mediaType === 'video' || m.mediaType === 'file') return [];
     if (m.mediaUrls && m.mediaUrls.length > 0) return m.mediaUrls;
@@ -4140,7 +4758,7 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
 
   const handleOpenMemberChat = (memberId: string, fromSearch = false) => {
     if (!currentUser?.uid) return;
-    if (fromSearch || isSearchingUsers) {
+    if (fromSearch || isSearchingUsers || isNewChatSheetOpen) {
       setSearchedAllowedUserIds((prev) => {
         if (prev.includes(memberId)) return prev;
         const next = [memberId, ...prev].slice(0, 100);
@@ -4160,7 +4778,354 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
     setShowHeaderMenu(false);
     setShowMobileAttachTray(false);
     setIsMobileComposerOpen(false);
+    setIsNewChatSheetOpen(false);
+    setSwipedRowId(null);
     setShowMobileChannels(false);
+  };
+
+  const handleOpenGroupChat = (groupId: string) => {
+    setUnreadCountsByChannel((prev) => (prev[groupId] === 0 ? prev : { ...prev, [groupId]: 0 }));
+    setActiveChannel(groupId);
+    setReplyingTo(null);
+    setReactionMenuMsgId(null);
+    setShowHeaderMenu(false);
+    setShowMobileAttachTray(false);
+    setIsMobileComposerOpen(false);
+    setSwipedRowId(null);
+    setShowMobileChannels(false);
+  };
+
+  // Mark a single conversation as unread
+  const handleMarkChannelUnread = async (channelId: string) => {
+    if (!channelId || !currentUser?.uid) return;
+    setUnreadCountsByChannel((prev) => ({ ...prev, [channelId]: Math.max(1, prev[channelId] || 1) }));
+    if (channelId.startsWith('dm_') && channelMetaMap[channelId]?.lastMessageText) {
+      await setDoc(
+        doc(db, 'channels', channelId),
+        {
+          unread: { [currentUser.uid]: 1 },
+          unreadCounts: { [currentUser.uid]: 1 }
+        },
+        { merge: true }
+      ).catch(() => {});
+    }
+    showGlobalToast('Marked conversation as unread.');
+  };
+
+  // Mark all unread inbox conversations as read
+  const handleMarkAllAsRead = async () => {
+    if (!currentUser?.uid) return;
+    const nowIso = new Date().toISOString();
+    const unreadChIds = unreadInboxRows.map((r) => r.channelId);
+    setUnreadCountsByChannel((prev) => {
+      const next = { ...prev };
+      unreadChIds.forEach((id) => {
+        next[id] = 0;
+      });
+      return next;
+    });
+    await Promise.all(
+      unreadChIds.map((chId) => {
+        if (chId.startsWith('dm_')) {
+          return setDoc(
+            doc(db, 'channels', chId),
+            {
+              lastSeen: { [currentUser.uid]: nowIso },
+              unread: { [currentUser.uid]: 0 },
+              unreadCounts: { [currentUser.uid]: 0 }
+            },
+            { merge: true }
+          ).catch(() => {});
+        }
+        return setDoc(
+          doc(db, 'groups', chId),
+          {
+            lastSeen: { [currentUser.uid]: nowIso }
+          },
+          { merge: true }
+        ).catch(() => {});
+      })
+    );
+    showGlobalToast('All inbox messages marked as read.');
+  };
+
+  // Accept a pending message request -> moves conversation to Inbox and adds sender to contacts
+  const handleAcceptChatRequest = async (member: UserProfile) => {
+    if (!currentUser?.uid) return;
+    const dmId = computeDmConversationId(currentUser.uid, member.id);
+    const nowIso = new Date().toISOString();
+    setLocalAcceptedChannels((prev) => {
+      const next = Array.from(new Set([...prev, dmId]));
+      try {
+        localStorage.setItem('wavelink_accepted_channels', JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+
+    const nextContactIds = Array.from(
+      new Set([...(userProfile?.contactIds || []), member.id])
+    );
+    updateUserProfile({ contactIds: nextContactIds }).catch(() => {});
+
+    const existingMeta = channelMetaMap[dmId];
+    const nextAcceptedBy = Array.from(
+      new Set([...(existingMeta?.acceptedBy || []), currentUser.uid, member.id])
+    );
+    await setDoc(
+      doc(db, 'channels', dmId),
+      {
+        requestStatus: 'accepted',
+        acceptedBy: nextAcceptedBy,
+        updatedAt: nowIso
+      },
+      { merge: true }
+    ).catch(() => {});
+
+    showGlobalToast(`Accepted chat request from ${member.displayName}. Moved to Inbox!`);
+    setInboxTab('inbox');
+    handleOpenMemberChat(member.id, true);
+  };
+
+  // Delete conversation for ME only (stores deletedAt.{myUid} so the other person keeps theirs; returns only if a new message arrives later)
+  const handleDeleteConversationForMe = async (channelId: string) => {
+    if (!channelId || !currentUser?.uid) return;
+    const nowIso = new Date().toISOString();
+
+    setLocalDeletedAtByChannel((prev) => {
+      const next = { ...prev, [channelId]: nowIso };
+      try {
+        localStorage.setItem('wavelink_deleted_at_channels', JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+    setUnreadCountsByChannel((prev) => ({ ...prev, [channelId]: 0 }));
+
+    if (activeChannel === channelId) {
+      setActiveChannel('');
+      setMessages([]);
+      setShowMobileChannels(true);
+    }
+
+    if (channelId.startsWith('dm_') && channelMetaMap[channelId]) {
+      await setDoc(
+        doc(db, 'channels', channelId),
+        {
+          deletedAt: { [currentUser.uid]: nowIso },
+          clearedAt: { [currentUser.uid]: nowIso },
+          unread: { [currentUser.uid]: 0 },
+          unreadCounts: { [currentUser.uid]: 0 }
+        },
+        { merge: true }
+      ).catch(() => {});
+    }
+
+    setConfirmDeleteChannelId(null);
+    setActionMenuRowId(null);
+    setSwipedRowId(null);
+    showGlobalToast('Conversation deleted for you.');
+  };
+
+  // Clear chat history for ME only (keeps conversation in inbox or clears messages up to now)
+  const handleClearConversationForMe = async (channelId: string) => {
+    if (!channelId || !currentUser?.uid) return;
+    const nowIso = new Date().toISOString();
+    if (channelId.startsWith('dm_') && channelMetaMap[channelId]) {
+      await setDoc(
+        doc(db, 'channels', channelId),
+        {
+          clearedAt: { [currentUser.uid]: nowIso },
+          unread: { [currentUser.uid]: 0 },
+          unreadCounts: { [currentUser.uid]: 0 }
+        },
+        { merge: true }
+      ).catch(() => {});
+    }
+    if (activeChannel === channelId) {
+      setMessages([]);
+    }
+    setActionMenuRowId(null);
+    showGlobalToast('Chat history cleared for you.');
+  };
+
+  // Save or clear 24-hour 60-character note on users/{myUid}.chatNote
+  const handleSaveMyChatNote = async (clearNote = false) => {
+    if (!currentUser?.uid) return;
+    const trimmed = clearNote ? '' : noteDraftText.trim().slice(0, 60);
+    if (trimmed) {
+      const modVerdict = await validateAndModerateText(trimmed, 'chat', userProfile);
+      if (!modVerdict.allowed) {
+        showGlobalToast(modVerdict.friendlyMessage);
+        return;
+      }
+    }
+    setIsSavingNote(true);
+    try {
+      if (!trimmed) {
+        await updateUserProfile({ chatNote: null });
+        showGlobalToast('Removed your note.');
+      } else {
+        const now = Date.now();
+        const noteObj = {
+          text: trimmed,
+          createdAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 24 * 3600 * 1000).toISOString()
+        };
+        await updateUserProfile({ chatNote: noteObj });
+        showGlobalToast('Your 24-hour note is live!');
+      }
+      setIsNoteModalOpen(false);
+    } catch {
+      showGlobalToast('Could not save note. Please try again.');
+    } finally {
+      setIsSavingNote(false);
+    }
+  };
+
+  // Desktop keyboard shortcuts (Up/Down to move, Enter to open, Delete to delete with confirmation, Ctrl+K to search)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsNewChatSheetOpen(true);
+        setTimeout(() => newChatInputRef.current?.focus(), 60);
+        return;
+      }
+
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (
+        tag === 'input' ||
+        tag === 'textarea' ||
+        tag === 'select' ||
+        target?.isContentEditable ||
+        isNewChatSheetOpen ||
+        isNoteModalOpen ||
+        Boolean(confirmDeleteChannelId) ||
+        Boolean(actionMenuRowId)
+      ) {
+        return;
+      }
+
+      if (visibleInboxRows.length === 0) return;
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setFocusedRowIndex((prev) =>
+          prev < visibleInboxRows.length - 1 ? prev + 1 : 0
+        );
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setFocusedRowIndex((prev) =>
+          prev > 0 ? prev - 1 : visibleInboxRows.length - 1
+        );
+      } else if (e.key === 'Enter' && focusedRowIndex >= 0 && focusedRowIndex < visibleInboxRows.length) {
+        e.preventDefault();
+        const targetRow = visibleInboxRows[focusedRowIndex];
+        if (targetRow.kind === 'dm') {
+          handleOpenMemberChat(targetRow.member.id);
+        } else {
+          handleOpenGroupChat(targetRow.group.id);
+        }
+      } else if (e.key === 'Delete') {
+        const targetRow =
+          focusedRowIndex >= 0 && focusedRowIndex < visibleInboxRows.length
+            ? visibleInboxRows[focusedRowIndex]
+            : visibleInboxRows.find((r) => r.channelId === activeChannel);
+        if (targetRow) {
+          e.preventDefault();
+          setConfirmDeleteChannelId(targetRow.channelId);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    visibleInboxRows,
+    focusedRowIndex,
+    activeChannel,
+    isNewChatSheetOpen,
+    isNoteModalOpen,
+    confirmDeleteChannelId,
+    actionMenuRowId
+  ]);
+
+  // Format a clean one-line message preview with media icons instead of raw text/filenames
+  const renderLastMessagePreviewContent = (params: {
+    previewText: string;
+    senderPrefix: string;
+    mediaType?: string;
+    isUnread: boolean;
+  }) => {
+    const { previewText, senderPrefix, mediaType, isUnread } = params;
+    const lower = (previewText || '').toLowerCase();
+    const isPhoto =
+      mediaType === 'image' ||
+      lower.startsWith('📷') ||
+      lower.includes('sent a photo') ||
+      lower.includes('shared a photo');
+    const isVideo =
+      mediaType === 'video' ||
+      lower.startsWith('🎬') ||
+      lower.includes('sent a video') ||
+      lower.includes('video clip');
+    const isAudio =
+      mediaType === 'audio' ||
+      lower.startsWith('🎤') ||
+      lower.includes('voice note') ||
+      lower.includes('sent an audio');
+    const isFile =
+      mediaType === 'file' ||
+      lower.startsWith('📎') ||
+      lower.includes('sent a file') ||
+      lower.includes('attachment');
+
+    const textWeightClass = isUnread
+      ? 'font-extrabold text-[var(--text-primary)]'
+      : 'font-medium text-[var(--text-secondary)]';
+
+    if (isPhoto) {
+      return (
+        <span className={`text-xs flex items-center gap-1.5 truncate mt-1 ${textWeightClass}`}>
+          <ImageIcon size={13} className="text-[var(--accent-primary)] shrink-0" />
+          <span className="truncate">{senderPrefix}Photo</span>
+        </span>
+      );
+    }
+    if (isVideo) {
+      return (
+        <span className={`text-xs flex items-center gap-1.5 truncate mt-1 ${textWeightClass}`}>
+          <Film size={13} className="text-[var(--accent-primary)] shrink-0" />
+          <span className="truncate">{senderPrefix}Video</span>
+        </span>
+      );
+    }
+    if (isAudio) {
+      return (
+        <span className={`text-xs flex items-center gap-1.5 truncate mt-1 ${textWeightClass}`}>
+          <Mic size={13} className="text-[var(--accent-primary)] shrink-0" />
+          <span className="truncate">{senderPrefix}Voice note</span>
+        </span>
+      );
+    }
+    if (isFile) {
+      return (
+        <span className={`text-xs flex items-center gap-1.5 truncate mt-1 ${textWeightClass}`}>
+          <Paperclip size={13} className="text-[var(--accent-primary)] shrink-0" />
+          <span className="truncate">{senderPrefix}Attachment</span>
+        </span>
+      );
+    }
+    return (
+      <span className={`text-xs block truncate mt-1 ${textWeightClass}`}>
+        {senderPrefix}
+        {previewText || 'Message'}
+      </span>
+    );
   };
 
   return (
@@ -4170,552 +5135,494 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
         className="wavelink-chat-shell bg-[var(--bg-surface)] text-[var(--text-primary)] border-y lg:border border-[var(--border-hairline)] shadow-sm w-full max-w-full overflow-hidden"
       >
         {/* =====================================================================
-            SCREEN 1: CHAT HOME (Mobile Full Screen; Desktop Left Column >= 1024px)
+            SCREEN 1: DARK GLASSY "MESSAGE" INBOX (Mobile Full Screen; Desktop ~380px Left Pane >= 1024px)
            ===================================================================== */}
         <div
-          className={`wavelink-chat-left-col relative w-full h-full lg:border-r border-[var(--border-hairline)] flex-col bg-[var(--bg-canvas)] shrink-0 ${
+          className={`wavelink-chat-left-col wavelink-msg-inbox-col relative w-full h-full lg:border-r border-[var(--border-hairline)] flex-col shrink-0 ${
             isMobileListScreenVisible ? 'flex' : 'hidden lg:flex'
           }`}
         >
-          {/* Top Header & Search Bar — slides up on scroll down and back in on scroll up on mobile (< 768px) */}
+          {/* 1. TOP BAR: Round glass back button on left, centered title "Message", round glass "..." menu on right */}
           <div
             ref={chatHomeHeaderRef}
             data-header-hidden={isMobileChatHeaderHidden ? 'true' : 'false'}
-            className="wavelink-chat-home-header p-3.5 sm:p-4 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] space-y-3 shrink-0"
+            className="wavelink-chat-home-header wavelink-msg-glass-header px-3.5 py-3 shrink-0"
           >
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2.5 min-w-0">
-                <div
-                  className="w-9 h-9 rounded-2xl flex items-center justify-center text-white shadow-xs shrink-0"
-                  style={{
-                    background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-                  }}
-                >
-                  <MessageSquare size={18} />
-                </div>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <h2 className="font-extrabold text-base sm:text-lg tracking-tight text-[var(--text-primary)] truncate">
-                      Chat
-                    </h2>
-                    {totalUnreadMessages > 0 && (
-                      <span
-                        className="px-2 py-0.5 rounded-full text-white text-[11px] font-extrabold shrink-0 shadow-2xs"
-                        style={{ backgroundColor: 'var(--accent-primary)' }}
-                      >
-                        {totalUnreadMessages} new
-                      </span>
-                    )}
-                  </div>
-                </div>
+            <div className="flex items-center justify-between gap-2 relative">
+              {/* Left: Round Glass Back Button */}
+              <button
+                type="button"
+                onClick={() => {
+                  if (inboxTab === 'archived' || inboxTab === 'groups') {
+                    setInboxTab('inbox');
+                    return;
+                  }
+                  window.dispatchEvent(
+                    new CustomEvent('wavelink:navigate', { detail: { tab: 'feed' } })
+                  );
+                }}
+                className="wavelink-msg-glass-circle-btn"
+                title={inboxTab === 'archived' || inboxTab === 'groups' ? 'Back to Inbox' : 'Back to Home'}
+                aria-label="Back"
+              >
+                <ArrowLeft size={18} />
+              </button>
+
+              {/* Center: Title "Message" */}
+              <div className="flex flex-col items-center justify-center min-w-0 pointer-events-none">
+                <h2 className="font-extrabold text-[17px] tracking-tight text-[var(--text-primary)] leading-tight">
+                  {inboxTab === 'archived'
+                    ? 'Archived'
+                    : inboxTab === 'groups'
+                    ? 'Groups'
+                    : 'Message'}
+                </h2>
               </div>
 
-              <div className="flex items-center gap-1.5 shrink-0">
+              {/* Right: Round Glass "..." Menu Button */}
+              <div className="relative">
                 <button
                   type="button"
-                  onClick={() => {
-                    setSelectedMemberIds([]);
-                    setNewGroupName('');
-                    setNewGroupDesc('');
-                    setNewGroupLogo(PRESET_LOGOS[0].url);
-                    setIsCreateGroupOpen(true);
-                  }}
-                  className="min-h-[44px] flex items-center gap-1.5 px-3.5 py-2 rounded-2xl text-white font-extrabold text-xs shadow-xs transition active:scale-95 cursor-pointer"
-                  style={{
-                    background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-                  }}
-                  title="Create a new group"
+                  onClick={() => setShowInboxMoreMenu((prev) => !prev)}
+                  className="wavelink-msg-glass-circle-btn"
+                  title="More options"
+                  aria-label="Message menu"
+                  aria-expanded={showInboxMoreMenu}
                 >
-                  <Plus size={15} />
-                  <span>New Group</span>
+                  <MoreHorizontal size={19} />
                 </button>
+
+                {showInboxMoreMenu && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-40"
+                      onClick={() => setShowInboxMoreMenu(false)}
+                    />
+                    <div className="absolute right-0 mt-2 w-56 rounded-2xl bg-[var(--bg-surface)]/95 backdrop-blur-xl border border-[var(--border-hairline)] shadow-2xl py-1.5 z-50 text-xs font-bold text-[var(--text-primary)]">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowInboxMoreMenu(false);
+                          setSelectedMemberIds([]);
+                          setNewGroupName('');
+                          setNewGroupDesc('');
+                          setNewGroupLogo(PRESET_LOGOS[0].url);
+                          setIsCreateGroupOpen(true);
+                        }}
+                        className="w-full px-3.5 py-2.5 flex items-center gap-2.5 hover:bg-[var(--bg-subtle)] transition text-left cursor-pointer"
+                      >
+                        <Users size={15} className="text-[var(--accent-primary)]" />
+                        <span>New group</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowInboxMoreMenu(false);
+                          handleMarkAllAsRead();
+                        }}
+                        className="w-full px-3.5 py-2.5 flex items-center gap-2.5 hover:bg-[var(--bg-subtle)] transition text-left cursor-pointer"
+                      >
+                        <CheckCheck size={15} className="text-emerald-500" />
+                        <span>Mark all as read</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowInboxMoreMenu(false);
+                          setInboxTab((prev) => (prev === 'groups' ? 'inbox' : 'groups'));
+                        }}
+                        className="w-full px-3.5 py-2.5 flex items-center justify-between gap-2.5 hover:bg-[var(--bg-subtle)] transition text-left cursor-pointer"
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <Hash size={15} className="text-[var(--accent-secondary)]" />
+                          <span>Groups</span>
+                        </span>
+                        <span className="px-1.5 py-0.5 rounded-full bg-[var(--bg-subtle)] text-[10px] font-extrabold text-[var(--text-secondary)]">
+                          {filteredGroups.length}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowInboxMoreMenu(false);
+                          setInboxTab((prev) => (prev === 'archived' ? 'inbox' : 'archived'));
+                        }}
+                        className="w-full px-3.5 py-2.5 flex items-center justify-between gap-2.5 hover:bg-[var(--bg-subtle)] transition text-left cursor-pointer"
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <Archive size={15} className="text-amber-500" />
+                          <span>Archived</span>
+                        </span>
+                        {archivedInboxRows.length > 0 && (
+                          <span className="px-1.5 py-0.5 rounded-full bg-[var(--bg-subtle)] text-[10px] font-extrabold text-[var(--text-secondary)]">
+                            {archivedInboxRows.length}
+                          </span>
+                        )}
+                      </button>
+
+                      <div className="my-1 border-t border-[var(--border-hairline)]" />
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowInboxMoreMenu(false);
+                          setIsChatSettingsModalOpen(true);
+                        }}
+                        className="w-full px-3.5 py-2.5 flex items-center gap-2.5 hover:bg-[var(--bg-subtle)] transition text-left cursor-pointer"
+                      >
+                        <SlidersHorizontal size={15} className="text-[var(--accent-primary)]" />
+                        <span>Chat settings</span>
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           </div>
 
-          {/* Scrollable Chat Home Body (Search & Tabs scroll away naturally with the list) */}
+          {/* Scrollable Message Inbox Body */}
           <div
             ref={chatHomeScrollRef}
-            className="wavelink-chat-home-scroll flex-1 overflow-y-auto p-3.5 space-y-4 pb-28"
+            onClick={() => {
+              if (swipedRowId) setSwipedRowId(null);
+            }}
+            className="wavelink-chat-home-scroll flex-1 overflow-y-auto px-3.5 pt-2 space-y-3.5 pb-36"
           >
-            {/* Search Input to find other users, chats, or groups in the app */}
-            <div className="space-y-1.5">
-              <div className="relative">
-                <Search
-                  size={16}
-                  className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none"
-                />
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Find users by name or @username to text..."
-                  className="w-full min-h-[44px] pl-10 pr-9 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-base sm:text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-primary)]/20 transition"
-                />
-                {searchQuery && (
-                  <button
-                    type="button"
-                    onClick={() => setSearchQuery('')}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-                    aria-label="Clear search"
-                  >
-                    <X size={14} />
-                  </button>
-                )}
-              </div>
-              {isSearchingUsers && (
-                <p className="text-[11px] font-semibold text-[var(--text-secondary)] px-1">
-                  Showing users matching "{searchQuery.trim()}" — tap Chat or Follow to message them.
-                </p>
-              )}
-            </div>
+            {/* 2. FLOATING PROFILE BUBBLE CLUSTER ROW (my bigger center bubble with "+" & "Add note", surrounded by max 8 contacts/online friends) */}
+            <div className="wavelink-msg-bubble-cluster">
+              {/* Left cluster contacts (max 4) */}
+              {leftClusterContacts.map((person, idx) => {
+                const firstName = (person.displayName || 'Waver').split(' ')[0];
+                const isBot = person.id === SUPPORT_BOT_ID;
+                const contactNote = showNotesInInbox ? getActiveChatNoteText(person.chatNote) : null;
+                const offsetClass =
+                  idx % 2 === 0
+                    ? 'wavelink-msg-bubble-node--offset-up'
+                    : 'wavelink-msg-bubble-node--offset-down';
 
-            {/* Tabs: Chats, People, Groups */}
-            <div className="grid grid-cols-3 gap-1.5 p-1 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
-              {(
-                [
-                  { id: 'chats', label: 'Chats', count: totalUnreadMessages },
-                  { id: 'people', label: 'Following', count: 0 },
-                  { id: 'groups', label: 'Groups', count: filteredGroups.length }
-                ] as const
-              ).map((tab) => {
-                const isSelected = convoFilter === tab.id;
                 return (
                   <button
-                    key={tab.id}
+                    key={`cluster_left_${person.id}`}
                     type="button"
-                    role="tab"
-                    aria-selected={isSelected}
-                    onClick={() => setConvoFilter(tab.id)}
-                    className={`min-h-[40px] px-2.5 py-1.5 rounded-xl text-xs font-extrabold transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                      isSelected
-                        ? 'text-white shadow-xs'
-                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                    style={
-                      isSelected
-                        ? {
-                            background:
-                              'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-                          }
-                        : undefined
-                    }
+                    onClick={() => handleOpenMemberChat(person.id)}
+                    className={`wavelink-msg-bubble-node ${offsetClass} group`}
+                    title={`Chat with ${person.displayName}`}
                   >
-                    <span>{tab.label}</span>
-                    {tab.count > 0 && (
-                      <span
-                        className={`px-1.5 py-0.2 rounded-full text-[10px] font-black ${
-                          isSelected
-                            ? 'bg-white/25 text-white'
-                            : 'bg-[var(--accent-primary)]/15 text-[var(--accent-primary)]'
-                        }`}
-                      >
-                        {tab.count}
+                    {contactNote && (
+                      <span className="wavelink-msg-note-bubble" title={contactNote}>
+                        {contactNote}
                       </span>
                     )}
+                    <div className="wavelink-msg-bubble-ring transition-transform group-hover:scale-105 group-active:scale-95">
+                      <Avatar
+                        uid={person.id}
+                        src={
+                          person.photoURL ||
+                          `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+                        }
+                        alt={person.displayName}
+                        fallbackName={person.displayName}
+                        size={48}
+                        showStatus={!isBot}
+                        targetProfile={person}
+                        imageClassName="border-2 border-[var(--bg-surface)]"
+                      />
+                      {isBot && (
+                        <span
+                          className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                          title="Online"
+                        />
+                      )}
+                    </div>
+                    <span className="text-[11px] font-bold text-[var(--text-primary)] max-w-[62px] truncate">
+                      {firstName}
+                    </span>
                   </button>
                 );
               })}
-            </div>
 
-            {/* 1. Horizontal "Active now" row of round avatars (only followed or texted contacts) */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between px-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-[#22c55e] animate-pulse" />
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
-                    Active now
-                  </span>
-                </div>
-                <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
-                  {connectedMembers
-                    .slice(0, 12)
-                    .filter((m) => m.id === SUPPORT_BOT_ID || getCachedIsOnline(m.id))
-                    .length}{' '}
-                  online
-                </span>
-              </div>
-
-              <div className="flex items-center gap-3 overflow-x-auto pb-1.5 pt-0.5 no-scrollbar">
-                {connectedMembers.slice(0, 12).map((person) => {
-                  const firstName = (person.displayName || 'Waver').split(' ')[0];
-                  const isBot = person.id === SUPPORT_BOT_ID;
-                  return (
-                    <button
-                      key={`active_${person.id}`}
-                      type="button"
-                      onClick={() => handleOpenMemberChat(person.id)}
-                      className="flex flex-col items-center gap-1.5 shrink-0 group cursor-pointer min-w-[60px]"
-                      title={`Chat with ${person.displayName}`}
-                    >
-                      <div
-                        className="relative p-[2.5px] rounded-full transition-transform group-hover:scale-105 group-active:scale-95 shadow-xs"
-                        style={{
-                          background:
-                            'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-                        }}
-                      >
-                        <Avatar
-                          uid={person.id}
-                          src={
-                            person.photoURL ||
-                            `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
-                          }
-                          alt={person.displayName}
-                          fallbackName={person.displayName}
-                          size={52}
-                          showStatus={!isBot}
-                          targetProfile={person}
-                          imageClassName="border-2 border-[var(--bg-surface)]"
-                        />
-                        {isBot && (
-                          <span
-                            className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
-                            title="24/7 Assistant"
-                          />
-                        )}
-                      </div>
-                      <span className="text-[11px] font-bold text-[var(--text-primary)] max-w-[64px] truncate">
-                        {firstName}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* 2. People Grid of Large Rounded Avatar Cards (shows Search Results when searching, or Followed Contacts) */}
-            {(convoFilter === 'people' || (convoFilter === 'chats' && (isSearchingUsers || connectedMembers.length > 0))) && (
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
-                    <Sparkles size={13} className="text-[var(--accent-primary)]" />
-                    <span>
-                      {isSearchingUsers
-                        ? `Found Users (${filteredMembers.filter((m) => m.id !== SUPPORT_BOT_ID).length})`
-                        : convoFilter === 'people'
-                        ? `People You Follow (${connectedMembers.length})`
-                        : 'Following & Contacts'}
+              {/* Center: My Own Bigger Bubble with Gradient Ring, Presence Dot, "+" Badge, and Floating "Add note" Speech Bubble */}
+              {currentUser && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNoteDraftText(myActiveNoteText || '');
+                    setIsNoteModalOpen(true);
+                  }}
+                  className="wavelink-msg-bubble-node wavelink-msg-bubble-node--center group"
+                  title={myActiveNoteText ? `Edit your note: "${myActiveNoteText}"` : 'Add a 24-hour note'}
+                >
+                  {showNotesInInbox && (
+                    <span className="wavelink-msg-note-bubble">
+                      {myActiveNoteText || 'Add note'}
                     </span>
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleToggleOnlineFirstSort}
-                      aria-pressed={onlineFirstSort}
-                      className={`px-2.5 py-1 rounded-full text-[11px] font-extrabold border transition flex items-center gap-1.5 cursor-pointer ${
-                        onlineFirstSort
-                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/40'
-                          : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-hairline)]'
-                      }`}
-                      title="Sort online contacts to the top"
-                    >
-                      <span
-                        className={`w-2 h-2 rounded-full ${
-                          onlineFirstSort ? 'bg-[#22c55e]' : 'bg-slate-400'
-                        }`}
-                      />
-                      <span>Online first</span>
-                    </button>
-                    {convoFilter === 'chats' && filteredMembers.length > 4 && (
-                      <button
-                        type="button"
-                        onClick={() => setConvoFilter('people')}
-                        className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline cursor-pointer"
-                      >
-                        See all
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {visibleMembersList.length === 0 ? (
-                  <div className="p-5 rounded-3xl bg-[var(--bg-surface)] border border-dashed border-[var(--border-hairline)] text-center space-y-2">
-                    <p className="text-xs font-extrabold text-[var(--text-primary)]">
-                      {isSearchingUsers
-                        ? `No users found matching "${searchQuery.trim()}"`
-                        : 'No followed contacts yet'}
-                    </p>
-                    <p className="text-xs text-[var(--text-secondary)]">
-                      Use the search bar above to find anyone in the app by name or @username.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-2.5">
-                    {(convoFilter === 'people' || isSearchingUsers
-                      ? visibleMembersList
-                      : filteredMembers.slice(0, 4)
-                    ).map((person) => (
-                      <ChatPersonGridCard
-                        key={`grid_${person.id}`}
-                        person={person}
-                        language={language === 'sw' ? 'sw' : 'en'}
-                        isFollowed={isMemberFollowed(person.id)}
-                        onToggleFollow={handleToggleFollowInChat}
-                        onSelect={(uid) => handleOpenMemberChat(uid, isSearchingUsers)}
-                        onStartCall={(targetPerson, callType) =>
-                          onOpenCall(callType, {
-                            id: targetPerson.id,
-                            name: targetPerson.displayName,
-                            photoURL: targetPerson.photoURL
-                          })
-                        }
-                      />
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* 3. Groups Section (shown in Groups tab or Chats tab) */}
-            {(convoFilter === 'groups' || (convoFilter === 'chats' && filteredGroups.length > 0)) && (
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between px-1">
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
-                    <Users size={13} className="text-[var(--accent-secondary)]" />
-                    <span>Groups ({filteredGroups.length})</span>
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setIsCreateGroupOpen(true)}
-                    className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline flex items-center gap-1 cursor-pointer"
-                  >
-                    <Plus size={12} />
-                    <span>New Group</span>
-                  </button>
-                </div>
-
-                {filteredGroups.length === 0 ? (
-                  <div className="p-5 rounded-3xl bg-[var(--bg-surface)] border border-dashed border-[var(--border-hairline)] text-center space-y-2.5">
-                    <p className="text-xs font-semibold text-[var(--text-secondary)]">
-                      No groups created yet. Start a group to chat with friends together!
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => setIsCreateGroupOpen(true)}
-                      className="min-h-[44px] px-4 py-2 rounded-2xl text-xs text-white font-extrabold inline-flex items-center gap-1.5 shadow-xs cursor-pointer"
+                  )}
+                  <div className="wavelink-msg-bubble-ring transition-transform group-hover:scale-105 group-active:scale-95">
+                    <Avatar
+                      uid={currentUser.uid}
+                      src={getBestAuthUserPhotoUrl(currentUser, userProfile)}
+                      alt={userProfile?.displayName || currentUser.displayName || 'You'}
+                      fallbackName={userProfile?.displayName || currentUser.displayName || 'You'}
+                      size={62}
+                      showStatus={true}
+                      targetProfile={userProfile || undefined}
+                      imageClassName="border-2 border-[var(--bg-surface)]"
+                    />
+                    <span
+                      className="absolute -bottom-0.5 -right-0.5 w-5 h-5 rounded-full text-white flex items-center justify-center ring-2 ring-[var(--bg-surface)] shadow-md"
                       style={{
                         background:
                           'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
                       }}
                     >
-                      <Plus size={14} />
-                      <span>Create First Group</span>
-                    </button>
+                      <Plus size={12} strokeWidth={3} />
+                    </span>
                   </div>
-                ) : (
-                  <div className="space-y-2.5">
-                    {(convoFilter === 'groups' ? filteredGroups : filteredGroups.slice(0, 4)).map(
-                      (group) => {
-                        const isActive = activeChannel === group.id && !showMobileChannels;
-                        const isGrpAdmin =
-                          group.adminIds?.includes(currentUser?.uid || '') ||
-                          group.creatorId === currentUser?.uid;
-                        const grpUnread =
-                          isActive ? 0 : unreadCountsByChannel[group.id] || 0;
-                        const grpLatest = latestMessageByChannel[group.id];
-                        const grpTypers = getActiveTypingUsersForChannel(group.id);
-                        const timeLabel = formatCompactConvoTime(
-                          grpLatest?.createdAt || group.lastMessageAt || group.updatedAt || group.createdAt
-                        );
-
-                        return (
-                          <button
-                            key={group.id}
-                            type="button"
-                            onClick={() => {
-                              setActiveChannel(group.id);
-                              setReplyingTo(null);
-                              setReactionMenuMsgId(null);
-                              setShowMobileChannels(false);
-                            }}
-                            className={`w-full min-h-[76px] flex items-center gap-3.5 p-3.5 rounded-3xl text-left transition border cursor-pointer ${
-                              isActive
-                                ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/20 shadow-sm'
-                                : grpUnread > 0
-                                ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)]/60 shadow-xs'
-                                : 'bg-[var(--bg-surface)] border-[var(--border-hairline)] hover:border-[var(--accent-primary)]/50'
-                            }`}
-                          >
-                            <div
-                              className="relative p-[2px] rounded-2xl shrink-0"
-                              style={{
-                                background:
-                                  'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-                              }}
-                            >
-                              <img
-                                src={group.logoUrl || PRESET_LOGOS[0].url}
-                                alt={group.name}
-                                className="w-12 h-12 rounded-[14px] object-cover bg-[var(--bg-surface)]"
-                              />
-                              {isGrpAdmin && (
-                                <span
-                                  className="absolute -top-1 -right-1 p-1 rounded-full bg-amber-500 text-white shadow-2xs"
-                                  title="Group Admin"
-                                >
-                                  <Crown size={10} />
-                                </span>
-                              )}
-                            </div>
-
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="font-extrabold text-sm text-[var(--text-primary)] truncate">
-                                  {group.name}
-                                </span>
-                                <div className="flex items-center gap-1.5 shrink-0">
-                                  {(localChatThemes[group.id]?.themeId &&
-                                    localChatThemes[group.id]?.themeId !== 'default') ||
-                                  localChatThemes[group.id]?.customBgUrl ||
-                                  localChatThemes[group.id]?.accentColor ? (
-                                    <span
-                                      className="w-5 h-5 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] inline-flex items-center justify-center shrink-0"
-                                      title={`Chat theme: ${getChatThemeDisplayName(
-                                        localChatThemes[group.id]?.themeId
-                                      )}`}
-                                    >
-                                      <ChatThemeBadgeIcon
-                                        themeId={localChatThemes[group.id]?.themeId}
-                                        size={11}
-                                      />
-                                    </span>
-                                  ) : null}
-                                  {timeLabel && (
-                                    <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
-                                      {timeLabel}
-                                    </span>
-                                  )}
-                                  {grpUnread > 0 && (
-                                    <span
-                                      className="min-w-[22px] h-5 px-1.5 rounded-full bg-[#F43F5E] text-white text-[11px] font-extrabold inline-flex items-center justify-center shadow-2xs"
-                                    >
-                                      {grpUnread}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-
-                              {grpTypers.length > 0 ? (
-                                <p className="text-xs text-emerald-600 dark:text-emerald-400 font-extrabold truncate mt-1 flex items-center gap-1.5">
-                                  <span className="inline-flex items-center gap-0.5">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
-                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
-                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
-                                  </span>
-                                  <span className="truncate">
-                                    {grpTypers.length === 1
-                                      ? `${grpTypers[0].name.split(' ')[0]} is typing...`
-                                      : `${grpTypers.length} people typing...`}
-                                  </span>
-                                </p>
-                              ) : grpLatest?.text ? (
-                                <p
-                                  className={`text-xs truncate mt-1 ${
-                                    grpUnread > 0
-                                      ? 'font-extrabold text-[var(--text-primary)]'
-                                      : 'font-medium text-[var(--text-secondary)]'
-                                  }`}
-                                >
-                                  {grpLatest.senderId === currentUser?.uid
-                                    ? `You: ${grpLatest.text}`
-                                    : `${grpLatest.senderName.split(' ')[0]}: ${grpLatest.text}`}
-                                </p>
-                              ) : (
-                                <p className="text-xs text-[var(--text-secondary)] truncate mt-1">
-                                  {group.description || `${group.memberIds?.length || 1} members`}
-                                </p>
-                              )}
-                            </div>
-                          </button>
-                        );
-                      }
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* 4. Conversation List (Strictly ONLY users you have actually texted, plus Support Bot) */}
-            {convoFilter === 'chats' && (
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between px-1">
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
-                    <MessageSquare size={13} className="text-[var(--accent-primary)]" />
-                    <span>Recent Conversations ({recentChatMembers.length})</span>
+                  <span className="text-[11px] font-extrabold text-[var(--text-primary)] max-w-[68px] truncate">
+                    You
                   </span>
+                </button>
+              )}
+
+              {/* Right cluster contacts (max 4) */}
+              {rightClusterContacts.map((person, idx) => {
+                const firstName = (person.displayName || 'Waver').split(' ')[0];
+                const isBot = person.id === SUPPORT_BOT_ID;
+                const contactNote = showNotesInInbox ? getActiveChatNoteText(person.chatNote) : null;
+                const offsetClass =
+                  idx % 2 === 0
+                    ? 'wavelink-msg-bubble-node--offset-down'
+                    : 'wavelink-msg-bubble-node--offset-up';
+
+                return (
+                  <button
+                    key={`cluster_right_${person.id}`}
+                    type="button"
+                    onClick={() => handleOpenMemberChat(person.id)}
+                    className={`wavelink-msg-bubble-node ${offsetClass} group`}
+                    title={`Chat with ${person.displayName}`}
+                  >
+                    {contactNote && (
+                      <span className="wavelink-msg-note-bubble" title={contactNote}>
+                        {contactNote}
+                      </span>
+                    )}
+                    <div className="wavelink-msg-bubble-ring transition-transform group-hover:scale-105 group-active:scale-95">
+                      <Avatar
+                        uid={person.id}
+                        src={
+                          person.photoURL ||
+                          `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+                        }
+                        alt={person.displayName}
+                        fallbackName={person.displayName}
+                        size={48}
+                        showStatus={!isBot}
+                        targetProfile={person}
+                        imageClassName="border-2 border-[var(--bg-surface)]"
+                      />
+                      {isBot && (
+                        <span
+                          className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                          title="Online"
+                        />
+                      )}
+                    </div>
+                    <span className="text-[11px] font-bold text-[var(--text-primary)] max-w-[62px] truncate">
+                      {firstName}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* 3. GLASS SEGMENTED PILL WITH 3 TABS: "Inbox <count>", "Unread", and "Requests" */}
+            <div className="space-y-2">
+              <div className="wavelink-msg-segmented-pill" role="tablist" aria-label="Message tabs">
+                {/* Tab 1: Inbox <count> (count of conversations with unread messages, or total if zero unread) */}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inboxTab === 'inbox'}
+                  onClick={() => setInboxTab('inbox')}
+                  className="wavelink-msg-segmented-tab"
+                >
+                  <span>Inbox</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded-full text-[11px] font-black leading-none ${
+                      inboxTab === 'inbox'
+                        ? 'bg-white/25 text-white'
+                        : unreadConversationsCount > 0
+                        ? 'bg-[var(--accent-primary)]/20 text-[var(--accent-primary)]'
+                        : 'bg-white/10 text-[var(--text-secondary)]'
+                    }`}
+                  >
+                    {inboxTabBadgeNumber}
+                  </span>
+                </button>
+
+                {/* Tab 2: Unread */}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inboxTab === 'unread'}
+                  onClick={() => setInboxTab('unread')}
+                  className="wavelink-msg-segmented-tab"
+                >
+                  <span>Unread</span>
+                  {unreadConversationsCount > 0 && (
+                    <span
+                      className={`px-1.5 py-0.5 rounded-full text-[10px] font-black leading-none ${
+                        inboxTab === 'unread'
+                          ? 'bg-white/25 text-white'
+                          : 'bg-[var(--accent-primary)]/20 text-[var(--accent-primary)]'
+                      }`}
+                    >
+                      {unreadConversationsCount}
+                    </span>
+                  )}
+                </button>
+
+                {/* Tab 3: Requests (with small count badge + dot when new; never adds to Inbox badge) */}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={inboxTab === 'requests'}
+                  onClick={() => setInboxTab('requests')}
+                  className="wavelink-msg-segmented-tab relative"
+                >
+                  <span>Requests</span>
+                  {pendingRequestsCount > 0 && (
+                    <span className="inline-flex items-center gap-1">
+                      <span
+                        className={`px-1.5 py-0.5 rounded-full text-[10px] font-black leading-none ${
+                          inboxTab === 'requests'
+                            ? 'bg-white/25 text-white'
+                            : 'bg-rose-500 text-white'
+                        }`}
+                      >
+                        {pendingRequestsCount}
+                      </span>
+                    </span>
+                  )}
+                </button>
+              </div>
+
+              {/* Filter chip strip for Groups, New Group, Archived, and quick search filter */}
+              <div className="flex items-center justify-between gap-1.5 overflow-x-auto no-scrollbar pt-0.5">
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setInboxTab((prev) => (prev === 'groups' ? 'inbox' : 'groups'))}
+                    className={`min-h-[32px] px-3 py-1 rounded-full text-[11px] font-extrabold border transition flex items-center gap-1.5 cursor-pointer ${
+                      inboxTab === 'groups'
+                        ? 'bg-[var(--accent-primary)] text-white border-transparent shadow-2xs'
+                        : 'bg-[var(--bg-subtle)]/80 text-[var(--text-secondary)] border-[var(--border-hairline)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    <Users size={12} />
+                    <span>Groups ({filteredGroups.length})</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedMemberIds([]);
+                      setNewGroupName('');
+                      setNewGroupDesc('');
+                      setNewGroupLogo(PRESET_LOGOS[0].url);
+                      setIsCreateGroupOpen(true);
+                    }}
+                    className="min-h-[32px] px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-[var(--bg-subtle)]/80 text-[var(--accent-primary)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] transition flex items-center gap-1 cursor-pointer"
+                  >
+                    <Plus size={12} />
+                    <span>New Group</span>
+                  </button>
+
+                  {archivedInboxRows.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setInboxTab((prev) => (prev === 'archived' ? 'inbox' : 'archived'))
+                      }
+                      className={`min-h-[32px] px-2.5 py-1 rounded-full text-[11px] font-extrabold border transition flex items-center gap-1 cursor-pointer ${
+                        inboxTab === 'archived'
+                          ? 'bg-amber-500 text-white border-transparent'
+                          : 'bg-[var(--bg-subtle)]/80 text-[var(--text-secondary)] border-[var(--border-hairline)]'
+                      }`}
+                    >
+                      <Archive size={11} />
+                      <span>Archived ({archivedInboxRows.length})</span>
+                    </button>
+                  )}
                 </div>
 
-                {isLoadingConversations ? (
-                  <div className="space-y-2.5">
-                    {[1, 2, 3, 4].map((n) => (
-                      <div
-                        key={n}
-                        className="w-full min-h-[76px] p-3.5 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] flex items-center gap-3.5 animate-pulse"
-                      >
-                        <div className="w-13 h-13 rounded-full bg-[var(--bg-subtle)] shrink-0" />
-                        <div className="flex-1 space-y-2">
-                          <div className="h-3.5 w-32 rounded-full bg-[var(--bg-subtle)]" />
-                          <div className="h-3 w-48 rounded-full bg-[var(--bg-subtle)]" />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : visibleRecentChatMembers.length === 0 ? (
-                  <div className="p-6 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-center space-y-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsNewChatSheetOpen(true);
+                    setTimeout(() => newChatInputRef.current?.focus(), 60);
+                  }}
+                  className="min-h-[32px] px-2.5 py-1 rounded-full text-[11px] font-bold bg-[var(--bg-subtle)]/80 text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border-hairline)] transition flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  title="Search chats or people (Ctrl+K)"
+                >
+                  <Search size={12} />
+                  <span>Search</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 4. THE LIST: REQUESTS TAB vs INBOX / UNREAD / GROUPS / ARCHIVED ROWS */}
+            {inboxTab === 'requests' ? (
+              <div className="space-y-2.5">
+                <div className="px-1 flex items-center justify-between">
+                  <p className="text-[11px] font-bold text-[var(--text-secondary)]">
+                    Messages from people you don&apos;t follow appear here (max 2 messages until you accept).
+                  </p>
+                </div>
+
+                {requestChatMembers.length === 0 ? (
+                  <div className="p-7 rounded-3xl bg-[var(--bg-surface)]/60 border border-[var(--border-hairline)] text-center space-y-2">
+                    <div className="w-12 h-12 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-center mx-auto text-[var(--text-secondary)]">
+                      <MailOpen size={22} />
+                    </div>
                     <p className="text-sm font-extrabold text-[var(--text-primary)]">
-                      No recent chats yet
+                      No message requests
                     </p>
                     <p className="text-xs text-[var(--text-secondary)]">
-                      Search for someone above or tap a person you follow to start texting!
+                      When someone outside your contacts sends you a message, you can preview, accept, or delete it here.
                     </p>
                   </div>
                 ) : (
                   <div className="space-y-2.5">
-                    {visibleRecentChatMembers.map((member) => {
+                    {requestChatMembers.map((member) => {
                       if (!currentUser) return null;
                       const dmId = computeDmConversationId(currentUser.uid, member.id);
-                      const isActive = activeChannel === dmId && !showMobileChannels;
-                      const dmTypers = getActiveTypingUsersForChannel(dmId);
-                      const isMemberTyping =
-                        dmTypers.length > 0 || (member.id === SUPPORT_BOT_ID && isBotReplying);
-                      const unreadCount = isActive ? 0 : unreadCountsByChannel[dmId] || 0;
-                      const latestMsg = latestMessageByChannel[dmId];
-                      const metaLastText = channelMetaMap[dmId]?.lastMessageText;
-                      const metaLastSenderId = channelMetaMap[dmId]?.lastMessageSenderId;
-                      const previewText = latestMsg?.text || metaLastText || '';
-                      const previewSenderId = latestMsg?.senderId || metaLastSenderId || '';
-                      const previewTimeIso =
-                        latestMsg?.createdAt ||
-                        channelMetaMap[dmId]?.lastMessageAt ||
-                        channelMetaMap[dmId]?.updatedAt ||
-                        member.lastSeen ||
-                        '';
-                      const compactTime = formatCompactConvoTime(previewTimeIso);
+                      const meta = channelMetaMap[dmId];
+                      const latest = latestMessageByChannel[dmId];
+                      const previewText = latest?.text || meta?.lastMessageText || 'Sent you a message request';
+                      const timeLabel = formatCompactConvoTime(
+                        latest?.createdAt || meta?.lastMessageAt || meta?.updatedAt
+                      );
 
                       return (
-                        <button
-                          key={member.id}
-                          type="button"
-                          onClick={() => handleOpenMemberChat(member.id)}
-                          className={`w-full min-h-[76px] flex items-center gap-3.5 p-3.5 rounded-3xl text-left transition border cursor-pointer ${
-                            isActive
-                              ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/20 shadow-sm'
-                              : unreadCount > 0
-                              ? 'bg-[var(--bg-surface)] border-[var(--accent-primary)]/60 shadow-xs'
-                              : 'bg-[var(--bg-surface)] border-[var(--border-hairline)] hover:border-[var(--accent-primary)]/40'
-                          }`}
+                        <div
+                          key={`req_${dmId}`}
+                          className="p-3.5 rounded-3xl bg-[var(--bg-surface)]/85 border border-[var(--border-hairline)] space-y-3 shadow-xs"
                         >
-                          {/* Big Avatar with Colored Ring + Live RTDB Presence Dot */}
-                          <div className="relative shrink-0">
-                            <div
-                              className="p-[2px] rounded-full"
-                              style={{
-                                background:
-                                  'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
-                              }}
-                            >
+                          <div
+                            onClick={() => handleOpenMemberChat(member.id)}
+                            role="button"
+                            tabIndex={0}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleOpenMemberChat(member.id);
+                            }}
+                            className="flex items-center gap-3.5 cursor-pointer"
+                          >
+                            <div className="wavelink-msg-bubble-ring shrink-0">
                               <Avatar
                                 uid={member.id}
                                 src={
@@ -4724,117 +5631,608 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                                 }
                                 alt={member.displayName}
                                 fallbackName={member.displayName}
-                                size={48}
-                                showStatus={member.id !== SUPPORT_BOT_ID}
+                                size={56}
+                                showStatus={true}
                                 targetProfile={member}
                                 imageClassName="border-2 border-[var(--bg-surface)]"
                               />
                             </div>
-                            {member.id === SUPPORT_BOT_ID && (
-                              <span
-                                className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
-                                title="24/7 Assistant"
-                              />
-                            )}
+
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-extrabold text-sm text-[var(--text-primary)] truncate">
+                                  {member.displayName}
+                                </span>
+                                {timeLabel && (
+                                  <span className="text-[11px] font-bold text-[var(--text-secondary)] shrink-0">
+                                    {timeLabel}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[11px] font-semibold text-[var(--text-secondary)] truncate">
+                                {member.username || '@waver'}
+                              </p>
+                              <p className="text-xs font-extrabold text-[var(--text-primary)] truncate mt-1">
+                                {previewText}
+                              </p>
+                            </div>
                           </div>
 
-                          {/* Conversation Info */}
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="truncate">
-                                <CrystalBadge
-                                  email={member.email}
-                                  name={member.displayName}
-                                  isPro={member.isPro}
-                                  hasBlueStar={member.hasBlueStar || member.isPro}
-                                  isSubAdmin={member.isSubAdmin || member.role === 'sub_admin'}
-                                  role={member.role}
-                                  size="sm"
-                                />
-                              </span>
+                          {/* Request Action Buttons: Accept, Delete, Block / Report */}
+                          <div className="grid grid-cols-3 gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => handleAcceptChatRequest(member)}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-2xs transition active:scale-95 cursor-pointer"
+                              style={{
+                                background:
+                                  'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                              }}
+                            >
+                              <Check size={14} />
+                              <span>Accept</span>
+                            </button>
 
-                              <div className="flex items-center gap-1.5 shrink-0">
-                                {(localChatThemes[dmId]?.themeId &&
-                                  localChatThemes[dmId]?.themeId !== 'default') ||
-                                localChatThemes[dmId]?.customBgUrl ||
-                                localChatThemes[dmId]?.accentColor ? (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteChannelId(dmId)}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:bg-rose-500/15 text-[var(--text-primary)] hover:text-rose-500 border border-[var(--border-hairline)] text-xs font-extrabold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+                            >
+                              <Trash2 size={13} />
+                              <span>Delete</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await toggleBlockUser(member.id);
+                                await reportContent({
+                                  targetType: 'user',
+                                  targetId: member.id,
+                                  reason: 'Unwanted message request / spam'
+                                }).catch(() => {});
+                                await handleDeleteConversationForMe(dmId);
+                              }}
+                              className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 border border-rose-500/25 text-xs font-extrabold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
+                            >
+                              <Ban size={13} />
+                              <span>Block</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* INBOX / UNREAD / GROUPS / ARCHIVED LIST */
+              <div className="space-y-2">
+                {isLoadingConversations ? (
+                  <div className="space-y-2">
+                    {[1, 2, 3, 4].map((n) => (
+                      <div
+                        key={n}
+                        className="w-full min-h-[78px] p-3 rounded-[22px] bg-[var(--bg-surface)]/60 border border-[var(--border-hairline)] flex items-center gap-3.5 animate-pulse"
+                      >
+                        <div className="w-14 h-14 rounded-full bg-[var(--bg-subtle)] shrink-0" />
+                        <div className="flex-1 space-y-2">
+                          <div className="h-3.5 w-32 rounded-full bg-[var(--bg-subtle)]" />
+                          <div className="h-3 w-48 rounded-full bg-[var(--bg-subtle)]" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : visibleInboxRows.length === 0 ? (
+                  <div className="p-7 rounded-3xl bg-[var(--bg-surface)]/60 border border-[var(--border-hairline)] text-center space-y-3">
+                    <div
+                      className="w-12 h-12 rounded-2xl flex items-center justify-center mx-auto text-white shadow-sm"
+                      style={{
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }}
+                    >
+                      <MessageSquare size={22} />
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-sm font-extrabold text-[var(--text-primary)]">
+                        {inboxTab === 'unread'
+                          ? 'All caught up!'
+                          : inboxTab === 'archived'
+                          ? 'No archived chats'
+                          : inboxTab === 'groups'
+                          ? 'No groups yet'
+                          : 'Your inbox is clean'}
+                      </p>
+                      <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+                        {inboxTab === 'unread'
+                          ? 'You have zero unread messages right now.'
+                          : inboxTab === 'groups'
+                          ? 'Create a group to chat with your circle together.'
+                          : 'Conversations appear here once you exchange a message. Tap New chat to message a contact or find someone.'}
+                      </p>
+                    </div>
+                    {inboxTab === 'inbox' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsNewChatSheetOpen(true);
+                          setTimeout(() => newChatInputRef.current?.focus(), 60);
+                        }}
+                        className="min-h-[42px] px-4 py-2 rounded-2xl text-white text-xs font-extrabold inline-flex items-center gap-2 shadow-sm transition active:scale-95 cursor-pointer"
+                        style={{
+                          background:
+                            'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                        }}
+                      >
+                        <Plus size={15} />
+                        <span>Start a New Chat</span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {visibleInboxRows.map((row, rowIdx) => {
+                      if (!currentUser) return null;
+                      const { channelId, unreadCount, isPinned, isMuted } = row;
+                      const isActive = activeChannel === channelId && !showMobileChannels;
+                      const isKeyboardFocused = focusedRowIndex === rowIdx;
+                      const isSwipedOpen = swipedRowId === channelId;
+                      const badgeText = unreadCount > 99 ? '99+' : String(unreadCount);
+
+                      const handleRowTouchStart = (e: React.TouchEvent) => {
+                        const t = e.touches[0];
+                        if (!t) return;
+                        rowSwipeTouchRef.current = {
+                          id: channelId,
+                          startX: t.clientX,
+                          startY: t.clientY
+                        };
+                        if (rowLongPressTimerRef.current) clearTimeout(rowLongPressTimerRef.current);
+                        rowLongPressTimerRef.current = setTimeout(() => {
+                          setActionMenuRowId(channelId);
+                        }, 520);
+                      };
+
+                      const handleRowTouchMove = (e: React.TouchEvent) => {
+                        const start = rowSwipeTouchRef.current;
+                        const t = e.touches[0];
+                        if (!start || start.id !== channelId || !t) return;
+                        const dx = t.clientX - start.startX;
+                        const dy = t.clientY - start.startY;
+                        if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+                          if (rowLongPressTimerRef.current) {
+                            clearTimeout(rowLongPressTimerRef.current);
+                            rowLongPressTimerRef.current = null;
+                          }
+                        }
+                        if (Math.abs(dx) > 36 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+                          if (dx < 0) {
+                            setSwipedRowId(channelId);
+                          } else if (dx > 0 && swipedRowId === channelId) {
+                            setSwipedRowId(null);
+                          }
+                        }
+                      };
+
+                      const handleRowTouchEnd = () => {
+                        if (rowLongPressTimerRef.current) {
+                          clearTimeout(rowLongPressTimerRef.current);
+                          rowLongPressTimerRef.current = null;
+                        }
+                        rowSwipeTouchRef.current = null;
+                      };
+
+                      if (row.kind === 'group') {
+                        const group = row.group;
+                        const grpLatest = latestMessageByChannel[group.id];
+                        const grpTypers = getActiveTypingUsersForChannel(group.id);
+                        const timeLabel = formatCompactConvoTime(row.lastMessageAt);
+                        const senderPrefix = grpLatest?.text
+                          ? grpLatest.senderId === currentUser.uid
+                            ? 'You: '
+                            : `${(grpLatest.senderName || 'Member').split(' ')[0]}: `
+                          : '';
+
+                        return (
+                          <div
+                            key={group.id}
+                            className="wavelink-msg-row-wrap"
+                            onTouchStart={handleRowTouchStart}
+                            onTouchMove={handleRowTouchMove}
+                            onTouchEnd={handleRowTouchEnd}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              setActionMenuRowId(group.id);
+                            }}
+                          >
+                            {/* Swipe-left Action Tray: Mute & Delete */}
+                            <div className="wavelink-msg-row-actions-tray">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleMuteChannel(group.id);
+                                  setSwipedRowId(null);
+                                }}
+                                className="w-16 h-full bg-slate-700 text-white text-[11px] font-extrabold flex flex-col items-center justify-center gap-1 cursor-pointer"
+                              >
+                                {isMuted ? <Bell size={15} /> : <BellOff size={15} />}
+                                <span>{isMuted ? 'Unmute' : 'Mute'}</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setConfirmDeleteChannelId(group.id);
+                                  setSwipedRowId(null);
+                                }}
+                                className="w-16 h-full bg-rose-600 text-white text-[11px] font-extrabold flex flex-col items-center justify-center gap-1 cursor-pointer"
+                              >
+                                <Trash2 size={15} />
+                                <span>Delete</span>
+                              </button>
+                            </div>
+
+                            {/* Foreground Row Card */}
+                            <div
+                              role="button"
+                              tabIndex={0}
+                              data-active={isActive ? 'true' : 'false'}
+                              data-unread={unreadCount > 0 ? 'true' : 'false'}
+                              style={{
+                                transform: isSwipedOpen ? 'translateX(-128px)' : 'translateX(0)'
+                              }}
+                              onClick={() => {
+                                if (isSwipedOpen) {
+                                  setSwipedRowId(null);
+                                  return;
+                                }
+                                setFocusedRowIndex(rowIdx);
+                                handleOpenGroupChat(group.id);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleOpenGroupChat(group.id);
+                              }}
+                              className={`wavelink-msg-row-card w-full flex items-center gap-3.5 text-left cursor-pointer ${
+                                isKeyboardFocused ? 'ring-2 ring-[var(--accent-primary)]' : ''
+                              }`}
+                            >
+                              {/* 56px Avatar with Gradient Ring + Presence Dot */}
+                              <div className="relative shrink-0">
+                                <div className="wavelink-msg-bubble-ring">
+                                  <img
+                                    src={group.logoUrl || PRESET_LOGOS[0].url}
+                                    alt={group.name}
+                                    className="w-[56px] h-[56px] rounded-full object-cover border-2 border-[var(--bg-surface)] bg-[var(--bg-surface)]"
+                                  />
+                                </div>
+                                <span
+                                  className="absolute bottom-0.5 right-0.5 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                                  title="Active group"
+                                />
+                              </div>
+
+                              {/* Name & 1-line Last Message Preview */}
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <span
+                                      className={`text-sm text-[var(--text-primary)] truncate ${
+                                        unreadCount > 0 ? 'font-black' : 'font-extrabold'
+                                      }`}
+                                    >
+                                      {group.name}
+                                    </span>
+                                    <span className="px-1.5 py-0.5 rounded-md bg-[var(--bg-subtle)] text-[9px] font-extrabold uppercase tracking-wider text-[var(--text-secondary)] shrink-0">
+                                      Group
+                                    </span>
+                                    {isPinned && (
+                                      <span title="Pinned" className="inline-flex shrink-0">
+                                        <Pin
+                                          size={12}
+                                          className="text-[var(--accent-primary)] shrink-0 rotate-45"
+                                        />
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {/* Right side: Time + Mute Bell + Unread Badge */}
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {timeLabel && (
+                                      <span
+                                        className={`text-[11px] ${
+                                          unreadCount > 0
+                                            ? 'font-extrabold text-[var(--accent-primary)]'
+                                            : 'font-semibold text-[var(--text-secondary)]'
+                                        }`}
+                                      >
+                                        {timeLabel}
+                                      </span>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        toggleMuteChannel(group.id);
+                                      }}
+                                      className={`p-1 rounded-full transition cursor-pointer ${
+                                        isMuted
+                                          ? 'text-amber-500 bg-amber-500/10'
+                                          : 'text-[var(--text-secondary)]/70 hover:text-[var(--text-primary)]'
+                                      }`}
+                                      title={isMuted ? 'Unmute group' : 'Mute group'}
+                                      aria-label={isMuted ? 'Unmute group' : 'Mute group'}
+                                    >
+                                      {isMuted ? <BellOff size={13} /> : <Bell size={13} />}
+                                    </button>
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="min-w-0 flex-1">
+                                    {grpTypers.length > 0 ? (
+                                      <span className="text-xs font-extrabold text-emerald-500 flex items-center gap-1.5 truncate mt-1">
+                                        <span className="inline-flex items-center gap-0.5">
+                                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
+                                        </span>
+                                        <span className="truncate">
+                                          {grpTypers[0].name.split(' ')[0]} is typing...
+                                        </span>
+                                      </span>
+                                    ) : (
+                                      renderLastMessagePreviewContent({
+                                        previewText:
+                                          grpLatest?.text ||
+                                          group.description ||
+                                          `${group.memberIds?.length || 1} members`,
+                                        senderPrefix,
+                                        isUnread: unreadCount > 0
+                                      })
+                                    )}
+                                  </div>
+
+                                  {unreadCount > 0 && (
+                                    <span
+                                      className={`wavelink-msg-unread-badge shrink-0 mt-1 ${
+                                        isMuted ? 'wavelink-msg-unread-badge--muted' : ''
+                                      }`}
+                                    >
+                                      {badgeText}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      /* DM Row */
+                      const member = row.member;
+                      const dmId = row.channelId;
+                      const dmTypers = getActiveTypingUsersForChannel(dmId);
+                      const isMemberTyping =
+                        dmTypers.length > 0 || (member.id === SUPPORT_BOT_ID && isBotReplying);
+                      const latestMsg = latestMessageByChannel[dmId];
+                      const meta = channelMetaMap[dmId];
+                      const previewText = latestMsg?.text || meta?.lastMessageText || '';
+                      const previewSenderId =
+                        latestMsg?.senderId || meta?.lastMessageSenderId || '';
+                      const senderPrefix =
+                        previewSenderId === currentUser.uid ? 'You: ' : '';
+                      const compactTime = formatCompactConvoTime(row.lastMessageAt);
+
+                      return (
+                        <div
+                          key={dmId}
+                          className="wavelink-msg-row-wrap"
+                          onTouchStart={handleRowTouchStart}
+                          onTouchMove={handleRowTouchMove}
+                          onTouchEnd={handleRowTouchEnd}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setActionMenuRowId(dmId);
+                          }}
+                        >
+                          {/* Swipe-left Action Tray: Mute & Delete */}
+                          <div className="wavelink-msg-row-actions-tray">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleMuteChannel(dmId);
+                                setSwipedRowId(null);
+                              }}
+                              className="w-16 h-full bg-slate-700 text-white text-[11px] font-extrabold flex flex-col items-center justify-center gap-1 cursor-pointer"
+                            >
+                              {isMuted ? <Bell size={15} /> : <BellOff size={15} />}
+                              <span>{isMuted ? 'Unmute' : 'Mute'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmDeleteChannelId(dmId);
+                                setSwipedRowId(null);
+                              }}
+                              className="w-16 h-full bg-rose-600 text-white text-[11px] font-extrabold flex flex-col items-center justify-center gap-1 cursor-pointer"
+                            >
+                              <Trash2 size={15} />
+                              <span>Delete</span>
+                            </button>
+                          </div>
+
+                          {/* Foreground Glassy Row Card */}
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            data-active={isActive ? 'true' : 'false'}
+                            data-unread={unreadCount > 0 ? 'true' : 'false'}
+                            style={{
+                              transform: isSwipedOpen ? 'translateX(-128px)' : 'translateX(0)'
+                            }}
+                            onClick={() => {
+                              if (isSwipedOpen) {
+                                setSwipedRowId(null);
+                                return;
+                              }
+                              setFocusedRowIndex(rowIdx);
+                              handleOpenMemberChat(member.id);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleOpenMemberChat(member.id);
+                            }}
+                            className={`wavelink-msg-row-card w-full flex items-center gap-3.5 text-left cursor-pointer ${
+                              isKeyboardFocused ? 'ring-2 ring-[var(--accent-primary)]' : ''
+                            }`}
+                          >
+                            {/* 56px Avatar with Gradient Ring + Live Green/Red Presence Dot */}
+                            <div className="relative shrink-0">
+                              <div className="wavelink-msg-bubble-ring">
+                                <Avatar
+                                  uid={member.id}
+                                  src={
+                                    member.photoURL ||
+                                    `https://api.dicebear.com/7.x/shapes/svg?seed=${member.id}`
+                                  }
+                                  alt={member.displayName}
+                                  fallbackName={member.displayName}
+                                  size={56}
+                                  showStatus={member.id !== SUPPORT_BOT_ID}
+                                  targetProfile={member}
+                                  imageClassName="border-2 border-[var(--bg-surface)]"
+                                />
+                              </div>
+                              {member.id === SUPPORT_BOT_ID && (
+                                <span
+                                  className="absolute bottom-0.5 right-0.5 w-3.5 h-3.5 rounded-full bg-[#22c55e] ring-2 ring-[var(--bg-surface)]"
+                                  title="24/7 Assistant"
+                                />
+                              )}
+                            </div>
+
+                            {/* Conversation Info */}
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5 min-w-0">
                                   <span
-                                    className="w-5 h-5 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] inline-flex items-center justify-center shrink-0"
-                                    title={`Chat theme: ${getChatThemeDisplayName(
-                                      localChatThemes[dmId]?.themeId
-                                    )}`}
-                                  >
-                                    <ChatThemeBadgeIcon
-                                      themeId={localChatThemes[dmId]?.themeId}
-                                      size={11}
-                                    />
-                                  </span>
-                                ) : null}
-                                {compactTime && (
-                                  <span
-                                    className={`text-[11px] font-semibold ${
-                                      unreadCount > 0
-                                        ? 'text-[var(--accent-primary)] font-extrabold'
-                                        : 'text-[var(--text-secondary)]'
+                                    className={`truncate ${
+                                      unreadCount > 0 ? 'font-black' : 'font-extrabold'
                                     }`}
                                   >
-                                    {compactTime}
+                                    <CrystalBadge
+                                      email={member.email}
+                                      name={member.displayName}
+                                      isPro={member.isPro}
+                                      hasBlueStar={member.hasBlueStar || member.isPro}
+                                      isSubAdmin={member.isSubAdmin || member.role === 'sub_admin'}
+                                      role={member.role}
+                                      size="sm"
+                                    />
                                   </span>
-                                )}
-                                {isSuperAdminEmail(member.email, member.role) && !canTalkToAdmin && (
-                                  <span className="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 text-[10px] font-bold flex items-center gap-0.5 shrink-0">
-                                    <Lock size={9} />
-                                    <span>Pro</span>
-                                  </span>
-                                )}
+                                  {isPinned && (
+                                    <span title="Pinned chat" className="inline-flex shrink-0">
+                                      <Pin
+                                        size={12}
+                                        className="text-[var(--accent-primary)] shrink-0 rotate-45"
+                                      />
+                                    </span>
+                                  )}
+                                  {(localChatThemes[dmId]?.themeId &&
+                                    localChatThemes[dmId]?.themeId !== 'default') ||
+                                  localChatThemes[dmId]?.customBgUrl ||
+                                  localChatThemes[dmId]?.accentColor ? (
+                                    <span
+                                      className="w-4 h-4 rounded-full bg-[var(--bg-subtle)] border border-[var(--border-hairline)] inline-flex items-center justify-center shrink-0"
+                                      title={`Chat theme: ${getChatThemeDisplayName(
+                                        localChatThemes[dmId]?.themeId
+                                      )}`}
+                                    >
+                                      <ChatThemeBadgeIcon
+                                        themeId={localChatThemes[dmId]?.themeId}
+                                        size={10}
+                                      />
+                                    </span>
+                                  ) : null}
+                                </div>
+
+                                {/* Right side: Time ("2m", "08:24", "Yesterday") + Small Bell Icon to Mute/Unmute */}
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {compactTime && (
+                                    <span
+                                      className={`text-[11px] ${
+                                        unreadCount > 0
+                                          ? 'text-[var(--accent-primary)] font-extrabold'
+                                          : 'text-[var(--text-secondary)] font-semibold'
+                                      }`}
+                                    >
+                                      {compactTime}
+                                    </span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleMuteChannel(dmId);
+                                    }}
+                                    className={`p-1 rounded-full transition cursor-pointer ${
+                                      isMuted
+                                        ? 'text-amber-500 bg-amber-500/10'
+                                        : 'text-[var(--text-secondary)]/70 hover:text-[var(--text-primary)]'
+                                    }`}
+                                    title={isMuted ? 'Unmute chat' : 'Mute chat'}
+                                    aria-label={isMuted ? 'Unmute chat' : 'Mute chat'}
+                                  >
+                                    {isMuted ? <BellOff size={13} /> : <Bell size={13} />}
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0 flex-1">
+                                  {isMemberTyping ? (
+                                    <span className="text-xs font-extrabold text-emerald-500 flex items-center gap-1.5 truncate mt-1">
+                                      <span className="inline-flex items-center gap-0.5">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
+                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
+                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
+                                      </span>
+                                      <span>typing...</span>
+                                    </span>
+                                  ) : (
+                                    renderLastMessagePreviewContent({
+                                      previewText,
+                                      senderPrefix,
+                                      mediaType: meta?.lastMessageMediaType,
+                                      isUnread: unreadCount > 0
+                                    })
+                                  )}
+                                </div>
+
                                 {unreadCount > 0 && (
                                   <span
-                                    className="min-w-[22px] h-5 px-1.5 rounded-full bg-[#F43F5E] text-white text-[11px] font-extrabold flex items-center justify-center shadow-2xs"
+                                    className={`wavelink-msg-unread-badge shrink-0 mt-1 ${
+                                      isMuted ? 'wavelink-msg-unread-badge--muted' : ''
+                                    }`}
                                   >
-                                    {unreadCount}
+                                    {badgeText}
                                   </span>
                                 )}
                               </div>
                             </div>
-
-                            {isMemberTyping ? (
-                              <span className="text-xs font-extrabold text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5 truncate mt-1">
-                                <span className="inline-flex items-center gap-0.5">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.3s]" />
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:-0.15s]" />
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
-                                </span>
-                                <span>typing...</span>
-                              </span>
-                            ) : previewText ? (
-                              <span
-                                className={`text-xs block truncate mt-1 ${
-                                  unreadCount > 0
-                                    ? 'font-extrabold text-[var(--text-primary)]'
-                                    : 'font-medium text-[var(--text-secondary)]'
-                                }`}
-                              >
-                                {previewSenderId === currentUser.uid
-                                  ? `You: ${previewText}`
-                                  : previewText}
-                              </span>
-                            ) : (
-                              <span className="text-xs font-medium text-[var(--text-secondary)] block truncate mt-1">
-                                {member.bio ||
-                                  (member.interests && member.interests.length > 0
-                                    ? member.interests.slice(0, 2).join(' • ')
-                                    : 'Tap to start chatting 👋')}
-                              </span>
-                            )}
                           </div>
-                        </button>
+                        </div>
                       );
                     })}
                   </div>
                 )}
 
                 {/* Load More Conversations Button (20 at first) */}
-                {(filteredMembers.length > convoDisplayLimit || members.length >= convoFetchLimit) && (
+                {(displayedInboxRows.length > convoDisplayLimit ||
+                  Object.keys(channelMetaMap).length >= convoFetchLimit) && (
                   <div className="pt-2 flex justify-center">
                     <button
                       type="button"
@@ -4842,10 +6240,10 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                         setConvoDisplayLimit((prev) => prev + 20);
                         setConvoFetchLimit((prev) => prev + 20);
                       }}
-                      className="min-h-[44px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
+                      className="min-h-[42px] px-4 py-2 rounded-2xl bg-[var(--bg-surface)]/80 border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
                     >
                       <History size={14} className="text-[var(--accent-primary)]" />
-                      <span>Load more conversations</span>
+                      <span>Load more</span>
                     </button>
                   </div>
                 )}
@@ -4853,25 +6251,643 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
             )}
           </div>
 
-          {/* Floating "New Chat" Button inside Chat Home */}
+          {/* 5. FLOATING GLASS "NEW CHAT" BUTTON (bottom-right, above floating nav) */}
           <button
             type="button"
             onClick={() => {
-              setConvoFilter((prev) => (prev === 'people' ? 'chats' : 'people'));
+              setIsNewChatSheetOpen(true);
+              setTimeout(() => newChatInputRef.current?.focus(), 60);
             }}
-            className="wavelink-floating-new-chat-btn absolute bottom-4 right-4 z-20 min-h-[48px] px-4 py-2.5 rounded-full text-white font-extrabold text-xs flex items-center gap-2 shadow-lg transition-all duration-200 hover:scale-105 active:scale-95 cursor-pointer"
+            className="wavelink-floating-new-chat-btn absolute bottom-5 right-4 z-20 min-h-[48px] px-4.5 py-2.5 rounded-full text-white font-extrabold text-xs flex items-center gap-2 shadow-xl transition-all duration-200 hover:scale-105 active:scale-95 cursor-pointer border border-white/25 backdrop-blur-xl"
             style={{
               background: 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
             }}
-            title="Start a new chat"
+            title="Start a new chat (Ctrl+K)"
           >
             <MessageSquare size={16} />
-            <span>{convoFilter === 'people' ? 'Back to Chats' : 'New chat'}</span>
+            <span>New chat</span>
           </button>
+
+          {/* =====================================================================
+              MODAL A: NEW CHAT SEARCH SHEET (My Contacts first + >=2 char prefix search)
+             ===================================================================== */}
+          {isNewChatSheetOpen && (
+            <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/65 backdrop-blur-sm p-0 sm:p-4">
+              <div className="w-full sm:max-w-md max-h-[86dvh] rounded-t-3xl sm:rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xl flex flex-col overflow-hidden">
+                <div className="px-4 py-3.5 border-b border-[var(--border-hairline)] flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                      New chat
+                    </h3>
+                    <p className="text-[11px] text-[var(--text-secondary)]">
+                      Select a contact or search by name / @handle
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsNewChatSheetOpen(false);
+                      setNewChatSearchQuery('');
+                    }}
+                    className="w-9 h-9 rounded-full bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center justify-center cursor-pointer"
+                    aria-label="Close new chat"
+                  >
+                    <X size={17} />
+                  </button>
+                </div>
+
+                {/* Search Input (queries Firestore ONLY after >= 2 characters, limit 10, debounced 400ms) */}
+                <div className="p-3.5 border-b border-[var(--border-hairline)] space-y-2.5">
+                  <div className="relative">
+                    <Search
+                      size={16}
+                      className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none"
+                    />
+                    <input
+                      ref={newChatInputRef}
+                      type="text"
+                      value={newChatSearchQuery}
+                      onChange={(e) => setNewChatSearchQuery(e.target.value)}
+                      placeholder="Type at least 2 letters to search @username or name..."
+                      className="w-full min-h-[44px] pl-10 pr-9 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:outline-none"
+                    />
+                    {newChatSearchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setNewChatSearchQuery('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Quick Actions: New Group & Invite Link */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsNewChatSheetOpen(false);
+                        setSelectedMemberIds([]);
+                        setNewGroupName('');
+                        setNewGroupDesc('');
+                        setNewGroupLogo(PRESET_LOGOS[0].url);
+                        setIsCreateGroupOpen(true);
+                      }}
+                      className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-xs font-extrabold text-[var(--text-primary)] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Users size={14} className="text-[var(--accent-primary)]" />
+                      <span>New Group</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const inviteUrl = `${window.location.origin}/?invite=${encodeURIComponent(
+                          currentUser?.uid || ''
+                        )}`;
+                        try {
+                          if (navigator.share) {
+                            await navigator.share({
+                              title: 'Join me on WaveLink',
+                              text: 'Join me on WaveLink and chat with me directly!',
+                              url: inviteUrl
+                            });
+                          } else {
+                            await navigator.clipboard.writeText(inviteUrl);
+                            showGlobalToast('Invite link copied! Friends who join are added to your contacts.');
+                          }
+                        } catch {
+                          // ignore share cancel
+                        }
+                      }}
+                      className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-[var(--bg-subtle)] hover:border-[var(--accent-primary)] border border-[var(--border-hairline)] text-xs font-extrabold text-[var(--text-primary)] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Share2 size={14} className="text-[var(--accent-secondary)]" />
+                      <span>Invite Friend Link</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Contacts & Search Results List */}
+                <div className="flex-1 overflow-y-auto p-3.5 space-y-2">
+                  {newChatSearchQuery.trim().length >= 2 ? (
+                    <>
+                      <p className="text-[11px] font-extrabold uppercase tracking-wider text-[var(--text-secondary)] px-1">
+                        {isSearchingNewChat
+                          ? 'Searching...'
+                          : `Search Results (${newChatSearchResults.length})`}
+                      </p>
+                      {!isSearchingNewChat && newChatSearchResults.length === 0 ? (
+                        <div className="p-6 text-center text-xs text-[var(--text-secondary)]">
+                          No users found matching &ldquo;{newChatSearchQuery.trim()}&rdquo;.
+                        </div>
+                      ) : (
+                        newChatSearchResults.map((person) => (
+                          <button
+                            key={`search_res_${person.id}`}
+                            type="button"
+                            onClick={() => handleOpenMemberChat(person.id, true)}
+                            className="w-full p-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] border border-transparent hover:border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div className="wavelink-msg-bubble-ring shrink-0">
+                                <Avatar
+                                  uid={person.id}
+                                  src={
+                                    person.photoURL ||
+                                    `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+                                  }
+                                  alt={person.displayName}
+                                  fallbackName={person.displayName}
+                                  size={44}
+                                  showStatus={true}
+                                  targetProfile={person}
+                                  imageClassName="border-2 border-[var(--bg-surface)]"
+                                />
+                              </div>
+                              <div className="min-w-0">
+                                <p className="text-sm font-extrabold text-[var(--text-primary)] truncate">
+                                  {person.displayName}
+                                </p>
+                                <p className="text-xs text-[var(--text-secondary)] truncate">
+                                  {person.username || '@waver'}
+                                </p>
+                              </div>
+                            </div>
+                            <span
+                              className="px-3 py-1.5 rounded-xl text-white text-xs font-extrabold shrink-0"
+                              style={{
+                                background:
+                                  'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                              }}
+                            >
+                              Message
+                            </span>
+                          </button>
+                        ))
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-[11px] font-extrabold uppercase tracking-wider text-[var(--text-secondary)] px-1">
+                        My Contacts ({connectedMembers.length})
+                      </p>
+                      {connectedMembers.map((person) => {
+                        const isInviteContact = (userProfile?.contactIds || []).includes(person.id);
+                        return (
+                          <button
+                            key={`contact_${person.id}`}
+                            type="button"
+                            onClick={() => handleOpenMemberChat(person.id, true)}
+                            className="w-full p-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] border border-transparent hover:border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div className="wavelink-msg-bubble-ring shrink-0">
+                                <Avatar
+                                  uid={person.id}
+                                  src={
+                                    person.photoURL ||
+                                    `https://api.dicebear.com/7.x/shapes/svg?seed=${person.id}`
+                                  }
+                                  alt={person.displayName}
+                                  fallbackName={person.displayName}
+                                  size={44}
+                                  showStatus={person.id !== SUPPORT_BOT_ID}
+                                  targetProfile={person}
+                                  imageClassName="border-2 border-[var(--bg-surface)]"
+                                />
+                              </div>
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-1.5">
+                                  <p className="text-sm font-extrabold text-[var(--text-primary)] truncate">
+                                    {person.displayName}
+                                  </p>
+                                  {isInviteContact && (
+                                    <span className="px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-500 text-[9px] font-extrabold">
+                                      Invite Contact
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs text-[var(--text-secondary)] truncate">
+                                  {person.id === SUPPORT_BOT_ID
+                                    ? '24/7 WaveLink Assistant'
+                                    : person.username || '@waver'}
+                                </p>
+                              </div>
+                            </div>
+                            <span className="px-3 py-1.5 rounded-xl bg-[var(--bg-subtle)] text-[var(--text-primary)] text-xs font-extrabold shrink-0">
+                              Chat
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* =====================================================================
+              MODAL B: LONG-PRESS / RIGHT-CLICK ROW QUICK ACTIONS SHEET
+             ===================================================================== */}
+          {actionMenuRowId && (
+            <div
+              className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/65 backdrop-blur-sm p-0 sm:p-4"
+              onClick={() => setActionMenuRowId(null)}
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="w-full sm:max-w-sm rounded-t-3xl sm:rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xl p-4 space-y-1.5"
+              >
+                <div className="pb-2 mb-1 border-b border-[var(--border-hairline)] flex items-center justify-between">
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-[var(--text-secondary)]">
+                    Conversation options
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setActionMenuRowId(null)}
+                    className="p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    togglePinChannel(actionMenuRowId);
+                    setActionMenuRowId(null);
+                  }}
+                  className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] transition cursor-pointer"
+                >
+                  <Pin size={16} className="text-[var(--accent-primary)]" />
+                  <span>
+                    {pinnedChannelIds.includes(actionMenuRowId) ? 'Unpin conversation' : 'Pin to top'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    toggleMuteChannel(actionMenuRowId);
+                    setActionMenuRowId(null);
+                  }}
+                  className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] transition cursor-pointer"
+                >
+                  {mutedChannelIds.includes(actionMenuRowId) ? (
+                    <Bell size={16} className="text-emerald-500" />
+                  ) : (
+                    <BellOff size={16} className="text-amber-500" />
+                  )}
+                  <span>
+                    {mutedChannelIds.includes(actionMenuRowId)
+                      ? 'Unmute notifications'
+                      : 'Mute notifications'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleMarkChannelUnread(actionMenuRowId);
+                    setActionMenuRowId(null);
+                  }}
+                  className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] transition cursor-pointer"
+                >
+                  <MailOpen size={16} className="text-[var(--accent-secondary)]" />
+                  <span>Mark as unread</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    toggleArchiveChannel(actionMenuRowId);
+                    setActionMenuRowId(null);
+                  }}
+                  className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] transition cursor-pointer"
+                >
+                  <Archive size={16} className="text-amber-500" />
+                  <span>
+                    {archivedChannelIds.includes(actionMenuRowId)
+                      ? 'Unarchive conversation'
+                      : 'Archive conversation'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleClearConversationForMe(actionMenuRowId)}
+                  className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] transition cursor-pointer"
+                >
+                  <RefreshCw size={16} className="text-[var(--text-secondary)]" />
+                  <span>Clear chat history (for me)</span>
+                </button>
+
+                {actionMenuRowId.startsWith('dm_') &&
+                  currentUser &&
+                  getOtherDmParticipantId(actionMenuRowId, currentUser.uid) !== SUPPORT_BOT_ID && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const targetUid = getOtherDmParticipantId(actionMenuRowId, currentUser.uid);
+                        setActionMenuRowId(null);
+                        if (targetUid) {
+                          await toggleBlockUser(targetUid);
+                        }
+                      }}
+                      className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-rose-500/10 flex items-center gap-3 text-sm font-bold text-rose-500 transition cursor-pointer"
+                    >
+                      <Ban size={16} />
+                      <span>Block user</span>
+                    </button>
+                  )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetId = actionMenuRowId;
+                    setActionMenuRowId(null);
+                    setConfirmDeleteChannelId(targetId);
+                  }}
+                  className="w-full px-3.5 py-2.5 rounded-2xl hover:bg-rose-500/10 flex items-center gap-3 text-sm font-extrabold text-rose-500 transition cursor-pointer"
+                >
+                  <Trash2 size={16} />
+                  <span>Delete conversation</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* =====================================================================
+              MODAL C: DELETE CONVERSATION CONFIRMATION MODAL
+             ===================================================================== */}
+          {confirmDeleteChannelId && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-4">
+              <div className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xl p-5 space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-11 h-11 rounded-2xl bg-rose-500/15 text-rose-500 flex items-center justify-center shrink-0">
+                    <Trash2 size={20} />
+                  </div>
+                  <div>
+                    <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                      Delete conversation?
+                    </h3>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      This removes the conversation from your inbox only. The other person keeps their copy.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteChannelId(null)}
+                    className="min-h-[40px] px-4 py-2 rounded-xl bg-[var(--bg-subtle)] text-xs font-extrabold text-[var(--text-primary)] cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteConversationForMe(confirmDeleteChannelId)}
+                    className="min-h-[40px] px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold shadow-sm cursor-pointer"
+                  >
+                    Delete for me
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* =====================================================================
+              MODAL D: 24-HOUR NOTE EDITOR MODAL (60-character speech bubble note)
+             ===================================================================== */}
+          {isNoteModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-4">
+              <div className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xl p-5 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                      Share a 24-hour note
+                    </h3>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      Visible above your avatar in the Message inbox for 24 hours.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsNoteModalOpen(false)}
+                    className="p-1.5 rounded-full bg-[var(--bg-subtle)] text-[var(--text-secondary)]"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="space-y-1.5">
+                  <input
+                    type="text"
+                    maxLength={60}
+                    value={noteDraftText}
+                    onChange={(e) => setNoteDraftText(e.target.value.slice(0, 60))}
+                    placeholder="What's on your mind? (max 60 chars)"
+                    className="w-full min-h-[44px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)]"
+                  />
+                  <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)] px-1">
+                    <span>Expires automatically after 24h</span>
+                    <span className="font-bold">{noteDraftText.length}/60</span>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  {myActiveNoteText ? (
+                    <button
+                      type="button"
+                      disabled={isSavingNote}
+                      onClick={() => handleSaveMyChatNote(true)}
+                      className="min-h-[40px] px-3.5 py-2 rounded-xl bg-rose-500/10 text-rose-500 text-xs font-extrabold cursor-pointer"
+                    >
+                      Clear note
+                    </button>
+                  ) : (
+                    <span />
+                  )}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsNoteModalOpen(false)}
+                      className="min-h-[40px] px-4 py-2 rounded-xl bg-[var(--bg-subtle)] text-xs font-extrabold text-[var(--text-primary)] cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isSavingNote}
+                      onClick={() => handleSaveMyChatNote(false)}
+                      className="min-h-[40px] px-4 py-2 rounded-xl text-white text-xs font-extrabold shadow-sm cursor-pointer"
+                      style={{
+                        background:
+                          'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                      }}
+                    >
+                      {isSavingNote ? 'Saving...' : 'Share note'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* =====================================================================
+              MODAL E: CHAT SETTINGS SHEET ("Who can message me", "Unread first", "24h Notes")
+             ===================================================================== */}
+          {isChatSettingsModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-4">
+              <div className="w-full max-w-md rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xl p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-[var(--border-hairline)] pb-3">
+                  <div>
+                    <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                      Chat settings
+                    </h3>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      Control who can message you and how your inbox is sorted
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsChatSettingsModalOpen(false)}
+                    className="p-1.5 rounded-full bg-[var(--bg-subtle)] text-[var(--text-secondary)]"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                {/* Who can message me */}
+                <div className="space-y-2">
+                  <label className="block text-xs font-extrabold text-[var(--text-primary)]">
+                    Who can message me
+                  </label>
+                  <select
+                    value={userProfile?.privacySettings?.allowDirectMessages || 'everyone'}
+                    onChange={(e) => {
+                      const val = e.target.value as 'everyone' | 'followers' | 'none';
+                      updateUserProfile({
+                        privacySettings: {
+                          ...(userProfile?.privacySettings || {
+                            profileVisibility: 'public',
+                            showOnlineStatus: true,
+                            showLastSeen: true,
+                            allowCalls: 'everyone',
+                            showReadReceipts: true,
+                            allowTagging: true,
+                            sparkVisibility: 'everyone',
+                            allowSearchByEmail: true
+                          }),
+                          allowDirectMessages: val
+                        }
+                      }).catch(() => {});
+                      showGlobalToast('Updated message privacy setting.');
+                    }}
+                    className="w-full min-h-[42px] px-3.5 py-2 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-bold text-[var(--text-primary)]"
+                  >
+                    <option value="everyone">Everyone (strangers go to Requests)</option>
+                    <option value="followers">Only people I follow / friends</option>
+                    <option value="none">No one (pause new chats)</option>
+                  </select>
+                </div>
+
+                {/* Unread first toggle */}
+                <div className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
+                  <div>
+                    <p className="text-xs font-extrabold text-[var(--text-primary)]">
+                      Unread chats first
+                    </p>
+                    <p className="text-[11px] text-[var(--text-secondary)]">
+                      Keep unread conversations above read ones
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleToggleUnreadFirstSort}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-extrabold transition cursor-pointer ${
+                      unreadFirstSort
+                        ? 'bg-[var(--accent-primary)] text-white'
+                        : 'bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border-hairline)]'
+                    }`}
+                  >
+                    {unreadFirstSort ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                {/* Online first toggle */}
+                <div className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
+                  <div>
+                    <p className="text-xs font-extrabold text-[var(--text-primary)]">
+                      Online contacts first
+                    </p>
+                    <p className="text-[11px] text-[var(--text-secondary)]">
+                      Prioritize online friends within the same group
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleToggleOnlineFirstSort}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-extrabold transition cursor-pointer ${
+                      onlineFirstSort
+                        ? 'bg-emerald-500 text-white'
+                        : 'bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border-hairline)]'
+                    }`}
+                  >
+                    {onlineFirstSort ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                {/* Show 24-hour notes toggle */}
+                <div className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
+                  <div>
+                    <p className="text-xs font-extrabold text-[var(--text-primary)]">
+                      Show 24-hour Notes
+                    </p>
+                    <p className="text-[11px] text-[var(--text-secondary)]">
+                      Display floating speech-bubble notes above avatars
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = userProfile?.showChatNotes === false;
+                      updateUserProfile({ showChatNotes: next }).catch(() => {});
+                    }}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-extrabold transition cursor-pointer ${
+                      showNotesInInbox
+                        ? 'bg-[var(--accent-primary)] text-white'
+                        : 'bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border-hairline)]'
+                    }`}
+                  >
+                    {showNotesInInbox ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                <div className="flex justify-end pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setIsChatSettingsModalOpen(false)}
+                    className="min-h-[40px] px-5 py-2 rounded-xl text-white text-xs font-extrabold cursor-pointer"
+                    style={{
+                      background:
+                        'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary))'
+                    }}
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* =====================================================================
-            SCREEN 2: CONVERSATION SCREEN (Mobile Full-Screen; Desktop Middle Column)
+            SCREEN 2: CONVERSATION SCREEN (Mobile Full-Screen; Desktop Right Pane >= 1024px)
            ===================================================================== */}
         <div
           style={activeChannel ? computedChatTheme.styleVars : undefined}
@@ -4883,9 +6899,9 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
           }`}
         >
           {!activeChannel ? (
-            /* Middle Column Empty State when no chat is selected (Desktop >= 1024px) */
+            /* Right Pane Empty State when no chat is selected (Desktop >= 1024px) */
             <div className="flex-1 h-full flex flex-col items-center justify-center p-8 text-center bg-[var(--bg-canvas)] select-none">
-              <div className="max-w-md w-full p-8 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-sm flex flex-col items-center gap-4">
+              <div className="max-w-md w-full p-8 rounded-3xl bg-[var(--bg-surface)]/80 backdrop-blur-xl border border-[var(--border-hairline)] shadow-sm flex flex-col items-center gap-4">
                 <div
                   className="w-20 h-20 rounded-3xl flex items-center justify-center text-white shadow-md"
                   style={{
@@ -4900,15 +6916,19 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                     Select a chat to start talking
                   </h3>
                   <p className="text-sm text-[var(--text-secondary)] leading-relaxed">
-                    Choose a conversation or active friend on the left, or start a brand new chat right now.
+                    Choose a conversation or active friend on the left, or press{' '}
+                    <kbd className="px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs font-mono">
+                      Ctrl+K
+                    </kbd>{' '}
+                    to start a new chat.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
                   <button
                     type="button"
                     onClick={() => {
-                      setConvoFilter('people');
-                      searchInputRef.current?.focus();
+                      setIsNewChatSheetOpen(true);
+                      setTimeout(() => newChatInputRef.current?.focus(), 60);
                     }}
                     className="min-h-[44px] px-5 py-2.5 rounded-2xl text-white font-extrabold text-sm flex items-center gap-2 shadow-sm hover:opacity-95 active:scale-95 transition cursor-pointer"
                     style={{
@@ -5319,12 +7339,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                           type="button"
                           onClick={() => {
                             setShowHeaderMenu(false);
-                            reportContent({
+                            setChatReportTarget({
                               targetType: 'user',
                               targetId: directRecipient.id,
                               targetAuthorId: directRecipient.id,
-                              targetSummary: `${directRecipient.displayName} (${directRecipient.username || directRecipient.email})`,
-                              reason: 'Reported user from Direct Messages'
+                              targetAuthorName: directRecipient.displayName,
+                              channelId: activeChannel,
+                              targetSummary: `${directRecipient.displayName} (${directRecipient.username || directRecipient.email})`
                             });
                           }}
                           className="w-full min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold text-amber-600 hover:bg-amber-500/10 flex items-center gap-2.5 cursor-pointer"
@@ -5726,12 +7747,13 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                           type="button"
                           onClick={() => {
                             setShowHeaderMenu(false);
-                            reportContent({
+                            setChatReportTarget({
                               targetType: 'user',
                               targetId: directRecipient.id,
                               targetAuthorId: directRecipient.id,
-                              targetSummary: `${directRecipient.displayName} (${directRecipient.username || directRecipient.email})`,
-                              reason: 'Reported user from Direct Messages'
+                              targetAuthorName: directRecipient.displayName,
+                              channelId: activeChannel,
+                              targetSummary: `${directRecipient.displayName} (${directRecipient.username || directRecipient.email})`
                             });
                           }}
                           className="w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold text-amber-600 hover:bg-amber-500/10 flex items-center gap-2.5 cursor-pointer"
@@ -6354,12 +8376,14 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    reportContent({
+                                    setChatReportTarget({
                                       targetType: 'message',
                                       targetId: msg.id,
                                       targetAuthorId: msg.senderId,
-                                      targetSummary: sanitizeUserText(msg.text || '[Attachment]', 160),
-                                      reason: 'Reported message from WaveLink Chat'
+                                      targetAuthorName: msg.senderName,
+                                      channelId: activeGroup ? undefined : activeChannel,
+                                      groupId: activeGroup ? activeGroup.id : undefined,
+                                      targetSummary: sanitizeUserText(msg.text || '[Attachment]', 160)
                                     })
                                   }
                                   className="p-1 rounded-lg hover:bg-amber-500/15 hover:text-amber-500 cursor-pointer"
@@ -8223,6 +10247,31 @@ export const ChatChannelsView: React.FC<ChatChannelsViewProps> = ({
           }}
         />
       )}
+
+      {/* Layer 4 Report & Block/Mute Modal */}
+      <ReportContentModal
+        isOpen={Boolean(chatReportTarget)}
+        target={chatReportTarget}
+        currentUid={currentUser?.uid}
+        isAuthorBlocked={Boolean(
+          chatReportTarget?.targetAuthorId &&
+            (userProfile?.blockedUserIds || []).includes(chatReportTarget.targetAuthorId)
+        )}
+        isAuthorMuted={Boolean(
+          chatReportTarget?.targetAuthorId &&
+            (userProfile?.mutedUserIds || []).includes(chatReportTarget.targetAuthorId)
+        )}
+        onClose={() => setChatReportTarget(null)}
+        onReportSubmitted={(res) => {
+          showGlobalToast?.(res.message);
+        }}
+        onBlockChanged={(_, blocked) => {
+          showGlobalToast?.(blocked ? 'User blocked.' : 'User unblocked.');
+        }}
+        onMuteChanged={(_, muted) => {
+          showGlobalToast?.(muted ? 'User muted.' : 'User unmuted.');
+        }}
+      />
 
       {/* Subscription Checkout Modal */}
       {showPaymentModal && (

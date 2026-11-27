@@ -1,7 +1,9 @@
 import React from 'react';
 import { ShieldCheck, Star, Bot, Trophy } from 'lucide-react';
-import { resolveCanonicalAdminRole } from '../firebase';
+import { getCachedUserProfile, resolveCanonicalAdminRole } from '../firebase';
 import { isSupportBotUser } from '../utils/security';
+import { resolveUnifiedBadge } from '../services/challengesService';
+import { BadgeIconGlyph } from './BadgeIconGlyph';
 
 // Lightweight client registry of active Weekly Challenge Winner UIDs/emails synced from challenges/users
 const activeWeeklyWinnerSet = new Set<string>();
@@ -41,6 +43,7 @@ interface CrystalBadgeProps {
   isBot?: boolean;
   weeklyWinnerUntil?: string | null;
   isWeeklyWinner?: boolean;
+  highlightedBadgeId?: string | null;
   role?: 'admin' | 'super_admin' | 'sub_admin' | 'moderator' | 'support_helper' | 'user' | 'bot';
   proBadge?: 'verified' | 'vip' | 'creator' | 'founder';
   size?: 'sm' | 'md' | 'lg';
@@ -58,6 +61,7 @@ export const CrystalBadge: React.FC<CrystalBadgeProps> = ({
   isBot = false,
   weeklyWinnerUntil,
   isWeeklyWinner = false,
+  highlightedBadgeId,
   role,
   size = 'md'
 }) => {
@@ -71,6 +75,15 @@ export const CrystalBadge: React.FC<CrystalBadgeProps> = ({
     (isWeeklyWinner ||
       isUserActiveWeeklyWinner(userId, weeklyWinnerUntil) ||
       isUserActiveWeeklyWinner(email, weeklyWinnerUntil));
+
+  // Resolve the user's single chosen highlighted badge with 0 extra Firestore reads
+  const cachedProfile = userId ? getCachedUserProfile(userId) : undefined;
+  const effectiveBadgeId = !isAutomatedBot
+    ? highlightedBadgeId !== undefined
+      ? highlightedBadgeId
+      : cachedProfile?.highlightedBadgeId || null
+    : null;
+  const highlightedBadge = effectiveBadgeId ? resolveUnifiedBadge(effectiveBadgeId) : null;
 
   const textSize = size === 'sm' ? 'text-xs' : size === 'lg' ? 'text-lg' : 'text-sm sm:text-base';
 
@@ -96,6 +109,15 @@ export const CrystalBadge: React.FC<CrystalBadgeProps> = ({
       <span className={`font-bold text-[#1C1917] ${textSize}`}>
         {name}
       </span>
+
+      {/* Single chosen highlighted badge icon next to author name on posts & comments */}
+      {highlightedBadge && (
+        <BadgeIconGlyph
+          badge={highlightedBadge}
+          size="xs"
+          title={highlightedBadge.name}
+        />
+      )}
 
       {(isSuperAdmin || isModerator) && showAdminTag ? (
         <span

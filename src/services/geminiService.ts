@@ -493,7 +493,7 @@ export interface ModerationResult {
 }
 
 /**
- * Moderate post, comment, or Spark text via the server-side /api/ai/moderate endpoint.
+ * Moderate post, comment, or Spark text via Layer 1 + server-side Layer 2 moderation.
  */
 export async function moderatePostContent(text: string): Promise<ModerationResult> {
   const cleanText = String(text || '').trim().slice(0, 4000);
@@ -501,26 +501,36 @@ export async function moderatePostContent(text: string): Promise<ModerationResul
     return { flagged: false, category: 'safe', reason: '' };
   }
 
+  const { checkTextModerationLocal } = await import('../utils/contentModeration');
+  const localRes = checkTextModerationLocal(cleanText);
+  if (localRes.blocked) {
+    return {
+      flagged: true,
+      category: localRes.category,
+      reason: localRes.friendlyMessage,
+    };
+  }
+
   try {
     const headers = await getAuthHeaders();
-    const res = await fetch('/api/ai/moderate', {
+    const res = await fetch('/api/moderation/check-text', {
       method: 'POST',
       headers,
-      body: JSON.stringify({ text: cleanText }),
+      body: JSON.stringify({ text: cleanText, context: 'spark' }),
     });
     const data = await res.json().catch(() => ({}));
     if (res.status === 429) {
-      throw new Error(data.error || 'AI moderation rate limit reached. Please wait a moment and try again.');
+      throw new Error(data.error || 'Safety check is busy right now. Please wait a moment and try again.');
     }
     if (res.ok && data.success) {
       return {
         flagged: Boolean(data.flagged),
         category: String(data.category || 'safe'),
-        reason: String(data.reason || ''),
+        reason: String(data.friendlyMessage || data.reason || ''),
       };
     }
   } catch (err: any) {
-    if (err?.message?.includes('rate limit')) {
+    if (err?.message?.toLowerCase?.().includes('busy') || err?.message?.includes('rate limit')) {
       throw err;
     }
   }
@@ -530,6 +540,7 @@ export async function moderatePostContent(text: string): Promise<ModerationResul
 
 /**
  * Generate 3 engaging social captions via the server-side /api/ai/post-assist endpoint.
+ * All AI-generated captions pass through Layer 1 safety filtering before display.
  */
 export async function generatePostCaptions(params: {
   text?: string;
@@ -537,6 +548,8 @@ export async function generatePostCaptions(params: {
   tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
   isPro?: boolean;
 }): Promise<string[]> {
+  const { sanitizeAiCaptionText } = await import('../utils/contentModeration');
+  const safeInput = sanitizeAiCaptionText(params.text || '');
   try {
     const headers = await getAuthHeaders();
     const res = await fetch('/api/ai/post-assist', {
@@ -544,7 +557,7 @@ export async function generatePostCaptions(params: {
       headers,
       body: JSON.stringify({
         mode: 'captions',
-        text: params.text || '',
+        text: safeInput,
         mediaType: params.mediaType || 'text',
         tone: params.tone || 'engaging',
         isPro: Boolean(params.isPro),
@@ -552,13 +565,16 @@ export async function generatePostCaptions(params: {
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.success && Array.isArray(data.suggestions)) {
-      return data.suggestions;
+      const safeList = data.suggestions
+        .map((s: unknown) => sanitizeAiCaptionText(typeof s === 'string' ? s : ''))
+        .filter(Boolean);
+      if (safeList.length > 0) return safeList;
     }
   } catch {
     // Fallback below
   }
   return [
-    `🌊 ${params.text || 'Sharing a quick thought with the WaveLink family today!'} ✨ #WaveLink #CommunityFirst`,
+    `🌊 ${safeInput || 'Sharing a quick thought with the WaveLink family today!'} ✨ #WaveLink #CommunityFirst`,
     `💡 Big energy today on WaveLink! 🚀 #WaveLinkCreators #GrowthMindset`,
     `🔥 What's your take? Drop a comment below 👇 #WaveLink`,
   ];
@@ -566,12 +582,14 @@ export async function generatePostCaptions(params: {
 
 /**
  * Polish and improve a post draft via the server-side /api/ai/post-assist endpoint.
+ * Filters both input and AI output through Layer 1 safety checks.
  */
 export async function improvePostContent(params: {
   text: string;
   tone?: 'engaging' | 'professional' | 'fun' | 'inspiring';
   isPro?: boolean;
 }): Promise<string> {
+  const { sanitizeAiCaptionText } = await import('../utils/contentModeration');
   try {
     const headers = await getAuthHeaders();
     const res = await fetch('/api/ai/post-assist', {
@@ -586,11 +604,12 @@ export async function improvePostContent(params: {
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.success && typeof data.improvedText === 'string') {
-      return data.improvedText;
+      return sanitizeAiCaptionText(data.improvedText) || params.text;
     }
   } catch {
     // Fallback below
   }
   return params.text;
 }
+
 

@@ -25,6 +25,14 @@ import {
   Zap,
   RotateCcw,
   Lightbulb,
+  Bell,
+  CheckCheck,
+  Pin,
+  ChevronDown,
+  ChevronUp,
+  RefreshCw,
+  ShieldCheck,
+  Globe,
 } from 'lucide-react';
 import {
   sendWelinkChatMessage,
@@ -47,9 +55,14 @@ import {
   detectUpgradeIdea,
   recordUpgradeFeedback,
 } from '../services/upgradeFeedbackService';
+import {
+  useAdminUpdates,
+  getUpdateTypeMeta,
+  formatAdminUpdateDateTime,
+} from '../services/adminUpdatesService';
 import { useBottomSheetLock } from '../utils/sheetLock';
 
-export type WelinkMode = 'chat' | 'image' | 'voice';
+export type WelinkMode = 'chat' | 'image' | 'voice' | 'updates';
 
 interface WelinkAssistantDrawerProps {
   isOpen: boolean;
@@ -114,14 +127,43 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
   onOpenUpgrade,
   initialMode,
 }) => {
-  const { currentUser, userProfile, isProEffective } = useAuth();
+  const { currentUser, userProfile, isProEffective, updateUserProfile } = useAuth();
+  const {
+    updates: adminUpdates,
+    lastSeenAt: lastSeenUpdateAt,
+    unseenCount: unseenUpdatesCount,
+    hasMore: hasMoreUpdates,
+    isLoading: isUpdatesLoading,
+    isLoadingMore: isLoadingMoreUpdates,
+    quotaError: updatesQuotaError,
+    markAllSeen: markAllUpdatesSeen,
+    markCardSeen: markSingleUpdateSeen,
+    refresh: refreshAdminUpdates,
+    loadMore: loadMoreAdminUpdates,
+    dismissUnseenToast,
+  } = useAdminUpdates(currentUser?.uid, userProfile?.lastSeenUpdateAt, updateUserProfile);
 
-  const [mode, setMode] = useState<WelinkMode>(initialMode || 'chat');
+  const [topTab, setTopTab] = useState<'assistant' | 'updates'>(
+    initialMode === 'updates' ? 'updates' : 'assistant'
+  );
+  const [mode, setMode] = useState<'chat' | 'image' | 'voice'>(
+    initialMode && initialMode !== 'updates' ? initialMode : 'chat'
+  );
   const [selectedModel, setSelectedModel] = useState<ChatModel>('gemini-3.8-flash');
+  const [expandedUpdateIds, setExpandedUpdateIds] = useState<Record<string, boolean>>({});
+  const [swahiliUpdateIds, setSwahiliUpdateIds] = useState<Record<string, boolean>>({});
 
+  // When the assistant opens: if initialMode === 'updates' OR there are unseen updates, open on "Admin Updates" first
   useEffect(() => {
-    if (isOpen && initialMode) {
+    if (!isOpen) return;
+    dismissUnseenToast();
+    if (initialMode === 'updates' || unseenUpdatesCount > 0) {
+      setTopTab('updates');
+    } else if (initialMode) {
+      setTopTab('assistant');
       setMode(initialMode);
+    } else {
+      setTopTab('assistant');
     }
   }, [isOpen, initialMode]);
 
@@ -1079,30 +1121,35 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
         onClick={onClose}
       />
 
-      {/* Drawer Container */}
+      {/* Drawer Container — Full height with 100dvh & safe-area on mobile, side panel on desktop */}
       <aside
-        className="relative z-10 w-full max-w-md sm:max-w-lg bg-[var(--bg-surface,#FFFFFF)] h-full shadow-2xl border-l border-[var(--border-hairline,#EFECE6)] flex flex-col overflow-hidden animate-slide-left"
-        style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
+        className="relative z-10 w-full max-w-full sm:max-w-lg bg-[var(--bg-surface,#FFFFFF)] h-[100dvh] max-h-[100dvh] shadow-2xl sm:border-l border-[var(--border-hairline,#EFECE6)] flex flex-col overflow-hidden animate-slide-left"
+        style={{
+          paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+          paddingTop: 'env(safe-area-inset-top, 0px)',
+        }}
       >
-        {/* Calm Warm Header */}
-        <div className="px-5 py-4 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white flex items-center justify-center shadow-xs">
+        {/* Header */}
+        <div className="px-4 sm:px-5 py-3.5 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] text-[var(--text-primary,#1C1917)] flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white flex items-center justify-center shadow-xs shrink-0">
               <Waves size={20} />
             </div>
-            <div>
+            <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <h2 className="font-extrabold text-base tracking-tight text-[var(--text-primary,#1C1917)] leading-none">
+                <h2 className="font-extrabold text-base tracking-tight text-[var(--text-primary,#1C1917)] leading-none truncate">
                   WELINK AI
                 </h2>
                 {isProEffective && (
-                  <span className="text-[10px] font-bold text-[#0D9488] bg-[#CCFBF1] px-2 py-0.5 rounded-full">
+                  <span className="text-[10px] font-bold text-[#0D9488] bg-[#CCFBF1] px-2 py-0.5 rounded-full shrink-0">
                     Pro
                   </span>
                 )}
               </div>
-              <p className="text-xs text-[var(--text-secondary,#78716C)] mt-0.5">
-                Community Guide &amp; Image Studio
+              <p className="text-xs text-[var(--text-secondary,#78716C)] mt-0.5 truncate">
+                {topTab === 'updates'
+                  ? 'Official WaveLink Announcements & Releases'
+                  : 'Community Guide & Image Studio'}
               </p>
             </div>
           </div>
@@ -1110,7 +1157,7 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
           <button
             type="button"
             onClick={onClose}
-            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition active:scale-95"
+            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition active:scale-95 shrink-0"
             title="Close WELINK"
             aria-label="Close WELINK"
           >
@@ -1118,8 +1165,48 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
           </button>
         </div>
 
+        {/* Top-Level Switcher: "Assistant" | "Admin Updates" */}
+        <div className="px-3 py-2 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => setTopTab('assistant')}
+            className={`flex-1 min-h-[42px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+              topTab === 'assistant'
+                ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
+                : 'bg-[var(--bg-canvas,#FAF7F2)] text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] border border-[var(--border-hairline,#EFECE6)]'
+            }`}
+          >
+            <Sparkles size={15} />
+            <span>Assistant</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setTopTab('updates')}
+            className={`flex-1 min-h-[42px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition relative ${
+              topTab === 'updates'
+                ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
+                : 'bg-[var(--bg-canvas,#FAF7F2)] text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] border border-[var(--border-hairline,#EFECE6)]'
+            }`}
+          >
+            <Bell size={15} />
+            <span>Admin Updates</span>
+            {unseenUpdatesCount > 0 && (
+              <span
+                className={`ml-1 min-w-[20px] h-5 px-1.5 rounded-full text-[11px] font-black inline-flex items-center justify-center ${
+                  topTab === 'updates'
+                    ? 'bg-white text-[var(--accent-primary,#2563EB)]'
+                    : 'bg-rose-500 text-white shadow-xs'
+                }`}
+              >
+                {unseenUpdatesCount > 99 ? '99+' : unseenUpdatesCount}
+              </span>
+            )}
+          </button>
+        </div>
+
         {/* Upgrade Suggestion Recorded Notification Banner */}
-        {upgradeNotice && (
+        {upgradeNotice && topTab === 'assistant' && (
           <div className="px-4 py-2.5 bg-gradient-to-r from-amber-500 via-amber-600 to-orange-500 text-white text-xs font-bold flex items-center justify-between gap-2 shadow-sm animate-in fade-in slide-in-from-top-2">
             <div className="flex items-center gap-2">
               <Lightbulb size={16} className="text-amber-200 shrink-0" />
@@ -1136,51 +1223,340 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
         )}
 
         {/* Main Content Area */}
-        <div className="flex-1 flex flex-col min-h-0 bg-[var(--bg-canvas,#FAF7F2)]">
-          {/* Mode Navigation Tabs (Chat Guide, Images, Live Voice) */}
-          <div className="px-3 pt-3 pb-2 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center gap-1.5 shrink-0">
-            <button
-              type="button"
-              onClick={() => setMode('chat')}
-              className={`flex-1 min-h-[44px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                mode === 'chat'
-                  ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
-                  : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
-              }`}
-            >
-              <MessageSquare size={15} />
-              <span>Chat Guide</span>
-            </button>
+        <div className="flex-1 flex flex-col min-h-0 bg-[var(--bg-canvas,#FAF7F2)] overflow-x-hidden">
+          {/* ========================================================== */}
+          {/* TOP TAB 2: ADMIN UPDATES (Big Glass Notification Cards)    */}
+          {/* ========================================================== */}
+          {topTab === 'updates' && (
+            <div className="flex-1 flex flex-col min-h-0">
+              {/* Sub-bar with Unseen Count & Mark All as Read */}
+              <div className="px-4 py-2.5 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between gap-2 shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-xs font-extrabold text-[var(--text-primary,#1C1917)] truncate">
+                    {unseenUpdatesCount > 0
+                      ? `${unseenUpdatesCount} new ${unseenUpdatesCount === 1 ? 'update' : 'updates'}`
+                      : 'All caught up'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {unseenUpdatesCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => markAllUpdatesSeen()}
+                      className="px-3 py-1.5 rounded-xl bg-[var(--accent-primary,#2563EB)]/10 hover:bg-[var(--accent-primary,#2563EB)]/20 text-[var(--accent-primary,#2563EB)] text-xs font-extrabold flex items-center gap-1.5 transition"
+                    >
+                      <CheckCheck size={14} />
+                      <span>Mark all as read</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => refreshAdminUpdates()}
+                    disabled={isUpdatesLoading}
+                    className="p-1.5 rounded-xl text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] hover:bg-[var(--bg-canvas,#FAF7F2)] transition disabled:opacity-40"
+                    title="Refresh updates"
+                  >
+                    <RefreshCw size={14} className={isUpdatesLoading ? 'animate-spin' : ''} />
+                  </button>
+                </div>
+              </div>
 
-            <button
-              type="button"
-              onClick={() => setMode('image')}
-              className={`flex-1 min-h-[44px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                mode === 'image'
-                  ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
-                  : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
-              }`}
-            >
-              <ImageIcon size={15} />
-              <span>Images</span>
-            </button>
+              {/* Updates Scroll List */}
+              <div className="flex-1 overflow-y-auto p-3.5 sm:p-4 space-y-4">
+                {/* Quota Exceeded Friendly Retry Card */}
+                {updatesQuotaError && (
+                  <div
+                    className="p-4 rounded-3xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    style={{
+                      background: 'var(--bg-surface, rgba(255,255,255,0.9))',
+                      borderColor: 'var(--border-hairline, rgba(239,236,230,0.8))',
+                    }}
+                  >
+                    <div className="flex items-start gap-3">
+                      <AlertCircle size={18} className="text-amber-500 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-xs font-extrabold text-[var(--text-primary,#1C1917)]">
+                          Updates are temporarily busy
+                        </p>
+                        <p className="text-[11px] text-[var(--text-secondary,#78716C)] mt-0.5">
+                          Daily read quota was reached. Tap Retry to check again.
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => refreshAdminUpdates()}
+                      className="px-4 py-2 rounded-2xl bg-[var(--accent-primary,#2563EB)] text-white text-xs font-extrabold flex items-center justify-center gap-1.5 shrink-0 shadow-xs"
+                    >
+                      <RefreshCw size={13} />
+                      <span>Retry</span>
+                    </button>
+                  </div>
+                )}
 
-            <button
-              type="button"
-              onClick={() => setMode('voice')}
-              className={`flex-1 min-h-[44px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
-                mode === 'voice'
-                  ? 'bg-[#0D9488] text-white shadow-xs'
-                  : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
-              }`}
-            >
-              <Mic size={15} />
-              <span>Live Voice</span>
-            </button>
-          </div>
+                {/* Loading Skeleton */}
+                {isUpdatesLoading && adminUpdates.length === 0 && (
+                  <div className="py-12 flex flex-col items-center justify-center gap-2 text-xs font-bold text-[var(--text-secondary,#78716C)]">
+                    <Loader2 size={22} className="animate-spin text-[var(--accent-primary,#2563EB)]" />
+                    <span>Loading WaveLink updates...</span>
+                  </div>
+                )}
 
-          {/* TAB 1: MULTI-TURN CHAT GUIDE (Rendered with react-markdown) */}
-          {mode === 'chat' && (
+                {/* Empty State */}
+                {!isUpdatesLoading && !updatesQuotaError && adminUpdates.length === 0 && (
+                  <div
+                    className="p-8 rounded-3xl border text-center space-y-2.5"
+                    style={{
+                      background: 'var(--bg-surface, rgba(255,255,255,0.85))',
+                      borderColor: 'var(--border-hairline, #EFECE6)',
+                    }}
+                  >
+                    <div className="w-12 h-12 rounded-2xl mx-auto bg-[var(--accent-primary,#2563EB)]/10 text-[var(--accent-primary,#2563EB)] flex items-center justify-center">
+                      <Bell size={22} />
+                    </div>
+                    <h3 className="text-sm font-extrabold text-[var(--text-primary,#1C1917)]">
+                      No updates yet.
+                    </h3>
+                    <p className="text-xs text-[var(--text-secondary,#78716C)] max-w-xs mx-auto">
+                      Official announcements, new features, and fixes from the WaveLink team will appear right here.
+                    </p>
+                  </div>
+                )}
+
+                {/* Big Glass Notification Cards */}
+                {adminUpdates.map((item) => {
+                  const meta = getUpdateTypeMeta(item.type);
+                  const isUnseen = !lastSeenUpdateAt || item.createdAt > lastSeenUpdateAt;
+                  const showSwahili = Boolean(swahiliUpdateIds[item.id] && item.messageSw);
+                  const activeMessage = showSwahili && item.messageSw ? item.messageSw : item.message;
+                  const isLongMessage = activeMessage.length > 220;
+                  const isExpanded = Boolean(expandedUpdateIds[item.id]);
+                  const displayedMessage =
+                    isLongMessage && !isExpanded
+                      ? `${activeMessage.slice(0, 220).trim()}…`
+                      : activeMessage;
+
+                  return (
+                    <article
+                      key={item.id}
+                      className="rounded-3xl p-4 sm:p-5 border transition-all relative overflow-hidden"
+                      style={{
+                        background: 'var(--bg-surface, rgba(255, 255, 255, 0.92))',
+                        backdropFilter: 'blur(18px)',
+                        WebkitBackdropFilter: 'blur(18px)',
+                        borderColor: isUnseen
+                          ? 'var(--accent-primary, #2563EB)'
+                          : 'var(--border-hairline, #EFECE6)',
+                        boxShadow: isUnseen
+                          ? '0 12px 32px -10px rgba(37, 99, 235, 0.22)'
+                          : '0 6px 20px -8px rgba(0, 0, 0, 0.08)',
+                      }}
+                    >
+                      {/* Top Row: Type Pill + Pinned + Unseen "New" Chip */}
+                      <div className="flex items-center justify-between gap-2 flex-wrap mb-3">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-extrabold border"
+                            style={{
+                              borderColor: meta.borderColor,
+                              background: meta.glowColor,
+                              color: 'var(--text-primary, #1C1917)',
+                            }}
+                          >
+                            <span>{meta.emoji}</span>
+                            <span>{showSwahili ? meta.labelSw : meta.label}</span>
+                          </span>
+
+                          {item.pinned && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-500/15 text-amber-600 border border-amber-500/30">
+                              <Pin size={10} />
+                              <span>Pinned</span>
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          {item.messageSw && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSwahiliUpdateIds((prev) => ({
+                                  ...prev,
+                                  [item.id]: !prev[item.id],
+                                }))
+                              }
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-extrabold border border-[var(--border-hairline,#EFECE6)] bg-[var(--bg-canvas,#FAF7F2)] text-[var(--text-secondary,#78716C)] hover:text-[var(--text-primary,#1C1917)] transition"
+                              title="Toggle English / Kiswahili"
+                            >
+                              <Globe size={11} />
+                              <span>{showSwahili ? 'EN' : 'SW'}</span>
+                            </button>
+                          )}
+
+                          {isUnseen && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-[var(--accent-primary,#2563EB)] text-white shadow-2xs">
+                              New
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Title */}
+                      <h3 className="text-base sm:text-lg font-extrabold text-[var(--text-primary,#1C1917)] leading-snug break-words">
+                        {item.title}
+                      </h3>
+
+                      {/* Message Body */}
+                      <p className="mt-2 text-xs sm:text-sm text-[var(--text-primary,#1C1917)] opacity-90 leading-relaxed whitespace-pre-wrap break-words">
+                        {displayedMessage}
+                      </p>
+
+                      {isLongMessage && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedUpdateIds((prev) => ({
+                              ...prev,
+                              [item.id]: !prev[item.id],
+                            }))
+                          }
+                          className="mt-1.5 inline-flex items-center gap-1 text-xs font-extrabold text-[var(--accent-primary,#2563EB)] hover:underline"
+                        >
+                          {isExpanded ? (
+                            <>
+                              <span>Show less</span>
+                              <ChevronUp size={13} />
+                            </>
+                          ) : (
+                            <>
+                              <span>Read full announcement</span>
+                              <ChevronDown size={13} />
+                            </>
+                          )}
+                        </button>
+                      )}
+
+                      {/* Optional Attached Image */}
+                      {item.imageUrl && (
+                        <div className="mt-3 rounded-2xl overflow-hidden border border-[var(--border-hairline,#EFECE6)] bg-black/5">
+                          <img
+                            src={item.imageUrl}
+                            alt={item.title}
+                            loading="lazy"
+                            className="w-full max-h-64 object-cover"
+                          />
+                        </div>
+                      )}
+
+                      {/* Footer: Author Name + Role Badge + Formatted Date/Time + "Got it" button */}
+                      <div className="mt-4 pt-3 border-t border-[var(--border-hairline,#EFECE6)] flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                          <span className="text-xs font-extrabold text-[var(--text-primary,#1C1917)] truncate">
+                            {item.authorName}
+                          </span>
+                          <span
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+                              item.role === 'admin'
+                                ? 'bg-[var(--accent-primary,#2563EB)]/15 text-[var(--accent-primary,#2563EB)] border border-[var(--accent-primary,#2563EB)]/30'
+                                : 'bg-teal-500/15 text-teal-600 border border-teal-500/30'
+                            }`}
+                          >
+                            <ShieldCheck size={10} />
+                            <span>{item.role === 'admin' ? 'Admin' : 'Team'}</span>
+                          </span>
+                          <span className="text-[11px] text-[var(--text-secondary,#78716C)]">
+                            • {formatAdminUpdateDateTime(item.createdAt)}
+                          </span>
+                        </div>
+
+                        {isUnseen && (
+                          <button
+                            type="button"
+                            onClick={() => markSingleUpdateSeen(item.createdAt)}
+                            className="px-3.5 py-1.5 rounded-xl bg-[var(--accent-primary,#2563EB)] hover:opacity-95 text-white text-xs font-extrabold flex items-center gap-1.5 transition shadow-2xs shrink-0"
+                          >
+                            <CheckCheck size={13} />
+                            <span>Got it</span>
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+
+                {/* Load Older Updates Pagination Button */}
+                {hasMoreUpdates && (
+                  <div className="pt-1 pb-4 flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => loadMoreAdminUpdates()}
+                      disabled={isLoadingMoreUpdates}
+                      className="w-full min-h-[44px] py-2.5 px-4 rounded-2xl bg-[var(--bg-surface,#FFFFFF)] hover:opacity-95 border border-[var(--border-hairline,#EFECE6)] text-xs font-extrabold text-[var(--text-primary,#1C1917)] flex items-center justify-center gap-2 transition shadow-2xs disabled:opacity-50"
+                    >
+                      {isLoadingMoreUpdates ? (
+                        <>
+                          <Loader2 size={14} className="animate-spin text-[var(--accent-primary,#2563EB)]" />
+                          <span>Loading older updates...</span>
+                        </>
+                      ) : (
+                        <span>Load older updates</span>
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ========================================================== */}
+          {/* TOP TAB 1: ASSISTANT (Chat Guide, Images, Live Voice)      */}
+          {/* ========================================================== */}
+          {topTab === 'assistant' && (
+            <>
+              {/* Mode Navigation Tabs (Chat Guide, Images, Live Voice) */}
+              <div className="px-3 pt-2.5 pb-2 bg-[var(--bg-surface,#FFFFFF)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setMode('chat')}
+                  className={`flex-1 min-h-[42px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                    mode === 'chat'
+                      ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
+                      : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
+                  }`}
+                >
+                  <MessageSquare size={15} />
+                  <span>Chat Guide</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setMode('image')}
+                  className={`flex-1 min-h-[42px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                    mode === 'image'
+                      ? 'bg-[var(--accent-primary,#2563EB)] text-white shadow-xs'
+                      : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
+                  }`}
+                >
+                  <ImageIcon size={15} />
+                  <span>Images</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setMode('voice')}
+                  className={`flex-1 min-h-[42px] py-2 px-3 rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                    mode === 'voice'
+                      ? 'bg-[#0D9488] text-white shadow-xs'
+                      : 'text-[var(--text-secondary,#78716C)] hover:bg-[var(--bg-canvas,#FAF7F2)] hover:text-[var(--text-primary,#1C1917)]'
+                  }`}
+                >
+                  <Mic size={15} />
+                  <span>Live Voice</span>
+                </button>
+              </div>
+
+              {/* TAB 1: MULTI-TURN CHAT GUIDE (Rendered with react-markdown) */}
+              {mode === 'chat' && (
             <div className="flex-1 flex flex-col min-h-0">
               {/* Model Selector Bar */}
               <div className="px-4 py-2 bg-[var(--bg-subtle,#F5F1EA)] border-b border-[var(--border-hairline,#EFECE6)] flex items-center justify-between gap-2 text-[11px]">
@@ -1914,8 +2290,11 @@ export const WelinkAssistantDrawer: React.FC<WelinkAssistantDrawerProps> = ({
               </form>
             </div>
           )}
+            </>
+          )}
         </div>
       </aside>
     </div>
   );
 };
+

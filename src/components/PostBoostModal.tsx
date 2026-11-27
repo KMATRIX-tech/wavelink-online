@@ -28,6 +28,7 @@ import {
 
 import { MobileMoneyPaymentModal } from './MobileMoneyPaymentModal';
 import { useBottomSheetLock } from '../utils/sheetLock';
+import { cleanCaption } from '../utils/cleanCaption';
 
 interface PostBoostModalProps {
   post: Post;
@@ -116,7 +117,7 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
       const formatted = formatPhoneNumber(phoneNumber.trim());
       const { transaction } = await initiatePostBoost({
         postId: post.id,
-        postTitle: post.content?.substring(0, 40) || 'Wave Post',
+        postTitle: cleanCaption(post.content).substring(0, 40) || 'Wave Post',
         userId: currentUser.uid,
         userEmail: currentUser.email || '',
         userName: userProfile?.displayName || currentUser.displayName || 'Creator',
@@ -211,7 +212,7 @@ export const PostBoostModal: React.FC<PostBoostModalProps> = ({
                   Wave Selected for Boosting:
                 </span>
                 <p className="text-[#1C1917] line-clamp-2 italic">
-                  "{post.content || 'Photo/Video wave moment'}"
+                  "{cleanCaption(post.content) || 'Photo/Video wave moment'}"
                 </p>
               </div>
 

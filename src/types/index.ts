@@ -196,6 +196,8 @@ export interface UserPrivacySettings {
   sparkVisibility: 'everyone' | 'followers';
   showReadReceipts: boolean;
   allowSearchByEmail: boolean;
+  showAchievementsAndChallenges?: boolean;
+  isTeenAccount?: boolean;
   dataSharingConsent?: boolean;
   updatedAt?: string;
 }
@@ -254,6 +256,12 @@ export interface FcmDeviceTokenDoc {
   updatedAt: string;
 }
 
+export interface UserChatNote {
+  text: string; // max 60 chars
+  createdAt: string;
+  expiresAt: string; // 24 hours from createdAt
+}
+
 export interface UserProfile {
   id: string; // Auth UID
   email: string;
@@ -266,9 +274,29 @@ export interface UserProfile {
   isBanned: boolean;
   savedPostIds?: string[];
   followingIds?: string[];
+  contactIds?: string[];
+  invitedByUid?: string;
   blockedUserIds?: string[];
+  mutedUserIds?: string[];
   closeFriendIds?: string[];
   mutedChannelIds?: string[];
+  pinnedChannelIds?: string[];
+  archivedChannelIds?: string[];
+  chatNote?: UserChatNote | null;
+  showChatNotes?: boolean;
+  chatUnreadFirst?: boolean;
+  /** Sensitive content filter (ON by default; locked ON for under-18 accounts) */
+  sensitiveContentFilter?: boolean;
+  /** Community Guidelines acceptance timestamp & version recorded at sign-up */
+  guidelinesAcceptedAt?: string;
+  guidelinesVersion?: string;
+  /** 4-step Strikes moderation ladder (Admin / Server writable only) */
+  strikesCount?: number;
+  strikeLevel?: StrikeLevel;
+  mutedUntilMs?: number;
+  suspendedUntilMs?: number;
+  banReason?: string;
+  strikeHistory?: UserStrikeEntry[];
   fcmTokens?: FcmTokenEntry[];
   appearanceTheme?: AppearanceTheme;
   chatThemes?: Record<string, ChatThemePreference>;
@@ -299,6 +327,7 @@ export interface UserProfile {
   // Phase 3: Selected user interests
   interests?: string[];
   interestsCompleted?: boolean;
+  hideAiGenerated?: boolean;
   // Phase 4: Weekly Challenge Winner Badge (valid until ISO timestamp)
   weeklyWinnerUntil?: string;
   weeklyWinnerChallengeTitle?: string;
@@ -332,6 +361,7 @@ export interface UserProfile {
   isOnline?: boolean;
   lastSeen?: string;
   lastSeenAt?: string;
+  lastSeenUpdateAt?: string;
   // Daily Login Reward & Habitual Engagement System
   points?: number;
   wavePoints?: number;
@@ -340,6 +370,44 @@ export interface UserProfile {
   lastDailyRewardAmount?: number;
   totalLoginDays?: number;
   pointTransactions?: PointTransaction[];
+  // Gamer Profile Progression, Achievements & Challenge Summary (stored directly on /users/{uid})
+  xp?: number;
+  level?: number;
+  streak?: number;
+  longestStreak?: number;
+  daysActive?: number;
+  totalLikesReceived?: number;
+  highlightedBadges?: string[]; // Owner-chosen up to 3 badge IDs (profile header)
+  highlightedBadgeId?: string | null; // Single chosen badge icon displayed next to name on posts & comments
+  badges?: Array<{ id: string; awardedAt: string }>; // Server/Admin awarded only
+  pendingWinnerCelebration?: PendingWinnerCelebration | null; // Cleared to null after user sees confetti celebration
+  challengeStats?: {
+    joined: number;
+    wins: number;
+    bestPlace: number | null;
+    entries: number;
+  };
+  recentChallenges?: Array<{
+    id: string;
+    title: string;
+    hashtag?: string;
+    date: string;
+    placement?: number | null;
+    participated?: boolean;
+    thumbnailUrl?: string;
+    badgeWonId?: string;
+    likesCount?: number;
+  }>;
+  isUnder18?: boolean;
+  // Minimal age & parental controls summary (data minimized — raw DOB never exposed publicly)
+  birthYear?: number;
+  birthMonth?: number;
+  turns18At?: string;
+  parentalLinkId?: string | null;
+  parentalStatus?: ParentalLinkStatus;
+  parentEmailMasked?: string | null;
+  parentalSettings?: ParentalControlsConfig | null;
+  hasLinkedTeens?: boolean; // Set by server on parent's user profile so Parent Dashboard appears with 0 extra reads
   // Duplicate Account Resolution & Data Preservation (30-day retention)
   mergedIntoUid?: string;
   isDuplicateDisabled?: boolean;
@@ -440,6 +508,7 @@ export interface Post {
   viewsCount?: number;
   challengeId?: string;
   challengeHashtag?: string;
+  authorHighlightedBadgeId?: string | null;
   isEdited?: boolean;
   // Monetization features: Boosting & Tipping
   isBoosted?: boolean;
@@ -456,12 +525,36 @@ export interface Post {
   affiliateProductUrl?: string;
   affiliateButtonText?: string;
   affiliateRating?: number;
-  // Safety Automation & Auto-Hide Moderation
+  // Safety Automation & 4-Layer Moderation
   isHidden?: boolean;
   moderationStatus?: 'active' | 'auto_hidden' | 'hidden_by_staff' | 'restored';
   moderationReason?: string;
+  moderationChecked?: boolean;
+  moderationCheckedAt?: string;
+  mediaSafety?: MediaSafetyLevel;
+  mediaSafetyReason?: string;
   reportCount?: number;
   reportedBy?: string[];
+  // Automatic System AI Tagging (saved once at upload time — zero reads at browse/search time)
+  category?:
+    | 'Art'
+    | 'Fashion'
+    | 'Travel'
+    | 'Music'
+    | 'Sports'
+    | 'Food'
+    | 'Comedy'
+    | 'Tech'
+    | 'Gaming'
+    | 'Education'
+    | 'Lifestyle'
+    | 'Other'
+    | string;
+  keywords?: string[];
+  language?: string;
+  aiGenerated?: boolean;
+  aiConfidence?: number;
+  taggedAt?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -526,6 +619,9 @@ export interface Spark {
   viewersCount?: number;
   viewerUsers?: SparkViewerEntry[];
   isHidden?: boolean;
+  moderationChecked?: boolean;
+  moderationCheckedAt?: string;
+  mediaSafety?: MediaSafetyLevel;
   reportCount?: number;
   createdAt: string;
   expiresAt: string;
@@ -562,12 +658,15 @@ export interface PostComment {
   authorName: string;
   authorUsername?: string;
   authorPhotoURL?: string;
+  authorHighlightedBadgeId?: string | null;
   content: string;
   createdAt: string;
   updatedAt?: string;
   parentId?: string | null;
   replyToName?: string | null;
   isHidden?: boolean;
+  moderationChecked?: boolean;
+  moderationCheckedAt?: string;
   reportCount?: number;
   reactions?: {
     heart?: string[];
@@ -665,6 +764,12 @@ export interface ChannelMessage {
   isBotReply?: boolean;
   botLogId?: string;
   reportedBadReply?: boolean;
+  isHidden?: boolean;
+  moderationChecked?: boolean;
+  moderationCheckedAt?: string;
+  mediaSafety?: MediaSafetyLevel;
+  reportCount?: number;
+  reportedBy?: string[];
   readBy?: string[];
   lastSeenAt?: string;
   expiresAt?: string;
@@ -685,16 +790,27 @@ export interface ChatChannelMeta {
   id: string;
   conversationId?: string;
   participants?: string[];
+  initiatedBy?: string;
+  acceptedBy?: string[];
+  requestStatus?: 'pending' | 'accepted';
+  senderMessageCount?: number;
   lastMessageText?: string;
+  lastMessageMediaType?: 'image' | 'video' | 'audio' | 'file' | 'none';
   lastMessageSenderId?: string;
   lastMessageSenderName?: string;
+  lastMessageSenderPhotoURL?: string;
   lastMessageAt?: string;
   unreadCounts?: Record<string, number>;
   unread?: Record<string, number>;
   lastSeen?: Record<string, string>;
+  deletedAt?: Record<string, string>;
+  clearedAt?: Record<string, string>;
+  pinnedBy?: string[];
+  archivedBy?: string[];
   typing?: Record<string, TypingStatusEntry>;
   suggestedTheme?: SharedChatThemeSuggestion | null;
   disappearingHours?: number;
+  createdAt?: string;
   updatedAt?: string;
 }
 
@@ -847,6 +963,7 @@ export type NotificationType =
   | 'post_comment'
   | 'post_reply'
   | 'challenge_reminder'
+  | 'challenge_won'
   | 'post_tip'
   | 'post_boost'
   | 'payment_verified'
@@ -967,6 +1084,26 @@ export interface ScheduledBotDraft {
   createdAt: string;
 }
 
+export type MediaSafetyLevel = 'safe' | 'borderline' | 'unsafe';
+
+export type ReportReasonCategory = 'abuse' | 'sexual' | 'hate' | 'spam' | 'other';
+
+export type StrikeLevel =
+  | 'none'
+  | 'warning'
+  | 'muted_24h'
+  | 'suspended_7d'
+  | 'permanent_ban';
+
+export interface UserStrikeEntry {
+  level: StrikeLevel;
+  reason: string;
+  actorId?: string;
+  actorName?: string;
+  createdAt: string;
+  expiresAt?: string;
+}
+
 export interface ContentReport {
   id: string;
   reporterId: string;
@@ -975,14 +1112,27 @@ export interface ContentReport {
   targetType: 'user' | 'post' | 'bot_reply' | 'comment' | 'video' | 'reel' | 'spark' | 'message';
   targetId: string;
   targetAuthorId?: string;
+  targetAuthorName?: string;
+  postId?: string;
+  channelId?: string;
+  groupId?: string;
   targetSummary?: string;
+  reasonCategory?: ReportReasonCategory;
   reason: string;
-  status: 'open' | 'reviewed' | 'dismissed' | 'auto_hidden' | 'restored';
+  details?: string;
+  source?: 'user_report' | 'auto_ai' | 'image_moderation';
+  status: 'open' | 'reviewed' | 'dismissed' | 'auto_hidden' | 'restored' | 'removed';
   independentReporters?: string[];
   reportCount?: number;
   autoHidden?: boolean;
   createdAt: string;
   updatedAt?: string;
+}
+
+export interface ModerationQueueResponse {
+  reports: ContentReport[];
+  appeals: ContentAppeal[];
+  recentLogs: AdminAuditLog[];
 }
 
 export type AuditActionType =
@@ -1007,7 +1157,23 @@ export type AuditActionType =
   | 'report_submitted'
   | 'upgrade_status_change'
   | 'merge_duplicate_accounts'
-  | 'mfa_factor_removed';
+  | 'mfa_factor_removed'
+  | 'admin_updates_post'
+  | 'admin_updates_edit'
+  | 'admin_updates_delete'
+  | 'subadmin_add'
+  | 'subadmin_remove'
+  | 'mute_user_24h'
+  | 'suspend_user_7d'
+  | 'permanent_ban_user'
+  | 'moderation_approve'
+  | 'moderation_remove'
+  | 'auto_ai_flag'
+  | 'image_moderation_block'
+  | 'challenge_created'
+  | 'challenge_winners_chosen'
+  | 'badge_created'
+  | 'badge_awarded';
 
 export interface AdminAuditLog {
   id: string;
@@ -1068,15 +1234,103 @@ export interface UpgradeFeedbackItem {
   reviewedAt?: string;
 }
 
+export type ChallengeEntryType = 'photo' | 'video' | 'text' | 'any';
+
+export interface ChallengeWinner {
+  uid: string;
+  displayName: string;
+  username?: string;
+  photoURL?: string;
+  placement: 1 | 2 | 3 | number;
+  postId?: string;
+  postThumbnailUrl?: string;
+  postExcerpt?: string;
+  likesTotal?: number;
+  postCount?: number;
+  badgeId?: string;
+  awardedAt: string;
+}
+
+export interface PendingWinnerCelebration {
+  challengeId: string;
+  challengeTitle: string;
+  hashtag?: string;
+  placement: number;
+  badgeId?: string | null;
+  badgeName?: string | null;
+  awardedAt: string;
+}
+
+export interface CustomBadge {
+  id: string;
+  name: string;
+  description: string;
+  color: string; // Hex color e.g. #8b5cf6
+  iconName?: string; // Curated Lucide icon key (e.g. 'trophy', 'crown', 'flame', 'star', 'sparkles', 'award', 'medal', 'zap', 'music', 'camera', 'video', 'heart', 'shield', 'gem', 'rocket')
+  imageUrl?: string; // Optional uploaded HTTPS badge image
+  challengeId?: string | null;
+  challengeTitle?: string | null;
+  createdBy: string;
+  createdByName?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface ChallengeEntry {
+  id: string; // Same as postId
+  postId: string;
+  challengeId: string;
+  uid: string;
+  authorName: string;
+  authorUsername?: string;
+  authorPhotoURL?: string;
+  mediaType?: 'image' | 'video' | 'none';
+  thumbnailUrl?: string;
+  imageUrl?: string;
+  excerpt?: string;
+  likesCount: number;
+  countedLikerIds?: string[];
+  moderationChecked: boolean;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface ChallengeParticipant {
+  uid: string;
+  challengeId: string;
+  displayName: string;
+  username?: string;
+  photoURL?: string;
+  postCount: number;
+  likesTotal: number;
+  lastPostAt: string;
+  suspiciousSpike?: boolean;
+  spikeReasons?: string[];
+  recentLikeTimestamps?: number[];
+  updatedAt?: string;
+}
+
 export interface CreatorChallenge {
   id: string;
+  title?: string;
   theme: string;
   themeSw?: string;
   hashtag: string;
   description: string;
   descriptionSw?: string;
-  deadline: string; // ISO date
+  rules?: string;
+  type?: ChallengeEntryType;
+  coverImageUrl?: string;
+  startDate?: string; // ISO date
+  endDate?: string; // ISO date (default +7 days)
+  endDateMs?: number; // Epoch ms for strict Firestore rules enforcement
+  deadline: string; // ISO date (kept in sync with endDate for backward compatibility)
+  maxEntriesPerUser?: number; // Optional anti-cheat cap (e.g. 3)
+  badgeId?: string | null; // Optional linked custom or built-in badge
   status: 'active' | 'completed';
+  participantsCount?: number;
+  entriesCount?: number;
+  winners?: ChallengeWinner[];
   createdBy: string;
   createdByName?: string;
   winnerUserId?: string;
@@ -1123,4 +1377,149 @@ export interface CreatorSpotlight {
   updatedAt: string;
 }
 
+export type AdminUpdateType =
+  | 'new_feature'
+  | 'improvement'
+  | 'bug_fix'
+  | 'maintenance'
+  | 'announcement';
+
+export type AdminRoleType = 'admin' | 'subadmin';
+
+export interface AdminRoleDoc {
+  uid: string;
+  role: AdminRoleType;
+  username?: string;
+  displayName?: string;
+  email?: string;
+  photoURL?: string;
+  assignedBy?: string;
+  updatedAt: string;
+}
+
+export interface AdminUpdateItem {
+  id: string;
+  title: string;
+  message: string;
+  messageSw?: string;
+  type: AdminUpdateType;
+  imageUrl?: string;
+  authorUid: string;
+  authorName: string;
+  role: AdminRoleType;
+  createdAt: string;
+  updatedAt?: string;
+  pinned?: boolean;
+  deleted: boolean;
+  alsoSendPush?: boolean;
+}
+
+// ===============================================================
+// PARENTAL CONTROLS & TEEN SAFETY TYPES
+// ===============================================================
+export type ParentalLinkStatus =
+  | 'none'
+  | 'unverified_teen'
+  | 'pending_parent'
+  | 'linked';
+
+export type TeenMessagingPolicy = 'nobody' | 'approved_friends';
+
+export interface ParentalControlsConfig {
+  dailyLimitMinutes: number; // e.g. 30, 60, 90, 120, 180
+  bedtimeEnabled: boolean;
+  bedtimeStart: string; // HH:MM (24h local time, e.g. "22:00")
+  bedtimeEnd: string;   // HH:MM (24h local time, e.g. "06:30")
+  messagingPolicy: TeenMessagingPolicy;
+  profileVisibility: 'private' | 'public';
+  allowCalls: boolean;
+  strictSensitiveFilter: true; // Always locked ON for teen accounts
+  requireFollowerApproval: boolean;
+  isPaused: boolean;
+  allowLocationSharing: false; // Always OFF for teen accounts
+  emailAlertsEnabled: boolean;
+  updatedAt?: string;
+  updatedByParentUid?: string;
+}
+
+export interface DailyScreenTimeEntry {
+  date: string; // YYYY-MM-DD
+  minutes: number;
+}
+
+export interface PendingFollowApproval {
+  id: string;
+  requesterUid: string;
+  requesterName: string;
+  requesterUsername?: string;
+  requesterPhotoURL?: string;
+  requestedAt: string;
+  status: 'pending' | 'approved' | 'declined';
+  decidedAt?: string;
+}
+
+export type ParentalAlertType =
+  | 'teen_reported'
+  | 'flagged_message'
+  | 'new_chat_request'
+  | 'new_follow_request'
+  | 'link_verified'
+  | 'deletion_requested';
+
+export interface ParentalAlertItem {
+  id: string;
+  teenUid: string;
+  teenName?: string;
+  parentUid?: string | null;
+  parentEmailLower: string;
+  type: ParentalAlertType;
+  title: string;
+  summary: string;
+  actorUid?: string;
+  actorName?: string;
+  read: boolean;
+  createdAt: string;
+}
+
+export interface ParentalActivitySummary {
+  todayMinutes: number;
+  dailyScreenTime: DailyScreenTimeEntry[];
+  postsCount: number;
+  following: Array<{
+    uid: string;
+    displayName: string;
+    username?: string;
+    photoURL?: string;
+  }>;
+  followers: Array<{
+    uid: string;
+    displayName: string;
+    username?: string;
+    photoURL?: string;
+  }>;
+  challengesJoined: Array<{
+    id: string;
+    title: string;
+    hashtag?: string;
+    date: string;
+  }>;
+}
+
+export interface ParentalLinkedTeenSummary {
+  linkId: string;
+  teenUid: string;
+  teenDisplayName: string;
+  teenUsername: string;
+  teenPhotoURL?: string;
+  turns18At?: string;
+  status: 'pending_parent' | 'verified';
+  parentEmailMasked: string;
+  verifiedAt?: string;
+  controls: ParentalControlsConfig;
+  activity: ParentalActivitySummary;
+  pendingFollowers: PendingFollowApproval[];
+  alerts: ParentalAlertItem[];
+  deletionRequested?: boolean;
+  deletionRequestedAt?: string;
+}
 

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
+import { awardProgressionAction } from '../services/progressionService';
 import {
   useDataSaver,
   getOptimizedImagePreviewUrl,
@@ -14,7 +15,6 @@ import {
 import {
   AFRICAN_COUNTRIES,
   PAN_AFRICAN_LANGUAGES,
-  COMMUNITY_REPORT_CATEGORIES,
   getAfricanCountryMeta,
   getKangaFrameClass,
   doesPostMatchCountry,
@@ -57,6 +57,13 @@ import {
 } from 'firebase/firestore';
 import { Post, PostComment, Announcement, ReactionType, UserProfile } from '../types';
 import { savePostDocument } from '../services/postService';
+import {
+  enterPostIntoChallenge,
+  formatCountdownParts,
+  isChallengeExpired,
+  syncChallengePostLike,
+} from '../services/challengesService';
+import type { CreatorChallenge } from '../types';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { CrystalBadge } from './CrystalBadge';
 import { VideoPlayer } from './VideoPlayer';
@@ -72,6 +79,8 @@ import { AddToHomeScreenHintCard } from './PWAInstallButton';
 import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
 import { checkClientSpam, checkWordFilter, formatCompactNumber } from '../utils/safetyFilters';
+import { validateAndModerateText } from '../services/moderationService';
+import { ReportContentModal } from './ReportContentModal';
 import {
   ThumbsUp,
   Heart,
@@ -170,6 +179,8 @@ import {
   clearFailedVideoAndStudioDrafts,
 } from '../services/videoUploadQueue';
 import { VideoUploadProgressChip, VideoUploadingFeedPostList } from './VideoUploadProgressChip';
+import { UnifiedPostCard } from './UnifiedPostCard';
+import { cleanCaption } from '../utils/cleanCaption';
 import { downloadPost, sharePost } from '../utils/share.js';
 
 const SPONSORED_ADS: Post[] = [
@@ -253,10 +264,13 @@ const FEED_CATEGORIES = [
   { id: 'Fashion', labelEn: 'Fashion', labelSw: 'Mitindo', keywords: ['fashion', 'style', 'outfit', 'kitenge', 'kanga', 'dress', 'wear', 'look', 'mitindo'] },
   { id: 'Travel', labelEn: 'Travel', labelSw: 'Safari', keywords: ['travel', 'safari', 'zanzibar', 'beach', 'kilimanjaro', 'arusha', 'nairobi', 'trip', 'explore', 'sunset'] },
   { id: 'Music', labelEn: 'Music', labelSw: 'Muziki', keywords: ['music', 'bongo', 'afrobeats', 'amapiano', 'song', 'beat', 'dance', 'muziki', 'audio', 'track'] },
-  { id: 'Sports', labelEn: 'Sports', labelSw: 'Michezo', keywords: ['sport', 'football', 'soccer', 'simba', 'yanga', 'run', 'fitness', 'gym', 'game', 'match', 'michezo'] },
-  { id: 'Food', labelEn: 'Food', labelSw: 'Chakula', keywords: ['food', 'cook', 'pilau', 'nyama', 'cafe', 'coffee', 'chai', 'taste', 'recipe', 'chakula', 'dinner'] },
-  { id: 'Comedy', labelEn: 'Comedy', labelSw: 'Vichekesho', keywords: ['comedy', 'funny', 'laugh', 'joke', 'meme', 'skit', 'vichekesho', 'lol', 'humor'] },
+  { id: 'Sports', labelEn: 'Sports', labelSw: 'Michezo', keywords: ['sport', 'football', 'soccer', 'simba', 'yanga', 'run', 'fitness', 'gym', 'game', 'match', 'michezo', 'soka'] },
+  { id: 'Food', labelEn: 'Food', labelSw: 'Chakula', keywords: ['food', 'cook', 'pilau', 'nyama', 'cafe', 'coffee', 'chai', 'taste', 'recipe', 'chakula', 'dinner', 'mapishi'] },
+  { id: 'Comedy', labelEn: 'Comedy', labelSw: 'Vichekesho', keywords: ['comedy', 'funny', 'laugh', 'joke', 'meme', 'skit', 'vichekesho', 'lol', 'humor', 'cheka'] },
   { id: 'Tech', labelEn: 'Tech', labelSw: 'Teknolojia', keywords: ['tech', 'ai', 'code', 'app', 'startup', 'mobile', 'gadget', 'crypto', 'digital', 'web', 'teknolojia'] },
+  { id: 'Gaming', labelEn: 'Gaming', labelSw: 'Michezo ya Video', keywords: ['gaming', 'game', 'ps5', 'fifa', 'eafc', 'pubg', 'cod', 'esports', 'gamer'] },
+  { id: 'Education', labelEn: 'Education', labelSw: 'Elimu', keywords: ['education', 'elimu', 'school', 'shule', 'chuo', 'campus', 'learn', 'study', 'tutorial'] },
+  { id: 'Lifestyle', labelEn: 'Lifestyle', labelSw: 'Maisha', keywords: ['lifestyle', 'maisha', 'vlog', 'family', 'motivation', 'faith', 'baraka', 'biashara'] },
   { id: 'Local', labelEn: 'Local', labelSw: 'Karibu', keywords: ['tanzania', 'kenya', 'uganda', 'rwanda', 'dar', 'nairobi', 'kampala', 'kigali', 'local', 'eastafrica', 'nyumbani'] },
 ] as const;
 
@@ -274,6 +288,8 @@ interface FeedViewProps {
   onLoadNewPosts?: () => void;
   hasUnreadNotifications?: boolean;
   unreadNotificationCount?: number;
+  joiningChallenge?: CreatorChallenge | null;
+  onClearJoiningChallenge?: () => void;
 }
 
 export const FeedView: React.FC<FeedViewProps> = ({
@@ -287,7 +303,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
   hasNewPosts = false,
   onLoadNewPosts,
   hasUnreadNotifications = false,
-  unreadNotificationCount = 0
+  unreadNotificationCount = 0,
+  joiningChallenge = null,
+  onClearJoiningChallenge
 }) => {
   const {
     currentUser,
@@ -336,12 +354,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [isSparkPromptExpanded, setIsSparkPromptExpanded] = useState(false);
   const [trendingCreatorPost, setTrendingCreatorPost] = useState<Post | null>(null);
   const [isLoadingTrendingCreator, setIsLoadingTrendingCreator] = useState(true);
-  const [gridPosts, setGridPosts] = useState<Post[]>([]);
-  const [lastGridDoc, setLastGridDoc] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
-  const [hasMoreGridPosts, setHasMoreGridPosts] = useState(true);
-  const [isLoadingGrid, setIsLoadingGrid] = useState(true);
-  const [isLoadingMoreGrid, setIsLoadingMoreGrid] = useState(false);
   const [activeGridActionPostId, setActiveGridActionPostId] = useState<string | null>(null);
+  const [activeHoverGridPostId, setActiveHoverGridPostId] = useState<string | null>(null);
   const [hiddenPostIds, setHiddenPostIds] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem(`wavelink_hidden_posts_${currentUser?.uid || 'guest'}`);
@@ -401,9 +415,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
     };
   }, [initialFocusPostId, onClearFocusPostId]);
   const [reportingPost, setReportingPost] = useState<Post | null>(null);
-  const [selectedReportCategory, setSelectedReportCategory] = useState<string>('stolen_content');
-  const [reportExtraNote, setReportExtraNote] = useState('');
-  const [isSubmittingReport, setIsSubmittingReport] = useState(false);
 
   const { enabled: isDataSaverOn, setEnabled: setDataSaverOn, formattedSaved } = useDataSaver();
   const [unlockedFullImages, setUnlockedFullImages] = useState<Record<string, boolean>>({});
@@ -522,8 +533,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
       return;
     }
 
+    const rawCaption = cleanCaption(post.content);
     const extractedTags = Array.from(
-      new Set((post.content || '').match(/#[a-zA-Z0-9_]+/g) || ['#WaveLink', '#EastAfrica'])
+      new Set(rawCaption.match(/#[a-zA-Z0-9_]+/g) || ['#WaveLink', '#EastAfrica'])
     ).slice(0, 5);
 
     const cacheKey = `ai_post_summary_${post.id}_${language}`;
@@ -547,7 +559,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
         : post.imageUrl || post.imageUrls?.length
         ? 'photo wave'
         : 'community wave';
-    const rawCaption = (post.content || '').trim();
     const prompt =
       language === 'sw'
         ? `Fupisha kwa sentensi 2 fupi na za kirafiki kuhusu ${mediaKind} hii iliyochapishwa na ${post.authorName}${post.locationTag ? ` (${post.locationTag})` : ''}: "${rawCaption || 'Chapisho la video/picha kwenye WaveLink'}".`
@@ -709,6 +720,16 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const handleFollowMember = async (targetUser: UserProfile) => {
     if (!currentUser) return;
     const isAlreadyFollowing = followedIds.includes(targetUser.id);
+    if (!isAlreadyFollowing) {
+      const { getTeenRestrictionState, submitTeenFollowRequest } = await import(
+        '../services/parentalService'
+      );
+      const targetTeen = getTeenRestrictionState(targetUser);
+      if (targetTeen.isTeen && targetTeen.requireFollowerApproval) {
+        await submitTeenFollowRequest(targetUser.id);
+        return;
+      }
+    }
     const nextFollowing = isAlreadyFollowing
       ? followedIds.filter((id) => id !== targetUser.id)
       : [...followedIds, targetUser.id];
@@ -763,58 +784,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Made For You Masonry Grid Loader: 12 cards at a time with pagination
-  const loadInitialGridPosts = async () => {
-    setIsLoadingGrid(true);
-    try {
-      const gridQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(12));
-      const snapshot = await getDocs(gridQuery);
-      const docs: Post[] = [];
-      snapshot.forEach((docSnap) => {
-        docs.push({ id: docSnap.id, ...docSnap.data() } as Post);
-      });
-      setGridPosts(docs);
-      setLastGridDoc(snapshot.docs[snapshot.docs.length - 1] || null);
-      setHasMoreGridPosts(snapshot.docs.length === 12);
-    } catch (error) {
-      if (isFirestoreQuotaError(error)) notifyQuotaExceeded(error);
-    } finally {
-      setIsLoadingGrid(false);
-    }
-  };
-
-  const loadMoreGridPosts = async () => {
-    if (isLoadingMoreGrid || !hasMoreGridPosts || !lastGridDoc) return;
-    setIsLoadingMoreGrid(true);
-    try {
-      const nextGridQuery = query(
-        collection(db, 'posts'),
-        orderBy('createdAt', 'desc'),
-        startAfter(lastGridDoc),
-        limit(12)
-      );
-      const snapshot = await getDocs(nextGridQuery);
-      if (!snapshot.empty) {
-        const newDocs: Post[] = [];
-        snapshot.forEach((docSnap) => {
-          newDocs.push({ id: docSnap.id, ...docSnap.data() } as Post);
-        });
-        setGridPosts((prev) => {
-          const existingIds = new Set(prev.map((p) => p.id));
-          return [...prev, ...newDocs.filter((p) => !existingIds.has(p.id))];
-        });
-        setLastGridDoc(snapshot.docs[snapshot.docs.length - 1] || null);
-        setHasMoreGridPosts(snapshot.docs.length === 12);
-      } else {
-        setHasMoreGridPosts(false);
-      }
-    } catch (error) {
-      if (isFirestoreQuotaError(error)) notifyQuotaExceeded(error);
-    } finally {
-      setIsLoadingMoreGrid(false);
-    }
-  };
-
   const handleHidePost = (postId: string) => {
     const nextHidden = Array.from(new Set([...hiddenPostIds, postId]));
     setHiddenPostIds(nextHidden);
@@ -830,12 +799,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
     showToast(language === 'sw' ? 'Chapisho limefichwa' : 'Post hidden from your feed', 'success');
   };
 
-  // Primary Feed Loader: 10 posts at a time using getDocs (loaded once on mount/refresh)
+  // Single Unified Feed Loader: 12 posts at a time using getDocs (eliminates duplicate grid query & cuts reads in half)
   const loadInitialPosts = async (showRefreshSpinner = false) => {
     if (showRefreshSpinner) setIsRefreshing(true);
     else setIsLoading(true);
     try {
-      const postsQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(10));
+      const postsQuery = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(12));
       const snapshot = await getDocs(postsQuery);
       const docs: Post[] = [];
       snapshot.forEach((docSnap) => {
@@ -843,7 +812,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       });
       setPosts(docs);
       setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1] || null);
-      setHasMorePosts(snapshot.docs.length === 10);
+      setHasMorePosts(snapshot.docs.length === 12);
     } catch (error) {
       console.warn('Feed posts fetch notice:', error);
       if (isFirestoreQuotaError(error)) {
@@ -855,7 +824,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
     }
   };
 
-  // Load more posts: fetches next 10 posts using startAfter(lastVisibleDoc)
+  // Load more posts: fetches next 12 posts using startAfter(lastVisibleDoc) into the same unified grid
   const loadMorePosts = async () => {
     if (isLoadingMore || !hasMorePosts || !lastVisibleDoc) return;
     setIsLoadingMore(true);
@@ -864,7 +833,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
         collection(db, 'posts'),
         orderBy('createdAt', 'desc'),
         startAfter(lastVisibleDoc),
-        limit(10)
+        limit(12)
       );
       const snapshot = await getDocs(nextQuery);
       if (!snapshot.empty) {
@@ -878,7 +847,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
           return [...prev, ...uniqueNew];
         });
         setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1] || null);
-        setHasMorePosts(snapshot.docs.length === 10);
+        setHasMorePosts(snapshot.docs.length === 12);
       } else {
         setHasMorePosts(false);
       }
@@ -896,7 +865,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
   useEffect(() => {
     loadInitialPosts();
     loadTrendingCreatorPost();
-    loadInitialGridPosts();
 
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
@@ -918,7 +886,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
       const created = (ev as CustomEvent<Post>)?.detail;
       if (created && created.id) {
         setPosts((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
-        setGridPosts((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
       }
     };
     window.addEventListener('wavelink:video-post-created', handleVideoPostCreated);
@@ -1236,6 +1203,15 @@ export const FeedView: React.FC<FeedViewProps> = ({
           actorPhotoURL: getBestAuthUserPhotoUrl(currentUser, userProfile) || undefined
         });
       }
+
+      // Anti-cheat verified challenge like counter sync (distinct accounts, no author self-likes, spike detection)
+      if (rawPost.challengeId && (type === 'heart' || type === 'like')) {
+        void syncChallengePostLike(
+          rawPost.challengeId,
+          rawPost.id,
+          isCurrentlyActive ? 'unlike' : 'like'
+        );
+      }
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `posts/${rawPost.id}`);
     }
@@ -1362,24 +1338,60 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const handleCreatePost = async () => {
     if (!currentUser || (!inlineContent.trim() && !inlineMediaPreview && !inlineMediaFile)) return;
 
+    let postModCheckedAt = new Date().toISOString();
     if (inlineContent.trim()) {
       const spamRes = checkClientSpam('post', inlineContent.trim());
       if (spamRes.isSpam) {
         setPostNotice({ type: 'error', text: spamRes.reason || 'Please slow down before posting again.' });
         return;
       }
-      const wordRes = checkWordFilter(inlineContent.trim());
-      if (wordRes.flagged) {
+      const modVerdict = await validateAndModerateText(inlineContent.trim(), 'post', userProfile);
+      if (!modVerdict.allowed) {
         setPostNotice({
           type: 'error',
-          text:
-            language === 'sw'
-              ? 'Ujumbe wako una maneno yasiyoruhusiwa na Mwongozo wa Usalama wa WaveLink.'
-              : 'Your post contains words blocked by WaveLink Safety Filters. Please revise and try again.',
+          text: modVerdict.friendlyMessage,
         });
         return;
       }
+      if (modVerdict.moderationCheckedAt) {
+        postModCheckedAt = modVerdict.moderationCheckedAt;
+      }
     }
+
+    // Enforce Weekly Challenge rules before upload/publish (deadline + entry media type)
+    if (joiningChallenge) {
+      if (isChallengeExpired(joiningChallenge)) {
+        setPostNotice({
+          type: 'error',
+          text: 'This weekly challenge has ended. Detach it to publish a regular post.',
+        });
+        return;
+      }
+      const reqType = joiningChallenge.type || 'any';
+      const actualType: 'image' | 'video' | 'none' =
+        inlineMediaType === 'video' && inlineMediaFile
+          ? 'video'
+          : inlineMediaType === 'image' && (inlineMediaFile || inlineMediaPreview)
+          ? 'image'
+          : 'none';
+      if (reqType === 'photo' && actualType !== 'image') {
+        setPostNotice({ type: 'error', text: 'This challenge requires a photo post. Attach a photo to enter.' });
+        return;
+      }
+      if (reqType === 'video' && actualType !== 'video') {
+        setPostNotice({ type: 'error', text: 'This challenge requires a video post. Attach a video to enter.' });
+        return;
+      }
+      if (reqType === 'text' && actualType !== 'none') {
+        setPostNotice({ type: 'error', text: 'This challenge accepts text-only posts. Remove attached media to enter.' });
+        return;
+      }
+    }
+
+    const challengeHashPrefix =
+      joiningChallenge?.hashtag && !inlineContent.toLowerCase().includes(joiningChallenge.hashtag.toLowerCase())
+        ? `${joiningChallenge.hashtag} `
+        : '';
 
     clearFailedVideoAndStudioDrafts();
     const emailPrefix = currentUser.email ? currentUser.email.split('@')[0] : 'waver';
@@ -1388,41 +1400,108 @@ export const FeedView: React.FC<FeedViewProps> = ({
       currentUser.uid
     );
 
-    // Video posts: upload directly from the browser to Cloudinary with live progress bar,
+    // Video posts: upload directly from the browser via Cloudflare with live progress bar,
     // create the Firestore post only after the upload succeeds, then show it at the top of the feed.
     if (inlineMediaType === 'video' && inlineMediaFile) {
       const clipDuration = Math.max(1, inlineVideoTrimEnd - inlineVideoTrimStart);
       if (clipDuration > maxVideoSeconds + 0.5) {
         setPostNotice({
           type: 'error',
-          text: isProTier
-            ? 'Pro videos can be up to 90 seconds. Please trim your clip to 90s or less.'
-            : 'Free users can upload videos up to 60 seconds (Pro up to 90 seconds). Please trim to 60s.',
+          text: `Videos can be up to ${maxVideoSeconds} seconds. Please trim your clip to ${maxVideoSeconds}s or less.`,
         });
         setInlineVideoTrimEnd(Math.min(inlineVideoDuration, inlineVideoTrimStart + maxVideoSeconds));
         return;
       }
 
-      enqueueVideoUploadJob({
-        file: inlineMediaFile,
-        isProUser: isProTier,
-        authorId: currentUser.uid,
-        authorEmail: currentUser.email || '',
-        authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
-        authorUsername: userProfile?.username || `@${emailPrefix}`,
-        authorPhotoURL: safeAuthorPhotoURL,
-        audience: postAudience,
-        content: sanitizeUserText(inlineContent, 2000),
-        trimStart: inlineVideoTrimStart,
-        trimEnd: inlineVideoTrimEnd,
-      });
-
-      setInlineContent('');
-      setInlineMediaFile(null);
-      setInlineMediaPreview(null);
-      setInlineVideoNeedsTrim(false);
-      setPostAudience('public');
+      setIsSubmittingPost(true);
+      setUploadProgress(5);
       setPostNotice(null);
+
+      try {
+        let uploadedVideoPost: Post | undefined;
+        let uploadedVideoPostId = '';
+        await new Promise<void>((resolve, reject) => {
+          enqueueVideoUploadJob({
+            file: inlineMediaFile,
+            isProUser: isProTier,
+            authorId: currentUser.uid,
+            authorEmail: currentUser.email || '',
+            authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
+            authorUsername: userProfile?.username || `@${emailPrefix}`,
+            authorPhotoURL: safeAuthorPhotoURL,
+            audience: postAudience,
+            content: cleanCaption(sanitizeUserText(`${challengeHashPrefix}${inlineContent}`, 2000)),
+            challengeId: joiningChallenge?.id,
+            challengeHashtag: joiningChallenge?.hashtag,
+            authorHighlightedBadgeId: userProfile?.highlightedBadgeId || null,
+            trimStart: inlineVideoTrimStart,
+            trimEnd: inlineVideoTrimEnd,
+            onProgress: (pct) => {
+              setUploadProgress(Math.max(5, Math.min(99, pct)));
+            },
+            onComplete: (createdPostId, createdPost) => {
+              uploadedVideoPostId = createdPostId;
+              uploadedVideoPost = createdPost;
+              resolve();
+            },
+            onError: (errMsg) => {
+              reject(new Error(errMsg));
+            },
+          });
+        });
+
+        let challengeEntryErr: string | null = null;
+        if (joiningChallenge && uploadedVideoPostId) {
+          try {
+            await enterPostIntoChallenge({
+              challengeId: joiningChallenge.id,
+              postId: uploadedVideoPostId,
+              content: uploadedVideoPost?.content || `${challengeHashPrefix}${inlineContent.trim()}`,
+              mediaType: 'video',
+              thumbnailUrl: uploadedVideoPost?.thumbnailUrl,
+              authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
+              authorUsername: userProfile?.username || `@${emailPrefix}`,
+              authorPhotoURL: safeAuthorPhotoURL,
+            });
+            onClearJoiningChallenge?.();
+          } catch (chErr: any) {
+            challengeEntryErr = chErr?.message || null;
+          }
+        }
+
+        setUploadProgress(100);
+        triggerCelebration('post');
+        setInlineContent('');
+        setInlineMediaFile(null);
+        setInlineMediaPreview(null);
+        setInlineVideoNeedsTrim(false);
+        setSelectedFeeling(null);
+        setPostAudience('public');
+        setPostNotice({
+          type: challengeEntryErr ? 'error' : 'success',
+          text:
+            challengeEntryErr ||
+            (joiningChallenge
+              ? `Your video entered ${joiningChallenge.title || joiningChallenge.theme}!`
+              : language === 'sw'
+              ? 'Video yako imechapishwa kupitia Cloudflare!'
+              : 'Your video wave is live on the feed via Cloudflare!'),
+        });
+        setTimeout(() => setPostNotice(null), 5000);
+      } catch (videoErr: any) {
+        console.error('Video post creation error:', videoErr);
+        setPostNotice({
+          type: 'error',
+          text:
+            videoErr?.message ||
+            (language === 'sw'
+              ? 'Upakiaji wa video umeshindikana. Gusa Jaribu Tena.'
+              : 'Video upload failed. Please tap Retry.'),
+        });
+      } finally {
+        setIsSubmittingPost(false);
+        setUploadProgress(0);
+      }
       return;
     }
 
@@ -1434,9 +1513,11 @@ export const FeedView: React.FC<FeedViewProps> = ({
       const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 
       let finalImageUrl: string | undefined = undefined;
+      let finalThumbnailUrl: string | undefined = undefined;
       let finalWidth: number | undefined = undefined;
       let finalHeight: number | undefined = undefined;
       let finalMediaType: 'image' | 'video' | undefined = undefined;
+      let finalMediaSafety: 'safe' | 'borderline' | undefined = undefined;
 
       if (inlineMediaType === 'image' && (inlineMediaFile || inlineMediaPreview)) {
         if (inlineMediaFile) {
@@ -1444,18 +1525,23 @@ export const FeedView: React.FC<FeedViewProps> = ({
             setUploadProgress(Math.max(8, Math.min(92, pct)));
           });
           if (!uploaded.secureUrl || !uploaded.secureUrl.startsWith('http')) {
-            throw new Error('Cloudinary photo upload did not return a valid secure_url.');
+            throw new Error('Cloudflare photo upload did not return a valid HTTPS URL.');
           }
           finalImageUrl = uploaded.secureUrl;
+          finalThumbnailUrl = uploaded.thumbnailUrl || uploaded.secureUrl;
           finalWidth = uploaded.width;
           finalHeight = uploaded.height;
+          if (uploaded.mediaSafety === 'borderline' || uploaded.mediaSafety === 'safe') {
+            finalMediaSafety = uploaded.mediaSafety;
+          }
         } else if (
           inlineMediaPreview &&
           (inlineMediaPreview.startsWith('https://') || inlineMediaPreview.startsWith('http://'))
         ) {
           finalImageUrl = inlineMediaPreview;
+          finalThumbnailUrl = inlineMediaPreview;
         } else {
-          throw new Error('Please select a valid photo file to upload to Cloudinary.');
+          throw new Error('Please select a valid photo file to upload via Cloudflare.');
         }
         finalMediaType = 'image';
         setUploadProgress(94);
@@ -1465,6 +1551,15 @@ export const FeedView: React.FC<FeedViewProps> = ({
         ? ` — ${language === 'sw' ? 'anajihisi ' + selectedFeeling.labelSw : 'feeling ' + selectedFeeling.labelEn} ${selectedFeeling.emoji}`
         : '';
 
+      const { getTeenRestrictionState } = await import('../services/parentalService');
+      const teenPostGuard = getTeenRestrictionState(userProfile);
+      const effectivePostAudience: 'public' | 'followers' | 'close_friends' =
+        teenPostGuard.isTeen && !teenPostGuard.canPostPublicly
+          ? postAudience === 'close_friends'
+            ? 'close_friends'
+            : 'followers'
+          : postAudience;
+
       const newPost: Post = {
         id: postId,
         authorId: currentUser.uid,
@@ -1472,14 +1567,24 @@ export const FeedView: React.FC<FeedViewProps> = ({
         authorName: userProfile?.displayName || currentUser.displayName || 'Waver',
         authorUsername: userProfile?.username || `@${emailPrefix}`,
         authorPhotoURL: safeAuthorPhotoURL,
-        content: sanitizeUserText(`${inlineContent.trim()}${feelingTag}`, 2000),
+        authorHighlightedBadgeId: userProfile?.highlightedBadgeId || null,
+        challengeId: joiningChallenge?.id || undefined,
+        challengeHashtag: joiningChallenge?.hashtag || undefined,
+        content: cleanCaption(sanitizeUserText(`${challengeHashPrefix}${inlineContent.trim()}${feelingTag}`, 2000)),
         imageUrl: finalImageUrl,
+        thumbnailUrl: finalThumbnailUrl,
         mediaType: finalMediaType,
+        mediaSafety: finalMediaSafety || 'safe',
+        moderationChecked: true,
+        moderationCheckedAt: postModCheckedAt,
         videoWidth: finalWidth,
         videoHeight: finalHeight,
         countryCode: activeCountryCode,
-        locationTag: `${activeCountryMeta.flag} ${activeCountryMeta.nameEn}`,
-        audience: postAudience,
+        // Teen Safety: location sharing is strictly disabled for teen accounts
+        locationTag: teenPostGuard.canShareLocation
+          ? `${activeCountryMeta.flag} ${activeCountryMeta.nameEn}`
+          : undefined,
+        audience: effectivePostAudience,
         likes: [],
         likesCount: 0,
         reactions: { like: [], heart: [], fire: [] },
@@ -1490,13 +1595,48 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
       // Validate < 900 KB & zero base64/data URLs, and create the Firestore document with timeout and server fallback
       await savePostDocument(newPost);
+
+      // Register entry & atomic participant counter if joining a Weekly Challenge
+      let challengeEntryErr: string | null = null;
+      if (joiningChallenge) {
+        try {
+          await enterPostIntoChallenge({
+            challengeId: joiningChallenge.id,
+            postId,
+            content: newPost.content,
+            mediaType: finalMediaType === 'image' ? 'image' : 'none',
+            thumbnailUrl: finalThumbnailUrl,
+            imageUrl: finalImageUrl,
+            authorName: newPost.authorName,
+            authorUsername: newPost.authorUsername,
+            authorPhotoURL: newPost.authorPhotoURL,
+          });
+          onClearJoiningChallenge?.();
+        } catch (chErr: any) {
+          challengeEntryErr = chErr?.message || null;
+        }
+      }
+
       setUploadProgress(100);
 
       // Trigger first-time celebration animation for new post
       triggerCelebration('post');
 
-      // Show the newly created post at the top of the feed after upload + Firestore creation succeed
+      // Show the newly created post at the top of the unified feed after upload + Firestore creation succeed
       setPosts((prev) => [newPost, ...prev.filter((p) => p.id !== postId)]);
+
+      // Server-verified XP & badge progression (enforced daily caps, 0 extra client Firestore reads)
+      const lowerPostText = (newPost.content || '').toLowerCase();
+      awardProgressionAction('post_created').catch(() => {});
+      const matchedChallengeTag = lowerPostText.match(/#(wavehustle\w*|challenge\w*|shindano\w*)/i);
+      if (joiningChallenge || matchedChallengeTag) {
+        awardProgressionAction('challenge_joined', {
+          challengeId: joiningChallenge?.id || `weekly_${matchedChallengeTag?.[0].toLowerCase()}`,
+          challengeTitle: joiningChallenge?.title || joiningChallenge?.theme || `Weekly Challenge (${matchedChallengeTag?.[0]})`,
+          challengeHashtag: joiningChallenge?.hashtag || matchedChallengeTag?.[0] || '',
+          thumbnailUrl: newPost.thumbnailUrl || newPost.imageUrl
+        }).catch(() => {});
+      }
 
       // Reset form
       setInlineContent('');
@@ -1505,21 +1645,25 @@ export const FeedView: React.FC<FeedViewProps> = ({
       setSelectedFeeling(null);
       setPostAudience('public');
       setPostNotice({
-        type: 'success',
+        type: challengeEntryErr ? 'error' : 'success',
         text:
-          finalMediaType === 'image'
-            ? (language === 'sw' ? 'Picha yako imechapishwa kwenye ukurasa!' : 'Your photo wave is live on the feed!')
-            : (language === 'sw' ? 'Ujumbe wako umechapishwa!' : 'Your wave is live on the community feed!')
+          challengeEntryErr ||
+          (joiningChallenge
+            ? `Your post entered ${joiningChallenge.title || joiningChallenge.theme}!`
+            : finalMediaType === 'image'
+            ? (language === 'sw' ? 'Picha yako imechapishwa kupitia Cloudflare!' : 'Your photo wave is live on the feed via Cloudflare!')
+            : (language === 'sw' ? 'Ujumbe wako umechapishwa!' : 'Your wave is live on the community feed!'))
       });
-      setTimeout(() => setPostNotice(null), 4000);
-    } catch (err) {
+      setTimeout(() => setPostNotice(null), 5000);
+    } catch (err: any) {
       console.error('Post creation error:', err);
       setPostNotice({
         type: 'error',
         text:
-          language === 'sw'
+          err?.message ||
+          (language === 'sw'
             ? 'Kuna hitilafu imetokea, hebu jaribu tena.'
-            : "Something went wrong, let's try again."
+            : "Something went wrong, let's try again.")
       });
     } finally {
       setIsSubmittingPost(false);
@@ -1681,6 +1825,12 @@ export const FeedView: React.FC<FeedViewProps> = ({
     const text = sanitizeUserText(commentInput[postId] || '', 800);
     if (!text || !currentUser) return;
 
+    const modVerdict = await validateAndModerateText(text, 'comment', userProfile);
+    if (!modVerdict.allowed) {
+      setPostNotice({ type: 'error', text: modVerdict.friendlyMessage });
+      return;
+    }
+
     try {
       const commentData = {
         postId,
@@ -1694,6 +1844,8 @@ export const FeedView: React.FC<FeedViewProps> = ({
           userProfile
         ),
         content: text,
+        moderationChecked: true,
+        moderationCheckedAt: modVerdict.moderationCheckedAt || new Date().toISOString(),
         createdAt: new Date().toISOString()
       };
 
@@ -1720,6 +1872,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
       }
 
       setCommentInput((prev) => ({ ...prev, [postId]: '' }));
+      awardProgressionAction('comment_created').catch(() => {});
     } catch (error) {
       handleFirestoreError(error, OperationType.CREATE, `posts/${postId}/comments`);
     }
@@ -1732,6 +1885,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
   };
 
   const blockedIds = userProfile?.blockedUserIds || [];
+  const mutedIds = userProfile?.mutedUserIds || [];
 
   const matchesCategory = (p: Post, catId: FeedCategoryId): boolean => {
     if (catId === 'All') return true;
@@ -1744,16 +1898,21 @@ export const FeedView: React.FC<FeedViewProps> = ({
         )
       );
     }
+    if (p.category && p.category.toLowerCase() === catId.toLowerCase()) {
+      return true;
+    }
     const cat = FEED_CATEGORIES.find((c) => c.id === catId);
     if (!cat || cat.keywords.length === 0) return true;
-    const text = `${p.content || ''} ${p.songTitle || ''} ${p.songArtist || ''} ${p.locationTag || ''}`.toLowerCase();
+    const text = `${p.content || ''} ${(p.keywords || []).join(' ')} ${(p.hashtags || []).join(' ')} ${p.songTitle || ''} ${p.songArtist || ''} ${p.locationTag || ''}`.toLowerCase();
     if (catId === 'Music' && (p.songPreviewUrl || p.songTitle)) return true;
     return cat.keywords.some((kw) => text.includes(kw));
   };
 
   const isPostVisibleToViewer = (p: Post): boolean => {
     if (hiddenPostIds.includes(p.id)) return false;
+    if (userProfile?.hideAiGenerated && p.aiGenerated) return false;
     if (blockedIds.includes(p.authorId)) return false;
+    if (mutedIds.includes(p.authorId)) return false;
     const authorCached = p.authorId ? getCachedUserProfile(p.authorId) : null;
     if (currentUser?.uid && (authorCached?.blockedUserIds || []).includes(currentUser.uid)) {
       return false;
@@ -1822,12 +1981,15 @@ export const FeedView: React.FC<FeedViewProps> = ({
 
   const activeFilter = (feedSearchQuery.trim() || internalFilterTag || initialFilterTag || null);
 
-  // If hashtag, mention, or search filter is active
+  // If hashtag, mention, or search filter is active (matches AI keywords, category, cleaned caption, and creator)
   const filteredSortedPosts = activeFilter
     ? sortedPosts.filter((p) => {
-        const q = activeFilter.toLowerCase();
+        const q = activeFilter.toLowerCase().replace(/^[@#]/, '');
         return (
-          p.content?.toLowerCase().includes(q) ||
+          cleanCaption(p.content).toLowerCase().includes(q) ||
+          p.category?.toLowerCase().includes(q) ||
+          (p.keywords || []).some((kw) => kw.toLowerCase().includes(q)) ||
+          (p.hashtags || []).some((ht) => ht.toLowerCase().includes(q)) ||
           p.authorUsername?.toLowerCase().includes(q) ||
           p.authorName?.toLowerCase().includes(q) ||
           p.locationTag?.toLowerCase().includes(q)
@@ -1840,7 +2002,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
     const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const pool = [
       ...(trendingCreatorPost ? [trendingCreatorPost] : []),
-      ...gridPosts,
       ...posts,
     ].filter((p) => p && !p.isSponsored && isPostVisibleToViewer(p));
     if (pool.length === 0) return null;
@@ -1860,28 +2021,30 @@ export const FeedView: React.FC<FeedViewProps> = ({
     })[0] || null;
   })();
 
-  // Made For You masonry grid items (filtered by active category, switcher tab, and search query)
-  const filteredGridPosts = (gridPosts.length > 0 ? gridPosts : posts)
-    .filter(isPostVisibleToViewer)
-    .filter((p) => {
-      if (feedMode === 'following') {
-        return followedIds.includes(p.authorId) || p.authorId === currentUser?.uid;
-      }
-      if (feedMode === 'saved') {
-        return (userProfile?.savedPostIds || []).includes(p.id);
-      }
-      return true;
-    })
-    .filter((p) => matchesCategory(p, selectedCategory))
-    .filter((p) => {
-      if (!activeFilter) return true;
-      const q = activeFilter.toLowerCase();
-      return (
-        p.content?.toLowerCase().includes(q) ||
-        p.authorUsername?.toLowerCase().includes(q) ||
-        p.authorName?.toLowerCase().includes(q)
+  // Unified Home masonry items (excluding the featured hero card when unfiltered so it isn't duplicated at the top)
+  const unifiedFeedPosts = filteredSortedPosts.filter((p) =>
+    !activeFilter && bestTrendingCreatorPost ? p.id !== bestTrendingCreatorPost.id : true
+  );
+
+  // Open full-screen Reels starting at tapped video with all loaded Home videos as swipe queue
+  const handleOpenHomeVideoInReels = (videoPost: Post) => {
+    const allVideos = [
+      ...(bestTrendingCreatorPost ? [bestTrendingCreatorPost] : []),
+      ...filteredSortedPosts,
+    ].filter((p) => Boolean(p.videoUrl || p.hasVideoChunks || p.mediaType === 'video'));
+    const uniqueQueue = Array.from(new Map(allVideos.map((v) => [v.id, v])).values());
+    onNavigateTab?.('videos');
+    window.setTimeout(() => {
+      window.dispatchEvent(
+        new CustomEvent('wavelink:open-reels-queue', {
+          detail: {
+            startPost: videoPost,
+            queue: uniqueQueue.length > 0 ? uniqueQueue : [videoPost],
+          },
+        })
       );
-    });
+    }, 40);
+  };
 
   // Interleave subtle, non-intrusive sponsored posts every 8 scrolls/items
   // (Exempt: Admins, Verified members, and Pro users have an ad-free experience!)
@@ -1987,7 +2150,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
     const q = feedSearchQuery.trim().toLowerCase();
     if (!q) return [];
     const map = new Map<string, { id: string; name: string; username: string; photoURL?: string }>();
-    [...posts, ...gridPosts].forEach((p) => {
+    posts.forEach((p) => {
       if (!p.authorId || p.isSponsored) return;
       if (
         p.authorName?.toLowerCase().includes(q) ||
@@ -2080,7 +2243,6 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                   onLoadNewPosts?.();
                   void loadInitialPosts(true);
-                  void loadInitialGridPosts();
                   void loadTrendingCreatorPost();
                 }}
                 className="pointer-events-auto min-h-[44px] px-4 py-2 rounded-full bg-[#F43F5E] hover:bg-rose-600 text-white text-xs font-extrabold shadow-lg flex items-center gap-2 ring-2 ring-white/80 dark:ring-slate-900 transition active:scale-95 cursor-pointer"
@@ -2450,407 +2612,30 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           </div>
 
-          {/* 5. TRENDING CREATOR & 6. MADE FOR YOU MASONRY GRID */}
-          <section aria-label="Creator Spotlight and Made For You" className="space-y-4">
-            {/* Section 5: TRENDING CREATOR Featured Card */}
-            {isLoadingTrendingCreator && !bestTrendingCreatorPost ? (
-              <div className="w-full h-60 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] animate-pulse p-5 flex flex-col justify-end">
-                <div className="w-28 h-4 rounded-full bg-slate-300/60 dark:bg-slate-700 mb-2" />
-                <div className="w-3/4 h-6 rounded-xl bg-slate-300/60 dark:bg-slate-700 mb-2" />
-                <div className="w-40 h-4 rounded-full bg-slate-300/60 dark:bg-slate-700" />
-              </div>
-            ) : bestTrendingCreatorPost ? (
-              (() => {
-                const featuredThumb = getPostPrimaryThumbnail(bestTrendingCreatorPost);
-                const featuredReactions = getReactionData(bestTrendingCreatorPost);
-                const featuredLikes = Math.max(
-                  featuredReactions.counts.heart,
-                  featuredReactions.counts.total,
-                  bestTrendingCreatorPost.likesCount || 0
-                );
-                const rawTitle = (bestTrendingCreatorPost.content || '').replace(/#[a-zA-Z0-9_]+/g, '').trim();
-                const cleanTitle =
-                  rawTitle.length > 0
-                    ? rawTitle.slice(0, 88) + (rawTitle.length > 88 ? '…' : '')
-                    : language === 'sw'
-                    ? `Wimbi maarufu kutoka kwa ${bestTrendingCreatorPost.authorName}`
-                    : `Featured wave by ${bestTrendingCreatorPost.authorName}`;
-                const creatorHandle =
-                  bestTrendingCreatorPost.authorUsername?.startsWith('@')
-                    ? bestTrendingCreatorPost.authorUsername
-                    : `@${bestTrendingCreatorPost.authorUsername || bestTrendingCreatorPost.authorName.toLowerCase().replace(/\s+/g, '')}`;
-
-                return (
-                  <div
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => handleOpenPostDetail(bestTrendingCreatorPost)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        handleOpenPostDetail(bestTrendingCreatorPost);
-                      }
-                    }}
-                    className="wavelink-trending-creator-card group relative w-full rounded-[28px] overflow-hidden border border-[var(--border-hairline)] shadow-md cursor-pointer transition-transform duration-200 hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-[var(--accent-primary)]"
-                  >
-                    {/* Media Thumbnail or Vibrant Creator Gradient Fallback */}
-                    <div className="relative w-full h-64 sm:h-72 bg-gradient-to-br from-[#7C3AED] via-[#EC4899] to-[#F97316] overflow-hidden">
-                      {featuredThumb ? (
-                        <img
-                          src={featuredThumb}
-                          alt={cleanTitle}
-                          loading="lazy"
-                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center p-6 text-white/25">
-                          <Waves size={88} />
-                        </div>
-                      )}
-                      {/* Soft dark gradient overlay for crisp text legibility */}
-                      <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/35 to-black/10" />
-
-                      {/* Top row: TRENDING CREATOR pill + Media badge */}
-                      <div className="absolute top-3.5 left-3.5 right-3.5 flex items-center justify-between gap-2">
-                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/20 text-white text-[10px] font-black uppercase tracking-widest border border-white/30">
-                          <Sparkles size={11} className="text-amber-300" />
-                          <span>TRENDING CREATOR</span>
-                        </span>
-                        {(bestTrendingCreatorPost.videoUrl || bestTrendingCreatorPost.hasVideoChunks || bestTrendingCreatorPost.mediaType === 'video') && (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/55 text-white text-[11px] font-bold">
-                            <Play size={11} className="fill-white" />
-                            <span>
-                              {bestTrendingCreatorPost.videoDurationSeconds
-                                ? `${Math.round(bestTrendingCreatorPost.videoDurationSeconds)}s`
-                                : 'Video'}
-                            </span>
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Bottom content: Bold title from caption, creator @handle + like count, and round arrow button */}
-                      <div className="absolute bottom-3.5 left-3.5 right-3.5 flex items-end justify-between gap-3">
-                        <div className="min-w-0 flex-1 space-y-1.5">
-                          <h2 className="text-lg sm:text-xl font-black text-white leading-snug line-clamp-2 drop-shadow-xs">
-                            {cleanTitle}
-                          </h2>
-                          <div className="flex items-center gap-2.5 text-xs font-bold text-white/90 flex-wrap">
-                            <div className="inline-flex items-center gap-1.5 min-w-0">
-                              <Avatar
-                                uid={bestTrendingCreatorPost.authorId}
-                                src={resolveUserAvatarUrl(
-                                  bestTrendingCreatorPost.authorId,
-                                  bestTrendingCreatorPost.authorPhotoURL
-                                )}
-                                alt={bestTrendingCreatorPost.authorName}
-                                fallbackName={bestTrendingCreatorPost.authorName}
-                                size={22}
-                                showStatus={false}
-                              />
-                              <span className="truncate font-mono">{creatorHandle}</span>
-                            </div>
-                            <span>•</span>
-                            <span className="inline-flex items-center gap-1 text-rose-300 font-mono">
-                              <Heart size={13} className="fill-rose-400 text-rose-400" />
-                              <span>{formatCompactNumber(featuredLikes)}</span>
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* Round Arrow Button that opens the post */}
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleOpenPostDetail(bestTrendingCreatorPost);
-                          }}
-                          aria-label="Open trending creator post"
-                          className="w-11 h-11 min-w-[44px] min-h-[44px] rounded-full bg-white text-[#0F172A] hover:bg-[var(--accent-primary)] hover:text-white flex items-center justify-center shadow-lg transition-transform active:scale-95 shrink-0 cursor-pointer"
-                        >
-                          <ArrowUpRight size={20} strokeWidth={2.5} />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()
-            ) : null}
-
-            {/* Section 6: MADE FOR YOU Masonry Grid (2-col on mobile <= 767px, 3-col on desktop >= 1024px) */}
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between px-1">
-                <div>
-                  <h2 className="text-base sm:text-lg font-extrabold text-[var(--text-primary)] tracking-tight">
-                    {language === 'sw' ? 'Imeundwa Kwa Ajili Yako' : 'Made for you'}
-                  </h2>
-                  <p className="text-[11px] text-[var(--text-secondary)]">
-                    {language === 'sw'
-                      ? 'Gusa mara mbili kupenda • Shikilia kwa chaguo za haraka'
-                      : 'Double tap to like • Long press for quick actions'}
-                  </p>
-                </div>
-                {selectedCategory !== 'All' && (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedCategory('All')}
-                    className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline cursor-pointer"
-                  >
-                    {language === 'sw' ? 'Onyesha zote' : 'Reset filter'}
-                  </button>
-                )}
-              </div>
-
-              {isLoadingGrid && filteredGridPosts.length === 0 ? (
-                <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-                  {[0, 1, 2, 3, 4, 5].map((n) => (
-                    <div
-                      key={n}
-                      className={`rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] animate-pulse ${
-                        n % 2 === 0 ? 'h-56' : 'h-44'
-                      }`}
-                    />
-                  ))}
-                </div>
-              ) : filteredGridPosts.length > 0 ? (
-                <>
-                  <div className="wavelink-masonry-grid">
-                    {filteredGridPosts.map((gridPost, idx) => {
-                      const thumbUrl = getPostPrimaryThumbnail(gridPost);
-                      const isVideoPost = Boolean(
-                        gridPost.videoUrl || gridPost.hasVideoChunks || gridPost.mediaType === 'video'
-                      );
-                      const multiPhotoCount = gridPost.imageUrls?.length || 0;
-                      const reactionInfo = getReactionData(gridPost);
-                      const isHearted = reactionInfo.active.heart || reactionInfo.active.like;
-                      const heartCount = Math.max(
-                        reactionInfo.counts.heart,
-                        reactionInfo.counts.total,
-                        gridPost.likesCount || 0
-                      );
-                      const handle =
-                        gridPost.authorUsername?.startsWith('@')
-                          ? gridPost.authorUsername
-                          : `@${gridPost.authorUsername || gridPost.authorName.toLowerCase().replace(/\s+/g, '')}`;
-                      const shortCaption =
-                        (gridPost.content || '').trim() ||
-                        (gridPost.songTitle ? `🎵 ${gridPost.songTitle}` : gridPost.authorName);
-                      const isTallCard = idx % 3 === 0 || idx % 5 === 0;
-                      const isSaved = (userProfile?.savedPostIds || []).includes(gridPost.id);
-                      const isQuickMenuOpen = activeGridActionPostId === gridPost.id;
-
-                      return (
-                        <div
-                          key={gridPost.id}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => handleGridCardClick(gridPost)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              handleOpenPostDetail(gridPost);
-                            }
-                          }}
-                          onTouchStart={() => handleGridCardTouchStart(gridPost.id)}
-                          onTouchEnd={handleGridCardTouchEnd}
-                          onTouchCancel={handleGridCardTouchEnd}
-                          onContextMenu={(e) => {
-                            e.preventDefault();
-                            setActiveGridActionPostId(gridPost.id);
-                          }}
-                          className={`wavelink-masonry-card group relative rounded-[24px] overflow-hidden border border-[var(--border-hairline)] bg-[var(--bg-surface)] shadow-xs cursor-pointer select-none transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md focus-visible:ring-2 focus-visible:ring-[var(--accent-primary)] ${
-                            isTallCard ? 'wavelink-masonry-card--tall' : 'wavelink-masonry-card--medium'
-                          }`}
-                        >
-                          {/* Media or Rich Themed Gradient */}
-                          <div className="relative w-full h-full overflow-hidden bg-gradient-to-br from-[#2563EB] via-[#7C3AED] to-[#EC4899]">
-                            {thumbUrl ? (
-                              <img
-                                src={thumbUrl}
-                                alt={shortCaption.slice(0, 60)}
-                                loading="lazy"
-                                className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
-                              />
-                            ) : (
-                              <div className="w-full h-full p-4 flex flex-col justify-center items-center text-center text-white">
-                                <p className="text-xs sm:text-sm font-extrabold line-clamp-4 leading-snug">
-                                  {shortCaption}
-                                </p>
-                              </div>
-                            )}
-
-                            {/* Soft dark gradient at the bottom */}
-                            <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-transparent pointer-events-none" />
-
-                            {/* Top-left badge: Small play icon + duration for videos, or stack icon for multi-photo posts */}
-                            <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5">
-                              {isVideoPost ? (
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-black/60 text-white text-[10px] font-bold">
-                                  <Play size={10} className="fill-white" />
-                                  <span>
-                                    {gridPost.videoDurationSeconds
-                                      ? `${Math.floor(gridPost.videoDurationSeconds / 60)}:${String(
-                                          Math.round(gridPost.videoDurationSeconds % 60)
-                                        ).padStart(2, '0')}`
-                                      : '0:15'}
-                                  </span>
-                                </span>
-                              ) : multiPhotoCount > 1 ? (
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-black/60 text-white text-[10px] font-bold">
-                                  <Layers size={11} />
-                                  <span>{multiPhotoCount}</span>
-                                </span>
-                              ) : null}
-                            </div>
-
-                            {/* Top-right Heart button in the corner (>= 44px touch target) */}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void handleToggleReaction(gridPost, 'heart');
-                              }}
-                              aria-label={`Like post by ${handle}`}
-                              className="absolute top-1.5 right-1.5 w-11 h-11 min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-white transition active:scale-90 cursor-pointer"
-                            >
-                              <span className="w-8 h-8 rounded-full bg-black/45 hover:bg-black/65 flex items-center justify-center">
-                                <Heart
-                                  size={15}
-                                  className={
-                                    isHearted
-                                      ? 'fill-[#F43F5E] text-[#F43F5E]'
-                                      : 'text-white'
-                                  }
-                                />
-                              </span>
-                            </button>
-
-                            {/* Bottom overlay: Short caption + @handle + like count + quick action trigger */}
-                            <div className="absolute bottom-2.5 left-2.5 right-2.5 flex items-end justify-between gap-1.5">
-                              <div className="min-w-0 flex-1">
-                                <p className="text-xs font-extrabold text-white line-clamp-2 leading-tight drop-shadow-xs">
-                                  {shortCaption}
-                                </p>
-                                <div className="flex items-center gap-1.5 mt-1 text-[11px] font-semibold text-white/85">
-                                  <span className="truncate font-mono">{handle}</span>
-                                  {heartCount > 0 && (
-                                    <>
-                                      <span>·</span>
-                                      <span className="font-mono">{formatCompactNumber(heartCount)}</span>
-                                    </>
-                                  )}
-                                </div>
-                              </div>
-
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setActiveGridActionPostId(
-                                    isQuickMenuOpen ? null : gridPost.id
-                                  );
-                                }}
-                                aria-label="Quick actions"
-                                className="w-7 h-7 rounded-full bg-black/45 hover:bg-black/70 text-white flex items-center justify-center shrink-0 cursor-pointer"
-                              >
-                                <MoreHorizontal size={14} />
-                              </button>
-                            </div>
-
-                            {/* Long-Press Quick Actions Overlay (Save, Share, Hide, Report) */}
-                            {isQuickMenuOpen && (
-                              <div
-                                onClick={(e) => e.stopPropagation()}
-                                className="absolute inset-0 bg-slate-950/85 p-3 flex flex-col justify-center gap-1.5 z-20 animate-in fade-in"
-                              >
-                                <div className="flex items-center justify-between mb-1">
-                                  <span className="text-[10px] font-black uppercase tracking-wider text-white/70">
-                                    {language === 'sw' ? 'Chaguo za Haraka' : 'Quick Actions'}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={() => setActiveGridActionPostId(null)}
-                                    aria-label="Close quick actions"
-                                    className="w-7 h-7 rounded-full bg-white/15 text-white flex items-center justify-center cursor-pointer"
-                                  >
-                                    <X size={14} />
-                                  </button>
-                                </div>
-
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    void handleToggleSave(gridPost.id);
-                                    setActiveGridActionPostId(null);
-                                  }}
-                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-extrabold flex items-center gap-2 cursor-pointer"
-                                >
-                                  <Bookmark size={14} className={isSaved ? 'fill-amber-400 text-amber-400' : ''} />
-                                  <span>{isSaved ? (language === 'sw' ? 'Imeondolewa' : 'Unsave') : (language === 'sw' ? 'Hifadhi' : 'Save')}</span>
-                                </button>
-
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setActiveGridActionPostId(null);
-                                    handleSharePost(gridPost);
-                                  }}
-                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-extrabold flex items-center gap-2 cursor-pointer"
-                                >
-                                  <Share2 size={14} />
-                                  <span>{language === 'sw' ? 'Shiriki' : 'Share'}</span>
-                                </button>
-
-                                <button
-                                  type="button"
-                                  onClick={() => handleHidePost(gridPost.id)}
-                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-extrabold flex items-center gap-2 cursor-pointer"
-                                >
-                                  <EyeOff size={14} />
-                                  <span>{language === 'sw' ? 'Ficha' : 'Hide'}</span>
-                                </button>
-
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setActiveGridActionPostId(null);
-                                    setReportingPost(gridPost);
-                                  }}
-                                  className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-rose-500/25 hover:bg-rose-500/40 text-rose-200 text-xs font-extrabold flex items-center gap-2 cursor-pointer"
-                                >
-                                  <Flag size={14} />
-                                  <span>{language === 'sw' ? 'Ripoti' : 'Report'}</span>
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Pagination button for Made for you grid (loads 12 cards at a time) */}
-                  {hasMoreGridPosts && (
-                    <div className="flex justify-center pt-1">
-                      <button
-                        type="button"
-                        onClick={() => void loadMoreGridPosts()}
-                        disabled={isLoadingMoreGrid}
-                        className="min-h-[44px] px-5 py-2 rounded-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-xs font-extrabold text-[var(--text-primary)] shadow-2xs transition active:scale-95 cursor-pointer disabled:opacity-50"
-                      >
-                        {isLoadingMoreGrid
-                          ? language === 'sw'
-                            ? 'Inapakia...'
-                            : 'Loading more...'
-                          : language === 'sw'
-                          ? 'Onyesha zaidi (12)'
-                          : 'Explore more waves'}
-                      </button>
-                    </div>
+          {/* 5. BIG TOP FEATURED CARD (UnifiedPostCard — Visual Media Only, Tap Video -> Reels) */}
+          {!activeFilter && (
+            <section aria-label="Featured Wave" className="space-y-4">
+              {isLoadingTrendingCreator && !bestTrendingCreatorPost ? (
+                <div className="w-full h-60 rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] animate-pulse" />
+              ) : bestTrendingCreatorPost ? (
+                <UnifiedPostCard
+                  post={bestTrendingCreatorPost}
+                  isLiked={Boolean(
+                    getReactionData(bestTrendingCreatorPost).active.heart ||
+                      getReactionData(bestTrendingCreatorPost).active.like
                   )}
-                </>
+                  isFeatured={true}
+                  activeHoverPostId={activeHoverGridPostId}
+                  onRequestHoverPlay={setActiveHoverGridPostId}
+                  onOpenVideoInReels={handleOpenHomeVideoInReels}
+                  onOpenPostDetail={(targetPost) => handleOpenPostDetail(targetPost)}
+                  onToggleLike={(targetPost) => void handleToggleReaction(targetPost, 'heart')}
+                  onDoubleTapLike={(targetPost) => void handleToggleReaction(targetPost, 'heart')}
+                  onLongPressQuickActions={(targetPost) => setActiveGridActionPostId(targetPost.id)}
+                />
               ) : null}
-            </div>
-          </section>
+            </section>
+          )}
 
           {/* Compact First-Time Welcome Strip if active */}
           {showWelcomeFlow && (
@@ -2947,15 +2732,52 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 className="mt-0.5"
               />
               <div className="flex-1 min-w-0">
+                {joiningChallenge && (
+                  <div
+                    className="mb-2.5 rounded-2xl border px-3.5 py-2.5 flex items-center justify-between gap-2.5"
+                    style={{
+                      backgroundColor: 'rgba(139, 92, 246, 0.14)',
+                      borderColor: 'rgba(139, 92, 246, 0.42)',
+                      color: 'var(--text-primary, #1c1917)',
+                    }}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[11px] font-extrabold uppercase tracking-wider text-purple-400">
+                        Joining Weekly Challenge • {formatCountdownParts(joiningChallenge.endDate || joiningChallenge.deadline).compact}
+                      </p>
+                      <p className="text-xs sm:text-sm font-bold truncate">
+                        {joiningChallenge.title || joiningChallenge.theme}{' '}
+                        <span className="opacity-80">{joiningChallenge.hashtag}</span>
+                      </p>
+                      <p className="text-[11px] opacity-75">
+                        Type: {(joiningChallenge.type || 'any').toUpperCase()}
+                        {joiningChallenge.maxEntriesPerUser ? ` • Max ${joiningChallenge.maxEntriesPerUser}/creator` : ''} • One challenge per post
+                      </p>
+                    </div>
+                    {onClearJoiningChallenge && (
+                      <button
+                        type="button"
+                        onClick={onClearJoiningChallenge}
+                        aria-label="Detach challenge"
+                        className="min-w-[36px] min-h-[36px] rounded-xl flex items-center justify-center border border-purple-400/30 hover:bg-purple-500/20 shrink-0"
+                      >
+                        <X size={15} />
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 <textarea
                   value={inlineContent}
                   onChange={(e) => setInlineContent(e.target.value)}
                   placeholder={
-                    language === 'sw'
+                    joiningChallenge
+                      ? `Write your entry for ${joiningChallenge.title || joiningChallenge.theme} (${joiningChallenge.hashtag})...`
+                      : language === 'sw'
                       ? 'Shiriki kitu na marafiki zako... unafikiria nini?'
                       : 'Share something with your friends... what is on your mind?'
                   }
-                  rows={inlineContent || inlineMediaPreview ? 3 : 2}
+                  rows={inlineContent || inlineMediaPreview || joiningChallenge ? 3 : 2}
                   className="w-full max-w-full bg-[var(--bg-subtle)]/70 rounded-2xl p-4 border border-[var(--border-hairline)] resize-none text-base text-[var(--text-primary)] placeholder-[var(--text-secondary)]/70 focus:outline-none focus:bg-[var(--bg-surface)] focus:border-[var(--accent-primary)] focus:ring-2 focus:ring-[var(--accent-primary)]/15 break-words leading-relaxed transition font-medium"
                 />
 
@@ -3278,58 +3100,101 @@ export const FeedView: React.FC<FeedViewProps> = ({
             </div>
           )}
 
-          {/* Full Posts Feed Below the Masonry Grid (10 posts at a time with infinite scroll) */}
-          <div className="space-y-5">
+          {/* 6. UNIFIED HOME FEED MASONRY GRID (Single UnifiedPostCard for first page AND every infinite-scroll batch) */}
+          <section aria-label="Made for you feed" className="space-y-4">
             {/* Friendly Quota Exceeded Notice */}
             <QuotaExceededBanner onRetry={() => loadInitialPosts(true)} />
 
-            {/* Full Feed Section Header & Quick Refresh button */}
-            <div className="flex items-center justify-between pb-1 px-1">
-              <span className="text-sm font-extrabold text-[var(--text-primary)]">
-                {language === 'sw' ? 'Mlisho Kamili wa Machapisho' : 'Latest Full Posts'}
-              </span>
+            {/* Section Header, Filter Reset & Quick Refresh button */}
+            <div className="flex items-center justify-between gap-2 pb-1 px-1">
+              <div className="flex items-center gap-2 min-w-0">
+                <h2 className="text-base sm:text-lg font-extrabold text-[var(--text-primary)] tracking-tight truncate">
+                  {activeFilter
+                    ? `${language === "sw" ? "Matokeo ya" : "Results for"} ${activeFilter}`
+                    : feedMode === "following"
+                    ? language === "sw"
+                      ? "Unaowafuata"
+                      : "Following"
+                    : feedMode === "local"
+                    ? `${activeCountryMeta.flag} ${language === "sw" ? "Hapa Karibu" : "Local Waves"}`
+                    : feedMode === "trending"
+                    ? language === "sw"
+                      ? "Vinavyovuma"
+                      : "Trending"
+                    : feedMode === "saved"
+                    ? language === "sw"
+                      ? "Zilizohifadhiwa"
+                      : "Saved Waves"
+                    : language === "sw"
+                    ? "Imeundwa Kwa Ajili Yako"
+                    : "Made for you"}
+                </h2>
+                {(selectedCategory !== "All" || activeFilter) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedCategory("All");
+                      setInternalFilterTag(null);
+                      setFeedSearchQuery("");
+                    }}
+                    className="text-xs font-extrabold text-[var(--accent-primary)] hover:underline cursor-pointer shrink-0"
+                  >
+                    {language === "sw" ? "Onyesha zote" : "Reset"}
+                  </button>
+                )}
+              </div>
+
               <button
                 type="button"
                 onClick={() => {
                   void loadInitialPosts(true);
-                  void loadInitialGridPosts();
                   void loadTrendingCreatorPost();
                 }}
                 disabled={isRefreshing || isLoading}
-                className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-bold transition active:scale-95 cursor-pointer disabled:opacity-50"
-                title={language === 'sw' ? 'Onyesha upya mlisho' : 'Refresh feed'}
+                className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-bold transition active:scale-95 cursor-pointer disabled:opacity-50 shrink-0"
+                title={language === "sw" ? "Onyesha upya mlisho" : "Refresh feed"}
               >
-                <RefreshCw size={12} className={isRefreshing ? 'animate-spin text-[var(--accent-secondary)]' : ''} />
+                <RefreshCw size={12} className={isRefreshing ? "animate-spin text-[var(--accent-secondary)]" : ""} />
                 <span>
                   {isRefreshing
-                    ? language === 'sw'
-                      ? 'Inaonyesha...'
-                      : 'Refreshing...'
-                    : language === 'sw'
-                    ? 'Onyesha Upya'
-                    : 'Refresh'}
+                    ? language === "sw"
+                      ? "Inaonyesha..."
+                      : "Refreshing..."
+                    : language === "sw"
+                    ? "Onyesha Upya"
+                    : "Refresh"}
                 </span>
               </button>
             </div>
 
             <VideoUploadingFeedPostList />
-            {isLoading ? (
-              <PostSkeleton count={4} />
-            ) : combinedFeed.length === 0 && activeOrFailedVideoJobs.length === 0 ? (
+
+            {isLoading && unifiedFeedPosts.length === 0 ? (
+              <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                {[0, 1, 2, 3, 4, 5].map((n) => (
+                  <div
+                    key={n}
+                    className={`rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] animate-pulse ${
+                      n % 2 === 0 ? "h-56" : "h-44"
+                    }`}
+                  />
+                ))}
+              </div>
+            ) : unifiedFeedPosts.length === 0 && !bestTrendingCreatorPost && activeOrFailedVideoJobs.length === 0 ? (
               <div className="wavelink-glass-post-card text-center py-14 px-6 bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl shadow-xs">
                 <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[var(--accent-primary)] to-[var(--accent-secondary)] text-white mx-auto flex items-center justify-center mb-4 shadow-md">
                   <Waves size={32} />
                 </div>
                 <p className="text-base font-extrabold text-[var(--text-primary)] max-w-sm mx-auto mb-5 leading-snug">
-                  {language === 'sw'
-                    ? 'Hakuna kitu hapa bado, kuwa wa kwanza kuchapisha'
-                    : 'Nothing here yet, be the first to post'}
+                  {language === "sw"
+                    ? "Hakuna kitu hapa bado, kuwa wa kwanza kuchapisha"
+                    : "Nothing here yet, be the first to post"}
                 </p>
                 <button
                   type="button"
                   onClick={() => {
                     if (onNavigateTab) {
-                      onNavigateTab('studio');
+                      onNavigateTab("studio");
                     } else {
                       fileInputRef.current?.click();
                     }
@@ -3337,998 +3202,226 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   className="min-h-[48px] px-7 py-3 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white font-extrabold text-base shadow-md active:scale-95 transition inline-flex items-center gap-2 cursor-pointer"
                 >
                   <Wand2 size={18} />
-                  <span>{language === 'sw' ? '+ Chapisha Sasa' : '+ Create Post'}</span>
+                  <span>{language === "sw" ? "+ Chapisha Sasa" : "+ Create Post"}</span>
                 </button>
               </div>
             ) : (
-              combinedFeed.map((post) => {
-                const isSaved = (userProfile?.savedPostIds || []).includes(post.id);
-                const isAuthor = post.authorId === currentUser?.uid;
-                const canDelete = isAuthor || isAdmin;
-                const canEdit = isAuthor && isProEffective;
-                const comments = commentsMap[post.id] || [];
-                const isExpanded = !!expandedComments[post.id];
-
-                // Case A: Designated Native In-Feed Sponsored Ad Unit with Smart Affiliate Tagging
-                if (post.isSponsored) {
+              <div className="wavelink-masonry-grid">
+                {unifiedFeedPosts.map((post) => {
+                  const reactionInfo = getReactionData(post);
+                  const isHearted = Boolean(
+                    reactionInfo.active.heart || reactionInfo.active.like
+                  );
                   return (
-                    <div
+                    <UnifiedPostCard
                       key={post.id}
-                      data-wave-feed-item="true"
-                      className="w-full my-4 rounded-3xl border border-slate-200/90 bg-white p-5 sm:p-6 overflow-hidden text-[#0F172A] shadow-[0_2px_16px_-4px_rgba(15,23,42,0.05)] transition hover:border-blue-300"
-                    >
-                      {/* Sponsored Header */}
-                      <div className="flex items-center justify-between mb-3.5">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <img
-                            src={post.authorPhotoURL}
-                            alt={post.authorName}
-                            className="w-10 h-10 rounded-full object-cover ring-2 ring-blue-500/20 shrink-0"
-                          />
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-extrabold text-sm sm:text-base text-[#0F172A] truncate">
-                                {post.authorName}
-                              </span>
-                              <span className="text-xs font-mono text-[#3B82F6] font-semibold truncate">
-                                {post.authorUsername}
-                              </span>
-                              {/* Subtle tiny sponsored tag */}
-                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase bg-blue-50 text-blue-700 border border-blue-200/70">
-                                <Tag size={10} className="text-amber-500" />
-                                <span>Sponsored</span>
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-1.5 text-xs text-slate-500 mt-0.5">
-                              <span>Recommended Partner Wave</span>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Content */}
-                      <PostBody
-                        postId={post.id}
-                        authorId={post.authorId}
-                        content={post.content}
-                        authorName={post.authorName}
-                        createdAt={post.createdAt}
-                        isSaved={isSaved}
-                        onToggleSave={handleToggleSave}
-                        className="mb-3.5"
-                        textClassName="text-slate-700"
-                      />
-
-                      {/* Image (with true aspect ratio, object-fit contain, and blurred darkened background copy) */}
-                      {post.imageUrl && (() => {
-                        const sponsoredDims =
-                          preloadedDimensions[post.imageUrl] || getPreloadedMediaInfo(post.imageUrl);
-                        return (
-                          <div
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setLightboxState({
-                                images: [post.imageUrl!],
-                                initialIndex: 0,
-                                caption: post.content,
-                                authorName: post.authorName,
-                                authorUsername: post.authorUsername,
-                                authorPhotoURL: post.authorPhotoURL
-                              });
-                            }}
-                            className="rounded-2xl overflow-hidden mb-3.5 border border-slate-200/80 max-h-96 min-h-[180px] bg-[#0C0A09] flex items-center justify-center cursor-zoom-in group relative"
-                            style={
-                              sponsoredDims
-                                ? {
-                                    aspectRatio: String(sponsoredDims.aspectRatio),
-                                  }
-                                : undefined
-                            }
-                          >
-                            <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
-                              <img
-                                src={post.imageUrl}
-                                alt=""
-                                className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
-                              />
-                              <div className="absolute inset-0 bg-black/30" />
-                            </div>
-                            <img
-                              src={post.imageUrl}
-                              alt="Sponsored item"
-                              decoding="async"
-                              onLoad={(e) => {
-                                const img = e.currentTarget;
-                                if (img.naturalWidth > 0 && img.naturalHeight > 0 && post.imageUrl) {
-                                  handleMediaDimensionsReady(post.imageUrl, {
-                                    width: img.naturalWidth,
-                                    height: img.naturalHeight,
-                                    aspectRatio: img.naturalWidth / img.naturalHeight,
-                                    loadedAt: Date.now()
-                                  });
-                                }
-                              }}
-                              style={
-                                sponsoredDims && sponsoredDims.width > 0 && sponsoredDims.height > 0
-                                  ? {
-                                      maxWidth: `min(100%, ${sponsoredDims.width}px)`,
-                                      maxHeight: `min(24rem, ${sponsoredDims.height}px)`
-                                    }
-                                  : undefined
-                              }
-                              className="relative z-10 w-full h-full max-h-96 object-contain transition-transform duration-300 group-hover:scale-[1.01]"
-                            />
-                          </div>
-                        );
-                      })()}
-
-                      {/* Smart Contextual Affiliate Shop Box */}
-                      {post.affiliateProductTitle && (
-                        <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-slate-200/90 mb-3.5 flex items-center justify-between flex-wrap gap-3">
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-2">
-                              <span className="text-[10px] font-black uppercase text-[#3B82F6] tracking-wider">
-                                Featured Product
-                              </span>
-                              <span className="text-[10px] font-bold text-amber-500">
-                                ★ {post.affiliateRating || 4.9}
-                              </span>
-                            </div>
-                            <h4 className="font-bold text-xs sm:text-sm text-[#0F172A] truncate mt-0.5">
-                              {post.affiliateProductTitle}
-                            </h4>
-                            <span className="text-xs font-black font-mono text-emerald-600">
-                              {post.affiliateProductPrice}
-                            </span>
-                          </div>
-
-                          <a
-                            href={post.affiliateProductUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="px-4 py-2.5 rounded-2xl bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold text-xs flex items-center gap-1.5 shadow-sm shadow-blue-600/20 active:scale-95 transition shrink-0"
-                          >
-                            <ShoppingBag size={14} />
-                            <span>{post.affiliateButtonText || 'Shop Now'}</span>
-                            <ExternalLink size={12} />
-                          </a>
-                        </div>
-                      )}
-
-                      {/* Action Bar */}
-                      <div className="flex items-center justify-between pt-3 border-t border-slate-100 text-xs font-semibold text-slate-500 flex-wrap gap-2">
-                        <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
-                          {renderReactionBar(post)}
-                          <button
-                            onClick={() => toggleComments(post.id)}
-                            className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 transition"
-                          >
-                            <MessageCircle size={16} />
-                            <span className="font-mono tabular-numbers">{post.commentsCount || 0}</span>
-                          </button>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => handleDownloadPost(post)}
-                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
-                            title="Download post"
-                          >
-                            <Download size={14} />
-                            <span>Download</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleSharePost(post)}
-                            className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition active:scale-95"
-                            title="Share on WhatsApp or via Web Share"
-                          >
-                            <Share2 size={14} />
-                            <span>Share</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
+                      post={post}
+                      isLiked={isHearted}
+                      activeHoverPostId={activeHoverGridPostId}
+                      onRequestHoverPlay={setActiveHoverGridPostId}
+                      onOpenVideoInReels={handleOpenHomeVideoInReels}
+                      onOpenPostDetail={(targetPost) => handleOpenPostDetail(targetPost)}
+                      onToggleLike={(targetPost) => void handleToggleReaction(targetPost, "heart")}
+                      onDoubleTapLike={(targetPost) => void handleToggleReaction(targetPost, "heart")}
+                      onLongPressQuickActions={(targetPost) => setActiveGridActionPostId(targetPost.id)}
+                    />
                   );
-                }
-
-                // Case B: Standard Community Wave Post (Glassmorphism Video/Photo Post Card)
-                const hasVideoMedia = Boolean(
-                  post.videoUrl || post.hasVideoChunks || post.mediaType === 'video'
-                );
-                const hasImageMedia = Boolean(
-                  (post.imageUrl || (post.imageUrls && post.imageUrls.length > 0)) && !hasVideoMedia
-                );
-                const hasAnyMedia = hasVideoMedia || hasImageMedia;
-                const likedByInfo = getLikedByInfo(post);
-                const isMenuOpen = openPostMenuId === post.id;
-                const authorAvatarUrl = resolveUserAvatarUrl(
-                  post.authorId,
-                  post.authorPhotoURL
-                );
-
-                const handleSelectAuthorProfile = () => {
-                  window.dispatchEvent(
-                    new CustomEvent('wavelink:open-profile', {
-                      detail: { userId: post.authorId, username: post.authorUsername },
-                    })
-                  );
-                };
-
-                const isAuthorInViewport = visibleFeedPostIds.includes(post.id);
-
-                return (
-                  <article
-                    key={post.id}
-                    data-wave-feed-item="true"
-                    data-post-id={post.id}
-                    className={`wavelink-glass-post-card wavelink-card-enter relative w-full max-w-full overflow-visible break-words rounded-[28px] sm:rounded-[32px] p-3.5 sm:p-5 transition ${
-                      post.isBoosted ? 'ring-2 ring-amber-400/50' : ''
-                    } ${highlightedPostId === post.id ? 'ring-2 ring-blue-500 shadow-lg' : ''}`}
-                  >
-                    {/* Compact Context Menu Dropdown triggered by the "..." round glass button */}
-                    {isMenuOpen && (
-                      <div
-                        role="menu"
-                        aria-label="Post options"
-                        className="wavelink-glass-overlay-pill absolute top-14 right-5 z-40 w-56 rounded-3xl p-2 shadow-2xl border border-white/25 text-white space-y-1 animate-in fade-in zoom-in-95 duration-150"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setOpenPostMenuId(null);
-                            handleOpenAiInfo(post);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                        >
-                          <Sparkles size={14} className="text-teal-300 shrink-0" />
-                          <span>{language === 'sw' ? 'Muhtasari wa WELINK AI' : 'AI Info & Summary'}</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setOpenPostMenuId(null);
-                            handleOpenPostDetail(post);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                        >
-                          <Eye size={14} className="text-sky-300 shrink-0" />
-                          <span>{language === 'sw' ? 'Soma kwa Ukubwa' : 'Read View'}</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setOpenPostMenuId(null);
-                            setPostsForSpark([post]);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                        >
-                          <Flame size={14} className="text-amber-300 shrink-0" />
-                          <span>{t('feed.addToSpark')}</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setOpenPostMenuId(null);
-                            setTippingPost(post);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                        >
-                          <HandCoins size={14} className="text-emerald-300 shrink-0" />
-                          <span>
-                            {t('feed.tip')} {post.tipsCount ? `(${post.tipsCount})` : ''}
-                          </span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setOpenPostMenuId(null);
-                            handleDownloadPost(post);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                        >
-                          <Download size={14} className="text-white/80 shrink-0" />
-                          <span>{language === 'sw' ? 'Pakua' : 'Download Wave'}</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setOpenPostMenuId(null);
-                            copyPostLink(post.id);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                        >
-                          <Share2 size={14} className="text-white/80 shrink-0" />
-                          <span>{copiedId === post.id ? 'Copied Link!' : 'Copy Wave Link'}</span>
-                        </button>
-
-                        {isAuthor && !post.isBoosted && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setOpenPostMenuId(null);
-                              setBoostingPost(post);
-                            }}
-                            className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-amber-500/25 flex items-center gap-2.5 text-xs font-bold text-amber-300 text-left transition cursor-pointer"
-                          >
-                            <Rocket size={14} className="shrink-0" />
-                            <span>Boost Wave (2k TZS)</span>
-                          </button>
-                        )}
-
-                        {canEdit && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setOpenPostMenuId(null);
-                              handleStartEditPost(post);
-                            }}
-                            className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-white/15 flex items-center gap-2.5 text-xs font-bold text-left transition cursor-pointer"
-                          >
-                            <Edit2 size={14} className="text-sky-300 shrink-0" />
-                            <span>Edit Wave</span>
-                          </button>
-                        )}
-
-                        {!isAuthor && post.authorId !== SUPPORT_BOT_ID && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setOpenPostMenuId(null);
-                                setReportingPost(post);
-                                setSelectedReportCategory('stolen_content');
-                                setReportExtraNote('');
-                              }}
-                              className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-amber-500/20 flex items-center gap-2.5 text-xs font-bold text-amber-200 text-left transition cursor-pointer"
-                            >
-                              <Flag size={14} className="shrink-0" />
-                              <span>{language === 'sw' ? 'Ripoti Chapisho' : 'Report Post'}</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                setOpenPostMenuId(null);
-                                await toggleBlockUser(post.authorId);
-                                setPostNotice({
-                                  type: 'success',
-                                  text:
-                                    language === 'sw'
-                                      ? `Umemzuia ${post.authorName}.`
-                                      : `Blocked ${post.authorName}.`,
-                                });
-                                setTimeout(() => setPostNotice(null), 3500);
-                              }}
-                              className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-rose-500/25 flex items-center gap-2.5 text-xs font-bold text-rose-300 text-left transition cursor-pointer"
-                            >
-                              <Ban size={14} className="shrink-0" />
-                              <span>Block {post.authorName}</span>
-                            </button>
-                          </>
-                        )}
-
-                        {canDelete && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setOpenPostMenuId(null);
-                              handleDeletePost(post.id);
-                            }}
-                            className="w-full min-h-[40px] px-3 py-2 rounded-2xl hover:bg-rose-500/25 flex items-center gap-2.5 text-xs font-bold text-rose-300 text-left transition cursor-pointer"
-                          >
-                            <Trash2 size={14} className="shrink-0" />
-                            <span>Delete Wave</span>
-                          </button>
-                        )}
-                      </div>
-                    )}
-
-                    {/* If the post has NO media (text-only wave), show the glass Author Pill + "..." + AI Info Pill at the top */}
-                    {!hasAnyMedia && (
-                      <div className="flex items-center justify-between gap-2 mb-3">
-                        <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                          <button
-                            type="button"
-                            onClick={handleSelectAuthorProfile}
-                            className="wavelink-glass-action-pill inline-flex items-center gap-2.5 pl-1.5 pr-3.5 py-1 rounded-full max-w-[75%] transition-transform active:scale-95 cursor-pointer"
-                          >
-                            <Avatar
-                              uid={post.authorId}
-                              src={authorAvatarUrl}
-                              alt={post.authorName}
-                              fallbackName={post.authorName}
-                              size={32}
-                              showStatus={isAuthorInViewport}
-                              onlyWhenVisible={false}
-                              className="shrink-0"
-                            />
-                            <div className="min-w-0 text-left">
-                              <CrystalBadge
-                                userId={post.authorId}
-                                email={post.authorEmail}
-                                name={post.authorName}
-                                isBot={post.authorId === SUPPORT_BOT_ID}
-                                size="sm"
-                              />
-                            </div>
-                          </button>
-
-                          {post.isBoosted && (
-                            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-xs">
-                              <Rocket size={10} className="fill-white" />
-                              <span>Boosted</span>
-                            </span>
-                          )}
-                          {post.audience && post.audience !== 'public' && (
-                            <span
-                              className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-stone-900/10 dark:bg-white/10 text-[var(--text-secondary)]"
-                              title={post.audience === 'close_friends' ? 'Visible to Close Friends' : 'Visible to Followers'}
-                            >
-                              {post.audience === 'close_friends' ? <Lock size={10} /> : <Users size={10} />}
-                              <span>{post.audience === 'close_friends' ? 'Close Friends' : 'Followers'}</span>
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenAiInfo(post)}
-                            className="wavelink-glass-action-pill wavelink-float-gentle inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-extrabold cursor-pointer transition-transform active:scale-95"
-                            title="Open WELINK AI caption & summary"
-                          >
-                            <Sparkles size={13} className="text-[#0D9488]" />
-                            <span>AI info</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setOpenPostMenuId((prev) => (prev === post.id ? null : post.id))
-                            }
-                            aria-label="More options"
-                            className="wavelink-glass-action-pill w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center cursor-pointer transition-transform active:scale-95"
-                          >
-                            <MoreHorizontal size={18} />
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* 1. FLOATING ROUNDED MEDIA FRAME (28px+ radius) FOR VIDEO OR PHOTO */}
-                    {hasVideoMedia && (
-                      <div className="mb-3.5">
-                        <VideoPlayer
-                          postId={post.id}
-                          videoUrl={post.videoUrl}
-                          hasVideoChunks={post.hasVideoChunks}
-                          thumbnailUrl={post.imageUrl || post.thumbnailUrl}
-                          duration={post.duration ?? post.videoDurationSeconds}
-                          videoWidth={post.videoWidth}
-                          videoHeight={post.videoHeight}
-                          aspectRatio={post.aspectRatio}
-                          showGlassOverlays={true}
-                          authorName={post.authorName}
-                          authorPhotoURL={authorAvatarUrl}
-                          authorId={post.authorId}
-                          showStatus={isAuthorInViewport}
-                          onAuthorClick={handleSelectAuthorProfile}
-                          onOpenMoreMenu={() =>
-                            setOpenPostMenuId((prev) => (prev === post.id ? null : post.id))
-                          }
-                          onOpenAiInfo={() => handleOpenAiInfo(post)}
-                        />
-                      </div>
-                    )}
-
-                    {hasImageMedia && (() => {
-                      const slides =
-                        post.imageUrls && post.imageUrls.length > 0
-                          ? post.imageUrls
-                          : post.imageUrl
-                          ? [post.imageUrl]
-                          : [];
-                      const activeSlideIdx = Math.min(
-                        slides.length - 1,
-                        Math.max(0, carouselIndices[post.id] || 0)
-                      );
-                      const currentImgUrl = slides[activeSlideIdx] || post.imageUrl!;
-                      const isFullImageUnlocked = Boolean(unlockedFullImages[post.id]);
-                      const displayImgUrl = getOptimizedImagePreviewUrl(
-                        currentImgUrl,
-                        isDataSaverOn,
-                        isFullImageUnlocked
-                      );
-                      const imgDims =
-                        preloadedDimensions[currentImgUrl] || getPreloadedMediaInfo(currentImgUrl);
-
-                      return (
-                        <div
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (isDataSaverOn && !isFullImageUnlocked) {
-                              setUnlockedFullImages((prev) => ({ ...prev, [post.id]: true }));
-                              return;
-                            }
-                            setLightboxState({
-                              images: slides.length > 0 ? slides : [currentImgUrl],
-                              initialIndex: activeSlideIdx,
-                              caption: post.content,
-                              authorName: post.authorName,
-                              authorUsername: post.authorUsername,
-                              authorPhotoURL: post.authorPhotoURL
-                            });
-                          }}
-                          className="wavelink-glass-media-frame relative rounded-[28px] overflow-hidden mb-3.5 max-h-[540px] min-h-[240px] bg-[#0C0A09] flex items-center justify-center group cursor-zoom-in"
-                          style={
-                            post.aspectRatio === '1:1'
-                              ? { aspectRatio: '1 / 1' }
-                              : post.aspectRatio === '4:5'
-                              ? { aspectRatio: '4 / 5' }
-                              : post.aspectRatio === '9:16'
-                              ? { aspectRatio: '9 / 16' }
-                              : imgDims
-                              ? {
-                                  aspectRatio: String(imgDims.aspectRatio),
-                                }
-                              : undefined
-                          }
-                        >
-                          {/* Soft blurred, darkened copy of the same photo filling empty side space */}
-                          <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
-                            <img
-                              src={displayImgUrl}
-                              alt=""
-                              className="w-full h-full object-cover scale-110 blur-2xl opacity-65 brightness-50"
-                            />
-                            <div className="absolute inset-0 bg-black/25" />
-                          </div>
-
-                          <img
-                            src={displayImgUrl}
-                            alt="Wave attachment"
-                            decoding="async"
-                            onLoad={(e) => {
-                              const img = e.currentTarget;
-                              if (isDataSaverOn && !isFullImageUnlocked) {
-                                recordDataSavedBytes(320 * 1024);
-                              }
-                              if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-                                handleMediaDimensionsReady(currentImgUrl, {
-                                  width: img.naturalWidth,
-                                  height: img.naturalHeight,
-                                  aspectRatio: img.naturalWidth / img.naturalHeight,
-                                  loadedAt: Date.now()
-                                });
-                              }
-                            }}
-                            style={
-                              imgDims && imgDims.width > 0 && imgDims.height > 0
-                                ? {
-                                    maxWidth: `min(100%, ${imgDims.width}px)`,
-                                    maxHeight: `min(540px, ${imgDims.height}px)`
-                                  }
-                                : undefined
-                            }
-                            className="relative z-10 w-full h-full max-h-[540px] object-contain transition-transform duration-300 group-hover:scale-[1.01]"
-                            onError={(e) => {
-                              (e.target as HTMLElement).style.display = 'none';
-                            }}
-                          />
-
-                          {/* Top-Left Author Glass Pill + Top-Right "..." Round Glass Button */}
-                          <div className="absolute top-3 left-3 right-3 z-20 flex items-center justify-between gap-2 pointer-events-none">
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleSelectAuthorProfile();
-                              }}
-                              className="wavelink-glass-overlay-pill pointer-events-auto inline-flex items-center gap-2.5 pl-1.5 pr-3.5 py-1 rounded-full text-white text-xs sm:text-sm font-bold max-w-[74%] transition-transform active:scale-95 cursor-pointer"
-                            >
-                              <Avatar
-                                uid={post.authorId}
-                                src={authorAvatarUrl}
-                                alt={post.authorName}
-                                fallbackName={post.authorName}
-                                size={28}
-                                showStatus={isAuthorInViewport}
-                                onlyWhenVisible={false}
-                                className="shrink-0"
-                              />
-                              <span className="truncate drop-shadow-xs">{post.authorName}</span>
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setOpenPostMenuId((prev) => (prev === post.id ? null : post.id));
-                              }}
-                              aria-label="Post options"
-                              title="Post options"
-                              className="wavelink-glass-overlay-pill pointer-events-auto w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-white transition-transform active:scale-95 cursor-pointer"
-                            >
-                              <MoreHorizontal size={18} />
-                            </button>
-                          </div>
-
-                          {/* Bottom-Left "AI info" Glass Pill with Sparkle Icon */}
-                          <div className="absolute bottom-3.5 left-3.5 z-20 pointer-events-none">
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleOpenAiInfo(post);
-                              }}
-                              aria-label="Open WELINK AI post summary"
-                              title="AI info — WELINK AI summary"
-                              className="wavelink-glass-overlay-pill wavelink-float-gentle pointer-events-auto inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-white text-xs font-extrabold tracking-wide transition-transform active:scale-95 cursor-pointer"
-                            >
-                              <Sparkles size={13} className="text-teal-300 shrink-0" />
-                              <span>AI info</span>
-                            </button>
-                          </div>
-
-                          {/* Phase 1 Data Saver Small Preview Pill (Tap to load full image) */}
-                          {isDataSaverOn && !isFullImageUnlocked && (
-                            <div className="absolute bottom-3.5 right-3.5 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/70 backdrop-blur-xs text-white text-[11px] font-bold border border-white/20 shadow-md pointer-events-none">
-                              <Zap size={12} className="text-teal-300" />
-                              <span>{t('datasaver.tapToLoadFullImage')}</span>
-                            </div>
-                          )}
-
-                          {slides.length > 1 && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setCarouselIndices((prev) => ({
-                                    ...prev,
-                                    [post.id]:
-                                      activeSlideIdx > 0
-                                        ? activeSlideIdx - 1
-                                        : slides.length - 1,
-                                  }));
-                                }}
-                                aria-label="Previous photo"
-                                className="absolute left-2.5 top-1/2 -translate-y-1/2 z-20 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
-                              >
-                                ‹
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setCarouselIndices((prev) => ({
-                                    ...prev,
-                                    [post.id]:
-                                      activeSlideIdx < slides.length - 1
-                                        ? activeSlideIdx + 1
-                                        : 0,
-                                  }));
-                                }}
-                                aria-label="Next photo"
-                                className="absolute right-2.5 top-1/2 -translate-y-1/2 z-20 min-w-[44px] min-h-[44px] rounded-full bg-black/55 hover:bg-black/75 text-white flex items-center justify-center font-bold text-sm transition cursor-pointer"
-                              >
-                                ›
-                              </button>
-
-                              <div className="absolute bottom-3.5 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/45">
-                                {slides.map((_, idx) => (
-                                  <button
-                                    key={idx}
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setCarouselIndices((prev) => ({
-                                        ...prev,
-                                        [post.id]: idx,
-                                      }));
-                                    }}
-                                    aria-label={`Slide ${idx + 1}`}
-                                    className={`h-1.5 rounded-full transition-all cursor-pointer ${
-                                      idx === activeSlideIdx
-                                        ? 'w-4 bg-white'
-                                        : 'w-1.5 bg-white/50'
-                                    }`}
-                                  />
-                                ))}
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })()}
-
-                    {/* Post Body with glass hashtag & mention chips */}
-                    {post.content && (
-                      <PostBody
-                        postId={post.id}
-                        authorId={post.authorId}
-                        content={post.content}
-                        authorName={post.authorName}
-                        createdAt={post.createdAt}
-                        isEdited={post.isEdited}
-                        isSaved={isSaved}
-                        onToggleSave={handleToggleSave}
-                        isEditing={editingPostId === post.id}
-                        onStartEdit={() => setEditingPostId(post.id)}
-                        onCancelEdit={() => setEditingPostId(null)}
-                        onSaveContent={() => setEditingPostId(null)}
-                        className="mb-3 px-1"
-                      />
-                    )}
-
-                    {/* In-Post Glass Music Pill INSIDE each post card (only one post plays audio at a time) */}
-                    {post.songPreviewUrl && post.songTitle && (
-                      <div className="mb-3.5">
-                        <SongPlayerCard
-                          title={post.songTitle}
-                          artist={post.songArtist || ''}
-                          albumArt={post.songAlbumArt}
-                          previewUrl={post.songPreviewUrl}
-                          albumName={post.songAlbumName}
-                          defaultMuted={hasVideoMedia}
-                          startTime={post.songStartTime}
-                          volume={post.songVolume}
-                        />
-                      </div>
-                    )}
-
-                    {/* BELOW THE MEDIA: Overlapping small avatars with "Liked by Name & others" in short text */}
-                    <div className="flex items-center justify-between gap-2 px-1 mb-2.5">
-                      <div className="flex items-center gap-2 min-w-0">
-                        {likedByInfo.avatars.length > 0 ? (
-                          <div className="flex items-center -space-x-2 shrink-0">
-                            {likedByInfo.avatars.map((avatarUrl, idx) => (
-                              <img
-                                key={idx}
-                                src={avatarUrl}
-                                alt=""
-                                className="w-6 h-6 rounded-full object-cover ring-2 ring-white/80 dark:ring-slate-900 shadow-2xs"
-                              />
-                            ))}
-                          </div>
-                        ) : (
-                          <img
-                            src={authorAvatarUrl}
-                            alt=""
-                            className="w-5 h-5 rounded-full object-cover ring-1 ring-white/60 shrink-0 opacity-85"
-                          />
-                        )}
-                        <p className="text-xs italic font-medium text-[var(--text-secondary)] truncate">
-                          {likedByInfo.totalReactions > 1 && likedByInfo.firstLikerName ? (
-                            <>
-                              {language === 'sw' ? 'Imependwa na ' : 'Liked by '}
-                              <span className="font-bold not-italic text-[var(--text-primary)]">
-                                {likedByInfo.firstLikerName}
-                              </span>
-                              {language === 'sw' ? ' na wengine' : ' & others'}
-                            </>
-                          ) : likedByInfo.totalReactions === 1 && likedByInfo.firstLikerName ? (
-                            <>
-                              {language === 'sw' ? 'Imependwa na ' : 'Liked by '}
-                              <span className="font-bold not-italic text-[var(--text-primary)]">
-                                {likedByInfo.firstLikerName}
-                              </span>
-                            </>
-                          ) : (
-                            <span>
-                              {post.authorName}
-                              {post.locationTag ? ` · ${post.locationTag}` : ''}
-                            </span>
-                          )}
-                        </p>
-                      </div>
-
-                      {/* Subtle Boosted / Tips pill if present */}
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {post.isBoosted && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-2xs">
-                            <Rocket size={10} className="fill-white" />
-                            <span>Boosted</span>
-                          </span>
-                        )}
-                        {Boolean(post.tipsTotalTZS && post.tipsTotalTZS > 0) && (
-                          <span className="wavelink-glass-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold">
-                            <HandCoins size={10} className="text-amber-500" />
-                            <span>TZS {post.tipsTotalTZS?.toLocaleString()}</span>
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* ROW OF GLASS PILL BUTTONS: Heart + count, Comment + count, Share + count, and Bookmark on the right */}
-                    <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        {/* 1. Heart + Count Glass Pill (with spring animation & glow on press) */}
-                        {renderReactionBar(post)}
-
-                        {/* 2. Comment + Count Glass Pill (Opens Frosted Comments Sheet) */}
-                        <button
-                          type="button"
-                          onClick={() => setActiveCommentsPost(post)}
-                          className={`wavelink-glass-action-pill min-h-[40px] px-3.5 py-1.5 rounded-full inline-flex items-center gap-1.5 text-xs font-extrabold transition-transform active:scale-95 cursor-pointer select-none ${
-                            activeCommentsPost?.id === post.id || isExpanded
-                              ? 'ring-1 ring-[#2563EB]/60 text-[#2563EB]'
-                              : ''
-                          }`}
-                          aria-label={`Comments (${post.commentsCount || 0})`}
-                        >
-                          <MessageCircle size={15} className="shrink-0 opacity-85" />
-                          <span className="font-mono tabular-nums">
-                            {(post.commentsCount || 0).toLocaleString()}
-                          </span>
-                        </button>
-
-                        {/* 3. Share + Count Glass Pill (Opens Frosted Share Sheet) */}
-                        <button
-                          type="button"
-                          onClick={() => handleSharePost(post)}
-                          className="wavelink-glass-action-pill min-h-[40px] px-3.5 py-1.5 rounded-full inline-flex items-center gap-1.5 text-xs font-extrabold transition-transform active:scale-95 cursor-pointer select-none"
-                          title="Share wave"
-                          aria-label="Share post"
-                        >
-                          <Send size={14} className="shrink-0 opacity-85 -rotate-12" />
-                          <span className="font-mono tabular-nums">
-                            {(post.sharesCount || 0).toLocaleString()}
-                          </span>
-                        </button>
-
-                        {/* Compact Tip Glass Pill */}
-                        <button
-                          type="button"
-                          onClick={() => setTippingPost(post)}
-                          className="wavelink-glass-action-pill min-h-[40px] px-3 py-1.5 rounded-full hidden sm:inline-flex items-center gap-1 text-xs font-bold transition-transform active:scale-95 cursor-pointer"
-                          title="Tip creator directly via Mobile Money"
-                        >
-                          <HandCoins size={14} className="text-amber-500" />
-                          <span>{t('feed.tip')}</span>
-                        </button>
-                      </div>
-
-                      {/* Right: Bookmark Glass Button */}
-                      <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-                        <button
-                          type="button"
-                          onClick={() => handleToggleSave(post.id)}
-                          className={`wavelink-glass-action-pill w-10 h-10 min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center transition-transform active:scale-95 cursor-pointer ${
-                            isSaved ? 'ring-1 ring-[#2563EB]/60 text-[#2563EB]' : ''
-                          }`}
-                          title={isSaved ? 'Saved to bookmarks' : 'Save post'}
-                          aria-label="Bookmark post"
-                        >
-                          <Bookmark
-                            size={15}
-                            className={isSaved ? 'fill-current text-[#2563EB]' : ''}
-                          />
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Collapsible Comments Section */}
-                    {isExpanded && (
-                      <div className="mt-4 pt-3.5 border-t border-[#EFECE6] space-y-3">
-                        {post.allowComments === false ? (
-                          <p className="text-xs text-[#78716C] italic py-1">
-                            Comments are turned off for this post.
-                          </p>
-                        ) : (
-                          <div className="flex items-center gap-2">
-                            <input
-                              type="text"
-                              value={commentInput[post.id] || ''}
-                              onChange={(e) =>
-                                setCommentInput((prev) => ({ ...prev, [post.id]: e.target.value }))
-                              }
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') handleAddComment(post.id);
-                              }}
-                              placeholder="Write a reply..."
-                              className="flex-1 min-h-[44px] py-2 px-3.5 rounded-xl bg-[#FAF7F2] border border-[#EFECE6] text-base sm:text-xs text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
-                            />
-                            <button
-                              onClick={() => handleAddComment(post.id)}
-                              disabled={!commentInput[post.id]?.trim()}
-                              className="min-w-[44px] min-h-[44px] p-2 rounded-xl bg-[#2563EB] text-white disabled:opacity-40 hover:bg-[#1D4ED8] flex items-center justify-center transition shadow-xs"
-                            >
-                              <Send size={15} />
-                            </button>
-                          </div>
-                        )}
-
-                        {loadingCommentsMap[post.id] || commentsMap[post.id] === undefined ? (
-                          <CommentSkeleton count={2} />
-                        ) : comments.length === 0 ? (
-                          <p className="text-[11px] text-[#78716C] italic py-1">
-                            No replies yet. Be the first to chime in!
-                          </p>
-                        ) : (
-                          <div className="space-y-2 pt-1">
-                            {comments.map((comment) => (
-                              <div
-                                key={comment.id}
-                                className="flex items-start gap-2.5 p-3 rounded-2xl bg-[#FAF7F2] text-xs"
-                              >
-                                <Avatar
-                                  uid={comment.authorId}
-                                  src={
-                                    comment.authorPhotoURL ||
-                                    `https://api.dicebear.com/7.x/shapes/svg?seed=${comment.authorId}`
-                                  }
-                                  alt={comment.authorName}
-                                  fallbackName={comment.authorName}
-                                  size={28}
-                                  showStatus={true}
-                                  ringClassName="ring-1 ring-blue-500/20"
-                                  className="mt-0.5"
-                                />
-                                <div className="flex-1">
-                                  <div className="flex items-center justify-between">
-                                    <CrystalBadge
-                                      email={comment.authorEmail}
-                                      name={comment.authorName}
-                                      size="sm"
-                                    />
-                                    <span className="text-[10px] text-[#78716C] font-mono tabular-numbers">
-                                      {new Date(comment.createdAt).toLocaleTimeString([], {
-                                        hour: '2-digit',
-                                        minute: '2-digit'
-                                      })}
-                                    </span>
-                                  </div>
-                                  <p className="mt-1 text-[#1C1917] leading-relaxed">
-                                    {comment.content}
-                                  </p>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </article>
-                );
-              })
+                })}
+              </div>
             )}
 
-            {/* Pagination Load More trigger & status */}
+            {/* Long-Press Quick Actions Sheet (Preserves AI Info, Tip, Comments, Save, Share, Boost, Hide, Delete, Report) */}
+            {activeGridActionPostId &&
+              (() => {
+                const actionPost =
+                  posts.find((p) => p.id === activeGridActionPostId) ||
+                  (bestTrendingCreatorPost?.id === activeGridActionPostId
+                    ? bestTrendingCreatorPost
+                    : null);
+                if (!actionPost) return null;
+                const isSaved = (userProfile?.savedPostIds || []).includes(actionPost.id);
+                const isAuthor = actionPost.authorId === currentUser?.uid;
+                const canDelete = isAuthor || isAdmin;
+                return (
+                  <div
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => setActiveGridActionPostId(null)}
+                    className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-3 animate-in fade-in"
+                  >
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-4 space-y-1.5 shadow-2xl"
+                    >
+                      <div className="flex items-center justify-between pb-2 border-b border-[var(--border-hairline)]">
+                        <span className="text-xs font-extrabold text-[var(--text-secondary)] uppercase tracking-wider">
+                          {language === "sw" ? "Chaguo za Haraka" : "Quick Actions"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setActiveGridActionPostId(null)}
+                          className="p-1.5 rounded-full hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] cursor-pointer"
+                        >
+                          <X size={15} />
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveGridActionPostId(null);
+                          void handleOpenAiInfo(actionPost);
+                        }}
+                        className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                      >
+                        <Sparkles size={16} className="text-[#0D9488]" />
+                        <span>{language === "sw" ? "Maelezo ya AI" : "AI info"}</span>
+                      </button>
+
+                      {!isAuthor && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveGridActionPostId(null);
+                            setTippingPost(actionPost);
+                          }}
+                          className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                        >
+                          <HandCoins size={16} className="text-amber-500" />
+                          <span>{language === "sw" ? "Tuma Bakshishi" : "Tip Creator"}</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveGridActionPostId(null);
+                          setActiveCommentsPost(actionPost);
+                        }}
+                        className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                      >
+                        <MessageCircle size={16} className="text-[#2563EB]" />
+                        <span>{language === "sw" ? "Maoni" : "Comments"}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleToggleSave(actionPost.id);
+                          setActiveGridActionPostId(null);
+                        }}
+                        className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                      >
+                        <Bookmark
+                          size={16}
+                          className={isSaved ? "fill-amber-400 text-amber-400" : ""}
+                        />
+                        <span>
+                          {isSaved
+                            ? language === "sw"
+                              ? "Ondoa kwenye Hifadhi"
+                              : "Unsave"
+                            : language === "sw"
+                            ? "Hifadhi"
+                            : "Save"}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveGridActionPostId(null);
+                          handleSharePost(actionPost);
+                        }}
+                        className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                      >
+                        <Share2 size={16} />
+                        <span>{language === "sw" ? "Shiriki" : "Share"}</span>
+                      </button>
+
+                      {isAuthor && !actionPost.isBoosted && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveGridActionPostId(null);
+                            setBoostingPost(actionPost);
+                          }}
+                          className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                        >
+                          <Rocket size={16} className="text-amber-500" />
+                          <span>{language === "sw" ? "Kuza Chapisho" : "Boost Post"}</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => handleHidePost(actionPost.id)}
+                        className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-[var(--bg-subtle)] flex items-center gap-3 text-sm font-bold text-[var(--text-primary)] cursor-pointer"
+                      >
+                        <EyeOff size={16} />
+                        <span>{language === "sw" ? "Ficha" : "Hide"}</span>
+                      </button>
+
+                      {canDelete && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveGridActionPostId(null);
+                            void handleDeletePost(actionPost.id);
+                          }}
+                          className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-rose-500/10 flex items-center gap-3 text-sm font-bold text-rose-500 cursor-pointer"
+                        >
+                          <Trash2 size={16} />
+                          <span>{language === "sw" ? "Futa Chapisho" : "Delete Post"}</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveGridActionPostId(null);
+                          setReportingPost(actionPost);
+                        }}
+                        className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl hover:bg-rose-500/10 flex items-center gap-3 text-sm font-bold text-rose-500 cursor-pointer"
+                      >
+                        <Flag size={16} />
+                        <span>{language === "sw" ? "Ripoti" : "Report"}</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+
+            {/* Unified Infinite Scroll Trigger & Load More Button (appends to the SAME UnifiedPostCard grid) */}
             <div ref={loadMoreTriggerRef} className="py-6 flex flex-col items-center justify-center gap-2">
               {isLoadingMore && (
-                <div className="flex items-center gap-2 text-xs font-semibold text-stone-500">
-                  <RefreshCw size={14} className="animate-spin text-teal-600" />
+                <div className="flex items-center gap-2 text-xs font-semibold text-[var(--text-secondary)]">
+                  <RefreshCw size={14} className="animate-spin text-[var(--accent-secondary)]" />
                   <span>
-                    {language === 'sw'
-                      ? 'Inapakia machapisho 10 zaidi...'
-                      : 'Loading 10 more waves...'}
+                    {language === "sw"
+                      ? "Inapakia machapisho 12 zaidi..."
+                      : "Loading 12 more waves..."}
                   </span>
                 </div>
               )}
               {!hasMorePosts && posts.length > 0 && (
-                <div className="text-center py-2 text-xs text-stone-400 font-medium">
-                  {language === 'sw'
-                    ? 'Umeona machapisho yote ya hivi karibuni ✨'
-                    : 'You are all caught up ✨'}
+                <div className="text-center py-2 text-xs text-[var(--text-secondary)] font-medium">
+                  {language === "sw"
+                    ? "Umeona machapisho yote ya hivi karibuni ✨"
+                    : "You are all caught up ✨"}
                 </div>
               )}
               {hasMorePosts && !isLoadingMore && (
                 <button
                   type="button"
                   onClick={loadMorePosts}
-                  className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition active:scale-95 cursor-pointer"
+                  className="min-h-[44px] px-5 py-2 rounded-full bg-[var(--bg-surface)] border border-[var(--border-hairline)] hover:border-[var(--accent-primary)] text-[var(--text-primary)] text-xs font-extrabold shadow-2xs transition active:scale-95 cursor-pointer"
                 >
-                  {language === 'sw' ? 'Pakia Zaidi (10 Zaidi)' : 'Load More (10 more)'}
+                  {language === "sw" ? "Pakia Zaidi (12 Zaidi)" : "Load More Waves"}
                 </button>
               )}
             </div>
-          </div>
+          </section>
 
           {/* Legal Footer for Privacy, Terms & Refund policies */}
           <LegalFooter className="mt-6" />
@@ -4379,142 +3472,44 @@ export const FeedView: React.FC<FeedViewProps> = ({
         />
       )}
 
-      {/* Community-Fitted Safety Report Modal (Stolen Content, Bullying, Scams, Adult Content, Spam) in Swahili & English */}
-      {reportingPost && (
-        <div
-          className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-xs flex items-center justify-center p-4"
-          onClick={() => setReportingPost(null)}
-        >
-          <div
-            className="w-full max-w-md bg-white border border-stone-200 rounded-3xl p-5 sm:p-6 shadow-2xl space-y-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-2xl bg-amber-50 text-amber-600 border border-amber-200">
-                  <Flag size={18} />
-                </div>
-                <div>
-                  <h3 className="text-base font-extrabold text-stone-900">
-                    {language === 'sw' ? 'Ripoti Maudhui kwa Usalama wa Jamii' : 'Report Content for Community Safety'}
-                  </h3>
-                  <p className="text-xs text-stone-500">
-                    {language === 'sw'
-                      ? `Chapisho la ${reportingPost.authorName} litakaguliwa kwa Kiswahili na Kiingereza.`
-                      : `Post by ${reportingPost.authorName} will be reviewed by our moderation team.`}
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setReportingPost(null)}
-                className="p-1.5 rounded-xl text-stone-400 hover:text-stone-700 hover:bg-stone-100"
-              >
-                <X size={16} />
-              </button>
-            </div>
-
-            <div className="space-y-2">
-              {COMMUNITY_REPORT_CATEGORIES.map((cat) => {
-                const isSelected = selectedReportCategory === cat.id;
-                return (
-                  <button
-                    key={cat.id}
-                    type="button"
-                    onClick={() => setSelectedReportCategory(cat.id)}
-                    className={`w-full p-3 rounded-2xl border text-left transition flex items-start justify-between gap-2 cursor-pointer ${
-                      isSelected
-                        ? 'bg-amber-50/90 border-amber-400 text-stone-900 shadow-2xs'
-                        : 'bg-stone-50/70 border-stone-200 hover:border-stone-300 text-stone-800'
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <div className="text-xs font-extrabold">
-                        {language === 'sw' ? cat.labelSw : cat.labelEn}
-                      </div>
-                      <div className="text-[11px] text-stone-500 mt-0.5">
-                        {language === 'sw' ? cat.descSw : cat.descEn}
-                      </div>
-                    </div>
-                    <div
-                      className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${
-                        isSelected ? 'bg-amber-500 border-amber-500 text-white' : 'border-stone-300 bg-white'
-                      }`}
-                    >
-                      {isSelected && <Check size={12} />}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div>
-              <label className="block text-xs font-bold text-stone-700 mb-1">
-                {language === 'sw' ? 'Maelezo ya ziada (Hiari)' : 'Additional details (Optional)'}
-              </label>
-              <textarea
-                rows={2}
-                value={reportExtraNote}
-                onChange={(e) => setReportExtraNote(e.target.value)}
-                placeholder={
-                  language === 'sw'
-                    ? 'Eleza kwa ufupi tatizo uliloliona...'
-                    : 'Briefly describe the issue...'
-                }
-                className="w-full p-2.5 rounded-xl bg-stone-50 border border-stone-200 text-xs text-stone-900 resize-none"
-              />
-            </div>
-
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setReportingPost(null)}
-                className="px-4 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-bold cursor-pointer"
-              >
-                {language === 'sw' ? 'Ghairi' : 'Cancel'}
-              </button>
-              <button
-                type="button"
-                disabled={isSubmittingReport}
-                onClick={async () => {
-                  const chosen =
-                    COMMUNITY_REPORT_CATEGORIES.find((c) => c.id === selectedReportCategory) ||
-                    COMMUNITY_REPORT_CATEGORIES[0];
-                  setIsSubmittingReport(true);
-                  try {
-                    await reportContent({
-                      targetType: 'post',
-                      targetId: reportingPost.id,
-                      targetAuthorId: reportingPost.authorId,
-                      targetSummary: reportingPost.authorName,
-                      reason: `${chosen.labelEn} / ${chosen.labelSw}${
-                        reportExtraNote.trim() ? `: ${reportExtraNote.trim()}` : ''
-                      }`
-                    });
-                    setPostNotice({
-                      type: 'success',
-                      text: language === 'sw' ? chosen.moderationNoticeSw : chosen.moderationNoticeEn
-                    });
-                    setTimeout(() => setPostNotice(null), 5000);
-                    setReportingPost(null);
-                  } finally {
-                    setIsSubmittingReport(false);
-                  }
-                }}
-                className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-extrabold cursor-pointer"
-              >
-                {isSubmittingReport
-                  ? language === 'sw'
-                    ? 'Inatuma...'
-                    : 'Submitting...'
-                  : language === 'sw'
-                  ? 'Tuma Ripoti'
-                  : 'Submit Report'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Layer 4 Report, Mute & Block Modal */}
+      <ReportContentModal
+        isOpen={Boolean(reportingPost)}
+        target={
+          reportingPost
+            ? {
+                targetType: reportingPost.mediaType === 'video' ? 'reel' : 'post',
+                targetId: reportingPost.id,
+                targetAuthorId: reportingPost.authorId,
+                targetAuthorName: reportingPost.authorName,
+                postId: reportingPost.id,
+                targetSummary: reportingPost.content || reportingPost.authorName
+              }
+            : null
+        }
+        currentUid={currentUser?.uid}
+        isAuthorBlocked={Boolean(reportingPost && blockedIds.includes(reportingPost.authorId))}
+        isAuthorMuted={Boolean(reportingPost && mutedIds.includes(reportingPost.authorId))}
+        onClose={() => setReportingPost(null)}
+        onReportSubmitted={(res) => {
+          setPostNotice({ type: 'success', text: res.message });
+          setTimeout(() => setPostNotice(null), 5000);
+        }}
+        onMuteChanged={(_, muted) => {
+          setPostNotice({
+            type: 'success',
+            text: muted ? 'User muted. Their posts will no longer appear in your feed.' : 'User unmuted.'
+          });
+          setTimeout(() => setPostNotice(null), 4000);
+        }}
+        onBlockChanged={(_, blocked) => {
+          setPostNotice({
+            type: 'success',
+            text: blocked ? 'User blocked.' : 'User unblocked.'
+          });
+          setTimeout(() => setPostNotice(null), 4000);
+        }}
+      />
 
       {/* Post Detail Reader Modal with Top Visual Reading Progress Bar */}
       {focusedPost && (
@@ -4585,8 +3580,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 />
                 <div>
                   <CrystalBadge
+                    userId={focusedPost.authorId}
                     email={focusedPost.authorEmail}
                     name={focusedPost.authorName}
+                    highlightedBadgeId={focusedPost.authorHighlightedBadgeId}
                     isBot={focusedPost.authorId === SUPPORT_BOT_ID}
                     size="md"
                   />
@@ -4596,7 +3593,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 </div>
               </div>
 
-              {focusedPost.content && (
+              {cleanCaption(focusedPost.content) && (
                 <PostBody
                   postId={focusedPost.id}
                   authorId={focusedPost.authorId}
@@ -4608,6 +3605,9 @@ export const FeedView: React.FC<FeedViewProps> = ({
                   onToggleSave={handleToggleSave}
                   onSaveContent={(newContent) => {
                     setFocusedPost((prev) => (prev ? { ...prev, content: newContent, isEdited: true } : null));
+                    setPosts((prev) =>
+                      prev.map((p) => (p.id === focusedPost.id ? { ...p, content: newContent, isEdited: true } : p))
+                    );
                   }}
                   className="mb-4"
                   textClassName="text-[#1C1917]"
@@ -4640,7 +3640,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                       setLightboxState({
                         images: imgs,
                         initialIndex: 0,
-                        caption: focusedPost.content,
+                        caption: cleanCaption(focusedPost.content),
                         authorName: focusedPost.authorName,
                         authorUsername: focusedPost.authorUsername,
                         authorPhotoURL: focusedPost.authorPhotoURL
@@ -4674,37 +3674,115 @@ export const FeedView: React.FC<FeedViewProps> = ({
                 />
               )}
 
-              {/* Action bar inside detail modal */}
-              <div className="flex items-center justify-between py-2 border-y border-stone-100 text-xs font-semibold text-slate-500">
-                <span className="text-xs text-stone-400 font-mono">
-                  {focusedPost.createdAt ? new Date(focusedPost.createdAt).toLocaleDateString() : ''}
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => handleDownloadPost(focusedPost)}
-                    className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 text-slate-700 transition active:scale-95"
-                    title="Download post image or text"
-                  >
-                    <Download size={14} />
-                    <span>Download</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSharePost(focusedPost)}
-                    className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 text-[#2563EB] font-bold transition active:scale-95"
-                    title="Share on WhatsApp or via Web Share"
-                  >
-                    <Share2 size={14} />
-                    <span>Share on WhatsApp</span>
-                  </button>
-                </div>
-              </div>
+              {/* Full Interactive Action Bar inside Detail Modal (Like, Comment, AI Info, Tip, Save, Share, Download) */}
+              {(() => {
+                const liveFocused = posts.find((p) => p.id === focusedPost.id) || focusedPost;
+                const rData = getReactionData(liveFocused);
+                const isLikedAny = rData.active.heart || rData.active.like || rData.active.fire;
+                const totalLikes = rData.counts.heart + rData.counts.like + rData.counts.fire;
+                const isSaved = (userProfile?.savedPostIds || []).includes(liveFocused.id);
+                const isAuthor = liveFocused.authorId === currentUser?.uid;
+                return (
+                  <div className="flex items-center justify-between py-2.5 border-y border-stone-100 text-xs font-semibold text-slate-600 flex-wrap gap-2">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleReaction(liveFocused, 'heart')}
+                        className={`flex items-center gap-1.5 py-1.5 px-3 rounded-xl font-bold transition active:scale-95 cursor-pointer ${
+                          isLikedAny
+                            ? 'bg-rose-50 text-rose-600 border border-rose-200'
+                            : 'hover:bg-slate-100 text-slate-700'
+                        }`}
+                      >
+                        <Heart size={14} className={isLikedAny ? 'fill-current' : ''} />
+                        <span className="font-mono">{totalLikes}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleSave(liveFocused.id)}
+                        className={`flex items-center gap-1.5 py-1.5 px-3 rounded-xl font-bold transition active:scale-95 cursor-pointer ${
+                          isSaved
+                            ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                            : 'hover:bg-slate-100 text-slate-700'
+                        }`}
+                      >
+                        <Bookmark size={14} className={isSaved ? 'fill-current' : ''} />
+                        <span>{isSaved ? 'Saved' : 'Save'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => void handleOpenAiInfo(liveFocused)}
+                        className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-blue-50 hover:bg-blue-100 text-[#2563EB] font-bold transition active:scale-95 cursor-pointer"
+                      >
+                        <Sparkles size={14} className="text-[#0D9488]" />
+                        <span>AI info</span>
+                      </button>
+
+                      {!isAuthor && (
+                        <button
+                          type="button"
+                          onClick={() => setTippingPost(liveFocused)}
+                          className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 font-bold transition active:scale-95 cursor-pointer"
+                        >
+                          <HandCoins size={14} />
+                          <span>Tip</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadPost(liveFocused)}
+                        className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 text-slate-700 transition active:scale-95 cursor-pointer"
+                        title="Download post image or text"
+                      >
+                        <Download size={14} />
+                        <span>Download</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSharePost(liveFocused)}
+                        className="flex items-center gap-1.5 py-1.5 px-3 rounded-xl hover:bg-slate-100 text-[#2563EB] font-bold transition active:scale-95 cursor-pointer"
+                        title="Share wave"
+                      >
+                        <Share2 size={14} />
+                        <span>Share</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div className="pt-4 border-t border-stone-100 space-y-3">
                 <h4 className="text-xs font-extrabold uppercase tracking-wider text-stone-500">
                   Replies ({(commentsMap[focusedPost.id] || []).length})
                 </h4>
+                {/* Reply input directly inside Post Detail Modal */}
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={commentInput[focusedPost.id] || ''}
+                    onChange={(e) =>
+                      setCommentInput((prev) => ({ ...prev, [focusedPost.id]: e.target.value }))
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') void handleAddComment(focusedPost.id);
+                    }}
+                    placeholder={language === 'sw' ? 'Andika maoni mazuri...' : 'Write a warm comment...'}
+                    className="flex-1 px-3.5 py-2 rounded-2xl bg-[#FAF7F2] border border-stone-200 text-xs text-[#1C1917] placeholder-[#78716C] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/30"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleAddComment(focusedPost.id)}
+                    disabled={!commentInput[focusedPost.id]?.trim()}
+                    className="p-2 rounded-xl bg-[#2563EB] hover:bg-blue-700 disabled:opacity-40 text-white transition cursor-pointer"
+                  >
+                    <Send size={14} />
+                  </button>
+                </div>
                 {(commentsMap[focusedPost.id] || []).length === 0 ? (
                   <p className="text-xs text-stone-400 italic">No replies yet on this wave.</p>
                 ) : (
@@ -4729,8 +3807,10 @@ export const FeedView: React.FC<FeedViewProps> = ({
                         <div className="flex-1">
                           <div className="flex items-center justify-between">
                             <CrystalBadge
+                              userId={comment.authorId}
                               email={comment.authorEmail}
                               name={comment.authorName}
+                              highlightedBadgeId={comment.authorHighlightedBadgeId}
                               size="sm"
                             />
                             <span className="text-[10px] text-[#78716C] font-mono">

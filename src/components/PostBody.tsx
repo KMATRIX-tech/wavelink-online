@@ -37,6 +37,8 @@ import { CrystalBadge } from './CrystalBadge';
 import { Avatar } from './Avatar';
 import { UserProfile } from '../types';
 import { toggleFollowUser } from '../services/notificationService';
+import { cleanCaption } from '../utils/cleanCaption';
+import { validateAndModerateText } from '../services/moderationService';
 
 export interface PostBodyProps {
   postId?: string;
@@ -132,8 +134,9 @@ export function formatRelativeTime(dateInput?: string | number | Date | null): s
  * Cleans markdown, expands hashtags and mentions, and simplifies URLs for pleasant listening.
  */
 export function prepareSpeechText(raw: string, author?: string): string {
-  if (!raw) return '';
-  let text = raw;
+  const sanitized = cleanCaption(raw);
+  if (!sanitized) return '';
+  let text = sanitized;
 
   // Simplify URLs into a clean spoken phrase (e.g. "link to wavelink.tz")
   text = text.replace(/(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi, (match) => {
@@ -357,12 +360,12 @@ export const PostBody: React.FC<PostBodyProps> = ({
   onStartChat
 }) => {
   const { currentUser, userProfile, toggleSavePost } = useAuth();
-  const [currentContent, setCurrentContent] = useState<string>(content || '');
+  const [currentContent, setCurrentContent] = useState<string>(() => cleanCaption(content));
   const [isEditedState, setIsEditedState] = useState<boolean>(Boolean(isEdited));
   const [isInternalEditing, setIsInternalEditing] = useState<boolean>(false);
   const isEditing = isEditingProp !== undefined ? isEditingProp : isInternalEditing;
 
-  const [editDraft, setEditDraft] = useState<string>(content || '');
+  const [editDraft, setEditDraft] = useState<string>(() => cleanCaption(content));
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState<boolean>(false);
@@ -388,11 +391,12 @@ export const PostBody: React.FC<PostBodyProps> = ({
 
   const instanceId = useId();
 
-  // Sync external content prop updates
+  // Sync external content prop updates (always sanitized via cleanCaption)
   useEffect(() => {
-    setCurrentContent(content || '');
+    const cleaned = cleanCaption(content);
+    setCurrentContent(cleaned);
     if (!isEditing) {
-      setEditDraft(content || '');
+      setEditDraft(cleaned);
     }
   }, [content, isEditing]);
 
@@ -584,10 +588,19 @@ export const PostBody: React.FC<PostBodyProps> = ({
     setIsSubmitting(true);
     setErrorMessage(null);
     try {
+      const modVerdict = await validateAndModerateText(clean, 'post', userProfile);
+      if (!modVerdict.allowed) {
+        setErrorMessage(modVerdict.friendlyMessage);
+        setIsSubmitting(false);
+        return;
+      }
+
       const postRef = doc(db, 'posts', postId);
       await updateDoc(postRef, {
         content: clean,
         isEdited: true,
+        moderationChecked: true,
+        moderationCheckedAt: modVerdict.moderationCheckedAt || new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
 
@@ -644,7 +657,8 @@ export const PostBody: React.FC<PostBodyProps> = ({
     handleStartEdit();
   };
 
-  if (!currentContent && !isEditing) return null;
+  const sanitizedDisplayContent = cleanCaption(currentContent);
+  if (!sanitizedDisplayContent && !isEditing) return null;
 
   const handleCopy = async (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
@@ -1230,7 +1244,7 @@ export const PostBody: React.FC<PostBodyProps> = ({
           </button>
         )}
 
-        {showTtsButton && isTtsSupported && (
+        {showTtsButton && isTtsSupported && Boolean(sanitizedDisplayContent) && (
           <button
             type="button"
             onClick={handleToggleTts}

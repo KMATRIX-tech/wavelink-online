@@ -32,6 +32,7 @@ import { Post, Spark, StoryHighlightItem, UserProfile } from '../types';
 import { CommentsSheet } from './CommentsSheet';
 import { ShareSheet } from './ShareSheet';
 import { Avatar } from './Avatar';
+import { cleanCaption } from '../utils/cleanCaption';
 import {
   compressImageForUpload,
   optimizeCloudinaryThumbnailUrl,
@@ -640,9 +641,9 @@ export const ProfilePostViewerModal: React.FC<ProfilePostViewerModalProps> = ({
               </div>
 
               {/* Post Text */}
-              {post.content && (
+              {cleanCaption(post.content) && (
                 <div className="px-4 pb-3 text-sm text-[var(--text-primary)] whitespace-pre-wrap leading-relaxed">
-                  {post.content}
+                  {cleanCaption(post.content)}
                 </div>
               )}
 

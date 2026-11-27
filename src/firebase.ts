@@ -66,17 +66,17 @@ export function formatCloudinaryUploadError(
     code = 'firestore/permission-denied';
     friendlyMessage = 'Profile save blocked by Firestore permissions. Please sign in again and tap Retry.';
   } else if (lower.includes('network') || lower.includes('failed to fetch')) {
-    code = 'cloudinary/network-error';
-    friendlyMessage = 'Network error while reaching Cloudinary. Check your internet connection and tap Retry.';
+    code = 'cloudflare/network-error';
+    friendlyMessage = 'Network error while uploading via Cloudflare. Check your internet connection and tap Retry.';
   } else if (lower.includes('timeout')) {
-    code = 'cloudinary/timeout';
+    code = 'cloudflare/timeout';
     friendlyMessage = 'Upload timed out on a slow connection. Tap Retry to try again.';
   } else if (lower.includes('preset') || lower.includes('unsigned')) {
-    code = 'cloudinary/preset-error';
-    friendlyMessage = `Cloudinary upload configuration error: ${rawMessage}`;
+    code = 'cloudflare/config-error';
+    friendlyMessage = `Cloudflare upload configuration error: ${rawMessage}`;
   }
 
-  console.error('[WaveLink Cloudinary Upload Error]', {
+  console.error('[WaveLink Cloudflare Upload Error]', {
     action: context?.action || 'upload',
     code,
     message: rawMessage,
@@ -292,8 +292,14 @@ export function getBestAuthUserPhotoUrl(
   const uid = user?.uid || (profile as any)?.id || (profile as any)?.uid || 'waver';
   const profilePhoto = typeof profile?.photoURL === 'string' ? profile.photoURL.trim() : '';
 
-  // 1. Custom uploaded Cloudinary avatar on profile takes top priority
-  if (isRealUserPhotoUrl(profilePhoto) && profilePhoto.includes('res.cloudinary.com')) {
+  // 1. Custom uploaded Cloudflare or Cloudinary avatar on profile takes top priority
+  if (
+    isRealUserPhotoUrl(profilePhoto) &&
+    (profilePhoto.includes('/api/cloudflare/media/') ||
+      profilePhoto.includes('imagedelivery.net') ||
+      profilePhoto.includes('r2.dev') ||
+      profilePhoto.includes('res.cloudinary.com'))
+  ) {
     recordDiscoveredUserAvatar(uid, profilePhoto, false);
     return profilePhoto;
   }
@@ -459,6 +465,13 @@ export function subscribeQuotaState(listener: (isExceeded: boolean, errorMsg: st
   return () => quotaListeners.delete(listener);
 }
 
+export const CLOUDFLARE_UPLOAD_URL: string =
+  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_CLOUDFLARE_UPLOAD_URL) ||
+  '/api/cloudflare/upload';
+export const CLOUDFLARE_PUBLIC_URL: string =
+  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_CLOUDFLARE_PUBLIC_URL) ||
+  '';
+
 export const CLOUDINARY_CLOUD_NAME = 'monarcking72';
 export const CLOUDINARY_UPLOAD_PRESET = 'monarcking72';
 export const CLOUDINARY_VIDEO_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/video/upload`;
@@ -520,11 +533,11 @@ export function formatVideoUploadError(
   }
 
   if (httpStatus === 413 || rawMessage.toLowerCase().includes('file size too large') || rawMessage.toLowerCase().includes('too large')) {
-    return 'File too big: this video exceeds the maximum file size allowed by Cloudinary (100 MB limit for unsigned uploads).';
+    return 'File too big: this video exceeds the maximum file size allowed (100 MB limit).';
   }
 
   if (httpStatus === 400 || httpStatus === 401 || httpStatus === 403) {
-    return `Cloudinary rejected the upload (HTTP ${httpStatus}): ${rawMessage || `Check that cloud name "${CLOUDINARY_CLOUD_NAME}" and unsigned upload preset "${CLOUDINARY_UPLOAD_PRESET}" are active.`}`;
+    return `Cloudflare upload rejected (HTTP ${httpStatus}): ${rawMessage || 'Please check your media file and try again.'}`;
   }
 
   if (
@@ -533,20 +546,20 @@ export function formatVideoUploadError(
     rawMessage.includes('No upload progress') ||
     rawMessage.toLowerCase().includes('network')
   ) {
-    return 'Network connection lost or timed out while uploading video to Cloudinary. Check your internet connection and tap Retry.';
+    return 'Network connection lost or timed out while uploading video via Cloudflare. Check your internet connection and tap Retry.';
   }
 
   if (
     rawMessage.includes('Missing or insufficient permissions') ||
     code === 'permission-denied'
   ) {
-    const limitSec = context?.maxAllowedSeconds || (context?.isProUser ? 90 : 60);
+    const limitSec = context?.maxAllowedSeconds || 90;
     return `Permission denied by Firestore rules when saving post (permission-denied). Ensure you are signed in and the video duration is within ${limitSec}s.`;
   }
 
   return rawMessage
     ? `Video upload failed: ${rawMessage}`
-    : 'Video upload to Cloudinary failed due to an unexpected error. Tap Retry to try again.';
+    : 'Video upload via Cloudflare failed due to an unexpected error. Tap Retry to try again.';
 }
 
 export const formatFirebaseStorageError = formatVideoUploadError;

@@ -8,6 +8,8 @@ import { CrystalBadge } from './CrystalBadge';
 import { PostBody } from './PostBody';
 import { triggerHaptic } from '../utils/haptics';
 import { Avatar } from './Avatar';
+import { UnifiedPostCard } from './UnifiedPostCard';
+import { cleanCaption } from '../utils/cleanCaption';
 import {
   X,
   User,
@@ -466,30 +468,37 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
                   {isLoadingUserPosts ? (
                     <div className="py-6 text-center text-xs text-slate-400">Loading recent waves...</div>
                   ) : userRecentPosts.length > 0 ? (
-                    <div className="space-y-2.5">
+                    <div className="grid grid-cols-2 gap-2.5">
                       {userRecentPosts.map((post) => (
-                        <div
+                        <UnifiedPostCard
                           key={post.id}
-                          onClick={() => {
+                          post={post}
+                          compact={true}
+                          aspectOverride="4:5"
+                          isLiked={Boolean(post.likes?.includes(currentUser?.uid || ''))}
+                          onOpenVideoInReels={(videoPost) => {
+                            const videoQueue = userRecentPosts.filter((p) =>
+                              Boolean(p.videoUrl || p.hasVideoChunks || p.mediaType === 'video')
+                            );
+                            onNavigateTab('videos');
+                            onClose();
+                            window.setTimeout(() => {
+                              window.dispatchEvent(
+                                new CustomEvent('wavelink:open-reels-queue', {
+                                  detail: {
+                                    startPost: videoPost,
+                                    queue: videoQueue.length > 0 ? videoQueue : [videoPost]
+                                  }
+                                })
+                              );
+                            }, 40);
+                          }}
+                          onOpenPostDetail={(target) => {
                             if (onSelectPreviewItem) {
-                              onSelectPreviewItem({ type: 'post', post });
+                              onSelectPreviewItem({ type: 'post', post: target });
                             }
                           }}
-                          className="p-3 rounded-2xl bg-slate-50 hover:bg-blue-50/50 border border-slate-100 hover:border-blue-200 transition cursor-pointer group"
-                        >
-                          <p className="text-xs text-slate-800 line-clamp-2 leading-relaxed font-medium">
-                            {post.content}
-                          </p>
-                          <div className="flex items-center justify-between text-[11px] text-slate-400 mt-2">
-                            <span className="flex items-center gap-1">
-                              <Heart size={11} className="text-rose-400" />
-                              {post.likesCount || 0} sparks
-                            </span>
-                            <span className="text-[#2563EB] font-bold group-hover:translate-x-0.5 transition-transform flex items-center gap-0.5">
-                              Preview Wave <ChevronRight size={12} />
-                            </span>
-                          </div>
-                        </div>
+                        />
                       ))}
                     </div>
                   ) : (
@@ -553,21 +562,23 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
                   </span>
                 </div>
 
-                {/* Formatted Post Body with Interactive Links & Web Speech API */}
-                <div className="bg-slate-50/70 p-4 rounded-2xl border border-slate-100">
-                  <PostBody
-                    postId={item.post.id}
-                    authorId={item.post.authorId}
-                    content={item.post.content}
-                    authorName={item.post.authorName}
-                    createdAt={item.post.createdAt}
-                    showCopyButton={true}
-                    showTtsButton={true}
-                    showBookmarkButton={true}
-                    showEditButton={false}
-                    className="text-sm sm:text-base leading-relaxed"
-                  />
-                </div>
+                {/* Formatted Post Body with Interactive Links & Web Speech API (hidden if caption is empty/auto-generated) */}
+                {cleanCaption(item.post.content) && (
+                  <div className="bg-slate-50/70 p-4 rounded-2xl border border-slate-100">
+                    <PostBody
+                      postId={item.post.id}
+                      authorId={item.post.authorId}
+                      content={item.post.content}
+                      authorName={item.post.authorName}
+                      createdAt={item.post.createdAt}
+                      showCopyButton={true}
+                      showTtsButton={true}
+                      showBookmarkButton={true}
+                      showEditButton={false}
+                      className="text-sm sm:text-base leading-relaxed"
+                    />
+                  </div>
+                )}
 
                 {/* Media Preview */}
                 {item.post.imageUrl && (
@@ -698,36 +709,37 @@ export const QuickSearchPreviewDrawer: React.FC<QuickSearchPreviewDrawerProps> =
                       Searching waves tagged with {item.tag}...
                     </div>
                   ) : tagRecentPosts.length > 0 ? (
-                    <div className="space-y-3">
+                    <div className="grid grid-cols-2 gap-2.5">
                       {tagRecentPosts.map((post) => (
-                        <div
+                        <UnifiedPostCard
                           key={post.id}
-                          onClick={() => {
+                          post={post}
+                          compact={true}
+                          aspectOverride="4:5"
+                          isLiked={Boolean(post.likes?.includes(currentUser?.uid || ''))}
+                          onOpenVideoInReels={(videoPost) => {
+                            const videoQueue = tagRecentPosts.filter((p) =>
+                              Boolean(p.videoUrl || p.hasVideoChunks || p.mediaType === 'video')
+                            );
+                            onNavigateTab('videos');
+                            onClose();
+                            window.setTimeout(() => {
+                              window.dispatchEvent(
+                                new CustomEvent('wavelink:open-reels-queue', {
+                                  detail: {
+                                    startPost: videoPost,
+                                    queue: videoQueue.length > 0 ? videoQueue : [videoPost]
+                                  }
+                                })
+                              );
+                            }, 40);
+                          }}
+                          onOpenPostDetail={(target) => {
                             if (onSelectPreviewItem) {
-                              onSelectPreviewItem({ type: 'post', post });
+                              onSelectPreviewItem({ type: 'post', post: target });
                             }
                           }}
-                          className="p-3.5 rounded-2xl bg-slate-50 hover:bg-blue-50/50 border border-slate-100 hover:border-blue-200 transition cursor-pointer group"
-                        >
-                          <div className="flex items-center justify-between text-xs font-bold text-slate-700 mb-1">
-                            <span className="truncate">{post.authorName || 'Waver'}</span>
-                            <span className="text-[10px] text-slate-400 font-normal">
-                              {post.mediaType === 'video' ? 'Reel' : 'Wave'}
-                            </span>
-                          </div>
-                          <p className="text-xs text-slate-800 line-clamp-2 leading-relaxed">
-                            {post.content}
-                          </p>
-                          <div className="flex items-center justify-between text-[11px] text-slate-400 mt-2">
-                            <span className="flex items-center gap-1">
-                              <Heart size={11} className="text-rose-400" />
-                              {post.likesCount || 0}
-                            </span>
-                            <span className="text-[#2563EB] font-bold group-hover:translate-x-0.5 transition-transform flex items-center gap-0.5">
-                              Preview Wave <ChevronRight size={12} />
-                            </span>
-                          </div>
-                        </div>
+                        />
                       ))}
                     </div>
                   ) : (

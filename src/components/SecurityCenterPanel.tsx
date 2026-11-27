@@ -1561,7 +1561,7 @@ export const SecurityCenterPanel: React.FC<SecurityCenterPanelProps> = ({
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-1.5">
             <label className="text-xs font-extrabold text-[#1C1917] block">
-              {language === 'sw' ? 'Ujumbe' : 'Messages'}
+              {language === 'sw' ? 'Nani anaweza kunitumia ujumbe' : 'Who can message me'}
             </label>
             <select
               value={currentPrivacy.allowDirectMessages}
@@ -1572,8 +1572,8 @@ export const SecurityCenterPanel: React.FC<SecurityCenterPanelProps> = ({
               }
               className="w-full min-h-[2.75rem] px-2.5 py-2 rounded-xl bg-white border border-[var(--border-hairline)] text-xs font-bold text-[#1C1917]"
             >
-              <option value="everyone">Everyone</option>
-              <option value="followers">Followers</option>
+              <option value="everyone">Everyone (strangers go to Requests)</option>
+              <option value="followers">Only people I follow / friends</option>
               <option value="none">No one</option>
             </select>
           </div>

@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
-import { ShieldCheck, FileText, RefreshCw, X, HelpCircle, CheckCircle2, Waves, Lock } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { ShieldCheck, FileText, RefreshCw, X, HelpCircle, CheckCircle2, Waves, Lock, HeartHandshake } from 'lucide-react';
 
-export type LegalDocType = 'privacy' | 'terms' | 'refund' | 'security';
+export type LegalDocType = 'guidelines' | 'privacy' | 'terms' | 'refund' | 'security';
 
 interface LegalModalProps {
   isOpen: boolean;
@@ -15,6 +15,10 @@ export const LegalModal: React.FC<LegalModalProps> = ({
   onClose
 }) => {
   const [activeDoc, setActiveDoc] = useState<LegalDocType>(initialDoc);
+
+  useEffect(() => {
+    setActiveDoc(initialDoc);
+  }, [initialDoc]);
 
   if (!isOpen) return null;
 
@@ -42,6 +46,17 @@ export const LegalModal: React.FC<LegalModalProps> = ({
 
         {/* Tab Navigation */}
         <div className="flex border-b border-[var(--border-subtle)] bg-[#FAF7F2]/60 px-4 pt-2 gap-2 overflow-x-auto scrollbar-none">
+          <button
+            onClick={() => setActiveDoc('guidelines')}
+            className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-bold flex items-center gap-2 border-b-2 transition whitespace-nowrap ${
+              activeDoc === 'guidelines'
+                ? 'border-[#0D9488] text-[#0D9488] bg-[#0D9488]/5'
+                : 'border-transparent text-[#57534E] hover:text-[#1C1917]'
+            }`}
+          >
+            <HeartHandshake size={15} />
+            <span>Community Guidelines</span>
+          </button>
           <button
             onClick={() => setActiveDoc('privacy')}
             className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-bold flex items-center gap-2 border-b-2 transition whitespace-nowrap ${
@@ -90,6 +105,55 @@ export const LegalModal: React.FC<LegalModalProps> = ({
 
         {/* Scrollable Document Content */}
         <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4 text-xs sm:text-sm text-[#57534E] leading-relaxed bg-white">
+          {activeDoc === 'guidelines' && (
+            <div className="space-y-4">
+              <div className="p-3.5 rounded-2xl bg-[#F0FDFA] border border-[#0D9488]/25 text-[#0F766E] text-xs font-medium flex items-center gap-2.5">
+                <HeartHandshake size={16} className="text-[#0D9488] shrink-0" />
+                <span>WaveLink is built to be respectful, creative, and safe for every age across every language.</span>
+              </div>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  1. Zero Tolerance for Abuse, Hate, Sexual Content &amp; Profanity
+                </h3>
+                <p>
+                  Abusive language, hate speech, slurs, harassment, threats, sexual/explicit content, scams, and severe profanity are not allowed anywhere on WaveLink — including posts, comments, replies, chat messages, group names, usernames, bios, hashtags, Sparks, and challenge entries, in any language.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  2. Four-Layer Safety Protection
+                </h3>
+                <p>
+                  Because no single automated filter is perfect, WaveLink combines four layers: (1) instant on-device multilingual filtering, (2) server-side verification and AI review for borderline text, (3) one-time image and video thumbnail safety screening at upload, and (4) community reporting, blocking, muting, and human moderator review.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  3. Sensitive Content &amp; Teen Safety (Under 18)
+                </h3>
+                <p>
+                  Explicit or unsafe media is blocked at upload. Borderline media is blurred behind a &ldquo;Sensitive content &mdash; tap to view&rdquo; screen when your Sensitive Content Filter is ON (default). For accounts marked under 18, the Sensitive Content Filter stays permanently locked ON and borderline media is hidden completely.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className="font-extrabold text-[#1C1917] text-sm sm:text-base flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-[#0D9488]" />
+                  4. Community Reports, Strikes &amp; Fair Appeals
+                </h3>
+                <p>
+                  Any post, comment, message, or profile can be reported in one tap (Abuse, Sexual, Hate, Spam, or Other). Content reported by 3 different members is automatically hidden pending review. Confirmed violations follow a clear strikes ladder: <strong>Strike 1: Warning</strong> &rarr; <strong>Strike 2: 24-hour Mute</strong> &rarr; <strong>Strike 3: 7-day Suspension</strong> &rarr; <strong>Strike 4: Permanent Ban</strong>. If you believe a decision was a mistake, you can submit a short appeal directly in the app for moderator review.
+                </p>
+              </section>
+            </div>
+          )}
+
           {activeDoc === 'privacy' && (
             <div className="space-y-4">
               <div className="p-3.5 rounded-2xl bg-[#EEF2FF] border border-[#2563EB]/20 text-[#1E40AF] text-xs font-medium flex items-center gap-2.5">
@@ -348,6 +412,13 @@ export const LegalFooter: React.FC<{ className?: string }> = ({ className = '' }
           </div>
 
           <div className="flex items-center gap-4 flex-wrap justify-center font-medium">
+            <button
+              onClick={() => openDoc('guidelines')}
+              className="hover:text-[#2563EB] transition hover:underline"
+            >
+              Community Guidelines
+            </button>
+            <span>•</span>
             <button
               onClick={() => openDoc('privacy')}
               className="hover:text-[#2563EB] transition hover:underline"

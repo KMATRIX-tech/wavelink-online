@@ -19,6 +19,7 @@ import {
   resolveVideoUrl,
   deleteSparkAndStorageFile
 } from '../utils/mediaStorage';
+import { validateAndModerateText } from '../services/moderationService';
 
 interface SparkViewerModalProps {
   sparks: Spark[];
@@ -510,6 +511,13 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
     if (!cleanText || isSendingReply) return;
 
     setIsSendingReply(true);
+    const modCheck = await validateAndModerateText(cleanText, 'message', userProfile);
+    if (!modCheck.allowed) {
+      showGlobalToast(modCheck.friendlyMessage || "This message includes language that isn't allowed on WaveLink");
+      setIsSendingReply(false);
+      return;
+    }
+
     const senderName = userProfile?.displayName || currentUser.displayName || 'Waver';
     const senderAvatar =
       userProfile?.photoURL ||
@@ -564,6 +572,8 @@ export const SparkViewerModal: React.FC<SparkViewerModalProps> = ({
           senderPhotoURL: senderAvatar,
           recipientId: currentSpark.authorId,
           text: replyMsgText,
+          moderationChecked: true,
+          moderationCheckedAt: nowIso,
           createdAt: nowIso
         }).catch(() => {});
 

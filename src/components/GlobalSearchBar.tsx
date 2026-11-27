@@ -24,6 +24,9 @@ import { CrystalBadge } from './CrystalBadge';
 import { QuickSearchPreviewDrawer, QuickPreviewItem } from './QuickSearchPreviewDrawer';
 import { Avatar } from './Avatar';
 import { triggerHaptic } from '../utils/haptics';
+import { UnifiedPostCard } from './UnifiedPostCard';
+import { cleanCaption } from '../utils/cleanCaption';
+import { shouldHideTeenFromSearch } from '../services/parentalService';
 
 interface GlobalSearchBarProps {
   onNavigateTab: (tab: ActiveTab) => void;
@@ -48,7 +51,7 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
   onSelectHashtag,
   className = ''
 }) => {
-  const { currentUser } = useAuth();
+  const { currentUser, userProfile, isAdmin } = useAuth();
   const [searchTerm, setSearchTerm] = useState('');
   const [isOpen, setIsOpen] = useState(false);
   const [activeCategory, setActiveCategory] = useState<'all' | 'users' | 'posts' | 'hashtags'>('all');
@@ -152,19 +155,28 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
   const cleanQuery = searchTerm.trim().toLowerCase();
 
   const matchedUsers = cleanQuery
-    ? allUsers.filter(
-        (u) =>
+    ? allUsers.filter((u) => {
+        const isConnected =
+          (userProfile?.followingIds || []).includes(u.id) ||
+          (u.followingIds || []).includes(currentUser?.uid || '');
+        if (shouldHideTeenFromSearch(u, userProfile, isConnected, isAdmin)) {
+          return false;
+        }
+        return (
           (u.displayName || '').toLowerCase().includes(cleanQuery) ||
           (u.username || '').toLowerCase().includes(cleanQuery) ||
           (u.email || '').toLowerCase().includes(cleanQuery) ||
           (u.bio || '').toLowerCase().includes(cleanQuery)
-      )
+        );
+      })
     : [];
 
   const matchedPosts = cleanQuery
     ? allPosts.filter(
         (p) =>
-          (p.content || '').toLowerCase().includes(cleanQuery) ||
+          cleanCaption(p.content).toLowerCase().includes(cleanQuery) ||
+          (p.category || '').toLowerCase().includes(cleanQuery) ||
+          (p.keywords || []).some((kw) => kw.toLowerCase().includes(cleanQuery)) ||
           (p.authorName || '').toLowerCase().includes(cleanQuery) ||
           (p.authorUsername || '').toLowerCase().includes(cleanQuery)
       )
@@ -439,9 +451,9 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
                 </div>
               )}
 
-              {/* 2. Posts Section */}
+              {/* 2. Posts Section — Unified clean cards */}
               {(activeCategory === 'all' || activeCategory === 'posts') && matchedPosts.length > 0 && (
-                <div className="space-y-1 pt-1 border-t border-slate-100">
+                <div className="space-y-2 pt-1.5 border-t border-slate-100">
                   <div className="px-2 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
                     <span>Waves &amp; Reels ({matchedPosts.length})</span>
                     <button
@@ -452,45 +464,35 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
                       Feed
                     </button>
                   </div>
-                  {matchedPosts.slice(0, 4).map((post) => (
-                    <div
-                      key={post.id}
-                      onClick={() => handleOpenPreview({ type: 'post', post })}
-                      className="p-2 rounded-xl hover:bg-slate-50 transition cursor-pointer flex items-center justify-between gap-3 group"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 mb-0.5">
-                          <span className="font-bold text-xs text-[#2563EB] truncate">
-                            {post.authorName || 'Waver'}
-                          </span>
-                          {post.mediaType === 'video' ? (
-                            <span className="px-1.5 py-0.2 rounded text-[9px] bg-blue-50 text-[#2563EB] font-bold flex items-center gap-0.5">
-                              <Film size={9} />
-                              Reel
-                            </span>
-                          ) : post.imageUrl ? (
-                            <span className="px-1.5 py-0.2 rounded text-[9px] bg-emerald-50 text-emerald-700 font-bold flex items-center gap-0.5">
-                              <ImageIcon size={9} />
-                              Photo
-                            </span>
-                          ) : null}
-                        </div>
-                        <p className="text-xs text-[#0F172A] line-clamp-1 break-words">
-                          {post.content}
-                        </p>
-                      </div>
-
-                      <div className="flex items-center gap-2 text-slate-400 text-[11px] shrink-0">
-                        <span className="flex items-center gap-0.5">
-                          <Heart size={11} className="text-rose-400" />
-                          {post.likesCount || 0}
-                        </span>
-                        <div className="p-1 rounded-md text-slate-400 group-hover:text-blue-600 group-hover:bg-blue-50 transition">
-                          <Eye size={13} />
-                        </div>
-                      </div>
-                    </div>
-                  ))}
+                  <div className="grid grid-cols-2 gap-2 px-1">
+                    {matchedPosts.slice(0, 4).map((post) => (
+                      <UnifiedPostCard
+                        key={post.id}
+                        post={post}
+                        compact={true}
+                        aspectOverride="4:5"
+                        isLiked={Boolean(post.likes?.includes(currentUser?.uid || ''))}
+                        onOpenVideoInReels={(videoPost) => {
+                          const videoQueue = matchedPosts.filter((p) =>
+                            Boolean(p.videoUrl || p.hasVideoChunks || p.mediaType === 'video')
+                          );
+                          setIsOpen(false);
+                          onNavigateTab('videos');
+                          window.setTimeout(() => {
+                            window.dispatchEvent(
+                              new CustomEvent('wavelink:open-reels-queue', {
+                                detail: {
+                                  startPost: videoPost,
+                                  queue: videoQueue.length > 0 ? videoQueue : [videoPost]
+                                }
+                              })
+                            );
+                          }, 40);
+                        }}
+                        onOpenPostDetail={(target) => handleOpenPreview({ type: 'post', post: target })}
+                      />
+                    ))}
+                  </div>
                 </div>
               )}
 

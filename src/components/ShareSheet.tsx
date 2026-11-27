@@ -33,6 +33,7 @@ import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
 import { COMMUNITY_REPORT_CATEGORIES } from '../utils/africanCultureConfig';
 import { sendNotification } from '../services/notificationService';
+import { cleanCaption } from '../utils/cleanCaption';
 import { Avatar } from './Avatar';
 import { useBottomSheetLock } from '../utils/sheetLock';
 import {
@@ -330,7 +331,8 @@ export const ShareSheet: React.FC<ShareSheetProps> = ({
         userProfile?.photoURL || currentUser.photoURL,
         currentUser.uid
       );
-      const snippet = post.content ? post.content.trim().slice(0, 80) : 'Check out this wave!';
+      const cleaned = cleanCaption(post.content);
+      const snippet = cleaned ? cleaned.slice(0, 80) : 'Check out this wave!';
       const messageText = `🌊 Shared a wave by @${post.authorName}:\n"${snippet}"\n${shareUrl}`;
       const nowIso = new Date().toISOString();
 

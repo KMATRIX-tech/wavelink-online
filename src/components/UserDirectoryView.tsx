@@ -21,6 +21,11 @@ import { toggleFollowUser } from '../services/notificationService';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { Avatar } from './Avatar';
 import { usePresence } from '../context/PresenceContext';
+import {
+  shouldHideTeenFromSearch,
+  getTeenRestrictionState,
+  submitTeenFollowRequest
+} from '../services/parentalService';
 
 const DirectoryPresenceBadge: React.FC<{ user: UserProfile }> = ({ user }) => {
   const presence = usePresence(user.id, user);
@@ -48,7 +53,7 @@ interface UserDirectoryViewProps {
 }
 
 export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartChat }) => {
-  const { currentUser, canTalkToAdmin, isSuperAdmin, isSubAdmin } = useAuth();
+  const { currentUser, userProfile, canTalkToAdmin, isSuperAdmin, isSubAdmin } = useAuth();
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoading, setIsLoading] = useState(true);
@@ -69,6 +74,19 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
 
   const handleToggleFollow = async (targetUser: UserProfile) => {
     if (!currentUser) return;
+    const alreadyFollowing = Boolean(followingMap[targetUser.id]);
+    const targetTeen = getTeenRestrictionState(targetUser);
+    if (!alreadyFollowing && targetTeen.isTeen && targetTeen.requireFollowerApproval) {
+      const reqRes = await submitTeenFollowRequest(targetUser.id);
+      setSuccessNotice(
+        reqRes.success
+          ? `Follow request sent for ${targetUser.displayName}'s parent approval.`
+          : reqRes.error || 'Could not send follow request.'
+      );
+      setTimeout(() => setSuccessNotice(null), 4000);
+      return;
+    }
+
     const isNowFollowing = await toggleFollowUser(
       currentUser.uid,
       currentUser.displayName || 'A waver',
@@ -136,6 +154,13 @@ export const UserDirectoryView: React.FC<UserDirectoryViewProps> = ({ onStartCha
   }, [currentUser?.uid]);
 
   const filteredUsers = users.filter((u) => {
+    const isConnected =
+      Boolean(followingMap[u.id]) ||
+      (userProfile?.followingIds || []).includes(u.id) ||
+      (u.followingIds || []).includes(currentUser?.uid || '');
+    if (shouldHideTeenFromSearch(u, userProfile, isConnected, isSuperAdmin || isSubAdmin)) {
+      return false;
+    }
     const matchesSearch =
       (u.displayName || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       (u.email || '').toLowerCase().includes(searchTerm.toLowerCase()) ||

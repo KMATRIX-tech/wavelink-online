@@ -20,6 +20,20 @@ import { sendNotification } from '../services/notificationService';
 import { INTEREST_CATALOG } from './InterestPickerModal';
 import { QuotaExceededBanner } from './QuotaExceededBanner';
 import { Avatar } from './Avatar';
+import { UnifiedPostCard } from './UnifiedPostCard';
+import { cleanCaption } from '../utils/cleanCaption';
+import { isExcludedFromPublicLeaderboards } from '../config/progressionConfig';
+import { awardProgressionAction } from '../services/progressionService';
+import { validateAndModerateText } from '../services/moderationService';
+import { ActiveChallengeBanner } from './ActiveChallengeBanner';
+import { WinnersWallView } from './WinnersWallView';
+import {
+  fetchChallengesCached,
+  getActiveChallengeFromList,
+  isChallengeExpired,
+  resolveUnifiedBadge,
+} from '../services/challengesService';
+import { BadgeIconGlyph } from './BadgeIconGlyph';
 import {
   AFRICAN_COUNTRIES,
   DEFAULT_CREATOR_SPOTLIGHT,
@@ -50,6 +64,8 @@ import {
 interface TrendingChallengesViewProps {
   onSelectHashtag?: (hashtag: string) => void;
   onJoinChallengeWithTag?: (hashtag: string) => void;
+  onJoinChallenge?: (challenge: CreatorChallenge) => void;
+  onViewProfile?: (userId: string) => void;
   onOpenAdminPanel?: () => void;
 }
 
@@ -151,6 +167,8 @@ export function computeAntiSpamPostScore(post: Post): {
 export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
   onSelectHashtag,
   onJoinChallengeWithTag,
+  onJoinChallenge,
+  onViewProfile,
   onOpenAdminPanel
 }) => {
   const { currentUser, userProfile, isAdmin, showGlobalToast } = useAuth();
@@ -161,6 +179,7 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
   const [usersMap, setUsersMap] = useState<Record<string, UserProfile>>({});
   const [remindedChallengeIds, setRemindedChallengeIds] = useState<string[]>([]);
   const [isAwardingWinner, setIsAwardingWinner] = useState(false);
+  const [winnersWallChallenge, setWinnersWallChallenge] = useState<CreatorChallenge | null>(null);
 
   // Admin quick challenge creation modal state
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -207,8 +226,7 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
     try {
       // 1. Posts query: bounded to 35 most recent posts
       const qPosts = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(35));
-      // 2. Challenges query: bounded to 8 challenges
-      const qChallenges = query(collection(db, 'challenges'), orderBy('createdAt', 'desc'), limit(8));
+      // 2. Challenges via shared 5-min cache (zero duplicate Firestore reads across Explore & Challenges)
       // 3. Users query: bounded to 30 active creators
       const qUsers = query(collection(db, 'users'), limit(30));
       // 4. Spotlight document
@@ -216,9 +234,9 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
       // 5. Events query: bounded to 6 announcements
       const qEvents = query(collection(db, 'announcements'), orderBy('createdAt', 'desc'), limit(6));
 
-      const [postsSnap, challengesSnap, usersSnap, spotlightSnap, eventsSnap] = await Promise.allSettled([
+      const [postsSnap, cachedChallenges, usersSnap, spotlightSnap, eventsSnap] = await Promise.allSettled([
         getDocs(qPosts),
-        getDocs(qChallenges),
+        fetchChallengesCached(isRefresh),
         getDocs(qUsers),
         getDoc(docSpotlightRef),
         getDocs(qEvents)
@@ -232,11 +250,9 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
         handleFirestoreError(postsSnap.reason, OperationType.LIST, 'posts');
       }
 
-      if (challengesSnap.status === 'fulfilled') {
-        const list: CreatorChallenge[] = [];
-        challengesSnap.value.forEach((d) => {
-          const data = { id: d.id, ...d.data() } as CreatorChallenge;
-          list.push(data);
+      if (cachedChallenges.status === 'fulfilled') {
+        const list = cachedChallenges.value;
+        list.forEach((data) => {
           if (data.winnerUserId && data.winnerBadgeUntil) {
             registerActiveWeeklyWinner(data.winnerUserId, data.winnerBadgeUntil);
           }
@@ -244,8 +260,6 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
         if (list.length > 0) {
           setChallenges(list);
         }
-      } else {
-        handleFirestoreError(challengesSnap.reason, OperationType.LIST, 'challenges');
       }
 
       if (usersSnap.status === 'fulfilled') {
@@ -394,6 +408,9 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
       const postScore = uniqueReactions * 2 + verifiedShares * 3 + 2;
 
       const profile = usersMap[p.authorId];
+      // Teen Wellbeing Rule: never show under-18 / teen accounts on public leaderboards to strangers
+      if (profile && isExcludedFromPublicLeaderboards(profile)) return;
+
       const existing = creatorScores.get(p.authorId) || {
         userId: p.authorId,
         name: profile?.displayName || p.authorName || 'Creator',
@@ -538,6 +555,15 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
 
       registerActiveWeeklyWinner(leader.userId, nextWeekIso);
 
+      // Award server-verified Challenge Win XP & badge on winner's profile
+      awardProgressionAction('challenge_won', {
+        targetUserId: leader.userId,
+        challengeId: activeChallenge.id,
+        challengeTitle: activeChallenge.theme,
+        challengeHashtag: activeChallenge.hashtag,
+        placement: 1
+      }).catch(() => {});
+
       await sendNotification({
         recipientId: leader.userId,
         actorId: currentUser.uid,
@@ -565,6 +591,12 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
   const handleCreateChallengeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isAdmin || !currentUser || !newTheme.trim() || !newHashtag.trim()) return;
+    const challengeText = `${newTheme.trim()} ${newHashtag.trim()} ${newDesc.trim()}`.trim();
+    const modVerdict = await validateAndModerateText(challengeText, 'challenge', userProfile);
+    if (!modVerdict.allowed) {
+      showGlobalToast(modVerdict.friendlyMessage);
+      return;
+    }
     setIsSavingChallenge(true);
     try {
       const cleanTag = newHashtag.trim().startsWith('#')
@@ -691,7 +723,7 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
 
       <div className="flex items-center justify-between px-1">
         <span className="text-xs font-bold text-stone-500">
-          {language === 'sw' ? 'Matokeo na Takwimu za Wiki' : 'Weekly Trends & Live Leaderboard'}
+          {language === 'sw' ? 'Matokeo na Takwimu za Wiki' : 'Weekly Challenges & Live Trends'}
         </span>
         <button
           type="button"
@@ -703,6 +735,111 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
           <span>{isRefreshing ? (language === 'sw' ? 'Inapakia...' : 'Refreshing...') : (language === 'sw' ? 'Sasisha Data' : 'Refresh Data')}</span>
         </button>
       </div>
+
+      {/* Active Weekly Challenge Banner at top of Challenges section */}
+      {(() => {
+        const currentActive = getActiveChallengeFromList(challenges);
+        const pastChallenges = challenges.filter((c) => c.id !== currentActive?.id && (c.status === 'completed' || isChallengeExpired(c)));
+        return (
+          <div className="space-y-4">
+            {currentActive && (
+              <ActiveChallengeBanner
+                challenge={currentActive}
+                onJoinWithPost={(ch) => {
+                  if (onJoinChallenge) {
+                    onJoinChallenge(ch);
+                  } else if (onJoinChallengeWithTag) {
+                    onJoinChallengeWithTag(ch.hashtag);
+                  }
+                }}
+                onOpenWinnersWall={(ch) => setWinnersWallChallenge(ch)}
+              />
+            )}
+
+            {/* Past Challenges & Winners Wall Cards */}
+            {pastChallenges.length > 0 && (
+              <div
+                className="rounded-3xl border p-4 sm:p-5 space-y-3"
+                style={{
+                  backgroundColor: 'var(--bg-surface, #ffffff)',
+                  borderColor: 'var(--border-subtle, rgba(0,0,0,0.08))',
+                  color: 'var(--text-primary, #1c1917)',
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Trophy size={16} className="text-amber-500 shrink-0" />
+                    <h3 className="text-sm sm:text-base font-extrabold">
+                      {language === 'sw' ? 'Mashindano Yaliyopita & Washindi' : 'Past Challenges & Winners'}
+                    </h3>
+                  </div>
+                  {isAdmin && onOpenAdminPanel && (
+                    <button
+                      type="button"
+                      onClick={onOpenAdminPanel}
+                      className="min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-bold border"
+                      style={{
+                        backgroundColor: 'var(--bg-subtle, rgba(0,0,0,0.04))',
+                        borderColor: 'var(--border-subtle, rgba(0,0,0,0.1))',
+                      }}
+                    >
+                      Manage
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {pastChallenges.slice(0, 6).map((ch) => {
+                    const topWinners = ch.winners?.length
+                      ? ch.winners
+                      : ch.winnerName
+                      ? [{ uid: ch.winnerUserId || '', displayName: ch.winnerName, placement: 1, awardedAt: ch.winnerAwardedAt || ch.createdAt }]
+                      : [];
+                    const prizeBadge = resolveUnifiedBadge(ch.badgeId);
+                    return (
+                      <div
+                        key={ch.id}
+                        className="rounded-2xl border p-3.5 flex flex-col justify-between gap-3"
+                        style={{
+                          backgroundColor: 'var(--bg-subtle, rgba(0,0,0,0.03))',
+                          borderColor: 'var(--border-subtle, rgba(0,0,0,0.08))',
+                        }}
+                      >
+                        <div className="space-y-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-bold opacity-75 truncate">{ch.hashtag}</span>
+                            {prizeBadge && <BadgeIconGlyph badge={prizeBadge} size="xs" />}
+                          </div>
+                          <h4 className="font-extrabold text-sm truncate">{ch.title || ch.theme}</h4>
+                          {topWinners.length > 0 ? (
+                            <p className="text-xs opacity-80 truncate">
+                              🏆 {topWinners.map((w) => w.displayName).join(', ')}
+                            </p>
+                          ) : (
+                            <p className="text-xs opacity-60">Winners coming soon</p>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setWinnersWallChallenge(ch)}
+                          className="min-h-[40px] w-full px-3 py-2 rounded-xl text-xs font-bold border inline-flex items-center justify-center gap-1.5"
+                          style={{
+                            backgroundColor: 'var(--bg-surface, rgba(255,255,255,0.08))',
+                            borderColor: 'var(--border-subtle, rgba(0,0,0,0.12))',
+                          }}
+                        >
+                          <Trophy size={13} className="text-amber-500" />
+                          <span>Winners Wall</span>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* 0. Creator Spotlight of the Week (Chosen by Admin) + Subtle Kitenge Border */}
       <div className="bg-white border border-stone-200/90 rounded-3xl overflow-hidden shadow-xs">
@@ -1136,68 +1273,33 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {fastestGrowingPosts.map(({ post, metrics, growthScore }, idx) => (
-            <div
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {fastestGrowingPosts.map(({ post }, idx) => (
+            <UnifiedPostCard
               key={post.id}
-              className="p-4 rounded-2xl bg-stone-50/80 border border-stone-200/80 flex flex-col justify-between gap-3 hover:border-blue-300 transition"
-            >
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <Avatar
-                      uid={post.authorId}
-                      src={
-                        post.authorPhotoURL ||
-                        `https://api.dicebear.com/7.x/shapes/svg?seed=${post.authorId}`
+              post={post}
+              aspectOverride="4:5"
+              badgeLabel={`#${idx + 1}`}
+              isLiked={Boolean(post.likes?.includes(currentUser?.uid || ''))}
+              onOpenVideoInReels={(videoPost) => {
+                const videoQueue = fastestGrowingPosts
+                  .map((entry) => entry.post)
+                  .filter((p) => Boolean(p.videoUrl || p.hasVideoChunks || p.mediaType === 'video'));
+                window.dispatchEvent(new CustomEvent('wavelink:navigate-tab', { detail: 'videos' }));
+                window.setTimeout(() => {
+                  window.dispatchEvent(
+                    new CustomEvent('wavelink:open-reels-queue', {
+                      detail: {
+                        startPost: videoPost,
+                        queue: videoQueue.length > 0 ? videoQueue : [videoPost]
                       }
-                      alt={post.authorName}
-                      fallbackName={post.authorName}
-                      size={32}
-                      showStatus={true}
-                    />
-                    <div className="min-w-0">
-                      <CrystalBadge
-                        userId={post.authorId}
-                        email={post.authorEmail}
-                        name={post.authorName}
-                        size="sm"
-                      />
-                    </div>
-                  </div>
-                  <span className="px-2.5 py-0.5 rounded-full bg-orange-50 text-orange-700 border border-orange-200 text-[11px] font-extrabold shrink-0">
-                    #{idx + 1} • +{growthScore}
-                  </span>
-                </div>
-
-                <p className="text-xs sm:text-sm text-stone-800 line-clamp-3 leading-relaxed">
-                  {post.content || (language === 'sw' ? 'Chapisho la picha/video' : 'Media wave post')}
-                </p>
-              </div>
-
-              <div className="pt-2 border-t border-stone-200/60 flex items-center justify-between text-xs text-stone-600">
-                <div className="flex items-center gap-3 font-semibold">
-                  <span className="inline-flex items-center gap-1 text-rose-600">
-                    <Heart size={13} /> {metrics.uniqueReactions}
-                  </span>
-                  <span className="inline-flex items-center gap-1 text-blue-600">
-                    <MessageCircle size={13} /> {post.commentsCount || 0}
-                  </span>
-                  <span className="inline-flex items-center gap-1 text-teal-600">
-                    <Share2 size={13} /> {metrics.verifiedShares}
-                  </span>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => handleSharePost(post)}
-                  className="px-3 py-1.5 rounded-xl bg-white hover:bg-blue-50 text-[#2563EB] border border-stone-200 text-xs font-bold inline-flex items-center gap-1.5 transition cursor-pointer"
-                >
-                  <Share2 size={12} />
-                  <span>{t('trends.share_post')}</span>
-                </button>
-              </div>
-            </div>
+                    })
+                  );
+                }, 40);
+              }}
+              onOpenPostDetail={(target) => handleSharePost(target)}
+              onLongPressQuickActions={(target) => handleSharePost(target)}
+            />
           ))}
         </div>
       </div>
@@ -1627,6 +1729,12 @@ export const TrendingChallengesView: React.FC<TrendingChallengesViewProps> = ({
           </form>
         </div>
       )}
+
+      <WinnersWallView
+        challenge={winnersWallChallenge}
+        onClose={() => setWinnersWallChallenge(null)}
+        onViewProfile={onViewProfile}
+      />
     </div>
   );
 };

@@ -34,9 +34,10 @@ import {
 } from '../firebase';
 import { useAuth } from '../context/AuthContext';
 import { useLanguage } from '../context/LanguageContext';
-import { COMMUNITY_REPORT_CATEGORIES } from '../utils/africanCultureConfig';
 import { sanitizeUserText } from '../utils/security';
 import { checkClientSpam, checkWordFilter, checkActionRateLimit } from '../utils/safetyFilters';
+import { validateAndModerateText } from '../services/moderationService';
+import { ReportContentModal } from './ReportContentModal';
 import { sendNotification } from '../services/notificationService';
 import { CrystalBadge } from './CrystalBadge';
 import { Avatar } from './Avatar';
@@ -92,11 +93,6 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
 
   // UGC Comment Report modal state
   const [reportingComment, setReportingComment] = useState<PostComment | null>(null);
-  const [selectedReportCategory, setSelectedReportCategory] = useState<string>(
-    COMMUNITY_REPORT_CATEGORIES[0]?.id || 'spam_misleading'
-  );
-  const [reportNote, setReportNote] = useState<string>('');
-  const [isSubmittingReport, setIsSubmittingReport] = useState<boolean>(false);
   const [sheetToast, setSheetToast] = useState<string | null>(null);
 
   // Mobile swipe-down drag state
@@ -277,9 +273,12 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
 
   // Combine server comments and pending/failed optimistic comments
   const allComments = useMemo(() => {
+    const blockedIds = userProfile?.blockedUserIds || [];
+    const mutedIds = userProfile?.mutedUserIds || [];
     const map = new Map<string, PostComment>();
     serverComments.forEach((c) => {
       if (c.isHidden && c.authorId !== currentUser?.uid && !isAdmin) return;
+      if (blockedIds.includes(c.authorId) || mutedIds.includes(c.authorId)) return;
       map.set(c.id, c);
     });
     optimisticComments.forEach((opt) => {
@@ -288,7 +287,14 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
       }
     });
     return Array.from(map.values());
-  }, [serverComments, optimisticComments, currentUser?.uid, isAdmin]);
+  }, [
+    serverComments,
+    optimisticComments,
+    currentUser?.uid,
+    isAdmin,
+    userProfile?.blockedUserIds,
+    userProfile?.mutedUserIds
+  ]);
 
   // Separate top-level comments (newest first) and replies grouped by parentId (oldest first)
   const { rootComments, repliesByParentId } = useMemo(() => {
@@ -342,6 +348,7 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
       authorName,
       authorUsername,
       authorPhotoURL,
+      authorHighlightedBadgeId: userProfile?.highlightedBadgeId || null,
       content: cleanText,
       createdAt: nowIso,
       parentId: parentComment ? parentComment.parentId || parentComment.id : null,
@@ -375,7 +382,10 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
         authorName,
         authorUsername,
         authorPhotoURL,
+        authorHighlightedBadgeId: userProfile?.highlightedBadgeId || null,
         content: cleanText,
+        moderationChecked: true,
+        moderationCheckedAt: nowIso,
         createdAt: nowIso,
         reactions: { heart: [], laugh: [], wow: [] },
         reactionCounts: { heart: 0, laugh: 0, wow: 0 }
@@ -440,13 +450,13 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
       triggerSheetToast(spamRes.reason || 'Please slow down before commenting again.');
       return;
     }
-    const wordRes = checkWordFilter(commentText.trim());
-    if (wordRes.flagged) {
-      triggerSheetToast(
-        language === 'sw'
-          ? 'Maoni yako yana maneno yaliyozuiwa na kichujio cha usalama.'
-          : 'Your comment contains words blocked by the WaveLink safety filter.'
-      );
+    const modVerdict = await validateAndModerateText(
+      commentText.trim(),
+      replyingTo ? 'reply' : 'comment',
+      userProfile
+    );
+    if (!modVerdict.allowed) {
+      triggerSheetToast(modVerdict.friendlyMessage);
       return;
     }
     const textToSend = commentText;
@@ -643,8 +653,10 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
               <div className="flex items-center justify-between gap-2 mb-1">
                 <div className="flex items-center gap-1.5 min-w-0">
                   <CrystalBadge
+                    userId={comment.authorId}
                     email={comment.authorEmail}
                     name={displayName}
+                    highlightedBadgeId={comment.authorHighlightedBadgeId}
                     size="sm"
                   />
                   {comment.replyToName && (
@@ -788,7 +800,6 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
                     type="button"
                     onClick={() => {
                       setReportingComment(comment);
-                      setReportNote('');
                     }}
                     className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[11px] text-[var(--text-secondary)] hover:text-amber-500 transition cursor-pointer"
                     title={language === 'sw' ? 'Ripoti maoni' : 'Report comment'}
@@ -1125,125 +1136,39 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
           )}
         </div>
 
-        {/* Google Play UGC Comment Report Sub-Modal */}
-        {reportingComment && (
-          <div
-            className="absolute inset-0 z-30 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4"
-            onClick={() => setReportingComment(null)}
-          >
-            <div
-              onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-sm rounded-3xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] p-4 shadow-2xl space-y-3"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
-                    <Flag size={16} />
-                  </div>
-                  <div>
-                    <h4 className="text-xs sm:text-sm font-extrabold text-[var(--text-primary)]">
-                      {language === 'sw' ? 'Ripoti Maoni' : 'Report Comment'}
-                    </h4>
-                    <p className="text-[11px] text-[var(--text-secondary)] truncate max-w-[200px]">
-                      @{reportingComment.authorName}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setReportingComment(null)}
-                  className="p-1 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
-                >
-                  <X size={16} />
-                </button>
-              </div>
-
-              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                {COMMUNITY_REPORT_CATEGORIES.map((cat) => {
-                  const selected = selectedReportCategory === cat.id;
-                  return (
-                    <button
-                      key={cat.id}
-                      type="button"
-                      onClick={() => setSelectedReportCategory(cat.id)}
-                      className={`w-full p-2.5 rounded-2xl border text-left transition flex items-center justify-between gap-2 cursor-pointer ${
-                        selected
-                          ? 'bg-amber-500/15 border-amber-500 text-[var(--text-primary)]'
-                          : 'bg-[var(--bg-subtle)] border-[var(--border-hairline)] text-[var(--text-primary)]'
-                      }`}
-                    >
-                      <div className="min-w-0">
-                        <div className="text-xs font-extrabold">
-                          {language === 'sw' ? cat.labelSw : cat.labelEn}
-                        </div>
-                        <div className="text-[10px] text-[var(--text-secondary)] truncate">
-                          {language === 'sw' ? cat.descSw : cat.descEn}
-                        </div>
-                      </div>
-                      {selected && <Check size={14} className="text-amber-500 shrink-0" />}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <textarea
-                rows={2}
-                value={reportNote}
-                onChange={(e) => setReportNote(e.target.value)}
-                placeholder={
-                  language === 'sw' ? 'Maelezo ya ziada (hiari)...' : 'Additional details (optional)...'
+        {/* Layer 4 Report, Mute & Block Modal */}
+        <ReportContentModal
+          isOpen={Boolean(reportingComment)}
+          target={
+            reportingComment && post
+              ? {
+                  targetType: 'comment',
+                  targetId: reportingComment.id,
+                  targetAuthorId: reportingComment.authorId,
+                  targetAuthorName: reportingComment.authorName,
+                  postId: post.id,
+                  targetSummary: `${reportingComment.authorName}: ${reportingComment.content.slice(0, 120)}`
                 }
-                className="w-full p-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-xs text-[var(--text-primary)] resize-none"
-              />
-
-              <div className="flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setReportingComment(null)}
-                  className="px-3.5 py-1.5 rounded-xl bg-[var(--bg-subtle)] text-xs font-bold text-[var(--text-secondary)] cursor-pointer"
-                >
-                  {language === 'sw' ? 'Ghairi' : 'Cancel'}
-                </button>
-                <button
-                  type="button"
-                  disabled={isSubmittingReport}
-                  onClick={async () => {
-                    const chosen =
-                      COMMUNITY_REPORT_CATEGORIES.find((c) => c.id === selectedReportCategory) ||
-                      COMMUNITY_REPORT_CATEGORIES[0];
-                    setIsSubmittingReport(true);
-                    try {
-                      await reportContent({
-                        targetType: 'comment',
-                        targetId: reportingComment.id,
-                        targetAuthorId: reportingComment.authorId,
-                        targetSummary: `${reportingComment.authorName}: ${reportingComment.content.slice(0, 80)}`,
-                        reason: `${chosen.labelEn}${reportNote.trim() ? `: ${reportNote.trim()}` : ''}`
-                      });
-                      setReportingComment(null);
-                      triggerSheetToast(
-                        language === 'sw'
-                          ? 'Ripoti imetumwa. Asante kwa kulinda jamii!'
-                          : 'Report submitted. Thank you for keeping WaveLink safe!'
-                      );
-                    } finally {
-                      setIsSubmittingReport(false);
-                    }
-                  }}
-                  className="px-4 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-extrabold cursor-pointer"
-                >
-                  {isSubmittingReport
-                    ? language === 'sw'
-                      ? 'Inatuma...'
-                      : 'Sending...'
-                    : language === 'sw'
-                    ? 'Tuma Ripoti'
-                    : 'Submit Report'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+              : null
+          }
+          currentUid={currentUser?.uid}
+          isAuthorBlocked={Boolean(
+            reportingComment &&
+              (userProfile?.blockedUserIds || []).includes(reportingComment.authorId)
+          )}
+          isAuthorMuted={Boolean(
+            reportingComment &&
+              (userProfile?.mutedUserIds || []).includes(reportingComment.authorId)
+          )}
+          onClose={() => setReportingComment(null)}
+          onReportSubmitted={(res) => triggerSheetToast(res.message)}
+          onMuteChanged={(_, muted) =>
+            triggerSheetToast(muted ? 'User muted.' : 'User unmuted.')
+          }
+          onBlockChanged={(_, blocked) =>
+            triggerSheetToast(blocked ? 'User blocked.' : 'User unblocked.')
+          }
+        />
       </div>
     </div>
   );

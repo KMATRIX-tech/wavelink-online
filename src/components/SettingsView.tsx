@@ -93,9 +93,18 @@ import {
   Share2,
   Tag,
   UserCheck,
-  Video
+  Video,
+  Award,
+  Trophy,
+  Info,
+  ShieldAlert,
+  VolumeX
 } from 'lucide-react';
 import { NotificationSettingsPanel } from './NotificationSettingsPanel';
+import { UnifiedPostCard } from './UnifiedPostCard';
+import { TeenParentalSettingsPanel } from './TeenParentalSettingsPanel';
+import { ParentDashboardView } from './ParentDashboardView';
+import { isTeenAccountActive } from '../config/ageConfig';
 
 import { inviteFriends, sharePost } from '../utils/share.js';
 import { LegalModal, LegalDocType } from './LegalModals';
@@ -144,6 +153,28 @@ import {
   ProfilePostViewerModal,
   StoryHighlightsBar
 } from './ProfileSocialModals';
+import { AdminUpdatesManager } from './AdminUpdatesManager';
+import { ModerationQueuePanel } from './ModerationQueuePanel';
+import { AdminChallengesManager } from './AdminChallengesManager';
+import { ProfileBadgesRow as EarnedBadgesRow } from './ProfileBadgesRow';
+import { ReportContentModal, type ReportModalTarget } from './ReportContentModal';
+import { validateAndModerateText, toggleMuteUser } from '../services/moderationService';
+import {
+  resolveProfileProgression,
+  canVisitorViewProgression
+} from '../config/progressionConfig';
+import {
+  formatJoinedMonthYear,
+  HighlightedBadgesInline,
+  ProfileLevelCard,
+  ProfileFavoriteBadgesCard,
+  ProfileNextGoalsCard,
+  ProfileAchievementsTab,
+  ProfileChallengesTab,
+  ProfileAboutTab,
+  ProfileLevelUpBanner,
+  ProfileQuotaRetryBanner
+} from './ProfileGamerSections';
 
 interface SettingsViewProps {
   onOpenAdminPanel?: () => void;
@@ -151,6 +182,11 @@ interface SettingsViewProps {
   onSelectUserProfile?: (userId: string | null) => void;
   onStartChatWithUser?: (userId: string) => void;
   onStartCallWithUser?: (recipient: CallRecipient, callType: 'voice' | 'video') => void;
+  initialSettingsSection?: string | null;
+  onClearInitialSettingsSection?: () => void;
+  parentVerifyToken?: string | null;
+  parentVerifyTeenUid?: string | null;
+  onClearParentVerify?: () => void;
 }
 
 type SettingsSection =
@@ -162,12 +198,18 @@ type SettingsSection =
   | 'notifications'
   | 'privacy'
   | 'security'
+  | 'parental_control'
+  | 'parent_dashboard'
   | 'terms'
   | 'pro'
   | 'support'
-  | 'upgrades';
+  | 'upgrades'
+  | 'admin_updates'
+  | 'admin_challenges'
+  | 'moderation_queue';
 
 type ProfileContentTab = 'posts' | 'reels' | 'saved' | 'tagged';
+type ProfileMainTab = 'posts' | 'achievements' | 'challenges' | 'about';
 
 const DEFAULT_PRIVACY_SETTINGS: UserPrivacySettings = {
   profileVisibility: 'public',
@@ -179,6 +221,8 @@ const DEFAULT_PRIVACY_SETTINGS: UserPrivacySettings = {
   sparkVisibility: 'everyone',
   showReadReceipts: true,
   allowSearchByEmail: true,
+  showAchievementsAndChallenges: true,
+  isTeenAccount: false,
   dataSharingConsent: false
 };
 
@@ -284,7 +328,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   viewedUserId,
   onSelectUserProfile,
   onStartChatWithUser,
-  onStartCallWithUser
+  onStartCallWithUser,
+  initialSettingsSection,
+  onClearInitialSettingsSection,
+  parentVerifyToken,
+  parentVerifyTeenUid,
+  onClearParentVerify
 }) => {
   const {
     currentUser,
@@ -345,14 +394,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const [viewedOtherProfile, setViewedOtherProfile] = useState<UserProfile | null>(null);
   const [isLoadingOtherProfile, setIsLoadingOtherProfile] = useState<boolean>(false);
+  const [profileQuotaError, setProfileQuotaError] = useState<string | null>(null);
+  const [profileReloadTick, setProfileReloadTick] = useState<number>(0);
 
-  // Read target profile once and cache in memory
+  // Read target profile once and cache in memory (1 Firestore read max, 0 extra reads for badges/challenges)
   useEffect(() => {
     if (isOwnProfile || !effectiveTargetUid) {
       setViewedOtherProfile(null);
       return;
     }
     let cancelled = false;
+    setProfileQuotaError(null);
     const cached = getCachedUserProfile(effectiveTargetUid);
     if (cached) {
       setViewedOtherProfile(cached);
@@ -366,6 +418,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           setViewedOtherProfile(fetched);
         }
       })
+      .catch((err: any) => {
+        if (!cancelled) {
+          const code = String(err?.code || err?.message || '').toLowerCase();
+          if (code.includes('resource-exhausted') || code.includes('quota')) {
+            setProfileQuotaError(
+              language === 'sw'
+                ? 'Ukomo wa data umefikiwa kwa muda. Gusa Jaribu Tena.'
+                : 'Firestore quota limit reached temporarily. Tap Retry to refresh.'
+            );
+          }
+        }
+      })
       .finally(() => {
         if (!cancelled) setIsLoadingOtherProfile(false);
       });
@@ -373,17 +437,39 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [isOwnProfile, effectiveTargetUid]);
+  }, [isOwnProfile, effectiveTargetUid, profileReloadTick]);
 
   const activeProfile: UserProfile | null = isOwnProfile ? userProfile : viewedOtherProfile;
 
+  // Layer 4 & 5 Safety & Moderation UI state (uses already-loaded userProfile — 0 extra reads)
+  const [reportTarget, setReportTarget] = useState<ReportModalTarget | null>(null);
+  const [modToast, setModToast] = useState<string | null>(null);
+  const triggerModToast = (msg: string) => {
+    setModToast(msg);
+    setTimeout(() => setModToast((prev) => (prev === msg ? null : prev)), 4200);
+  };
+  const isViewedUserMuted = Boolean(
+    effectiveTargetUid && (userProfile?.mutedUserIds || []).includes(effectiveTargetUid)
+  );
+  const isAccountUnder18 = Boolean(
+    userProfile?.isUnder18 || userProfile?.privacySettings?.isTeenAccount
+  );
+  const sensitiveFilterEnabled = isAccountUnder18
+    ? true
+    : userProfile?.sensitiveContentFilter !== false;
+
   // Profile redesign interactive states
+  const [activeMainTab, setActiveMainTab] = useState<ProfileMainTab>('posts');
+  const [selectedBadgeSheetId, setSelectedBadgeSheetId] = useState<string | null>(null);
   const [activeProfileTab, setActiveProfileTab] = useState<ProfileContentTab>('posts');
   const [isBioExpanded, setIsBioExpanded] = useState<boolean>(false);
   const [isCoverModalOpen, setIsCoverModalOpen] = useState<boolean>(false);
   const [followersModalTab, setFollowersModalTab] = useState<'followers' | 'following' | null>(null);
   const [isOtherMenuOpen, setIsOtherMenuOpen] = useState<boolean>(false);
   const [selectedViewerPostId, setSelectedViewerPostId] = useState<string | null>(null);
+  const [activeHoverProfilePostId, setActiveHoverProfilePostId] = useState<string | null>(null);
+  const touchStartXRef = React.useRef<number | null>(null);
+  const touchStartYRef = React.useRef<number | null>(null);
 
   // Person's Posts, Saved Posts, Tagged Posts, Active 24h Sparks, and Follower IDs
   const [userPosts, setUserPosts] = useState<Post[]>([]);
@@ -406,6 +492,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     let cancelled = false;
     setIsLoadingPosts(true);
     setVisiblePostsCount(12);
+    setProfileQuotaError(null);
 
     const loadProfileContent = async () => {
       try {
@@ -477,8 +564,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         } else if (!cancelled) {
           setTaggedPostsList([]);
         }
-      } catch {
-        // Offline or cached fallback
+      } catch (err: any) {
+        if (!cancelled) {
+          const msg = String(err?.code || err?.message || '').toLowerCase();
+          if (msg.includes('resource-exhausted') || msg.includes('quota')) {
+            setProfileQuotaError(
+              language === 'sw'
+                ? 'Ukomo wa maombi ya Firestore umefikiwa kwa muda. Gusa Jaribu Tena.'
+                : 'Daily data quota was temporarily reached. Tap Retry to reload profile posts.'
+            );
+          }
+        }
       } finally {
         if (!cancelled) setIsLoadingPosts(false);
       }
@@ -488,7 +584,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [effectiveTargetUid, isOwnProfile, userProfile?.username, viewedOtherProfile?.username]);
+  }, [effectiveTargetUid, isOwnProfile, userProfile?.username, viewedOtherProfile?.username, profileReloadTick]);
 
   // Load saved posts when on own profile and Saved tab is selected
   useEffect(() => {
@@ -520,6 +616,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   }, [isOwnProfile, activeProfileTab, userProfile?.savedPostIds]);
 
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>(() => {
+    if (
+      initialSettingsSection === 'parent_dashboard' ||
+      initialSettingsSection === 'parental_control'
+    ) {
+      return initialSettingsSection;
+    }
     if (typeof window !== 'undefined') {
       const requested = localStorage.getItem('wavelink_settings_initial_section');
       if (
@@ -533,6 +635,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     return 'profile';
   });
+
+  useEffect(() => {
+    if (
+      initialSettingsSection === 'parent_dashboard' ||
+      initialSettingsSection === 'parental_control'
+    ) {
+      setActiveSettingsSection(initialSettingsSection);
+      onClearInitialSettingsSection?.();
+    }
+  }, [initialSettingsSection, onClearInitialSettingsSection]);
 
   useEffect(() => {
     const openNotificationsSection = () => {
@@ -851,12 +963,31 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setProfileSaveError(null);
 
     try {
+      const trimmedDisplayName = displayName.trim();
+      const trimmedUsername = username.trim();
+      const trimmedBio = bio.trim();
+
+      // Layer 1 + Layer 2 moderation check on profile display name, username, and bio
+      for (const [fieldText, fieldCtx] of [
+        [trimmedDisplayName, 'username'] as const,
+        [trimmedUsername, 'username'] as const,
+        [trimmedBio, 'bio'] as const,
+      ]) {
+        if (!fieldText) continue;
+        const verdict = await validateAndModerateText(fieldText, fieldCtx);
+        if (verdict.blocked) {
+          setProfileSaveError(verdict.friendlyMessage);
+          setIsSaving(false);
+          return;
+        }
+      }
+
       const safeAvatar = sanitizeShortHttpsUrl(photoURL.trim(), 500) || undefined;
 
       await updateUserProfile({
-        displayName: displayName.trim(),
-        username: username.trim(),
-        bio: bio.trim(),
+        displayName: trimmedDisplayName,
+        username: trimmedUsername,
+        bio: trimmedBio,
         photoURL: safeAvatar,
         proBorderEffect,
         proAccentColor,
@@ -1352,6 +1483,85 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const paginatedTabPosts = currentTabPosts.slice(0, visiblePostsCount);
 
+  // Progression, Levels, Badges & Challenges derived strictly from single /users/{uid} doc + loaded posts (0 extra Firestore reads)
+  const totalLoadedPostLikes = userPosts.reduce((sum, p) => sum + (p.likesCount || 0), 0);
+  const progression = resolveProfileProgression(
+    activeProfile,
+    userPosts.length,
+    totalLoadedPostLikes,
+    followerUserIds.length
+  );
+  const progressionVisibility = canVisitorViewProgression({
+    targetProfile: activeProfile,
+    viewerUid: currentUser?.uid,
+    viewerFollowingIds: myFollowingIds
+  });
+  const canShowProgression = progressionVisibility.allowed;
+  const visibleMainTabs: ProfileMainTab[] = canShowProgression
+    ? ['posts', 'achievements', 'challenges', 'about']
+    : ['posts', 'about'];
+  const effectiveMainTab: ProfileMainTab = visibleMainTabs.includes(activeMainTab)
+    ? activeMainTab
+    : 'posts';
+
+  const checkedInToday = Boolean(
+    isOwnProfile && userProfile?.lastDailyRewardDate === getLocalDateKey()
+  );
+
+  // Owner chooses up to 3 highlighted badges next to their name
+  const handleToggleHighlightedBadge = async (badgeId: string) => {
+    if (!isOwnProfile || !currentUser) return;
+    const currentList = (userProfile?.highlightedBadges || []).filter((id) =>
+      progression.earnedBadgeIds.has(id)
+    );
+    const exists = currentList.includes(badgeId);
+    let nextList: string[];
+    if (exists) {
+      nextList = currentList.filter((id) => id !== badgeId);
+    } else {
+      if (currentList.length >= 3) return;
+      nextList = [...currentList, badgeId];
+    }
+    await updateUserProfile({ highlightedBadges: nextList });
+    setInviteToast({
+      message: exists
+        ? language === 'sw'
+          ? 'Beji imeondolewa kwenye jina lako.'
+          : 'Badge unpinned from your name.'
+        : language === 'sw'
+        ? 'Beji imewekwa karibu na jina lako!'
+        : 'Badge highlighted next to your name!',
+      type: 'success'
+    });
+    setTimeout(() => setInviteToast(null), 2400);
+  };
+
+  // Swipe left/right support on mobile between Posts | Achievements | Challenges | About
+  const handleProfileTabTouchStart = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch) return;
+    touchStartXRef.current = touch.clientX;
+    touchStartYRef.current = touch.clientY;
+  };
+
+  const handleProfileTabTouchEnd = (e: React.TouchEvent) => {
+    if (touchStartXRef.current === null || touchStartYRef.current === null) return;
+    const touch = e.changedTouches[0];
+    if (!touch) return;
+    const dx = touch.clientX - touchStartXRef.current;
+    const dy = touch.clientY - touchStartYRef.current;
+    touchStartXRef.current = null;
+    touchStartYRef.current = null;
+
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.4) return;
+    const currentIndex = visibleMainTabs.indexOf(effectiveMainTab);
+    if (dx < 0 && currentIndex < visibleMainTabs.length - 1) {
+      setActiveMainTab(visibleMainTabs[currentIndex + 1]);
+    } else if (dx > 0 && currentIndex > 0) {
+      setActiveMainTab(visibleMainTabs[currentIndex - 1]);
+    }
+  };
+
   // Reusable Reference Menu Cards (shown below header on mobile, and in right side panel on desktop >= 1280px)
   const renderReferenceMenuCards = () => {
     if (!isOwnProfile) {
@@ -1453,12 +1663,53 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         onClick: () => setActiveSettingsSection('privacy')
       },
       {
+        id: 'parental_control',
+        icon: <ShieldCheck size={18} className="text-teal-500" />,
+        iconBg: 'bg-teal-500/15 border-teal-500/25',
+        label: isTeenAccountActive(userProfile)
+          ? 'Parental Control'
+          : userProfile?.hasLinkedTeens
+          ? 'Parent Dashboard'
+          : 'Parental Control',
+        onClick: () =>
+          setActiveSettingsSection(
+            !isTeenAccountActive(userProfile) && userProfile?.hasLinkedTeens
+              ? 'parent_dashboard'
+              : 'parental_control'
+          )
+      },
+      {
         id: 'settings',
         icon: <Settings size={18} className="text-sky-500" />,
         iconBg: 'bg-sky-500/15 border-sky-500/25',
         label: language === 'sw' ? 'Mipangilio' : 'Settings',
         onClick: () => setActiveSettingsSection('settings_hub')
       },
+      ...(isAdmin
+        ? [
+            {
+              id: 'admin_updates',
+              icon: <Sparkles size={18} className="text-indigo-500" />,
+              iconBg: 'bg-indigo-500/15 border-indigo-500/25',
+              label: 'Admin Updates',
+              onClick: () => setActiveSettingsSection('admin_updates')
+            },
+            {
+              id: 'admin_challenges',
+              icon: <Trophy size={18} className="text-amber-500" />,
+              iconBg: 'bg-amber-500/15 border-amber-500/25',
+              label: language === 'sw' ? 'Mashindano & Beji' : 'Admin Challenges',
+              onClick: () => setActiveSettingsSection('admin_challenges')
+            },
+            {
+              id: 'moderation_queue',
+              icon: <ShieldAlert size={18} className="text-amber-500" />,
+              iconBg: 'bg-amber-500/15 border-amber-500/25',
+              label: language === 'sw' ? 'Foleni ya Usalama' : 'Moderation Queue',
+              onClick: () => setActiveSettingsSection('moderation_queue')
+            }
+          ]
+        : []),
       {
         id: 'help',
         icon: <HelpCircle size={18} className="text-rose-500" />,
@@ -1636,7 +1887,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         )}
 
         <div className="wavelink-profile-header-inner">
-          {/* Avatar overlapping bottom of cover with story ring & realtime RTDB presence dot */}
+          {/* Avatar overlapping bottom-left of cover with gradient ring, Level badge/crown & presence dot */}
           <div className="wavelink-profile-top-bar">
             <div className="relative">
               <div
@@ -1663,6 +1914,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 />
               </div>
 
+              {/* Level Badge / Crown on Avatar Corner */}
+              {canShowProgression && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveSettingsSection('profile');
+                    setActiveMainTab('achievements');
+                  }}
+                  title={
+                    language === 'sw'
+                      ? `Ngazi ${progression.levelInfo.level} (${progression.levelInfo.tierNameSw})`
+                      : `Level ${progression.levelInfo.level} (${progression.levelInfo.tierName})`
+                  }
+                  aria-label={`Level ${progression.levelInfo.level}`}
+                  className="wavelink-gamer-avatar-level-badge cursor-pointer"
+                >
+                  <Crown size={11} />
+                  <span>{progression.levelInfo.level}</span>
+                </button>
+              )}
+
               {/* Country flag badge */}
               <span
                 className="absolute -bottom-1 -left-1 z-20 text-xs leading-none bg-[var(--bg-surface)] rounded-full px-1.5 py-0.5 shadow-xs border border-[var(--border-hairline)]"
@@ -1673,79 +1945,122 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Identity, Bio (3 lines max + "more"), Stats Row, Badges, and Action Buttons */}
+          {/* Identity, Highlighted Badges, Joined Date, Bio, Action Buttons, Level Card & Stats Row */}
           <div className="wavelink-profile-identity-col">
-            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h1 className="text-xl sm:text-2xl font-extrabold text-[var(--text-primary)] tracking-tight truncate">
-                    {displayedName}
-                  </h1>
+            <div className="wavelink-gamer-header-grid">
+              <div className="min-w-0 space-y-2.5">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h1 className="text-xl sm:text-2xl font-extrabold text-[var(--text-primary)] tracking-tight truncate">
+                      {displayedName}
+                    </h1>
 
-                  {/* Verified Tick */}
-                  {isDisplayedUserVerified && (
-                    <span
-                      className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-[#2563EB] text-white shrink-0 shadow-2xs"
-                      title={language === 'sw' ? 'Akaunti Imethibitishwa' : 'Verified Account'}
-                    >
-                      <Check size={12} strokeWidth={3} />
-                    </span>
-                  )}
-
-                  {/* Pro Badge */}
-                  {isDisplayedUserPro && (
-                    <span className="px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[11px] font-black uppercase tracking-wider inline-flex items-center gap-1 shadow-2xs">
-                      <Crown size={11} />
-                      <span>Pro</span>
-                    </span>
-                  )}
-
-                  {isOwnProfile && isAdmin && (
-                    <CrystalBadge
-                      userId={currentUser?.uid}
-                      email={currentUser?.email}
-                      name={displayedName}
-                      isPro={isProUser}
-                      hasBlueStar={isProUser}
-                      isSubAdmin={isSubAdmin}
-                      weeklyWinnerUntil={userProfile?.weeklyWinnerUntil}
-                      size="sm"
-                      showAdminTag={true}
-                    />
-                  )}
-                </div>
-
-                {/* @username + Realtime Online / Last seen status */}
-                <div className="flex items-center gap-2 flex-wrap mt-0.5">
-                  <span className="text-xs sm:text-sm font-mono font-bold text-[var(--accent-primary)]">
-                    {displayedUsername}
-                  </span>
-                  {profilePresenceSubtitle && (
-                    <span
-                      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
-                        isDisplayedUserOnline
-                          ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 border-emerald-500/25'
-                          : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-hairline)]'
-                      }`}
-                    >
-                      <span
-                        className={`w-2 h-2 rounded-full shrink-0 ${
-                          isDisplayedUserOnline ? 'bg-[#22c55e]' : 'bg-[#ef4444]'
-                        }`}
+                    {/* Up to 3 Highlighted Badges next to Name */}
+                    {canShowProgression && (
+                      <HighlightedBadgesInline
+                        badgeIds={progression.displayedHighlightedBadges}
+                        language={language === 'sw' ? 'sw' : 'en'}
+                        onSelectBadge={(badgeId) => {
+                          setActiveSettingsSection('profile');
+                          setActiveMainTab('achievements');
+                          setSelectedBadgeSheetId(badgeId);
+                        }}
                       />
-                      <span>{profilePresenceSubtitle}</span>
+                    )}
+
+                    {/* Verified Tick */}
+                    {isDisplayedUserVerified && (
+                      <span
+                        className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-[#2563EB] text-white shrink-0 shadow-2xs"
+                        title={language === 'sw' ? 'Akaunti Imethibitishwa' : 'Verified Account'}
+                      >
+                        <Check size={12} strokeWidth={3} />
+                      </span>
+                    )}
+
+                    {/* Pro Badge */}
+                    {isDisplayedUserPro && (
+                      <span className="px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[11px] font-black uppercase tracking-wider inline-flex items-center gap-1 shadow-2xs">
+                        <Crown size={11} />
+                        <span>Pro</span>
+                      </span>
+                    )}
+
+                    {isOwnProfile && isAdmin && (
+                      <CrystalBadge
+                        userId={currentUser?.uid}
+                        email={currentUser?.email}
+                        name={displayedName}
+                        isPro={isProUser}
+                        hasBlueStar={isProUser}
+                        isSubAdmin={isSubAdmin}
+                        weeklyWinnerUntil={userProfile?.weeklyWinnerUntil}
+                        size="sm"
+                        showAdminTag={true}
+                      />
+                    )}
+                  </div>
+
+                  {/* @username + Joined [Month Year] + Realtime Online / Last seen status */}
+                  <div className="flex items-center gap-2 flex-wrap mt-1">
+                    <span className="text-xs sm:text-sm font-mono font-bold text-[var(--accent-primary)]">
+                      {displayedUsername}
                     </span>
-                  )}
-                  {hasActiveStoryRing && (
-                    <span className="text-[11px] font-bold text-[#0D9488] bg-teal-500/10 px-2 py-0.5 rounded-full">
-                      ● {activeUserSparks.length} {language === 'sw' ? 'Spark Mpya' : 'Active Spark'}
+                    <span className="text-[11px] font-bold text-[var(--text-secondary)]">
+                      • {formatJoinedMonthYear(activeProfile?.createdAt, language === 'sw' ? 'sw' : 'en')}
                     </span>
+                    {profilePresenceSubtitle && (
+                      <span
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                          isDisplayedUserOnline
+                            ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 border-emerald-500/25'
+                            : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-hairline)]'
+                        }`}
+                      >
+                        <span
+                          className={`w-2 h-2 rounded-full shrink-0 ${
+                            isDisplayedUserOnline ? 'bg-[#22c55e]' : 'bg-[#ef4444]'
+                          }`}
+                        />
+                        <span>{profilePresenceSubtitle}</span>
+                      </span>
+                    )}
+                    {hasActiveStoryRing && (
+                      <span className="text-[11px] font-bold text-[#0D9488] bg-teal-500/10 px-2 py-0.5 rounded-full">
+                        ● {activeUserSparks.length} {language === 'sw' ? 'Spark Mpya' : 'Active Spark'}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Bio (3 lines max with "more" toggle) */}
+                <div className="max-w-2xl">
+                  <p
+                    className={`text-sm text-[var(--text-primary)] leading-relaxed break-words ${
+                      !isBioExpanded ? 'line-clamp-3' : ''
+                    }`}
+                  >
+                    {displayedBio}
+                  </p>
+                  {(displayedBio.length > 120 || displayedBio.split('\n').length > 3) && (
+                    <button
+                      type="button"
+                      onClick={() => setIsBioExpanded((prev) => !prev)}
+                      className="text-xs font-extrabold text-[var(--accent-primary)] mt-0.5 hover:underline cursor-pointer"
+                    >
+                      {isBioExpanded
+                        ? language === 'sw'
+                          ? 'ficha'
+                          : 'less'
+                        : language === 'sw'
+                        ? '...zaidi'
+                        : '...more'}
+                    </button>
                   )}
                 </div>
-              </div>
 
-              {/* Action Buttons: Own Profile vs Other Person's Profile */}
-              <div className="wavelink-profile-actions-row lg:w-auto">
+                {/* Action Buttons: Own Profile vs Other Person's Profile */}
+                <div className="wavelink-profile-actions-row">
                 {isOwnProfile ? (
                   <>
                     <button
@@ -1951,6 +2266,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             type="button"
                             onClick={async () => {
                               setIsOtherMenuOpen(false);
+                              if (currentUser?.uid && effectiveTargetUid) {
+                                const nextMuted = !isViewedUserMuted;
+                                await toggleMuteUser(currentUser.uid, effectiveTargetUid, nextMuted);
+                                triggerModToast(
+                                  nextMuted
+                                    ? `${displayedName} muted. Their posts won't appear in your feeds.`
+                                    : `${displayedName} unmuted.`
+                                );
+                              }
+                            }}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-xl hover:bg-stone-500/10 text-[var(--text-primary)] text-xs font-extrabold flex items-center gap-2 text-left cursor-pointer"
+                          >
+                            <VolumeX size={14} className="text-amber-500" />
+                            <span>
+                              {isViewedUserMuted
+                                ? language === 'sw'
+                                  ? 'Ondoa Kunyamazisha (Unmute)'
+                                  : 'Unmute User'
+                                : language === 'sw'
+                                ? 'Nyamazisha Akaunti (Mute)'
+                                : 'Mute User'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              setIsOtherMenuOpen(false);
                               if (effectiveTargetUid) {
                                 await toggleBlockUser(effectiveTargetUid);
                               }
@@ -1971,15 +2314,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
                           <button
                             type="button"
-                            onClick={async () => {
+                            onClick={() => {
                               setIsOtherMenuOpen(false);
                               if (effectiveTargetUid) {
-                                await reportContent({
+                                setReportTarget({
                                   targetType: 'user',
                                   targetId: effectiveTargetUid,
                                   targetAuthorId: effectiveTargetUid,
-                                  targetSummary: `${displayedName} (${displayedUsername})`,
-                                  reason: 'Reported profile from user profile menu'
+                                  targetAuthorName: displayedName,
+                                  targetSummary: `${displayedName} (${displayedUsername})`
                                 });
                               }
                             }}
@@ -1996,33 +2339,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </>
                 )}
               </div>
-            </div>
+              </div>
 
-            {/* Bio (3 lines max with "more" toggle) */}
-            <div className="max-w-2xl">
-              <p
-                className={`text-sm text-[var(--text-primary)] leading-relaxed break-words ${
-                  !isBioExpanded ? 'line-clamp-3' : ''
-                }`}
-              >
-                {displayedBio}
-              </p>
-              {(displayedBio.length > 120 || displayedBio.split('\n').length > 3) && (
-                <button
-                  type="button"
-                  onClick={() => setIsBioExpanded((prev) => !prev)}
-                  className="text-xs font-extrabold text-[var(--accent-primary)] mt-0.5 hover:underline cursor-pointer"
-                >
-                  {isBioExpanded
-                    ? language === 'sw'
-                      ? 'ficha'
-                      : 'less'
-                    : language === 'sw'
-                    ? '...zaidi'
-                    : '...more'}
-                </button>
+              {/* Gamer Level Card: Right side on Desktop (>= 1024px), under bio/actions on Mobile (< 1024px) */}
+              {canShowProgression && (
+                <ProfileLevelCard
+                  levelInfo={progression.levelInfo}
+                  streak={progression.streak}
+                  language={language === 'sw' ? 'sw' : 'en'}
+                  isSimpleMode={isSimpleMode}
+                  onOpenAchievements={() => {
+                    setActiveSettingsSection('profile');
+                    setActiveMainTab('achievements');
+                  }}
+                />
               )}
             </div>
+
+            {/* Dedicated Profile Badges Row (Custom + Built-in badges, tap for details & pin next to name) */}
+            <EarnedBadgesRow
+              profile={(isOwnProfile ? userProfile : activeProfile) || null}
+              isOwnProfile={isOwnProfile}
+              language={language === 'sw' ? 'sw' : 'en'}
+              onSelectHighlightedBadge={async (badgeId) => {
+                await updateUserProfile({ highlightedBadgeId: badgeId });
+              }}
+            />
 
             {/* Row of Stats: Posts, Followers, Following, WavePoints */}
             <div className="wavelink-profile-stats-row">
@@ -2030,6 +2372,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="button"
                 onClick={() => {
                   setActiveSettingsSection('profile');
+                  setActiveMainTab('posts');
                   setActiveProfileTab('posts');
                   postsGridSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 }}
@@ -2085,14 +2428,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </span>
               </button>
             </div>
-
-            {/* Badges & Achievements Row (with tap tooltips explaining how each was earned) */}
-            <ProfileBadgesRow
-              profile={activeProfile}
-              isProEffective={isDisplayedUserPro}
-              isVerifiedEffective={isDisplayedUserVerified}
-              language={language === 'sw' ? 'sw' : 'en'}
-            />
           </div>
         </div>
       </section>
@@ -2115,11 +2450,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 { id: 'edit_profile', label: language === 'sw' ? 'Hariri' : 'Edit Profile' },
                 { id: 'appearance', label: language === 'sw' ? 'Mandhari' : 'Themes' },
                 { id: 'privacy', label: language === 'sw' ? 'Faragha' : 'Privacy' },
+                { id: 'parental_control', label: 'Parental Control' },
+                ...(!isTeenAccountActive(userProfile)
+                  ? [{ id: 'parent_dashboard' as SettingsSection, label: 'Parent Dashboard' }]
+                  : []),
                 { id: 'security', label: language === 'sw' ? 'Kituo cha Usalama' : 'Security Center' },
                 { id: 'notifications', label: language === 'sw' ? 'Arifa' : 'Notifications' },
                 { id: 'stats', label: language === 'sw' ? 'Takwimu' : 'Stats' },
                 { id: 'pro', label: 'Pro' },
                 { id: 'settings_hub', label: language === 'sw' ? 'Mipangilio' : 'All Settings' },
+                ...(isAdmin
+                  ? [
+                      { id: 'admin_updates' as SettingsSection, label: 'Admin Updates' },
+                      {
+                        id: 'admin_challenges' as SettingsSection,
+                        label: language === 'sw' ? 'Mashindano & Beji' : 'Challenges'
+                      },
+                      {
+                        id: 'moderation_queue' as SettingsSection,
+                        label: language === 'sw' ? 'Foleni ya Usalama' : 'Moderation Queue'
+                      }
+                    ]
+                  : []),
                 { id: 'support', label: language === 'sw' ? 'Msaada' : 'Help' }
               ] as { id: SettingsSection; label: string }[]
             ).map((sec) => (
@@ -2236,6 +2588,68 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           SECTION: PUSH NOTIFICATIONS & ALERT SETTINGS
       ===================================================================== */}
       {activeSettingsSection === 'notifications' && <NotificationSettingsPanel />}
+
+      {/* =====================================================================
+          SECTION: PARENTAL CONTROL (Teen Linking & Transparency)
+      ===================================================================== */}
+      {activeSettingsSection === 'parental_control' && (
+        <TeenParentalSettingsPanel
+          onOpenParentDashboard={() => setActiveSettingsSection('parent_dashboard')}
+        />
+      )}
+
+      {/* =====================================================================
+          SECTION: PARENT DASHBOARD (Separate Verified Parent Controls & Alerts)
+      ===================================================================== */}
+      {activeSettingsSection === 'parent_dashboard' && (
+        <ParentDashboardView
+          initialVerifyToken={parentVerifyToken}
+          initialVerifyTeenUid={parentVerifyTeenUid}
+          onClearVerifyParams={onClearParentVerify}
+          onBack={() => setActiveSettingsSection('settings_hub')}
+        />
+      )}
+
+      {/* =====================================================================
+          SECTION: ADMIN UPDATES (Strictly Admin & Sub-admins Only)
+      ===================================================================== */}
+      {activeSettingsSection === 'admin_updates' && isAdmin && <AdminUpdatesManager />}
+
+      {/* =====================================================================
+          SECTION: ADMIN CHALLENGES & CUSTOM BADGES (Strictly Admin & Sub-admins Only)
+      ===================================================================== */}
+      {activeSettingsSection === 'admin_challenges' && isAdmin && (
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-4 sm:p-6 shadow-xs space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-amber-500/15 text-amber-500 border border-amber-500/25 flex items-center justify-center shrink-0">
+              <Trophy size={20} />
+            </div>
+            <div>
+              <h2 className="font-extrabold text-[var(--text-primary)] text-base sm:text-lg">
+                Admin • Weekly Challenges &amp; Custom Badges
+              </h2>
+              <p className="text-xs text-[var(--text-secondary)]">
+                Create weekly challenges, review participants 20 at a time, choose winners, and design custom badges.
+              </p>
+            </div>
+          </div>
+          <AdminChallengesManager
+            isAdmin={isAdmin}
+            onViewProfile={(uid) => {
+              setInternalViewedUserId(uid);
+              onSelectUserProfile?.(uid);
+              setActiveSettingsSection('profile');
+            }}
+          />
+        </div>
+      )}
+
+      {/* =====================================================================
+          SECTION: LAYER 4 MODERATION QUEUE (Strictly Admin & Sub-admins Only)
+      ===================================================================== */}
+      {activeSettingsSection === 'moderation_queue' && isAdmin && (
+        <ModerationQueuePanel isAdmin={isAdmin} onToast={triggerModToast} />
+      )}
 
       {/* =====================================================================
           SECTION: AI UPGRADES & FEEDBACK INBOX
@@ -2514,7 +2928,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
                 <label className="text-xs font-extrabold text-[#1C1917] flex items-center gap-1.5">
                   <MessageSquare size={14} className="text-[#0D9488]" />
-                  <span>Who Can Send Direct Messages</span>
+                  <span>Who can message me</span>
                 </label>
                 <select
                   value={privacySettings.allowDirectMessages}
@@ -2526,10 +2940,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   }
                   className="w-full min-h-[42px] px-3 py-2 rounded-xl bg-white border border-[var(--border-hairline)] text-xs font-bold text-[#1C1917] focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
                 >
-                  <option value="everyone">Everyone on WaveLink</option>
-                  <option value="followers">Followers Only</option>
+                  <option value="everyone">Everyone (strangers go to Requests)</option>
+                  <option value="followers">Only people I follow / friends</option>
                   <option value="none">No One (Pause New Chats)</option>
                 </select>
+                <p className="text-[11px] text-[#78716C] leading-snug">
+                  {privacySettings.allowDirectMessages === 'followers'
+                    ? 'Only people you follow or added as contacts can message you.'
+                    : 'Messages from strangers go to your Requests tab (never your Inbox).'}
+                </p>
               </div>
 
               <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] space-y-2">
@@ -2628,15 +3047,44 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   key: 'allowSearchByEmail' as const,
                   title: 'Allow Members to Find Me by Email',
                   desc: 'Let friends find your profile using your registered email address.'
+                },
+                {
+                  key: 'showAchievementsAndChallenges' as const,
+                  title:
+                    language === 'sw'
+                      ? 'Onyesha mafanikio na maendeleo ya mashindano yangu'
+                      : 'Show my achievements and challenge progress',
+                  desc:
+                    language === 'sw'
+                      ? 'Ikizimwa, wageni wataona wasifu wa msingi pekee (hakuna kadi ya ngazi au beji).'
+                      : 'Default ON. When turned OFF, visitors see only your basic profile without level, badges, or challenge history.'
+                },
+                {
+                  key: 'isTeenAccount' as const,
+                  title:
+                    language === 'sw'
+                      ? 'Ulinzi wa Faragha kwa Vijana (Chini ya miaka 18)'
+                      : 'Teen / Under-18 Privacy Protection',
+                  desc:
+                    language === 'sw'
+                      ? 'Kwa akaunti za chini ya miaka 18, ngazi, beji na mashindano huonekana kwa marafiki pekee na hazionyeshwi kwenye ubao wa umma.'
+                      : 'Keeps level, badges, and challenge history visible only to you and mutual/close friends, and excludes your account from public leaderboards.'
                 }
               ].map((item) => {
-                const isChecked = Boolean(privacySettings[item.key]);
+                const isChecked =
+                  item.key === 'showAchievementsAndChallenges'
+                    ? privacySettings.showAchievementsAndChallenges !== false
+                    : Boolean(privacySettings[item.key]);
                 return (
                   <div
                     key={item.key}
                     onClick={() => {
                       setPrivacySettings((prev) => {
-                        const nextVal = !prev[item.key];
+                        const prevVal =
+                          item.key === 'showAchievementsAndChallenges'
+                            ? prev.showAchievementsAndChallenges !== false
+                            : Boolean(prev[item.key]);
+                        const nextVal = !prevVal;
                         const nextSettings = {
                           ...prev,
                           [item.key]: nextVal,
@@ -2650,10 +3098,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-4 cursor-pointer hover:bg-stone-100/60 transition"
                   >
                     <div>
-                      <span className="text-xs sm:text-sm font-bold text-[#1C1917] block">
+                      <span className="text-xs sm:text-sm font-bold text-[var(--text-primary)] block">
                         {item.title}
                       </span>
-                      <span className="text-[11px] text-[#78716C] block mt-0.5">{item.desc}</span>
+                      <span className="text-[11px] text-[var(--text-secondary)] block mt-0.5">{item.desc}</span>
                     </div>
                     <button
                       type="button"
@@ -3390,299 +3838,493 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         />
       )}
 
-      {/* =====================================================================
-          MAIN REDESIGNED PROFILE BODY (when activeSettingsSection === 'profile'):
-          - Mobile (< 1024px): Reference Menu Cards + Story Highlights + Tabs + 3-Col Posts Grid
-          - Desktop (>= 1024px): Two-column layout (Posts grid on left max 720px, Side panel on right at >= 1280px)
-      ===================================================================== */}
-      {activeSettingsSection === 'profile' && (
-        <div className="wavelink-profile-desktop-body">
-          {/* Mobile & Tablet (< 1280px) Menu Cards above the posts grid so they are immediately accessible */}
-          <div className="xl:hidden">{renderReferenceMenuCards()}</div>
+      <ReportContentModal
+        isOpen={Boolean(reportTarget)}
+        target={reportTarget}
+        currentUid={currentUser?.uid}
+        isAuthorBlocked={isViewedUserBlocked}
+        isAuthorMuted={isViewedUserMuted}
+        onClose={() => setReportTarget(null)}
+        onReportSubmitted={(res) => triggerModToast(res.message)}
+        onMuteChanged={(_, muted) =>
+          triggerModToast(muted ? 'User muted.' : 'User unmuted.')
+        }
+        onBlockChanged={(_, blocked) =>
+          triggerModToast(blocked ? 'User blocked.' : 'User unblocked.')
+        }
+      />
 
-          {/* Left Column on Desktop (Main Posts Column, max-width 720px) */}
-          <div ref={postsGridSectionRef} className="wavelink-profile-main-col">
-            {/* Story Highlights Row */}
-            <StoryHighlightsBar
-              profile={activeProfile}
-              activeSparks={activeUserSparks}
-              isOwnProfile={isOwnProfile}
-              language={language === 'sw' ? 'sw' : 'en'}
-              onSaveHighlights={async (nextHighlights: StoryHighlightItem[]) => {
-                await updateUserProfile({ storyHighlights: nextHighlights });
-              }}
-            />
-
-            {/* Profile Content Tabs: Posts, Reels, Saved (own profile only), Tagged */}
-            <div
-              role="tablist"
-              aria-label="Profile posts tabs"
-              className="grid grid-cols-3 sm:grid-cols-4 gap-1.5 p-1.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xs"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeProfileTab === 'posts'}
-                onClick={() => {
-                  setActiveProfileTab('posts');
-                  setVisiblePostsCount(12);
-                }}
-                className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  activeProfileTab === 'posts'
-                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              >
-                <Grid size={15} />
-                <span>{language === 'sw' ? 'Machapisho' : 'Posts'}</span>
-              </button>
-
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeProfileTab === 'reels'}
-                onClick={() => {
-                  setActiveProfileTab('reels');
-                  setVisiblePostsCount(12);
-                }}
-                className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  activeProfileTab === 'reels'
-                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              >
-                <Video size={15} />
-                <span>Reels</span>
-              </button>
-
-              {isOwnProfile && (
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={activeProfileTab === 'saved'}
-                  onClick={() => {
-                    setActiveProfileTab('saved');
-                    setVisiblePostsCount(12);
-                  }}
-                  className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                    activeProfileTab === 'saved'
-                      ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
-                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                  }`}
-                >
-                  <Bookmark size={15} />
-                  <span>{language === 'sw' ? 'Zilizohifadhiwa' : 'Saved'}</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeProfileTab === 'tagged'}
-                onClick={() => {
-                  setActiveProfileTab('tagged');
-                  setVisiblePostsCount(12);
-                }}
-                className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  activeProfileTab === 'tagged'
-                    ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              >
-                <Tag size={15} />
-                <span>{language === 'sw' ? 'Zilizotajwa' : 'Tagged'}</span>
-              </button>
-            </div>
-
-            {/* Posts Grid / Private Lock / Loading Skeleton / Empty State */}
-            {isViewedAccountPrivateAndLocked ? (
-              <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-3">
-                <div className="w-14 h-14 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--accent-primary)] flex items-center justify-center mx-auto">
-                  <Lock size={24} />
-                </div>
-                <h3 className="font-extrabold text-base text-[var(--text-primary)]">
-                  {language === 'sw' ? 'Akaunti Hii ni ya Faragha' : 'This Account is Private'}
-                </h3>
-                <p className="text-xs sm:text-sm text-[var(--text-secondary)] max-w-sm mx-auto">
-                  {language === 'sw'
-                    ? `Mfuateni ${displayedName} ili kuona picha, video na machapisho yake.`
-                    : `Follow ${displayedName} to see their photos, reels, and community posts.`}
-                </p>
-              </div>
-            ) : isLoadingPosts || isLoadingOtherProfile ? (
-              <div className="wavelink-profile-posts-grid">
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((item) => (
-                  <div
-                    key={item}
-                    className="wavelink-profile-post-tile animate-pulse bg-[var(--bg-subtle)]"
-                  />
-                ))}
-              </div>
-            ) : paginatedTabPosts.length === 0 ? (
-              <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-4">
-                <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center mx-auto shadow-md shadow-blue-500/20">
-                  {activeProfileTab === 'reels' ? (
-                    <Video size={28} />
-                  ) : activeProfileTab === 'saved' ? (
-                    <Bookmark size={28} />
-                  ) : activeProfileTab === 'tagged' ? (
-                    <Tag size={28} />
-                  ) : (
-                    <Grid size={28} />
-                  )}
-                </div>
-                <p className="font-extrabold text-base text-[var(--text-primary)] max-w-xs mx-auto leading-snug">
-                  {activeProfileTab === 'reels'
-                    ? language === 'sw'
-                      ? 'Bado hakuna Reels. Bonyeza + kushiriki video yako ya kwanza.'
-                      : 'No reels yet. Tap + to share your first video.'
-                    : activeProfileTab === 'saved'
-                    ? language === 'sw'
-                      ? 'Bado hakuna machapisho yaliyohifadhiwa.'
-                      : 'No saved posts yet. Tap Save on any post to keep it here.'
-                    : activeProfileTab === 'tagged'
-                    ? language === 'sw'
-                      ? 'Bado hakuna machapisho uliyotajwa.'
-                      : 'No tagged posts yet. Friends can tag you with @username.'
-                    : language === 'sw'
-                    ? 'Bado hakuna machapisho. Bonyeza + kushiriki la kwanza.'
-                    : 'No posts yet. Tap + to share your first one.'}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    window.location.href = '/?tab=studio';
-                  }}
-                  className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-sm font-extrabold inline-flex items-center justify-center gap-2 shadow-sm active:scale-95 transition cursor-pointer"
-                >
-                  <Sparkles size={16} />
-                  <span>{language === 'sw' ? '+ Shiriki' : '+ Share'}</span>
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div className="wavelink-profile-posts-grid">
-                  {paginatedTabPosts.map((post) => {
-                    const isPinned = pinnedPostId === post.id && activeProfileTab === 'posts';
-                    const isVideo = Boolean(post.videoUrl) || post.mediaType === 'video';
-                    const images =
-                      Array.isArray(post.imageUrls) && post.imageUrls.length > 0
-                        ? post.imageUrls
-                        : post.imageUrl
-                        ? [post.imageUrl]
-                        : [];
-                    const isMultiPhoto = images.length > 1;
-                    const thumbSrc = post.thumbnailUrl || images[0] || '';
-                    const viewOrLikeCount = post.viewsCount || post.likesCount || 0;
-
-                    return (
-                      <button
-                        key={post.id}
-                        type="button"
-                        onClick={() => setSelectedViewerPostId(post.id)}
-                        className="wavelink-profile-post-tile group text-left"
-                      >
-                        {thumbSrc ? (
-                          <img
-                            src={thumbSrc}
-                            alt={post.content?.slice(0, 40) || 'Post thumbnail'}
-                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                            loading="lazy"
-                          />
-                        ) : isVideo && post.videoUrl ? (
-                          <video
-                            src={post.videoUrl}
-                            muted
-                            playsInline
-                            preload="metadata"
-                            className="w-full h-full object-cover"
-                          />
-                        ) : (
-                          <div className="w-full h-full p-2.5 sm:p-3.5 bg-gradient-to-br from-[var(--bg-subtle)] to-[var(--bg-surface)] flex flex-col justify-between">
-                            <p className="text-[11px] sm:text-xs font-bold text-[var(--text-primary)] line-clamp-4 leading-snug">
-                              {post.content || 'WaveLink Post'}
-                            </p>
-                            <span className="text-[10px] font-mono text-[var(--text-secondary)]">
-                              {new Date(post.createdAt).toLocaleDateString([], {
-                                month: 'short',
-                                day: 'numeric'
-                              })}
-                            </span>
-                          </div>
-                        )}
-
-                        {/* Top-Left Pinned Badge */}
-                        {isPinned && (
-                          <span
-                            className="absolute top-2 left-2 z-10 px-2 py-0.5 rounded-full bg-amber-500 text-white text-[10px] font-extrabold inline-flex items-center gap-1 shadow-md"
-                            title={language === 'sw' ? 'Chapisho Lililobandikwa' : 'Pinned post'}
-                          >
-                            <Pin size={10} />
-                            <span className="hidden sm:inline">Pinned</span>
-                          </span>
-                        )}
-
-                        {/* Top-Right Multi-Photo Stack Icon */}
-                        {isMultiPhoto && (
-                          <span
-                            className="absolute top-2 right-2 z-10 w-6 h-6 rounded-lg bg-black/60 text-white backdrop-blur-xs flex items-center justify-center"
-                            title={`${images.length} photos`}
-                          >
-                            <Layers size={13} />
-                          </span>
-                        )}
-
-                        {/* Bottom-Left Video Play Icon + View/Like Count */}
-                        {isVideo && (
-                          <span className="absolute bottom-2 left-2 z-10 px-2 py-0.5 rounded-full bg-black/65 text-white text-[10px] font-extrabold inline-flex items-center gap-1 backdrop-blur-xs">
-                            <Play size={10} className="fill-white" />
-                            <span>{viewOrLikeCount.toLocaleString()}</span>
-                          </span>
-                        )}
-
-                        {/* Hover Stats Overlay */}
-                        <div className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-3 text-white text-xs font-extrabold">
-                          <span className="inline-flex items-center gap-1">
-                            <Heart size={14} className="fill-white" />
-                            {(post.likesCount || 0).toLocaleString()}
-                          </span>
-                          <span className="inline-flex items-center gap-1">
-                            <MessageCircle size={14} className="fill-white" />
-                            {(post.commentsCount || 0).toLocaleString()}
-                          </span>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {/* Pagination: Load 12 tiles at first, and more on tap */}
-                {currentTabPosts.length > visiblePostsCount && (
-                  <div className="pt-2 text-center">
-                    <button
-                      type="button"
-                      onClick={() => setVisiblePostsCount((prev) => prev + 12)}
-                      className="min-h-[44px] px-6 py-2.5 rounded-2xl bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold transition cursor-pointer"
-                    >
-                      {language === 'sw'
-                        ? `Onyesha Machapisho Zaidi (${currentTabPosts.length - visiblePostsCount} yaliyosalia)`
-                        : `Load More Posts (${currentTabPosts.length - visiblePostsCount} more)`}
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Right Column on Wide Desktop (>= 1280px): Side Panel with Pro Highlight Card, Menu Cards, Badges & WavePoints */}
-          <aside className="hidden xl:flex wavelink-profile-side-col">
-            {renderReferenceMenuCards()}
-          </aside>
+      {modToast && (
+        <div
+          role="status"
+          className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[140] px-4 py-2.5 rounded-2xl bg-slate-900/95 text-white text-xs font-bold shadow-xl border border-white/15 max-w-md text-center"
+        >
+          {modToast}
         </div>
       )}
 
+      {/* =====================================================================
+          MAIN REDESIGNED GAMER PROFILE BODY (when activeSettingsSection === 'profile'):
+          - Mobile (< 1024px): Next Goals (owner) + Sticky Swipeable Tabs + Active Tab Content
+          - Desktop (>= 1024px): Two-column gamer dashboard
+            Left column = Favorite badges, Next Goals (owner), Quick Profile/Settings Menu
+            Right column = Tabs (Posts | Achievements | Challenges | About) + Active Tab Content
+      ===================================================================== */}
+      {activeSettingsSection === 'profile' && (
+        <div className="space-y-4">
+          {/* Quota Exceeded Retry Banner */}
+          {profileQuotaError && (
+            <ProfileQuotaRetryBanner
+              message={profileQuotaError}
+              language={language === 'sw' ? 'sw' : 'en'}
+              onRetry={() => setProfileReloadTick((t) => t + 1)}
+            />
+          )}
+
+          <div className="wavelink-profile-desktop-body">
+            {/* Desktop Left Column (>= 1024px): Favorite Badges + Owner-Only Next Goals + Settings Menu */}
+            <aside className="hidden lg:flex wavelink-profile-side-col">
+              {canShowProgression && (
+                <ProfileFavoriteBadgesCard
+                  displayedHighlightedBadges={progression.displayedHighlightedBadges}
+                  earnedCount={progression.earnedBadges.length}
+                  totalCount={12}
+                  language={language === 'sw' ? 'sw' : 'en'}
+                  onOpenAchievements={() => setActiveMainTab('achievements')}
+                  onSelectBadge={(badgeId) => {
+                    setActiveMainTab('achievements');
+                    setSelectedBadgeSheetId(badgeId);
+                  }}
+                />
+              )}
+
+              {isOwnProfile && (
+                <ProfileNextGoalsCard
+                  levelInfo={progression.levelInfo}
+                  streak={progression.streak}
+                  checkedInToday={checkedInToday}
+                  earnedBadgeIds={progression.earnedBadgeIds}
+                  challengeJoinedCount={progression.challengeStats.joined}
+                  language={language === 'sw' ? 'sw' : 'en'}
+                  onOpenCheckIn={() => setIsDailyRewardModalOpen(true)}
+                  onOpenAchievements={() => setActiveMainTab('achievements')}
+                  onOpenChallenges={() => setActiveMainTab('challenges')}
+                />
+              )}
+
+              {renderReferenceMenuCards()}
+            </aside>
+
+            {/* Right Column on Desktop / Single Column on Mobile */}
+            <div ref={postsGridSectionRef} className="wavelink-profile-main-col">
+              {/* Mobile Owner-Only "Next Goals" Card */}
+              {isOwnProfile && (
+                <div className="lg:hidden">
+                  <ProfileNextGoalsCard
+                    levelInfo={progression.levelInfo}
+                    streak={progression.streak}
+                    checkedInToday={checkedInToday}
+                    earnedBadgeIds={progression.earnedBadgeIds}
+                    challengeJoinedCount={progression.challengeStats.joined}
+                    language={language === 'sw' ? 'sw' : 'en'}
+                    onOpenCheckIn={() => setIsDailyRewardModalOpen(true)}
+                    onOpenAchievements={() => setActiveMainTab('achievements')}
+                    onOpenChallenges={() => setActiveMainTab('challenges')}
+                  />
+                </div>
+              )}
+
+              {/* Primary Profile Tabs: Posts | Achievements | Challenges | About (Sticky pill bar on mobile) */}
+              <div
+                role="tablist"
+                aria-label={language === 'sw' ? 'Sehemu za wasifu' : 'Profile sections'}
+                className="wavelink-gamer-tabs-bar"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={effectiveMainTab === 'posts'}
+                  onClick={() => setActiveMainTab('posts')}
+                  className={`wavelink-gamer-tab-pill ${
+                    effectiveMainTab === 'posts' ? 'wavelink-gamer-tab-pill--active' : ''
+                  }`}
+                >
+                  <Grid size={15} />
+                  <span>{language === 'sw' ? 'Machapisho' : 'Posts'}</span>
+                </button>
+
+                {canShowProgression && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={effectiveMainTab === 'achievements'}
+                    onClick={() => setActiveMainTab('achievements')}
+                    className={`wavelink-gamer-tab-pill ${
+                      effectiveMainTab === 'achievements' ? 'wavelink-gamer-tab-pill--active' : ''
+                    }`}
+                  >
+                    <Award size={15} />
+                    <span>{language === 'sw' ? 'Mafanikio' : 'Achievements'}</span>
+                  </button>
+                )}
+
+                {canShowProgression && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={effectiveMainTab === 'challenges'}
+                    onClick={() => setActiveMainTab('challenges')}
+                    className={`wavelink-gamer-tab-pill ${
+                      effectiveMainTab === 'challenges' ? 'wavelink-gamer-tab-pill--active' : ''
+                    }`}
+                  >
+                    <Trophy size={15} />
+                    <span>{language === 'sw' ? 'Mashindano' : 'Challenges'}</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={effectiveMainTab === 'about'}
+                  onClick={() => setActiveMainTab('about')}
+                  className={`wavelink-gamer-tab-pill ${
+                    effectiveMainTab === 'about' ? 'wavelink-gamer-tab-pill--active' : ''
+                  }`}
+                >
+                  <Info size={15} />
+                  <span>{language === 'sw' ? 'Kuhusu' : 'About'}</span>
+                </button>
+              </div>
+
+              {/* Swipeable Tab Content Area */}
+              <div
+                onTouchStart={handleProfileTabTouchStart}
+                onTouchEnd={handleProfileTabTouchEnd}
+                className="space-y-4 min-w-0"
+              >
+                {/* TAB 1: POSTS (preserves Story Highlights + Posts/Reels/Saved/Tagged sub-filters + 3-col Grid) */}
+                {effectiveMainTab === 'posts' && (
+                  <div className="space-y-4">
+                    <StoryHighlightsBar
+                      profile={activeProfile}
+                      activeSparks={activeUserSparks}
+                      isOwnProfile={isOwnProfile}
+                      language={language === 'sw' ? 'sw' : 'en'}
+                      onSaveHighlights={async (nextHighlights: StoryHighlightItem[]) => {
+                        await updateUserProfile({ storyHighlights: nextHighlights });
+                      }}
+                    />
+
+                    {/* Existing Posts Sub-Filter Tabs: Posts, Reels, Saved (own profile only), Tagged */}
+                    <div
+                      role="tablist"
+                      aria-label="Profile posts filters"
+                      className="grid grid-cols-3 sm:grid-cols-4 gap-1.5 p-1.5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] shadow-2xs"
+                    >
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeProfileTab === 'posts'}
+                        onClick={() => {
+                          setActiveProfileTab('posts');
+                          setVisiblePostsCount(12);
+                        }}
+                        className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                          activeProfileTab === 'posts'
+                            ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                            : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        <Grid size={15} />
+                        <span>{language === 'sw' ? 'Machapisho' : 'Posts'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeProfileTab === 'reels'}
+                        onClick={() => {
+                          setActiveProfileTab('reels');
+                          setVisiblePostsCount(12);
+                        }}
+                        className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                          activeProfileTab === 'reels'
+                            ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                            : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        <Video size={15} />
+                        <span>Reels</span>
+                      </button>
+
+                      {isOwnProfile && (
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={activeProfileTab === 'saved'}
+                          onClick={() => {
+                            setActiveProfileTab('saved');
+                            setVisiblePostsCount(12);
+                          }}
+                          className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                            activeProfileTab === 'saved'
+                              ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                          }`}
+                        >
+                          <Bookmark size={15} />
+                          <span>{language === 'sw' ? 'Zilizohifadhiwa' : 'Saved'}</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeProfileTab === 'tagged'}
+                        onClick={() => {
+                          setActiveProfileTab('tagged');
+                          setVisiblePostsCount(12);
+                        }}
+                        className={`min-h-[44px] px-3 py-2 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                          activeProfileTab === 'tagged'
+                            ? 'bg-[var(--accent-primary)] text-white shadow-2xs'
+                            : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        <Tag size={15} />
+                        <span>{language === 'sw' ? 'Zilizotajwa' : 'Tagged'}</span>
+                      </button>
+                    </div>
+
+                    {/* Posts Grid / Private Lock / Loading Skeleton / Empty State */}
+                    {isViewedAccountPrivateAndLocked ? (
+                      <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-3">
+                        <div className="w-14 h-14 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] text-[var(--accent-primary)] flex items-center justify-center mx-auto">
+                          <Lock size={24} />
+                        </div>
+                        <h3 className="font-extrabold text-base text-[var(--text-primary)]">
+                          {language === 'sw' ? 'Akaunti Hii ni ya Faragha' : 'This Account is Private'}
+                        </h3>
+                        <p className="text-xs sm:text-sm text-[var(--text-secondary)] max-w-sm mx-auto">
+                          {language === 'sw'
+                            ? `Mfuateni ${displayedName} ili kuona picha, video na machapisho yake.`
+                            : `Follow ${displayedName} to see their photos, reels, and community posts.`}
+                        </p>
+                      </div>
+                    ) : isLoadingPosts || isLoadingOtherProfile ? (
+                      <div className="wavelink-profile-posts-grid">
+                        {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((item) => (
+                          <div
+                            key={item}
+                            className="wavelink-profile-post-tile animate-pulse bg-[var(--bg-subtle)]"
+                          />
+                        ))}
+                      </div>
+                    ) : paginatedTabPosts.length === 0 ? (
+                      <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-10 text-center space-y-4">
+                        <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-[#2563EB] to-[#0D9488] text-white flex items-center justify-center mx-auto shadow-md shadow-blue-500/20">
+                          {activeProfileTab === 'reels' ? (
+                            <Video size={28} />
+                          ) : activeProfileTab === 'saved' ? (
+                            <Bookmark size={28} />
+                          ) : activeProfileTab === 'tagged' ? (
+                            <Tag size={28} />
+                          ) : (
+                            <Grid size={28} />
+                          )}
+                        </div>
+                        <p className="font-extrabold text-base text-[var(--text-primary)] max-w-xs mx-auto leading-snug">
+                          {activeProfileTab === 'reels'
+                            ? language === 'sw'
+                              ? 'Bado hakuna Reels. Bonyeza + kushiriki video yako ya kwanza.'
+                              : 'No reels yet. Tap + to share your first video.'
+                            : activeProfileTab === 'saved'
+                            ? language === 'sw'
+                              ? 'Bado hakuna machapisho yaliyohifadhiwa.'
+                              : 'No saved posts yet. Tap Save on any post to keep it here.'
+                            : activeProfileTab === 'tagged'
+                            ? language === 'sw'
+                              ? 'Bado hakuna machapisho uliyotajwa.'
+                              : 'No tagged posts yet. Friends can tag you with @username.'
+                            : language === 'sw'
+                            ? 'Bado hakuna machapisho. Bonyeza + kushiriki la kwanza.'
+                            : 'No posts yet. Tap + to share your first one.'}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            window.location.href = '/?tab=studio';
+                          }}
+                          className="min-h-[48px] px-6 py-2.5 rounded-2xl bg-[var(--accent-primary)] hover:opacity-95 text-white text-sm font-extrabold inline-flex items-center justify-center gap-2 shadow-sm active:scale-95 transition cursor-pointer"
+                        >
+                          <Sparkles size={16} />
+                          <span>{language === 'sw' ? '+ Shiriki' : '+ Share'}</span>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        <div className="wavelink-profile-posts-grid">
+                          {paginatedTabPosts.map((post) => {
+                            const isPinned = pinnedPostId === post.id && activeProfileTab === 'posts';
+                            const isLiked = Boolean(post.likes?.includes(currentUser?.uid || ''));
+                            return (
+                              <UnifiedPostCard
+                                key={post.id}
+                                post={post}
+                                isLiked={isLiked}
+                                isPinned={isPinned}
+                                aspectOverride="square"
+                                compact={true}
+                                activeHoverPostId={activeHoverProfilePostId}
+                                onRequestHoverPlay={setActiveHoverProfilePostId}
+                                onOpenVideoInReels={(videoPost) => {
+                                  const profileVideoQueue = currentTabPosts.filter((p) =>
+                                    Boolean(p.videoUrl || p.hasVideoChunks || p.mediaType === 'video')
+                                  );
+                                  window.dispatchEvent(
+                                    new CustomEvent('wavelink:navigate-tab', { detail: 'videos' })
+                                  );
+                                  window.setTimeout(() => {
+                                    window.dispatchEvent(
+                                      new CustomEvent('wavelink:open-reels-queue', {
+                                        detail: {
+                                          startPost: videoPost,
+                                          queue:
+                                            profileVideoQueue.length > 0
+                                              ? profileVideoQueue
+                                              : [videoPost]
+                                        }
+                                      })
+                                    );
+                                  }, 40);
+                                }}
+                                onOpenPostDetail={(target) => setSelectedViewerPostId(target.id)}
+                                onLongPressQuickActions={(target) =>
+                                  setSelectedViewerPostId(target.id)
+                                }
+                              />
+                            );
+                          })}
+                        </div>
+
+                        {/* Pagination: Load 12 tiles at first, and more on tap */}
+                        {currentTabPosts.length > visiblePostsCount && (
+                          <div className="pt-2 text-center">
+                            <button
+                              type="button"
+                              onClick={() => setVisiblePostsCount((prev) => prev + 12)}
+                              className="min-h-[44px] px-6 py-2.5 rounded-2xl bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] border border-[var(--border-hairline)] text-xs font-extrabold transition cursor-pointer"
+                            >
+                              {language === 'sw'
+                                ? `Onyesha Machapisho Zaidi (${currentTabPosts.length - visiblePostsCount} yaliyosalia)`
+                                : `Load More Posts (${currentTabPosts.length - visiblePostsCount} more)`}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* TAB 2: ACHIEVEMENTS */}
+                {effectiveMainTab === 'achievements' && canShowProgression && (
+                  <ProfileAchievementsTab
+                    earnedBadges={progression.earnedBadges}
+                    earnedBadgeIds={progression.earnedBadgeIds}
+                    highlightedBadges={progression.highlightedBadges}
+                    isOwnProfile={isOwnProfile}
+                    streak={progression.streak}
+                    longestStreak={progression.longestStreak}
+                    daysActive={progression.daysActive}
+                    totalPosts={userPosts.length}
+                    totalLikesReceived={progression.totalLikesReceived}
+                    language={language === 'sw' ? 'sw' : 'en'}
+                    selectedBadgeId={selectedBadgeSheetId}
+                    onSelectBadge={setSelectedBadgeSheetId}
+                    onToggleHighlightBadge={handleToggleHighlightedBadge}
+                    onGoToChallenges={() => setActiveMainTab('challenges')}
+                  />
+                )}
+
+                {/* TAB 3: CHALLENGES */}
+                {effectiveMainTab === 'challenges' && canShowProgression && (
+                  <ProfileChallengesTab
+                    challengeStats={progression.challengeStats}
+                    recentChallenges={progression.recentChallenges}
+                    userPosts={userPosts}
+                    weeklyWinnerChallengeTitle={activeProfile?.weeklyWinnerChallengeTitle}
+                    weeklyWinnerHashtag={activeProfile?.weeklyWinnerHashtag}
+                    isOwnProfile={isOwnProfile}
+                    language={language === 'sw' ? 'sw' : 'en'}
+                  />
+                )}
+
+                {/* TAB 4: ABOUT */}
+                {effectiveMainTab === 'about' && (
+                  <ProfileAboutTab
+                    profile={activeProfile}
+                    displayedName={displayedName}
+                    displayedUsername={displayedUsername}
+                    displayedBio={displayedBio}
+                    countryLabel={getAfricanCountryMeta(activeProfile?.countryCode || activeCountryCode).nameEn}
+                    countryFlag={getAfricanCountryMeta(activeProfile?.countryCode || activeCountryCode).flag}
+                    language={language === 'sw' ? 'sw' : 'en'}
+                    isOwnProfile={isOwnProfile}
+                    onEditProfile={() => setActiveSettingsSection('edit_profile')}
+                    onOpenPrivacy={() => setActiveSettingsSection('privacy')}
+                  />
+                )}
+              </div>
+
+              {/* Mobile & Tablet (< 1024px): Preserve full Settings & Quick Menu Cards below tab content */}
+              <div className="lg:hidden pt-1">{renderReferenceMenuCards()}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Celebratory Level-Up Banner (respects prefers-reduced-motion and Simple/Lite mode) */}
+      <ProfileLevelUpBanner
+        isSimpleMode={isSimpleMode}
+        language={language === 'sw' ? 'sw' : 'en'}
+      />
+
       {(activeSettingsSection === 'settings_hub' || activeSettingsSection === 'edit_profile') && (
         <div className="space-y-6">
+          {/* Highlighted Badge Selector (single badge icon shown next to your name on posts & comments) */}
+          {isOwnProfile && (
+            <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-xs space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="font-extrabold text-[var(--text-primary)] text-sm">
+                  {language === 'sw' ? 'Beji Pembeni ya Jina Lako' : 'Highlighted Badge (Posts & Comments)'}
+                </h3>
+                {userProfile?.highlightedBadgeId && (
+                  <button
+                    type="button"
+                    onClick={() => updateUserProfile({ highlightedBadgeId: null })}
+                    className="text-xs font-semibold text-[var(--text-secondary)] hover:underline cursor-pointer"
+                  >
+                    {language === 'sw' ? 'Ondoa' : 'Clear'}
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-[var(--text-secondary)]">
+                {language === 'sw'
+                  ? 'Chagua beji moja unayopenda ionekane pembeni ya jina lako kwenye machapisho na maoni.'
+                  : 'Choose one earned badge icon to show next to your name on posts and comments.'}
+              </p>
+              <EarnedBadgesRow
+                profile={userProfile}
+                isOwnProfile={true}
+                language={language === 'sw' ? 'sw' : 'en'}
+                onSelectHighlightedBadge={async (badgeId) => {
+                  await updateUserProfile({ highlightedBadgeId: badgeId });
+                }}
+              />
+            </div>
+          )}
+
           {/* Quick Settings Shortcuts Card (Terms, Privacy, Password, Log Out) */}
           <div className="bg-[var(--bg-surface)] border border-[var(--border-hairline)] rounded-3xl p-5 shadow-xs space-y-3">
             <h3 className="font-extrabold text-[#1C1917] text-sm px-1">
@@ -3754,6 +4396,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               <button
                 type="button"
+                onClick={() => setActiveSettingsSection('parental_control')}
+                className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-teal-50/60 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-teal-50 text-teal-700 border border-teal-200 flex items-center justify-center shrink-0">
+                    <ShieldCheck size={16} />
+                  </div>
+                  <div>
+                    <span className="text-xs font-extrabold text-[#1C1917] block">
+                      Parental Control
+                    </span>
+                    <span className="text-[11px] text-[#78716C] block">
+                      {isTeenAccountActive(userProfile)
+                        ? 'Parent link status, limits & transparency'
+                        : 'Link as a parent & open Parent Dashboard'}
+                    </span>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-[#78716C]" />
+              </button>
+
+              {!isTeenAccountActive(userProfile) && (
+                <button
+                  type="button"
+                  onClick={() => setActiveSettingsSection('parent_dashboard')}
+                  className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-indigo-50/60 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 border border-indigo-200 flex items-center justify-center shrink-0">
+                      <Shield size={16} />
+                    </div>
+                    <div>
+                      <span className="text-xs font-extrabold text-[#1C1917] block">
+                        Parent Dashboard
+                      </span>
+                      <span className="text-[11px] text-[#78716C] block">
+                        Teen activity summary, screen time, approvals &amp; alerts
+                      </span>
+                    </div>
+                  </div>
+                  <ChevronRight size={16} className="text-[#78716C]" />
+                </button>
+              )}
+
+              <button
+                type="button"
                 onClick={() => setActiveSettingsSection('security')}
                 className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-blue-50/60 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left"
               >
@@ -3772,6 +4460,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
                 <ChevronRight size={16} className="text-[#78716C]" />
               </button>
+
+              {isAdmin && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setActiveSettingsSection('admin_updates')}
+                    className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-blue-50/60 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 border border-indigo-200 flex items-center justify-center shrink-0">
+                        <Sparkles size={16} />
+                      </div>
+                      <div>
+                        <span className="text-xs font-extrabold text-[#1C1917] block">
+                          Admin Updates
+                        </span>
+                        <span className="text-[11px] text-[#78716C] block">
+                          Post AI-polished updates &amp; manage sub-admins
+                        </span>
+                      </div>
+                    </div>
+                    <ChevronRight size={16} className="text-[#78716C]" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setActiveSettingsSection('admin_challenges')}
+                    className="p-3.5 rounded-2xl bg-[var(--bg-subtle)] hover:bg-amber-50/60 border border-[var(--border-hairline)] flex items-center justify-between gap-3 transition text-left cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-xl bg-amber-50 text-amber-600 border border-amber-200 flex items-center justify-center shrink-0">
+                        <Trophy size={16} />
+                      </div>
+                      <div>
+                        <span className="text-xs font-extrabold text-[#1C1917] block">
+                          Admin • Challenges &amp; Badges
+                        </span>
+                        <span className="text-[11px] text-[#78716C] block">
+                          Create weekly challenges, choose winners &amp; custom badges
+                        </span>
+                      </div>
+                    </div>
+                    <ChevronRight size={16} className="text-[#78716C]" />
+                  </button>
+                </>
+              )}
 
               <button
                 type="button"
@@ -4225,7 +4959,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </span>
                   ) : (
                     (userProfile?.interests || []).map((id) => {
-                      const item = INTEREST_CATALOG.find((c) => c.id === id);
+                      const item = INTEREST_CATALOG.find(
+                        (c) => c.id === id || c.exploreCategory.toLowerCase() === id.toLowerCase()
+                      );
                       if (!item) return null;
                       return (
                         <span
@@ -4246,6 +4982,192 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               >
                 {t('interests.editButton')}
               </button>
+            </div>
+
+            {/* 6. Filter / Hide AI-Generated Content in Feed & Explore */}
+            <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <Sparkles size={15} className="text-[#2563EB]" />
+                  <span className="font-extrabold text-[#1C1917] text-xs">
+                    {language === 'sw'
+                      ? 'Ficha Maudhui Yaliyoundwa na AI'
+                      : 'Hide AI-Generated Content'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-[#78716C] mt-1">
+                  {language === 'sw'
+                    ? 'Ficha video na picha zilizotambuliwa kuwa zimeundwa na AI kwenye Explore na Mlisho.'
+                    : 'Filter out posts flagged as AI-generated on Explore and Home Feed.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={Boolean(userProfile?.hideAiGenerated)}
+                onClick={() => {
+                  const next = !userProfile?.hideAiGenerated;
+                  try {
+                    localStorage.setItem('wavelink_hide_ai_generated', next ? '1' : '0');
+                  } catch {}
+                  updateUserProfile({ hideAiGenerated: next }).catch(() => {});
+                }}
+                className={`min-h-[38px] px-4 py-1.5 rounded-xl text-xs font-extrabold transition cursor-pointer shrink-0 ${
+                  userProfile?.hideAiGenerated
+                    ? 'bg-[#2563EB] text-white'
+                    : 'bg-white border border-[var(--border-hairline)] text-[#1C1917]'
+                }`}
+              >
+                {userProfile?.hideAiGenerated
+                  ? language === 'sw'
+                    ? 'Imewashwa'
+                    : 'Hidden'
+                  : language === 'sw'
+                  ? 'Inaonyeshwa'
+                  : 'Showing All'}
+              </button>
+            </div>
+
+            {/* 7. Show 24-Hour Notes in Chat Inbox */}
+            <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <MessageCircle size={15} className="text-[#0D9488]" />
+                  <span className="font-extrabold text-[#1C1917] text-xs">
+                    {language === 'sw'
+                      ? 'Onyesha Vidokezo vya Saa 24 kwenye Ujumbe (Chat Notes)'
+                      : 'Show 24-Hour Notes in Chat Inbox'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-[#78716C] mt-1">
+                  {language === 'sw'
+                    ? 'Onyesha viputo vya ujumbe mfupi wa herufi 60 juu ya picha za marafiki kwenye Ujumbe.'
+                    : 'Display short 60-character speech-bubble notes above contact avatars in the Message inbox.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={userProfile?.showChatNotes !== false}
+                onClick={() => {
+                  const next = userProfile?.showChatNotes === false;
+                  updateUserProfile({ showChatNotes: next }).catch(() => {});
+                }}
+                className={`min-h-[38px] px-4 py-1.5 rounded-xl text-xs font-extrabold transition cursor-pointer shrink-0 ${
+                  userProfile?.showChatNotes !== false
+                    ? 'bg-[#0D9488] text-white'
+                    : 'bg-white border border-[var(--border-hairline)] text-[#1C1917]'
+                }`}
+              >
+                {userProfile?.showChatNotes !== false
+                  ? language === 'sw'
+                    ? 'Imewashwa'
+                    : 'On'
+                  : language === 'sw'
+                  ? 'Imezimwa'
+                  : 'Off'}
+              </button>
+            </div>
+
+            {/* 8. Sensitive Content Filter (ON by default; locked ON for under-18 accounts) */}
+            <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <ShieldAlert size={15} className="text-amber-500" />
+                  <span className="font-extrabold text-[var(--text-primary)] text-xs">
+                    {language === 'sw'
+                      ? 'Kichujio cha Maudhui Nyeti (Sensitive Content Filter)'
+                      : 'Sensitive Content Filter'}
+                  </span>
+                  {isAccountUnder18 && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 text-[10px] font-extrabold">
+                      <Lock size={10} />
+                      <span>{language === 'sw' ? 'Imefungwa (<18)' : 'Locked ON (<18)'}</span>
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-[var(--text-secondary)] mt-1">
+                  {isAccountUnder18
+                    ? language === 'sw'
+                      ? 'Kwa usalama wa watumiaji walio chini ya miaka 18, maudhui nyeti hufichwa kabisa na kichujio hiki hakiwezi kuzimwa.'
+                      : 'For under-18 safety, borderline or sensitive media is completely hidden and this filter is locked ON.'
+                    : language === 'sw'
+                    ? 'Huweka ukungu kwenye picha au video nyeti hadi uguse ili kuona. Kimewashwa kwa chaguo-msingi.'
+                    : 'Blurs borderline photos and video thumbnails with a tap-to-view cover. Enabled by default.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={sensitiveFilterEnabled}
+                disabled={isAccountUnder18}
+                onClick={() => {
+                  if (isAccountUnder18) return;
+                  const next = !sensitiveFilterEnabled;
+                  updateUserProfile({ sensitiveContentFilter: next }).catch(() => {});
+                }}
+                className={`min-h-[38px] px-4 py-1.5 rounded-xl text-xs font-extrabold transition shrink-0 ${
+                  isAccountUnder18
+                    ? 'bg-amber-600/80 text-white cursor-not-allowed opacity-85'
+                    : sensitiveFilterEnabled
+                    ? 'bg-emerald-600 text-white cursor-pointer'
+                    : 'bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] cursor-pointer'
+                }`}
+              >
+                {isAccountUnder18
+                  ? language === 'sw'
+                    ? 'Imefungwa ON'
+                    : 'Locked ON'
+                  : sensitiveFilterEnabled
+                  ? language === 'sw'
+                    ? 'Imewashwa'
+                    : 'On'
+                  : language === 'sw'
+                  ? 'Imezimwa'
+                  : 'Off'}
+              </button>
+            </div>
+
+            {/* 9. Community Guidelines, Terms & Privacy Quick Links */}
+            <div className="p-4 rounded-2xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <BookOpen size={15} className="text-[var(--accent-primary)]" />
+                  <span className="font-extrabold text-[var(--text-primary)] text-xs">
+                    {language === 'sw'
+                      ? 'Miongozo ya Jamii na Sheria za WaveLink'
+                      : 'Community Guidelines & Safety Policies'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-[var(--text-secondary)] mt-1">
+                  {language === 'sw'
+                    ? 'Soma sheria za lugha salama, maonyo (strikes), na jinsi ya kukata rufaa.'
+                    : 'Read what is allowed on WaveLink, our 4-layer safety rules, strikes, and appeals.'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setSelectedLegalDoc('guidelines')}
+                  className="min-h-[36px] px-3 py-1.5 rounded-xl bg-[var(--accent-primary)] text-white text-xs font-extrabold cursor-pointer hover:opacity-95 transition"
+                >
+                  {language === 'sw' ? 'Miongozo ya Jamii' : 'Community Guidelines'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedLegalDoc('terms')}
+                  className="min-h-[36px] px-3 py-1.5 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-bold cursor-pointer hover:opacity-90 transition"
+                >
+                  {language === 'sw' ? 'Masharti' : 'Terms'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedLegalDoc('privacy')}
+                  className="min-h-[36px] px-3 py-1.5 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-hairline)] text-[var(--text-primary)] text-xs font-bold cursor-pointer hover:opacity-90 transition"
+                >
+                  {language === 'sw' ? 'Faragha' : 'Privacy'}
+                </button>
+              </div>
             </div>
           </div>
 

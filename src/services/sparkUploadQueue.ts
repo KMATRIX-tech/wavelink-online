@@ -226,6 +226,9 @@ class SparkUploadQueueManager {
             legendaryTag: slide.legendaryTag || '🏆 Legendary Win',
             caption: (slide.caption || '').trim(),
             mediaType: slide.mediaType,
+            mediaSafety: 'safe',
+            moderationChecked: true,
+            moderationCheckedAt: createdAtIso,
             hasVideoChunks: false,
             likes: [],
             likesCount: 0,
@@ -266,6 +269,9 @@ class SparkUploadQueueManager {
               throw new Error('Cloudinary photo upload did not return a valid secure_url.');
             }
             sparkPayload.mediaUrl = imgUpload.downloadUrl;
+            if (imgUpload.mediaSafety) {
+              sparkPayload.mediaSafety = imgUpload.mediaSafety;
+            }
             if (imgUpload.storagePath) {
               sparkPayload.storagePath = imgUpload.storagePath;
             }

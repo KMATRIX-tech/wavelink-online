@@ -24,7 +24,8 @@ import {
   PRO_SPARK_MAX_SECONDS
 } from '../utils/mediaStorage';
 import { enqueueSparkUploadJob } from '../services/sparkUploadQueue';
-import { moderatePostContent } from '../services/geminiService';
+import { validateAndModerateText } from '../services/moderationService';
+import { checkTextModerationLocal } from '../utils/contentModeration';
 import { SongSelectorModal } from './SongSelectorModal';
 import {
   Flame,
@@ -518,6 +519,14 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
   // Add a text/quote post slide to the Spark queue
   const handleAddTextSlide = () => {
     if (!textCardInput.trim()) return;
+    const localCheck = checkTextModerationLocal(textCardInput.trim());
+    if (localCheck.flagged) {
+      setFeedbackBanner({
+        type: 'error',
+        text: localCheck.friendlyMessage
+      });
+      return;
+    }
     const authorName = userProfile?.displayName || currentUser?.displayName || 'Waver';
     const dataUrl = createTextPostSparkImage(
       textCardInput.trim(),
@@ -665,33 +674,21 @@ export const MultiSparkPosterModal: React.FC<MultiSparkPosterModalProps> = ({
     setPublishProgress(15);
     setFeedbackBanner(null);
 
-    // 3. Pre-publish AI content moderation on slide captions
+    // 3. Pre-publish Layer 1 + Layer 2 moderation on slide captions & tags
     const combinedCaptions = slides
-      .map((s) => (s.caption || s.textCardBody || '').trim())
+      .map((s) => `${s.caption || ''} ${s.textCardBody || ''} ${s.legendaryTag || ''}`.trim())
       .filter(Boolean)
       .join(' | ');
     if (combinedCaptions) {
-      try {
-        const modCheck = await moderatePostContent(combinedCaptions);
-        if (modCheck.flagged) {
-          setFeedbackBanner({
-            type: 'error',
-            text: modCheck.reason || 'Spark caption flagged by WaveLink AI Safety Moderation.'
-          });
-          setIsPublishing(false);
-          setPublishProgress(0);
-          return;
-        }
-      } catch (err: any) {
-        if (err?.message?.toLowerCase?.().includes('rate limit')) {
-          setFeedbackBanner({
-            type: 'error',
-            text: 'You posted Sparks very quickly. Please wait a moment and tap Try again.'
-          });
-          setIsPublishing(false);
-          setPublishProgress(0);
-          return;
-        }
+      const modVerdict = await validateAndModerateText(combinedCaptions, 'spark', userProfile);
+      if (!modVerdict.allowed) {
+        setFeedbackBanner({
+          type: 'error',
+          text: modVerdict.friendlyMessage
+        });
+        setIsPublishing(false);
+        setPublishProgress(0);
+        return;
       }
     }
 
